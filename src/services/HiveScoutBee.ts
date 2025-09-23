@@ -34,9 +34,9 @@ export class HiveScoutBeeWrapper {
                 name: 'approximation-approach',
                 description: 'Suitable for stable, low-variance streams',
                 maxThresholds: {
-                    variance: 10,
-                    entropy: 2.0,
-                    fftEntropy: 1.5
+                    variance: 50,
+                    entropy: 5.0,
+                    fftEntropy: 3.0
                 },
                 priority: 1
             },
@@ -44,8 +44,8 @@ export class HiveScoutBeeWrapper {
                 name: 'fetching-client-side',
                 description: 'Optimal for high-variance, complex streams',
                 minThresholds: {
-                    variance: 50,
-                    entropy: 3.0
+                    variance: 20,
+                    entropy: 2.0
                 },
                 priority: 2
             },
@@ -53,13 +53,18 @@ export class HiveScoutBeeWrapper {
                 name: 'chunked-approach',
                 description: 'Best for high-volume, regular streams',
                 minThresholds: {
-                    tripleCount: 100
+                    tripleCount: 50
                 },
                 maxThresholds: {
-                    variance: 30
+                    variance: 100
                 },
                 priority: 3
             },
+            {
+                name: 'streaming-query-hive',
+                description: 'Advanced streaming query processing with intelligent orchestration',
+                priority: 4
+            }
         ];
 
         this.coreScoutBee = new HiveScoutBeeCore(approachConfigs);
@@ -117,9 +122,9 @@ export class HiveScoutBeeWrapper {
      */
     getApproachRecommendation(): ApproachRecommendation | null {
 
-        // The core package needs a minimum amount of data to perform analysis, we require at least 5 data points (arbitrary choice for demo)
+        // The core package needs a minimum amount of data to perform analysis, we require at least 10 data points
         // Normally with such a small amount of data it is better to do a fetching approach on client side.
-        if (this.dataBuffer.length < 5) {
+        if (this.dataBuffer.length < 10) {
             console.log(`Insufficient data for analysis (${this.dataBuffer.length} points)`);
             return null;
         }
@@ -157,7 +162,7 @@ export class HiveScoutBeeWrapper {
      * @memberof HiveScoutBeeWrapper 
      */
     getStreamSignature(): CoreStreamSignature | null {
-        if (this.dataBuffer.length < 5) {
+        if (this.dataBuffer.length < 10) {
             return null;
         }
 
@@ -219,28 +224,30 @@ export class HiveScoutBeeWrapper {
 
         const values = this.dataBuffer.map(d => d.value);
         const timestamps = this.dataBuffer.map(d => d.timestamp);
+        const topics = [...new Set(this.dataBuffer.map(d => d.topic))];
 
         const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
         const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;
+        const min = Math.min(...values);
+        const max = Math.max(...values);
 
-        const intervals = timestamps.slice(1).map((t, i) => t - timestamps[i]);
-        const avgInterval = intervals.length > 0 ? intervals.reduce((sum, i) => sum + i, 0) / intervals.length : 0;
-        const dataRate = avgInterval > 0 ? 1000 / avgInterval : 0;
+        const startTime = Math.min(...timestamps);
+        const endTime = Math.max(...timestamps);
 
         return {
-            bufferSize: this.dataBuffer.length,
-            dataRate: dataRate.toFixed(2) + ' Hz',
-            valueRange: {
-                min: Math.min(...values),
-                max: Math.max(...values),
-                mean: mean.toFixed(2),
-                variance: variance.toFixed(2)
-            },
+            count: this.dataBuffer.length,
+            mean: mean,
+            min: min,
+            max: max,
+            variance: variance,
+            topics: topics,
             timeRange: {
-                start: new Date(Math.min(...timestamps)).toISOString(),
-                end: new Date(Math.max(...timestamps)).toISOString(),
-                duration: (Math.max(...timestamps) - Math.min(...timestamps)) + 'ms'
-            }
+                start: startTime,
+                end: endTime,
+                duration: endTime - startTime
+            },
+            latest: this.dataBuffer[this.dataBuffer.length - 1],
+            oldest: this.dataBuffer[0]
         };
     }
 
@@ -276,6 +283,16 @@ export class HiveScoutBeeWrapper {
                 if (signature.variance < 30) {
                     reasons.push(`Moderate variance (${signature.variance.toFixed(2)}) suitable for chunking`);
                 }
+                break;
+
+            case 'streaming-query-hive':
+                reasons.push(`Moderate entropy (${signature.entropy.toFixed(2)}) and variance (${signature.variance.toFixed(2)}) suitable for advanced streaming query processing`);
+                reasons.push(`Complex patterns detected that benefit from intelligent orchestration`);
+                break;
+
+            default:
+                reasons.push(`Stream characteristics (variance: ${signature.variance.toFixed(2)}, entropy: ${signature.entropy.toFixed(2)}) analyzed`);
+                reasons.push(`Using ${coreRecommendation.recommendedApproach} approach based on current stream signature`);
                 break;
         }
 

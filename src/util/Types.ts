@@ -64,6 +64,7 @@ export type AnalysisSummary = {
     manualApproach: string | null;
     lastRecommendation: ApproachRecommendation | null;
     historyLength: number;
+    cachedRecommendation?: ApproachRecommendation | null;
     warning?: string;
     recentApproaches?: Record<string, number>;
     averageConfidence?: number;

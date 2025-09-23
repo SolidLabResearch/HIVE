@@ -23,6 +23,7 @@ export class IntelligentOrchestrator {
     private analysisHistory: ApproachRecommendation[] = [];
     private manualApproach: string | null = null;
     private analysisMode: 'automatic' | 'manual' | 'hybrid' = 'automatic';
+    private cachedRecommendation: ApproachRecommendation | null = null;
 
 
     /**
@@ -139,6 +140,45 @@ export class IntelligentOrchestrator {
     }
 
     /**
+     * Pre-analyze streams and cache recommendation for later use
+     * Useful for getting approach recommendations before query execution
+     * @param {number} queryComplexity - Estimated complexity of the query to be executed (1-10 scale)
+     * @returns {Promise<ApproachRecommendation | null>} - The cached recommendation, or null if analysis failed
+     */
+    async preAnalyzeStreams(queryComplexity: number = 5): Promise<ApproachRecommendation | null> {
+        if (!this.streamAnalysisEnabled) {
+            console.log('Stream analysis is disabled, cannot pre-analyze');
+            return null;
+        }
+
+        try {
+            console.log('Pre-analyzing streams for approach recommendation...');
+            const recommendation = await this.getApproachRecommendation(queryComplexity);
+            
+            if (recommendation) {
+                this.cachedRecommendation = recommendation;
+                console.log(`Pre-analysis complete: ${recommendation.recommendedApproach} (confidence: ${(recommendation.confidence * 100).toFixed(1)}%)`);
+                return recommendation;
+            } else {
+                console.log('Pre-analysis failed: no recommendation generated');
+                return null;
+            }
+        } catch (error) {
+            console.error('Error during pre-analysis:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Clear the cached recommendation from pre-analysis
+     * @returns {void} - No return value.
+     */
+    clearCachedRecommendation(): void {
+        this.cachedRecommendation = null;
+        console.log('Cached recommendation cleared');
+    }
+
+    /**
      * Get approach recommendation based on current stream analysis data
      * @param {number} queryComplexity - Estimated complexity of the registered query (1-10 scale)
      * @returns {Promise<ApproachRecommendation | null>} - The recommended approach and details, or null if no recommendation could be made
@@ -216,8 +256,14 @@ export class IntelligentOrchestrator {
 
             case 'automatic':
                 if (this.streamAnalysisEnabled) {
-                    const queryComplexity = this.estimateQueryComplexity(this.registeredQuery);
-                    const recommendation = await this.getApproachRecommendation(queryComplexity);
+                    // Use cached recommendation if available, otherwise analyze
+                    let recommendation = this.cachedRecommendation;
+                    if (!recommendation) {
+                        const queryComplexity = this.estimateQueryComplexity(this.registeredQuery);
+                        recommendation = await this.getApproachRecommendation(queryComplexity);
+                    } else {
+                        console.log(`Using pre-analyzed recommendation: ${recommendation.recommendedApproach} (confidence: ${(recommendation.confidence * 100).toFixed(1)}%)`);
+                    }
                     
                     if (recommendation && recommendation.confidence > 0.6) {
                         const selectedApproach = this.mapApproachToOperatorType(recommendation.recommendedApproach);
@@ -235,8 +281,14 @@ export class IntelligentOrchestrator {
             case 'hybrid':
                 // Try automatic first, fall back to manual if available
                 if (this.streamAnalysisEnabled) {
-                    const queryComplexity = this.estimateQueryComplexity(this.registeredQuery);
-                    const recommendation = await this.getApproachRecommendation(queryComplexity);
+                    // Use cached recommendation if available, otherwise analyze
+                    let recommendation = this.cachedRecommendation;
+                    if (!recommendation) {
+                        const queryComplexity = this.estimateQueryComplexity(this.registeredQuery);
+                        recommendation = await this.getApproachRecommendation(queryComplexity);
+                    } else {
+                        console.log(`Using pre-analyzed recommendation (hybrid mode): ${recommendation.recommendedApproach} (confidence: ${(recommendation.confidence * 100).toFixed(1)}%)`);
+                    }
                     
                     if (recommendation && recommendation.confidence > 0.7) {
                         const selectedApproach = this.mapApproachToOperatorType(recommendation.recommendedApproach);
@@ -269,7 +321,8 @@ export class IntelligentOrchestrator {
             streamAnalysisEnabled: this.streamAnalysisEnabled,
             manualApproach: this.manualApproach,
             lastRecommendation: this.lastRecommendation,
-            historyLength: this.analysisHistory.length
+            historyLength: this.analysisHistory.length,
+            cachedRecommendation: this.cachedRecommendation
         };
 
         if (!this.streamAnalysisEnabled && this.analysisMode !== 'manual') {
