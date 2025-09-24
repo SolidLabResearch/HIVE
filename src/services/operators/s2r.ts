@@ -139,6 +139,7 @@ export class CSPARQLWindow {
     private current_watermark: number; // To track the current watermark of the window
     public max_delay: number; // The maximum delay allowed for a observation to be considered in the window
     public pending_triggers: Set<WindowInstance>; // Tracking windows that have pending triggers
+    public enableOOO: boolean; // Toggle for enabling/disabling out-of-order processing
     /**
      * Constructor for the CSPARQLWindow class.
      * @param {string} name - The name of the CSPARQL Window.
@@ -148,8 +149,9 @@ export class CSPARQLWindow {
      * @param {Tick} tick - The tick of the window.
      * @param {number} start_time - The start time of the window.
      * @param {number} max_delay - The maximum delay allowed for an observation to be considered in the window used for out-of-order processing.
+     * @param {boolean} enableOOO - Toggle for enabling/disabling out-of-order processing.
      */
-    constructor(name: string, width: number, slide: number, report: ReportStrategy, tick: Tick, start_time: number, max_delay: number) {
+    constructor(name: string, width: number, slide: number, report: ReportStrategy, tick: Tick, start_time: number, max_delay: number, enableOOO: boolean = true) {
         this.name = name;
         this.width = width;
         this.slide = slide;
@@ -164,6 +166,7 @@ export class CSPARQLWindow {
         this.emitter = new EventEmitter();
         this.max_delay = max_delay;
         this.pending_triggers = new Set<WindowInstance>();
+        this.enableOOO = enableOOO;
     }
 
     /**
@@ -207,6 +210,11 @@ export class CSPARQLWindow {
         const t_e = timestamp;
         const to_evict = new Set<WindowInstance>();
         if (this.time > timestamp) {
+            if (!this.enableOOO) {
+                this.logger.info(`out_of_order_event_ignored`, `CSPARQLWindow`);
+                console.debug(`Out-of-order processing is disabled. Ignoring event [" + ${event} + "] at time : ${timestamp}`);
+                return;
+            }
             this.logger.info(`out_of_order_event_received`, `CSPARQLWindow`);
             const event_latency = this.time - timestamp;
             this.logger.info(`Event Latency : ${event_latency}`, `CSPARQLWindow`);
@@ -259,6 +267,98 @@ export class CSPARQLWindow {
             this.update_watermark(t_e);
             this.trigger_window_content(this.current_watermark, timestamp);
         }
+    }
+
+    /**
+     * Add an in-order event to the window. This method only processes events that arrive in chronological order.
+     * @param {Quad} event - The event to be added to the window.
+     * @param {number} timestamp - The timestamp of the event.
+     * @returns {void} - The function does not return anything.
+     */
+    addInOrder(event: Quad, timestamp: number): void {
+        this.logger.info(`adding_in_order_event_to_the_window`, `CSPARQLWindow`);
+        console.debug(`Adding in-order event [" + ${event} + "] at time : ${timestamp} and watermark ${this.current_watermark}`);
+
+        if (timestamp < this.time) {
+            this.logger.info(`in_order_event_ignored_late_timestamp`, `CSPARQLWindow`);
+            console.debug(`Ignoring in-order event with timestamp ${timestamp} as it is earlier than current time ${this.time}`);
+            return;
+        }
+
+        const t_e = timestamp;
+        const to_evict = new Set<WindowInstance>();
+
+        this.time = timestamp;
+        this.logger.info(`in_order_event_received`, `CSPARQLWindow`);
+        // In order event handling
+        this.scope(t_e);
+        for (const w of this.active_windows.keys()) {
+            console.debug(`Processing Window ${w.getDefinition()} for the event ${event} at time ${timestamp}`);
+            if (w.open <= t_e && t_e < w.close) {
+                console.debug(`Adding the event ${event} to the window ${w.getDefinition()} at time ${timestamp}`);
+                const window_to_add = this.active_windows.get(w);
+                if (window_to_add) {
+                    this.logger.info(`adding_in_order_event ${event.subject.value} to the window ${this.name} with bounds ${w.getDefinition()} at time ${timestamp}`, `CSPARQLWindow`);
+                    window_to_add.add(event, t_e);
+                }
+            }
+            else if (t_e >= w.close + this.max_delay && !w.has_triggered) {
+                console.debug(`Scheduled to evict the window ${w.getDefinition()} at time ${timestamp}`);
+                to_evict.add(w);
+            }
+        }
+        this.update_watermark(t_e);
+        this.trigger_window_content(this.current_watermark, timestamp);
+    }
+
+    /**
+     * Add an out-of-order event to the window. This method only processes events that arrive out of chronological order.
+     * @param {Quad} event - The event to be added to the window.
+     * @param {number} timestamp - The timestamp of the event.
+     * @returns {void} - The function does not return anything.
+     */
+    addOutOfOrder(event: Quad, timestamp: number): void {
+        this.logger.info(`adding_out_of_order_event_to_the_window`, `CSPARQLWindow`);
+        console.debug(`Adding out-of-order event [" + ${event} + "] at time : ${timestamp} and watermark ${this.current_watermark}`);
+
+        if (timestamp >= this.time) {
+            this.logger.info(`out_of_order_event_ignored_early_timestamp`, `CSPARQLWindow`);
+            console.debug(`Ignoring out-of-order event with timestamp ${timestamp} as it is not earlier than current time ${this.time}`);
+            return;
+        }
+
+        const t_e = timestamp;
+        const to_evict = new Set<WindowInstance>();
+
+        this.logger.info(`out_of_order_event_received`, `CSPARQLWindow`);
+        const event_latency = this.time - timestamp;
+        this.logger.info(`Event Latency : ${event_latency}`, `CSPARQLWindow`);
+        // Out of order event handling
+        console.error(`The event is late and has arrived out of order at time ${timestamp}`);
+        if (t_e - this.time > this.max_delay) {
+            this.logger.info(`out_of_order_event_out_of_delay`, `CSPARQLWindow`);
+            // Discard the event if it is too late to be considered in the window based on a simple static heuristic pre-decided
+            // when the CSPARQL Window was initialized.
+            console.error("Late element [" + event + "] with timestamp [" + timestamp + "] is out of the allowed delay [" + this.max_delay + "]");
+        }
+        else if (t_e - this.time <= this.max_delay) {
+            this.logger.info(`out_of_order_event_within_delay`, `CSPARQLWindow`);
+            // The event is late but within the allowed delay, so we will add it to the specific window instance.
+            for (const w of this.active_windows.keys()) {
+                if (w.open <= t_e && t_e < w.close) {
+                    const temp_window = this.active_windows.get(w);
+                    if (temp_window) {
+                        // TODO: log this for when the event is added to the window and for the latency calculation
+                        this.logger.info(`adding_out_of_order_event ${event.subject.value} to the window ${this.name} with bounds ${w.getDefinition()} at time ${timestamp}`, `CSPARQLWindow`);
+                        temp_window.add(event, t_e);
+                    }
+                }
+                else if (t_e >= w.close) {
+                    to_evict.add(w);
+                }
+            }
+        }
+        this.time = timestamp;
     }
 
     /**
