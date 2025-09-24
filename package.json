@@ -17,7 +17,8 @@
         "experiment:run": "npx ts-node experiments/run-frequency-experiment.ts",
         "experiment:run-realworld": "npx ts-node experiments/run-realworld-frequency-experiment.ts",
         "experiment:analyze": "npx ts-node experiments/analyze-frequency-results.ts",
-        "experiment:independent": "npx ts-node experiments/experiment-evaluation-independent-stream-processing.ts"
+        "experiment:independent": "npx ts-node experiments/experiment-evaluation-independent-stream-processing.ts",
+        "experiment:4hz-comparison": "node experiments/run-4hz-comparison-35-iterations.js"
     },
     "keywords": [],
     "author": "Kushagra Singh Bisen",
@@ -27,7 +28,7 @@
         "@types/n3": "^1.24.2",
         "@types/node": "^22.15.30",
         "@typescript-eslint/parser": "^6.21.0",
-        "esdoc": "^1.1.0",
+        "esdoc": "^0.0.2",
         "eslint": "^8.56.0",
         "eslint-plugin-jest": "^27.8.0",
         "eslint-plugin-jsdoc": "^48.0.6",

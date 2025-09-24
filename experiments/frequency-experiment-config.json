@@ -1,17 +1,12 @@
 {
   "experiment": {
-    "name": "Frequency-Based Streaming Query Comparison",
-    "description": "Compare different streaming query approaches across multiple frequencies",
-    "timestamp": "2025-09-17T07:47:49.903Z",
-    "iterations": 5
+    "name": "4Hz Frequency Streaming Query Comparison (35 Iterations)",
+    "description": "Compare different streaming query approaches at 4Hz frequency with 35 iterations",
+    "timestamp": "2025-09-24T00:00:00.000Z",
+    "iterations": 35
   },
   "frequencies": [
-    "4Hz",
-    "8Hz",
-    "16Hz",
-    "32Hz",
-    "64Hz",
-    "128Hz"
+    "4Hz"
   ],
   "deviceTypes": [
     "smartphone",
@@ -20,7 +15,8 @@
   "approaches": [
     "fetching-client-side",
     "chunked-approach",
-    "approximation-approach"
+    "approximation-approach",
+    "independent-stream-processing"
   ],
   "dataBasePath": "/Users/kushbisen/Code/streaming-query-hive/src/streamer/data/frequency_variants/2mins",
   "outputPath": "/Users/kushbisen/Code/streaming-query-hive/results/frequency-experiments",

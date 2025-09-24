@@ -3,7 +3,8 @@ import { EventEmitter } from "events";
 import { Quad } from 'n3';
 import { Logger } from "../../util/logger/Logger";
 import { LogLevel, LogDestination } from "../../util/logger/LoggerEnum";
-import * as LOG_CONFIG from "../../config/log_config.json";
+// @ts-ignore
+import LOG_CONFIG from "../../config/log_config.json";
 
 /* eslint-disable no-unused-vars */
 
@@ -229,7 +230,7 @@ export class CSPARQLWindow {
             else if (t_e - this.time <= this.max_delay) {
                 this.logger.info(`out_of_order_event_within_delay`, `CSPARQLWindow`);
                 // The event is late but within the allowed delay, so we will add it to the specific window instance.
-                for (const w of this.active_windows.keys()) {
+                for (const w of Array.from(this.active_windows.keys())) {
                     if (w.open <= t_e && t_e < w.close) {
                         const temp_window = this.active_windows.get(w);
                         if (temp_window) {
@@ -249,7 +250,7 @@ export class CSPARQLWindow {
             this.logger.info(`in_order_event_received`, `CSPARQLWindow`);
             // In order event handling
             this.scope(t_e);
-            for (const w of this.active_windows.keys()) {
+            for (const w of Array.from(this.active_windows.keys())) {
                 console.debug(`Processing Window ${w.getDefinition()} for the event ${event} at time ${timestamp}`);
                 if (w.open <= t_e && t_e < w.close) {
                     console.debug(`Adding the event ${event} to the window ${w.getDefinition()} at time ${timestamp}`);
@@ -292,7 +293,7 @@ export class CSPARQLWindow {
         this.logger.info(`in_order_event_received`, `CSPARQLWindow`);
         // In order event handling
         this.scope(t_e);
-        for (const w of this.active_windows.keys()) {
+        for (const w of Array.from(this.active_windows.keys())) {
             console.debug(`Processing Window ${w.getDefinition()} for the event ${event} at time ${timestamp}`);
             if (w.open <= t_e && t_e < w.close) {
                 console.debug(`Adding the event ${event} to the window ${w.getDefinition()} at time ${timestamp}`);
@@ -344,7 +345,7 @@ export class CSPARQLWindow {
         else if (t_e - this.time <= this.max_delay) {
             this.logger.info(`out_of_order_event_within_delay`, `CSPARQLWindow`);
             // The event is late but within the allowed delay, so we will add it to the specific window instance.
-            for (const w of this.active_windows.keys()) {
+            for (const w of Array.from(this.active_windows.keys())) {
                 if (w.open <= t_e && t_e < w.close) {
                     const temp_window = this.active_windows.get(w);
                     if (temp_window) {
@@ -427,7 +428,7 @@ export class CSPARQLWindow {
      * @param target
      */
     private findWindowInstance(target: WindowInstance): WindowInstance | undefined {
-        for (const window of this.active_windows.keys()) {
+        for (const window of Array.from(this.active_windows.keys())) {
             if (window.is_same(target)) {
                 return window;
             }
@@ -538,7 +539,7 @@ export class CSPARQLWindow {
      */
     getCSPARQLWindowDefinition() {
         const windowDefinitions = [];
-        for (const [window] of this.active_windows.entries()) {
+        for (const [window] of Array.from(this.active_windows.entries())) {
             windowDefinitions.push(window.getDefinition());
         }
         return `CSPARQLWindow {
@@ -565,7 +566,7 @@ export function computeWindowIfAbsent(map: Map<WindowInstance, QuadContainer>, w
     mappingFunction: (key: WindowInstance) => QuadContainer) {
     let found = false;
 
-    for (const w of map.keys()) {
+    for (const w of Array.from(map.keys())) {
         if (w.is_same(window)) {
             found = true;
             break;

@@ -2,7 +2,7 @@ import { EventEmitter } from "events";
 import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import { v4 as uuidv4 } from 'uuid';
-import fs from 'fs';
+import * as fs from 'fs';
 const N3 = require('n3');
 const mqtt = require('mqtt');
 const { DataFactory } = N3;

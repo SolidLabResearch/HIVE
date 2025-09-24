@@ -24,7 +24,9 @@ class IndependentStreamProcessingExperiment {
 
     constructor() {
         this.approach = new IndependentStreamProcessingApproach();
-        this.logDir = path.join(__dirname, '../logs/independent-stream-processing');
+        // Use custom log directory if provided, otherwise use default
+        const customLogDir = process.env.CUSTOM_LOG_DIR;
+        this.logDir = customLogDir || path.join(__dirname, '../logs/independent-stream-processing');
         this.projectRoot = path.resolve(__dirname, '../..');
     }
 
