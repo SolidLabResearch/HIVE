@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { IndependentStreamProcessingApproach } from '../../src/approaches/IndependentStreamProcessingApproach';
+import { IndependentStreamProcessingApproach } from '../src/approaches/IndependentStreamProcessingApproach';
 import { spawn, ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -27,7 +27,12 @@ class IndependentStreamProcessingExperiment {
         // Use custom log directory if provided, otherwise use default
         const customLogDir = process.env.CUSTOM_LOG_DIR;
         this.logDir = customLogDir || path.join(__dirname, '../logs/independent-stream-processing');
-        this.projectRoot = path.resolve(__dirname, '../..');
+        
+        // Fix project root resolution - from experiments/, go up one level to project root
+        this.projectRoot = path.resolve(__dirname, '..');
+        console.log(`Constructor __dirname: ${__dirname}`);
+        console.log(`Calculated projectRoot: ${this.projectRoot}`);
+        console.log(`Current working directory: ${process.cwd()}`);
     }
 
     /**
@@ -365,6 +370,10 @@ WHERE {
      */
     private async ensureProjectBuilt(): Promise<void> {
         const distPath = path.join(this.projectRoot, 'dist');
+        console.log(`Checking dist path: ${distPath}`);
+        console.log(`Project root: ${this.projectRoot}`);
+        console.log(`Dist exists: ${fs.existsSync(distPath)}`);
+        
         if (!fs.existsSync(distPath)) {
             this.log('Building project...');
             
@@ -372,6 +381,9 @@ WHERE {
                 cwd: this.projectRoot,
                 stdio: 'inherit'
             });
+            
+            console.log(`Build process cwd: ${this.projectRoot}`);
+            console.log(`Build command: npm run build`);
             
             await new Promise<void>((resolve, reject) => {
                 buildProcess.on('exit', (code) => {
