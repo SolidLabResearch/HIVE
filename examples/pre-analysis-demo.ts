@@ -5,14 +5,14 @@ import { IntelligentOrchestrator } from '../src/orchestrator/IntelligentOrchestr
  * This shows how to pre-analyze streams before query execution
  */
 async function demonstratePreAnalysis() {
-    console.log('\n🔍 Pre-Analysis Streams Demo');
+    console.log('\nPre-Analysis Streams Demo');
     console.log('=' .repeat(50));
 
     // Create orchestrator with stream analysis enabled
     const orchestrator = new IntelligentOrchestrator("default", true);
 
     // Simulate some stream data flowing in
-    console.log('\n📊 Simulating stream data...');
+    console.log('\nSimulating stream data...');
     for (let i = 0; i < 50; i++) {
         // Mix of stable and volatile data
         const value = i < 25 ? 50 + Math.random() * 2 : Math.random() * 100;
@@ -20,11 +20,11 @@ async function demonstratePreAnalysis() {
     }
 
     // Pre-analyze streams (this caches the recommendation)
-    console.log('\n🎯 Pre-analyzing streams...');
+    console.log('\nPre-analyzing streams...');
     const preAnalysisResult = await orchestrator.preAnalyzeStreams(5);
 
     if (preAnalysisResult) {
-        console.log(`✅ Pre-analysis complete:`);
+        console.log(`Pre-analysis complete:`);
         console.log(`   Recommended: ${preAnalysisResult.recommendedApproach}`);
         console.log(`   Confidence: ${(preAnalysisResult.confidence * 100).toFixed(1)}%`);
         console.log(`   Reasoning: ${preAnalysisResult.reasoning.join(', ')}`);
@@ -32,12 +32,12 @@ async function demonstratePreAnalysis() {
 
     // Check analysis summary
     const summary = orchestrator.getAnalysisSummary();
-    console.log('\n📋 Analysis Summary:');
+    console.log('\nAnalysis Summary:');
     console.log(`   Mode: ${summary.analysisMode}`);
     console.log(`   Cached Recommendation: ${summary.cachedRecommendation ? 'YES' : 'NO'}`);
 
     // Register a query
-    console.log('\n📝 Registering query...');
+    console.log('\nRegistering query...');
     orchestrator.registerOutputQuery(`
         PREFIX saref: <https://saref.etsi.org/core/>
         REGISTER RStream <results> AS
@@ -45,7 +45,7 @@ async function demonstratePreAnalysis() {
     `);
 
     // Run query (will use cached recommendation)
-    console.log('\n🚀 Running query with pre-analyzed recommendation...');
+    console.log('\nRunning query with pre-analyzed recommendation...');
     await orchestrator.runRegisteredQueryIntelligent();
 
     // Clear cache if needed

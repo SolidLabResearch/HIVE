@@ -133,7 +133,7 @@ WHERE {
             this.mainLogStream.write('timestamp,message\n');
         }
 
-        console.log(`📝 Logging initialized for ${frequency} iteration ${iteration}`);
+        console.log(`Logging initialized for ${frequency} iteration ${iteration}`);
         console.log(`   Resource log: ${resourceLogPath}`);
         console.log(`   Main log: ${mainLogPath}`);
     }
@@ -184,21 +184,21 @@ WHERE {
      * Run experiment for a specific frequency
      */
     public async runFrequencyExperiment(frequency: string, iterations: number = 3): Promise<void> {
-        console.log(`\n🚀 Starting Independent Stream Processing experiment for ${frequency}`);
+        console.log(`\nStarting Independent Stream Processing experiment for ${frequency}`);
         console.log(`   Running ${iterations} iterations`);
 
         for (let i = 1; i <= iterations; i++) {
-            console.log(`\n📊 Iteration ${i}/${iterations} for ${frequency}`);
+            console.log(`\nIteration ${i}/${iterations} for ${frequency}`);
             await this.runSingleIteration(frequency, i);
             
             // Wait between iterations
             if (i < iterations) {
-                console.log('⏱️  Waiting 5 seconds between iterations...');
+                console.log('Waiting 5 seconds between iterations...');
                 await new Promise(resolve => setTimeout(resolve, 5000));
             }
         }
 
-        console.log(`✅ Completed all iterations for ${frequency}`);
+        console.log(`Completed all iterations for ${frequency}`);
     }
 
     /**
@@ -255,14 +255,14 @@ WHERE {
             if (firstMainQueryResultTime) {
                 const firstEventLatencyMs = firstMainQueryResultTime - this.queryRegisteredTime;
                 const firstEventLatencySeconds = firstEventLatencyMs / 1000;
-                this.log(`🎯 MAIN QUERY FIRST EVENT LATENCY: ${firstEventLatencyMs}ms (${firstEventLatencySeconds.toFixed(1)}s)`);
+                this.log(`MAIN QUERY FIRST EVENT LATENCY: ${firstEventLatencyMs}ms (${firstEventLatencySeconds.toFixed(1)}s)`);
                 this.log(`   Query registered at: ${this.queryRegisteredTime}`);
                 this.log(`   Main query first result at: ${firstMainQueryResultTime}`);
                 
                 // Log in format compatible with analysis scripts
                 this.log(`LATENCY_RESULT: queryRegisteredTime=${this.queryRegisteredTime}, firstResultTime=${firstMainQueryResultTime}, latencyMs=${firstEventLatencyMs}`);
             } else {
-                this.log('⚠️  No main query results detected during monitoring period');
+                this.log('No main query results detected during monitoring period');
             }
             
             // Stop all processors
@@ -281,7 +281,7 @@ WHERE {
             
         } catch (error) {
             this.log(`Error in experiment: ${error}`);
-            console.error('❌ Experiment failed:', error);
+            console.error('Experiment failed:', error);
             
             // Cleanup on error
             await this.stopDataPublishers();
@@ -420,7 +420,7 @@ WHERE {
                     if (elapsedTime > 65000) { // ~65 seconds for sliding window first result
                         firstMainQueryResultDetected = true;
                         firstMainQueryResultTime = currentTime;
-                        this.log(`🎯 Main query first result detected at ${firstMainQueryResultTime} (after ${elapsedTime}ms)`);
+                        this.log(`Main query first result detected at ${firstMainQueryResultTime} (after ${elapsedTime}ms)`);
                         this.log(`   Main query uses sliding windows: 120s window, 60s step`);
                         clearInterval(monitorInterval);
                         resolve(firstMainQueryResultTime);
@@ -432,7 +432,7 @@ WHERE {
             const timeout = setTimeout(() => {
                 clearInterval(monitorInterval);
                 if (!firstMainQueryResultDetected) {
-                    this.log('⚠️  Timeout waiting for main query first result');
+                    this.log('Timeout waiting for main query first result');
                     resolve(null);
                 } else {
                     resolve(firstMainQueryResultTime);
@@ -458,7 +458,7 @@ WHERE {
         frequencies: string[] = ['4Hz', '8Hz', '16Hz', '32Hz', '64Hz', '128Hz'],
         iterations: number = 3
     ): Promise<void> {
-        console.log('🎯 Starting Independent Stream Processing approach experiments');
+        console.log('Starting Independent Stream Processing approach experiments');
         console.log(`   Frequencies: ${frequencies.join(', ')}`);
         console.log(`   Iterations per frequency: ${iterations}`);
         console.log(`   Total experiments: ${frequencies.length * iterations}`);
@@ -467,12 +467,12 @@ WHERE {
             try {
                 await this.runFrequencyExperiment(frequency, iterations);
             } catch (error) {
-                console.error(`❌ Failed experiment for ${frequency}:`, error);
+                console.error(`Failed experiment for ${frequency}:`, error);
             }
         }
 
-        console.log('\n🎉 All Independent Stream Processing experiments completed!');
-        console.log(`📂 Results saved in: ${this.logDir}`);
+        console.log('\nAll Independent Stream Processing experiments completed!');
+        console.log(`Results saved in: ${this.logDir}`);
     }
 }
 
@@ -492,7 +492,7 @@ async function main() {
             parseInt(args[args.indexOf('--iterations') + 1]) : 3;
 
         if (!frequencyArg) {
-            console.error('❌ Please specify frequency after --frequency');
+            console.error('Please specify frequency after --frequency');
             process.exit(1);
         }
 
@@ -504,7 +504,7 @@ async function main() {
             await experiment.runFrequencyExperiment(frequencies[0], iterations);
         }
     } else {
-        console.log('🔧 Independent Stream Processing Experiment');
+        console.log('Independent Stream Processing Experiment');
         console.log('Usage:');
         console.log('  npm run experiment:independent --frequencies          # Run all frequencies');
         console.log('  npm run experiment:independent --frequency 16Hz       # Run specific frequency');
@@ -514,17 +514,17 @@ async function main() {
 
 // Handle graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n⚠️  Shutting down experiment...');
+    console.log('\nShutting down experiment...');
     // Cleanup any running processes
     process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-    console.log('\n⚠️  Experiment terminated');
+    console.log('\nExperiment terminated');
     process.exit(0);
 });
 
 main().catch(error => {
-    console.error('💥 Experiment crashed:', error);
+    console.error('Experiment crashed:', error);
     process.exit(1);
 });
