@@ -42,7 +42,7 @@ async function runApproach(name, command, approachKey) {
         try {
             // Kill any lingering processes
             try {
-                execSync('pkill -f StreamingQueryHiveApproachOrchestrator.js');
+                execSync('pkill -f StreamingQueryChunkedApproachOrchestrator.js');
                 execSync('pkill -f StreamingQueryApproximationApproachOrchestrator.js');
                 execSync('pkill -f IndependentStreamProcessingApproach');
                 execSync('pkill -f publish.js');
@@ -75,15 +75,24 @@ async function runApproach(name, command, approachKey) {
                     reject(new Error('Timeout'));
                 }, timeout);
 
+                let publisherFinished = false;
+
                 publisher.on('exit', (code) => {
-                    clearTimeout(timeoutId);
-                    approach.kill();
-                    resolve();
+                    publisherFinished = true;
+                    console.log('Publisher finished, waiting for approach to process data...');
+                    // Wait additional 30 seconds for processing after publisher finishes
+                    setTimeout(() => {
+                        clearTimeout(timeoutId);
+                        approach.kill();
+                        resolve();
+                    }, 30000);
                 });
 
                 approach.on('exit', (code) => {
                     clearTimeout(timeoutId);
-                    publisher.kill();
+                    if (!publisherFinished) {
+                        publisher.kill();
+                    }
                     resolve();
                 });
             });
@@ -109,7 +118,7 @@ async function main() {
         // Run Independent Stream Processing (TypeScript)
         await runApproach(
             'Independent Stream Processing',
-            ['npx', ['ts-node', 'experiments/experiment-evaluation-independent-stream-processing.ts', '--frequency', FREQUENCY, '--iterations', ITERATIONS.toString()]],
+            ['npx', ['ts-node', 'experiments/experiment-evaluation-independent-stream-processing.ts', '--frequency', FREQUENCY, '--iterations', '1']],
             'independent-stream-processing'
         );
 
@@ -123,7 +132,7 @@ async function main() {
         // Run Streaming Query Hive
         await runApproach(
             'Streaming Query Hive',
-            ['node', ['dist/approaches/StreamingQueryHiveApproachOrchestrator.js']],
+            ['node', ['dist/approaches/StreamingQueryChunkedApproachOrchestrator.js']],
             'streaming-query-hive'
         );
 
