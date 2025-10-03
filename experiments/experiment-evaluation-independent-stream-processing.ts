@@ -422,7 +422,9 @@ WHERE {
                         firstMainQueryResultTime = currentTime;
                         this.log(`Main query first result detected at ${firstMainQueryResultTime} (after ${elapsedTime}ms)`);
                         this.log(`   Main query uses sliding windows: 120s window, 60s step`);
+                        this.log(`Stopping monitoring early - first result detected`);
                         clearInterval(monitorInterval);
+                        clearTimeout(timeout);
                         resolve(firstMainQueryResultTime);
                     }
                 }
@@ -442,13 +444,12 @@ WHERE {
     }
 
     private getMonitoringDuration(frequency: string): number {
-        const baseTime = 180000; // 3 minutes base
+        // Reduced monitoring time - just enough to detect first result + small buffer
+        const baseTime = 75000; // 75 seconds - just over the 65s detection threshold
         const freq = parseInt(frequency.replace('Hz', ''));
         
-        // More time for lower frequencies to see more windows
-        if (freq <= 8) return baseTime;
-        if (freq <= 32) return baseTime * 0.75;
-        return baseTime * 0.5;
+        // Consistent shorter time for all frequencies
+        return baseTime;
     }
 
     /**
