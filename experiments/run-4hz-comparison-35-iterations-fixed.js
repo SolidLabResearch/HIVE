@@ -4,7 +4,7 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const ITERATIONS = 1;
+const ITERATIONS = 35;
 const FREQUENCY = '4Hz';
 
 // Create timestamped experiment directory
@@ -85,11 +85,9 @@ async function runIndependentStreamProcessing() {
 
     } catch (error) {
         console.log(`   Independent Stream Processing failed: ${error.message}`);
-        console.error('Full error:', error);
     }
 
     console.log('Independent Stream Processing approach completed');
-    console.log('DEBUG: About to start other approaches...');
 }
 
 async function runSingleApproachIteration(name, command, approachKey, iteration) {
@@ -229,31 +227,27 @@ async function main() {
 
         // Run Independent Stream Processing (handles iterations internally)
         await runIndependentStreamProcessing();
-        console.log('DEBUG: Independent Stream Processing finished, starting Approximation Approach...');
 
         // Run Approximation Approach (35 external iterations)
         await runMultipleIterationsApproach(
             'Approximation Approach',
-            ['node', 'experiments/experiment-evaluation-approximation-approach.js'],
+            ['node', 'dist/approaches/StreamingQueryApproximationApproachOrchestrator.js'],
             'approximation-approach'
         );
-        console.log('DEBUG: Approximation Approach finished, starting Streaming Query Hive...');
 
         // Run Streaming Query Hive (35 external iterations)
         await runMultipleIterationsApproach(
             'Streaming Query Hive',
-            ['node', 'experiments/experiment-evaluation-streaming-query-hive.js', '--frequency=4Hz'],
+            ['node', 'dist/approaches/StreamingQueryChunkedApproachOrchestrator.js'],
             'streaming-query-hive'
         );
-        console.log('DEBUG: Streaming Query Hive finished, starting Fetching Client Side...');
 
         // Run Fetching Client Side (35 external iterations)
         await runMultipleIterationsApproach(
             'Fetching Client Side',
-            ['node', 'experiments/experiment-evaluation-fetching-client-side.js'],
+            ['node', 'dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js'],
             'fetching-client-side'
         );
-        console.log('DEBUG: All approaches completed!');
 
         console.log('\nAll experiments completed!');
         console.log(`Results are saved in: experiments/logs/${experimentDir}/`);

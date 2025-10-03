@@ -2,16 +2,16 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const RUNS = 3;
-const LOGS_DIR = 'logs/fetching-client-side';
-const APPROACH_CMD = ['node', ['dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js']];
-const PUBLISH_CMD = ['node', ['dist/streamer/src/publish.js']];
+const RUNS = 35;
+const LOGS_DIR = process.env.CUSTOM_LOG_DIR || 'logs/fetching-client-side';
+const APPROACH_CMD = ['node', 'dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js'];
+const PUBLISH_CMD = ['node', 'dist/streamer/src/publish.js'];
 const LOG_FILES = [
   'fetching_client_side_log.csv',
   'fetching_client_side_resource_usage.csv',
   'replayer-log.csv'
 ];
-const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
 
@@ -33,10 +33,10 @@ async function runOnce(iter) {
 
   killLingeringProcesses(); // Ensure no lingering processes before starting
 
-  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { stdio: 'inherit' });
+  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD.slice(1), { stdio: 'inherit' });
 
   await new Promise(res => setTimeout(res, 2000));
-  const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD[1], { stdio: 'inherit' });
+  const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD.slice(1), { stdio: 'inherit' });
 
   const timeout = setTimeout(() => {
     console.log('Timeout reached, killing processes...');

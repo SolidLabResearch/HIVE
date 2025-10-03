@@ -112,3 +112,14 @@ function startResourceUsageLogging(filePath = 'streaming_query_hive_resource_log
 }
 
 startResourceUsageLogging();
+
+// Add exit logic to ensure the process terminates after processing
+setTimeout(() => {
+    console.log('Streaming Query Hive approach processing completed, exiting...');
+    process.exit(0);
+}, 120000); // 2 minutes timeout
+
+StreamingQueryHiveApproachOrchestrator().catch(error => {
+    console.error("Error in orchestrator:", error);
+    process.exit(1);
+});

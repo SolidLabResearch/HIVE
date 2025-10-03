@@ -2,15 +2,15 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const RUNS = 1;
-const LOGS_DIR = 'logs/streaming-query-hive';
-const APPROACH_CMD = ['node', ['dist/approaches/StreamingQueryHiveApproachOrchestrator.js']];
+const RUNS = 35;
+const LOGS_DIR = process.env.CUSTOM_LOG_DIR || 'logs/streaming-query-hive';
+const APPROACH_CMD = ['node', 'dist/approaches/StreamingQueryChunkedApproachOrchestrator.js'];
 const LOG_FILES = [
   'streaming_query_hive_log.csv',
   'streaming_query_hive_resource_usage.csv',
   'replayer-log.csv'
 ];
-const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 // Check if we should run frequency tests
 const args = process.argv.slice(2);
@@ -37,7 +37,7 @@ async function runOnce(iter, frequency = null) {
 
   killLingeringProcesses(); // Ensure no lingering processes before starting
 
-  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { stdio: 'inherit' });
+  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD.slice(1), { stdio: 'inherit' });
 
   if (frequency) {
     // Frequency testing with experiment publishers
@@ -47,22 +47,22 @@ async function runOnce(iter, frequency = null) {
     
     // Start smartphone publisher
     console.log(`Starting smartphone publisher for ${frequency}...`);
-    const smartphoneCmd = ['node', ['dist/streamer/src/experiment-publisher.js', 
+    const smartphoneCmd = ['node', 'dist/streamer/src/experiment-publisher.js', 
       `src/streamer/data/frequency_variants/2mins/smartphone/${frequency}/data.nt`, 
       'smartphoneX', 
-      frequency.replace('Hz', '')]];
+      frequency.replace('Hz', '')];
     
-    const smartphonePublisher = spawn(smartphoneCmd[0], smartphoneCmd[1], { stdio: 'inherit' });
+    const smartphonePublisher = spawn(smartphoneCmd[0], smartphoneCmd.slice(1), { stdio: 'inherit' });
     publishers.push(smartphonePublisher);
     
     // Start wearable publisher
     console.log(`Starting wearable publisher for ${frequency}...`);
-    const wearableCmd = ['node', ['dist/streamer/src/experiment-publisher.js', 
+    const wearableCmd = ['node', 'dist/streamer/src/experiment-publisher.js', 
       `src/streamer/data/frequency_variants/2mins/wearable/${frequency}/data.nt`, 
       'wearableX', 
-      frequency.replace('Hz', '')]];
+      frequency.replace('Hz', '')];
     
-    const wearablePublisher = spawn(wearableCmd[0], wearableCmd[1], { stdio: 'inherit' });
+    const wearablePublisher = spawn(wearableCmd[0], wearableCmd.slice(1), { stdio: 'inherit' });
     publishers.push(wearablePublisher);
 
     const timeout = setTimeout(() => {

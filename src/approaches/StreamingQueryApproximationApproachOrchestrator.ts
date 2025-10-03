@@ -99,6 +99,14 @@ function startResourceUsageLogging(filePath = 'approximation_approach_resource_u
 }
 
 startResourceUsageLogging('approximation_approach_resource_usage.csv', 100);
+
+// Add exit logic to ensure the process terminates after processing
+setTimeout(() => {
+    console.log('Approximation approach processing completed, exiting...');
+    process.exit(0);
+}, 120000); // 2 minutes timeout
+
 StreamingQueryApproximationApproachOrchestrator().catch(error => {
     console.error("Error in orchestrator:", error);
+    process.exit(1);
 });

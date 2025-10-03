@@ -484,6 +484,8 @@ async function main() {
     if (args.includes('--frequencies')) {
         // Run all frequency experiments
         await experiment.runAllFrequencyExperiments();
+        console.log('Independent Stream Processing experiment completed successfully');
+        process.exit(0);
     } else if (args.includes('--frequency')) {
         // Support comma-separated frequency lists
         const freqIndex = args.indexOf('--frequency');
@@ -503,6 +505,9 @@ async function main() {
         } else {
             await experiment.runFrequencyExperiment(frequencies[0], iterations);
         }
+        
+        console.log('Independent Stream Processing experiment completed successfully');
+        process.exit(0);
     } else {
         console.log('Independent Stream Processing Experiment');
         console.log('Usage:');

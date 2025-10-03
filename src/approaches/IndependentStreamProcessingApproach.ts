@@ -3,8 +3,8 @@ import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import { v4 as uuidv4 } from 'uuid';
 import * as fs from 'fs';
-const N3 = require('n3');
-const mqtt = require('mqtt');
+import N3 from 'n3';
+import mqtt from 'mqtt';
 const { DataFactory } = N3;
 
 /**
@@ -19,10 +19,6 @@ class IndependentProcessor {
     public rstream_emitter: EventEmitter;
     private logStream!: fs.WriteStream;
     private processorId: string;
-    private windowStreamMap: { [key: string]: string } = {
-        "mqtt://localhost:1883/wearableX": "https://rsp.jsw1",
-        "mqtt://localhost:1883/smartphoneX": "https://rsp.jsw1",
-    }
     private expectedWindowInterval: number = 60000; // 60 seconds based on STEP 60000
     private tolerance: number = 5000; // 5 second tolerance
     private startTime: number = 0;
@@ -120,11 +116,17 @@ class IndependentProcessor {
         const quads = event_store.getQuads(null, null, null, null);
         const graph = DataFactory.namedNode(stream_name.name);
         
+        // Build a Set<Quad> because the RDFStream.add method expects a Set of quads
+        const quadSet = new Set<N3.Quad>();
+
         for (const q of quads) {
             const quadWithGraph = DataFactory.quad(q.subject, q.predicate, q.object, graph);
             console.log(`[${this.processorId}] DEBUG: Adding quad to stream ${stream_name.name} at ${timestamp}:`, quadWithGraph.subject.value, quadWithGraph.predicate.value, quadWithGraph.object.value);
-            stream_name.add(quadWithGraph, timestamp);
+            quadSet.add(quadWithGraph);
         }
+
+        // Add the entire set of quads to the stream at once
+        stream_name.add(quadSet, timestamp);
     }
 
     private isWithinExpectedWindowTiming(timestamp: number): boolean {
@@ -352,7 +354,7 @@ export class IndependentStreamProcessingApproach {
             console.log(`Stopped SubQuery processor ${index}`);
         });
         
-        // Clean up superquery processor
+        // Clean up super-query processor
         if (this.superQueryProcessor) {
             this.superQueryProcessor.cleanup();
             console.log('Stopped SuperQuery processor');

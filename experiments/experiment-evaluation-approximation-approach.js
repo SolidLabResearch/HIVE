@@ -2,16 +2,16 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const RUNS = 1;
-const LOGS_DIR = 'logs/approximation-approach';
-const APPROACH_CMD = ['node', ['dist/approaches/StreamingQueryApproximationApproachOrchestrator.js']];
-const PUBLISH_CMD = ['node', ['dist/streamer/src/publish.js']];
+const RUNS = 35;
+const LOGS_DIR = process.env.CUSTOM_LOG_DIR || 'logs/approximation-approach';
+const APPROACH_CMD = ['node', 'dist/approaches/StreamingQueryApproximationApproachOrchestrator.js'];
+const PUBLISH_CMD = ['node', 'dist/streamer/src/publish.js'];
 const LOG_FILES = [
   'approximation_approach_log.csv',
   'approximation_approach_resource_usage.csv',
   'replayer-log.csv'
 ];
-const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 // Check if we should run pattern tests
 const args = process.argv.slice(2);
@@ -28,14 +28,14 @@ async function runOnce(iter, patternName = null, dataPath = null) {
   const env = dataPath ? { ...process.env, DATA_PATH: dataPath } : process.env;
 
   // Start the approach process
-  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { 
+  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD.slice(1), { 
     stdio: 'inherit',
     env: env
   });
 
   // Start the publisher process after a short delay
   await new Promise(res => setTimeout(res, 2000));
-  const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD[1], { 
+  const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD.slice(1), { 
     stdio: 'inherit',
     env: env
   });

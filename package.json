@@ -18,7 +18,8 @@
         "experiment:run-realworld": "npx ts-node experiments/run-realworld-frequency-experiment.ts",
         "experiment:analyze": "npx ts-node experiments/analyze-frequency-results.ts",
         "experiment:independent": "npx ts-node experiments/experiment-evaluation-independent-stream-processing.ts",
-        "experiment:4hz-comparison": "node experiments/run-4hz-comparison-35-iterations.js"
+        "experiment:4hz-comparison": "node experiments/run-4hz-comparison-35-iterations.js",
+        "experiment:4hz-noise": "node experiments/run-4hz-noise-experiments.js"
     },
     "keywords": [],
     "author": "Kushagra Singh Bisen",

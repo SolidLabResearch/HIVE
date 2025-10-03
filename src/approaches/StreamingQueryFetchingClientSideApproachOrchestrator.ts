@@ -3,6 +3,7 @@ import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
+import path from 'path';
 const N3 = require('n3');
 const mqtt = require('mqtt');
 const { DataFactory } = N3;
@@ -32,8 +33,9 @@ export class FetchingAllDataClientSide {
      *
      * @param query
      * @param r2s_topic
+     * @param logDirectory
      */
-    constructor(query: string, r2s_topic: string) {
+    constructor(query: string, r2s_topic: string, logDirectory?: string) {
         this.query = query;
         this.r2s_topic = r2s_topic;
         this.rspql_parser = new RSPQLParser();
@@ -43,7 +45,7 @@ export class FetchingAllDataClientSide {
         this.queryRegisteredTime = Date.now(); // Track when query was registered
         
         // Initialize CSV logging for this approach
-        this.initializeLogging();
+        this.initializeLogging(logDirectory);
         this.log('fetching_query_registered');
         
         this.subscribeRStream();
@@ -53,8 +55,9 @@ export class FetchingAllDataClientSide {
     /**
      * Initialize CSV logging for this approach
      */
-    private initializeLogging() {
-        const logFilePath = 'fetching_client_side_log.csv';
+    private initializeLogging(logDirectory?: string) {
+        const baseName = 'fetching_client_side_log.csv';
+        const logFilePath = logDirectory ? path.join(logDirectory, baseName) : baseName;
         const writeHeader = !fs.existsSync(logFilePath);
         this.logStream = fs.createWriteStream(logFilePath, { flags: 'a' });
         
@@ -346,7 +349,8 @@ WHERE {
     console.log(new RSPQLParser().parse(query).sparql);
 
     const r2s_topic = "client_operation_output";
-    const client = new FetchingAllDataClientSide(query, r2s_topic);
+    const logDirectory = process.env.CUSTOM_LOG_DIR;
+    const client = new FetchingAllDataClientSide(query, r2s_topic, logDirectory);
     
     // Add cleanup handlers
     process.on('exit', () => client.cleanup());
