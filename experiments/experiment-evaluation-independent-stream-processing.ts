@@ -444,12 +444,13 @@ WHERE {
     }
 
     private getMonitoringDuration(frequency: string): number {
-        // Reduced monitoring time - just enough to detect first result + small buffer
-        const baseTime = 75000; // 75 seconds - just over the 65s detection threshold
+        const baseTime = 180000; // 3 minutes base
         const freq = parseInt(frequency.replace('Hz', ''));
         
-        // Consistent shorter time for all frequencies
-        return baseTime;
+        // More time for lower frequencies to see more windows
+        if (freq <= 8) return baseTime;
+        if (freq <= 32) return baseTime * 0.75;
+        return baseTime * 0.5;
     }
 
     /**
