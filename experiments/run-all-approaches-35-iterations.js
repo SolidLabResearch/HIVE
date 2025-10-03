@@ -43,13 +43,13 @@ async function runApproach(approach) {
         console.log(`\n📊 Starting ${approach.name} Approach...`);
         console.log(`Command: ${approach.command} ${approach.args.join(' ')}\n`);
         
-        const process = spawn(approach.command, approach.args, {
-            cwd: path.resolve(__dirname),
+        const childProcess = spawn(approach.command, approach.args, {
+            cwd: path.resolve(__dirname, '..'),
             stdio: 'inherit',
             env: { ...process.env }
         });
 
-        process.on('close', (code) => {
+        childProcess.on('close', (code) => {
             if (code === 0) {
                 console.log(`\n✅ ${approach.name} completed successfully!\n`);
                 resolve();
@@ -59,7 +59,7 @@ async function runApproach(approach) {
             }
         });
 
-        process.on('error', (error) => {
+        childProcess.on('error', (error) => {
             console.error(`\n❌ Error starting ${approach.name}:`, error);
             reject(error);
         });
