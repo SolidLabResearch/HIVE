@@ -1,14 +1,14 @@
 import { Orchestrator } from "../orchestrator/Orchestrator";
 import fs from 'fs';
-
 import { CSVLogger } from "../util/logger/CSVLogger";
+
 /**
- *
+ * Streaming Query Hive Approach Orchestrator
+ * This orchestrator sets up and runs a streaming query using the Hive approach.
  */
 async function StreamingQueryHiveApproachOrchestrator() {
     const logger = new CSVLogger('streaming_query_chunk_aggregator_log.csv');
     const orchestrator = new Orchestrator("StreamingQueryChunkAggregatorOperator");
-    // Add sub-queries
     const query1 = `
             PREFIX mqtt_broker: <mqtt://localhost:1883/>
     PREFIX saref: <https://saref.etsi.org/core/>
@@ -26,8 +26,6 @@ WHERE {
     `;
     const query2 = `
                 PREFIX mqtt_broker: <mqtt://localhost:1883/>
-    PREFIX saref: <https://saref.etsi.org/core/>
-PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js> 
 REGISTER RStream <output> AS
 SELECT (MAX(?value) AS ?avgSmartphoneX)
@@ -83,9 +81,9 @@ StreamingQueryHiveApproachOrchestrator().catch(error => {
 });
 
 /**
- *
- * @param filePath
- * @param intervalMs
+ * Logs CPU and memory usage to a CSV file at regular intervals.
+ * @param {string} filePath - Path to the CSV file. 
+ * @param {number} intervalMs - Interval in milliseconds for logging.
  */
 function startResourceUsageLogging(filePath = 'streaming_query_hive_resource_log.csv', intervalMs = 100) {
     const writeHeader = !fs.existsSync(filePath);

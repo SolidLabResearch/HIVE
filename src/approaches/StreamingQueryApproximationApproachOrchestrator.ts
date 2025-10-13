@@ -1,5 +1,5 @@
 import { Orchestrator } from "../orchestrator/Orchestrator";
-import fs, { write } from "fs";
+import fs from "fs";
 import { CSVLogger } from "../util/logger/CSVLogger";
 
 async function StreamingQueryApproximationApproachOrchestrator() {
@@ -65,7 +65,7 @@ WHERE {
     }
 }   
     `;
-    await orchestrator.registerQuery(registeredQuery);
+    orchestrator.registerQuery(registeredQuery);
     logger.log(`Registered query: ${registeredQuery}`);
 
     orchestrator.runRegisteredQuery();
