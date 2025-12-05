@@ -11,7 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 
-console.log('🔍 COMPREHENSIVE QUERY PERFORMANCE ANALYSIS');
+console.log(' COMPREHENSIVE QUERY PERFORMANCE ANALYSIS');
 console.log('=' .repeat(80));
 
 const LOGS_BASE_DIR = '/Users/kushbisen/Code/streaming-query-hive/tools/experiments/logs';
@@ -238,7 +238,7 @@ function calculateStats(results) {
 function runMainAnalysis() {
     const analysis = {};
     
-    console.log('📊 Analyzing all approaches and frequencies...\n');
+    console.log(' Analyzing all approaches and frequencies...\n');
     
     for (const approach of APPROACHES) {
         console.log(`🔬 ${approach.toUpperCase().replace(/-/g, ' ')}:`);
@@ -254,16 +254,16 @@ function runMainAnalysis() {
             
             if (stats) {
                 if (stats.hasLatencyData && stats.hasResourceData) {
-                    console.log(`✅ (${stats.latency.avg.toFixed(0)}ms, ${stats.resources.avgCPUTotal.toFixed(1)}% CPU, ${stats.resources.avgMemoryRSS.toFixed(1)}MB)`);
+                    console.log(`[OK] (${stats.latency.avg.toFixed(0)}ms, ${stats.resources.avgCPUTotal.toFixed(1)}% CPU, ${stats.resources.avgMemoryRSS.toFixed(1)}MB)`);
                 } else if (stats.hasLatencyData) {
-                    console.log(`⚠️  (${stats.latency.avg.toFixed(0)}ms, no resource data)`);
+                    console.log(`[WARNING]  (${stats.latency.avg.toFixed(0)}ms, no resource data)`);
                 } else if (stats.hasResourceData) {
-                    console.log(`⚠️  (no latency data, ${stats.resources.avgCPUTotal.toFixed(1)}% CPU)`);
+                    console.log(`[WARNING]  (no latency data, ${stats.resources.avgCPUTotal.toFixed(1)}% CPU)`);
                 } else {
-                    console.log(`❌ (no valid data)`);
+                    console.log(`[FAIL] (no valid data)`);
                 }
             } else {
-                console.log(`❌ (no data found)`);
+                console.log(`[FAIL] (no data found)`);
             }
         }
         console.log();
@@ -276,7 +276,7 @@ function runMainAnalysis() {
  * Generate comprehensive summary table
  */
 function generateSummaryTable(analysis) {
-    console.log('📋 COMPREHENSIVE PERFORMANCE SUMMARY');
+    console.log(' COMPREHENSIVE PERFORMANCE SUMMARY');
     console.log('=' .repeat(120));
     console.log();
     
@@ -313,13 +313,13 @@ function generateSummaryTable(analysis) {
                 }
                 
                 if (data.hasLatencyData && data.hasResourceData) {
-                    status = '✅ Complete'.padEnd(11);
+                    status = '[OK] Complete'.padEnd(11);
                 } else if (data.hasLatencyData) {
-                    status = '⚠️  Partial'.padEnd(11);
+                    status = '[WARNING]  Partial'.padEnd(11);
                 } else if (data.hasResourceData) {
-                    status = '⚠️  Partial'.padEnd(11);
+                    status = '[WARNING]  Partial'.padEnd(11);
                 } else {
-                    status = '❌ Failed'.padEnd(11);
+                    status = '[FAIL] Failed'.padEnd(11);
                 }
             }
             
@@ -334,7 +334,7 @@ function generateSummaryTable(analysis) {
  * Generate approach comparison
  */
 function generateApproachComparison(analysis) {
-    console.log('\n📊 APPROACH COMPARISON ANALYSIS');
+    console.log('\n APPROACH COMPARISON ANALYSIS');
     console.log('=' .repeat(80));
     
     for (const approach of APPROACHES) {
@@ -421,14 +421,14 @@ function generatePerformanceRankings(analysis) {
     }
     
     if (validConfigurations.length === 0) {
-        console.log('❌ No complete configurations found for ranking');
+        console.log('[FAIL] No complete configurations found for ranking');
         return;
     }
     
     // Sort by latency (lower is better)
     const byLatency = [...validConfigurations].sort((a, b) => a.latency - b.latency);
     
-    console.log('\n🚀 BEST LATENCY PERFORMANCE:');
+    console.log('\n BEST LATENCY PERFORMANCE:');
     byLatency.slice(0, 5).forEach((config, index) => {
         const name = `${config.approach.replace(/-/g, ' ')} @ ${config.frequency}`;
         console.log(`   ${index + 1}. ${name}: ${config.latency.toFixed(0)}ms (CPU: ${config.cpu.toFixed(1)}%, Memory: ${config.memory.toFixed(1)}MB)`);
@@ -518,5 +518,5 @@ const outputFile = 'comprehensive-performance-analysis.json';
 fs.writeFileSync(outputFile, JSON.stringify(analysis, null, 2));
 
 console.log('\n' + '=' .repeat(80));
-console.log(`✅ Analysis complete! Detailed results exported to: ${outputFile}`);
+console.log(`[OK] Analysis complete! Detailed results exported to: ${outputFile}`);
 console.log('=' .repeat(80));

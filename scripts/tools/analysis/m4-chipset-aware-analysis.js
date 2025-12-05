@@ -27,7 +27,7 @@ const M4_SPECS = {
     unifiedMemory: true
 };
 
-console.log('🔧 Apple M4 Chipset Specifications:');
+console.log(' Apple M4 Chipset Specifications:');
 console.log(`   • Performance Cores: ${M4_SPECS.performanceCores}`);
 console.log(`   • Efficiency Cores: ${M4_SPECS.efficiencyCores}`);
 console.log(`   • Total Cores: ${M4_SPECS.totalCores}`);
@@ -79,7 +79,7 @@ function loadAndReanalyzeResults() {
     const resultsFile = path.join(__dirname, 'final-comprehensive-analysis.json');
     
     if (!fs.existsSync(resultsFile)) {
-        console.log('❌ Previous analysis results not found. Please run final-comprehensive-analysis.js first.');
+        console.log('[FAIL] Previous analysis results not found. Please run final-comprehensive-analysis.js first.');
         return null;
     }
     
@@ -126,7 +126,7 @@ function loadAndReanalyzeResults() {
  * Generate M4-aware performance table
  */
 function generateM4AwareTable(results) {
-    console.log('📊 M4 CHIPSET-AWARE PERFORMANCE ANALYSIS');
+    console.log(' M4 CHIPSET-AWARE PERFORMANCE ANALYSIS');
     console.log('=' .repeat(130));
     console.log();
     
@@ -178,7 +178,7 @@ function generateM4AwareTable(results) {
  * Generate M4-specific insights
  */
 function generateM4Insights(results) {
-    console.log('\n🔍 M4 CHIPSET-SPECIFIC INSIGHTS');
+    console.log('\n M4 CHIPSET-SPECIFIC INSIGHTS');
     console.log('=' .repeat(90));
     
     const validConfigs = [];
@@ -199,7 +199,7 @@ function generateM4Insights(results) {
     }
     
     if (validConfigs.length === 0) {
-        console.log('❌ No valid M4 metrics found');
+        console.log('[FAIL] No valid M4 metrics found');
         return;
     }
     
@@ -210,7 +210,7 @@ function generateM4Insights(results) {
         const approachConfigs = validConfigs.filter(c => c.approach === approach);
         if (approachConfigs.length === 0) continue;
         
-        console.log(`\n📊 ${approach.replace(/-/g, ' ').toUpperCase()}:`);
+        console.log(`\n ${approach.replace(/-/g, ' ').toUpperCase()}:`);
         
         approachConfigs.forEach(config => {
             const utilizationPercent = (config.cpu.coreUtilization * 100).toFixed(1);
@@ -264,11 +264,11 @@ function generateM4Insights(results) {
         
         // M4-specific recommendations
         if (highest.cpu.coreUtilization > 0.8) {
-            console.log(`   ⚠️  High M4 utilization at ${highest.frequency} - consider workload distribution`);
+            console.log(`   [WARNING]  High M4 utilization at ${highest.frequency} - consider workload distribution`);
         }
         
         if (coreScaling > 300) {
-            console.log(`   🔧 Significant core scaling - may benefit from M4 performance core optimization`);
+            console.log(`    Significant core scaling - may benefit from M4 performance core optimization`);
         }
     }
 }
@@ -298,11 +298,11 @@ function generateM4Recommendations(results) {
     }
     
     if (validConfigs.length === 0) {
-        console.log('❌ Insufficient data for M4-specific recommendations');
+        console.log('[FAIL] Insufficient data for M4-specific recommendations');
         return;
     }
     
-    console.log('\n🎯 FOR M4 PERFORMANCE OPTIMIZATION:');
+    console.log('\n FOR M4 PERFORMANCE OPTIMIZATION:');
     
     // Sort by efficiency while considering M4 utilization
     const m4Optimized = [...validConfigs].sort((a, b) => {
@@ -347,28 +347,28 @@ function generateM4Recommendations(results) {
     console.log('   • High core usage (>80%) suggests potential for parallel optimization');
     console.log('   • Consider ARM64-specific optimizations for better M4 utilization');
     
-    console.log('\n🚀 SCALING RECOMMENDATIONS FOR M4:');
+    console.log('\n SCALING RECOMMENDATIONS FOR M4:');
     
     const highUtilizationConfigs = validConfigs.filter(c => c.cpu.coreUtilization > 0.7);
     if (highUtilizationConfigs.length > 0) {
-        console.log('   ⚠️  High utilization detected in:');
+        console.log('   [WARNING]  High utilization detected in:');
         highUtilizationConfigs.forEach(config => {
             const name = `${config.approach.replace(/-/g, ' ')} @ ${config.frequency}`;
             const utilization = (config.cpu.coreUtilization * 100).toFixed(1);
             console.log(`      • ${name}: ${utilization}% M4 utilization`);
         });
-        console.log('   🔧 Consider: workload distribution, async processing, or algorithm optimization');
+        console.log('    Consider: workload distribution, async processing, or algorithm optimization');
     }
     
     const lowUtilizationConfigs = validConfigs.filter(c => c.cpu.coreUtilization < 0.3);
     if (lowUtilizationConfigs.length > 0) {
-        console.log('\n   ✅ Underutilized M4 capacity in:');
+        console.log('\n   [OK] Underutilized M4 capacity in:');
         lowUtilizationConfigs.forEach(config => {
             const name = `${config.approach.replace(/-/g, ' ')} @ ${config.frequency}`;
             const utilization = (config.cpu.coreUtilization * 100).toFixed(1);
             console.log(`      • ${name}: ${utilization}% M4 utilization`);
         });
-        console.log('   🚀 Opportunity: increase throughput or run concurrent workloads');
+        console.log('    Opportunity: increase throughput or run concurrent workloads');
     }
 }
 
@@ -385,7 +385,7 @@ if (results) {
     fs.writeFileSync(outputFile, JSON.stringify(results, null, 2));
     
     console.log('\n' + '=' .repeat(90));
-    console.log(`✅ M4 CHIPSET-AWARE ANALYSIS COMPLETE!`);
-    console.log(`📊 Results exported to: ${outputFile}`);
+    console.log(`[OK] M4 CHIPSET-AWARE ANALYSIS COMPLETE!`);
+    console.log(` Results exported to: ${outputFile}`);
     console.log('=' .repeat(90));
 }

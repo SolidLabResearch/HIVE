@@ -10,7 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 
-console.log('🎯 FINAL COMPREHENSIVE QUERY PERFORMANCE ANALYSIS');
+console.log(' FINAL COMPREHENSIVE QUERY PERFORMANCE ANALYSIS');
 console.log('=' .repeat(90));
 
 const LOGS_BASE_DIR = '/Users/kushbisen/Code/streaming-query-hive/tools/experiments/logs';
@@ -225,7 +225,7 @@ function calculateStats(results) {
 function runMainAnalysis() {
     const analysis = {};
     
-    console.log('📊 Analyzing all approaches and frequencies...\n');
+    console.log(' Analyzing all approaches and frequencies...\n');
     
     for (const approach of APPROACHES) {
         console.log(`🔬 ${approach.toUpperCase().replace(/-/g, ' ')}:`);
@@ -244,18 +244,18 @@ function runMainAnalysis() {
                     const latency = (stats.latency.avg / 1000).toFixed(1); // Convert to seconds
                     const cpu = stats.resources.avgCPUTotal.toFixed(1);
                     const memory = stats.resources.avgMemoryRSS.toFixed(1);
-                    console.log(`✅ (${latency}s, ${cpu}% CPU, ${memory}MB)`);
+                    console.log(`[OK] (${latency}s, ${cpu}% CPU, ${memory}MB)`);
                 } else if (stats.hasLatencyData) {
                     const latency = (stats.latency.avg / 1000).toFixed(1);
-                    console.log(`⚠️  (${latency}s, no resource data)`);
+                    console.log(`[WARNING]  (${latency}s, no resource data)`);
                 } else if (stats.hasResourceData) {
                     const cpu = stats.resources.avgCPUTotal.toFixed(1);
-                    console.log(`⚠️  (no latency data, ${cpu}% CPU)`);
+                    console.log(`[WARNING]  (no latency data, ${cpu}% CPU)`);
                 } else {
-                    console.log(`❌ (no valid data)`);
+                    console.log(`[FAIL] (no valid data)`);
                 }
             } else {
-                console.log(`❌ (no data found)`);
+                console.log(`[FAIL] (no data found)`);
             }
         }
         console.log();
@@ -268,7 +268,7 @@ function runMainAnalysis() {
  * Generate final summary table
  */
 function generateFinalSummaryTable(analysis) {
-    console.log('📋 FINAL PERFORMANCE SUMMARY TABLE');
+    console.log(' FINAL PERFORMANCE SUMMARY TABLE');
     console.log('=' .repeat(130));
     console.log();
     
@@ -305,13 +305,13 @@ function generateFinalSummaryTable(analysis) {
                 }
                 
                 if (data.hasLatencyData && data.hasResourceData) {
-                    status = '✅ Complete'.padEnd(11);
+                    status = '[OK] Complete'.padEnd(11);
                 } else if (data.hasLatencyData) {
-                    status = '⚠️  Latency'.padEnd(11);
+                    status = '[WARNING]  Latency'.padEnd(11);
                 } else if (data.hasResourceData) {
-                    status = '⚠️  Resource'.padEnd(11);
+                    status = '[WARNING]  Resource'.padEnd(11);
                 } else {
-                    status = '❌ Failed'.padEnd(11);
+                    status = '[FAIL] Failed'.padEnd(11);
                 }
             }
             
@@ -326,7 +326,7 @@ function generateFinalSummaryTable(analysis) {
  * Generate key insights
  */
 function generateKeyInsights(analysis) {
-    console.log('\n🔍 KEY INSIGHTS & FINDINGS');
+    console.log('\n KEY INSIGHTS & FINDINGS');
     console.log('=' .repeat(90));
     
     // Find best and worst performers
@@ -383,7 +383,7 @@ function generateKeyInsights(analysis) {
         const avgCPU = approachConfigs.reduce((sum, c) => sum + c.cpu, 0) / approachConfigs.length;
         const avgMemory = approachConfigs.reduce((sum, c) => sum + c.memory, 0) / approachConfigs.length;
         
-        console.log(`\n   📊 ${approach.replace(/-/g, ' ').toUpperCase()}:`);
+        console.log(`\n    ${approach.replace(/-/g, ' ').toUpperCase()}:`);
         console.log(`      • Average Latency: ${avgLatency.toFixed(1)}s`);
         console.log(`      • Average CPU: ${avgCPU.toFixed(1)}%`);
         console.log(`      • Average Memory: ${avgMemory.toFixed(1)}MB`);
@@ -439,14 +439,14 @@ function generateRecommendations(analysis) {
     }
     
     if (validConfigs.length === 0) {
-        console.log('❌ Insufficient data for recommendations');
+        console.log('[FAIL] Insufficient data for recommendations');
         return;
     }
     
     // Sort by latency performance
     validConfigs.sort((a, b) => a.latency - b.latency);
     
-    console.log('\n🎯 FOR MINIMUM LATENCY:');
+    console.log('\n FOR MINIMUM LATENCY:');
     const fastestConfigs = validConfigs.slice(0, 3);
     fastestConfigs.forEach((config, index) => {
         console.log(`   ${index + 1}. Use ${config.approach.replace(/-/g, ' ')} @ ${config.frequency}`);
@@ -471,7 +471,7 @@ function generateRecommendations(analysis) {
         console.log(`      └─ Expected: ${config.memory.toFixed(1)}MB memory, ${config.latency.toFixed(1)}s latency, ${config.cpu.toFixed(1)}% CPU`);
     });
     
-    console.log('\n⚠️  IMPORTANT NOTES:');
+    console.log('\n[WARNING]  IMPORTANT NOTES:');
     console.log('   • streaming-query-hive approach appears to have execution issues');
     console.log('   • Consider investigating MQTT connectivity problems for streaming-query-hive');
     console.log('   • All measurements are for first result latency (query registration → first output)');
@@ -491,5 +491,5 @@ const outputFile = 'final-comprehensive-analysis.json';
 fs.writeFileSync(outputFile, JSON.stringify(analysis, null, 2));
 
 console.log('\n' + '=' .repeat(90));
-console.log(`✅ ANALYSIS COMPLETE! Full results exported to: ${outputFile}`);
+console.log(`[OK] ANALYSIS COMPLETE! Full results exported to: ${outputFile}`);
 console.log('=' .repeat(90));

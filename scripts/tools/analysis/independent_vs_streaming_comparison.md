@@ -41,7 +41,7 @@ The independent approach shows higher resource usage (memory and CPU) compared t
 
 **Analysis:** Independent CPU usage becomes 2.2x higher than approximation. Memory overhead continues at ~2x. Latency overhead grows to 6.8%.
 
-### 32Hz ⚠️ 
+### 32Hz [WARNING] 
 | Metric | Independent | Fetching-Client-Side | Streaming-Query-Hive | Approximation |
 |--------|-------------|---------------------|---------------------|---------------|
 | **Latency (ms)** | 66,825.33 | 63,092.67 | N/A | 62,422.00 |
@@ -50,11 +50,11 @@ The independent approach shows higher resource usage (memory and CPU) compared t
 | **Heap (MB)** | 2,461.06 | 60.68 | 74.37 | 59.84 |
 | **Sample Count** | 62 | 1,498.67 | 1,490 | 1,495.67 |
 
-**⚠️ Warning:** Independent data based on only 62 samples - treat as unreliable.
+**[WARNING] Warning:** Independent data based on only 62 samples - treat as unreliable.
 
 **Analysis:** If reliable, independent would show 4.6x more RSS and 41x more heap usage - indicating serious memory scaling issues.
 
-### 64Hz ⚠️
+### 64Hz [WARNING]
 | Metric | Independent | Fetching-Client-Side | Streaming-Query-Hive | Approximation |
 |--------|-------------|---------------------|---------------------|---------------|
 | **Latency (ms)** | N/A | 63,924.67 | N/A | 62,815.33 |
@@ -63,7 +63,7 @@ The independent approach shows higher resource usage (memory and CPU) compared t
 | **Heap (MB)** | 3,715.95 | 81.26 | 30.80 | 72.41 |
 | **Sample Count** | 6 | 1,490.33 | 1,047.33 | 1,491 |
 
-**⚠️ Warning:** Independent data based on only 6 samples - unreliable.
+**[WARNING] Warning:** Independent data based on only 6 samples - unreliable.
 
 ### 128Hz
 | Metric | Independent | Fetching-Client-Side | Streaming-Query-Hive | Approximation |
@@ -97,11 +97,11 @@ The independent approach shows higher resource usage (memory and CPU) compared t
 
 ## Key Findings
 
-### ✅ Advantages of Independent Approach
+### [OK] Advantages of Independent Approach
 - Conceptually simpler architecture
 - Independent processing streams
 
-### ❌ Disadvantages of Independent Approach
+### [FAIL] Disadvantages of Independent Approach
 1. **Higher Memory Usage:** 2-2.5x more RSS memory at reliable frequencies
 2. **Higher CPU Usage:** 2-3x more CPU utilization
 3. **Higher Latency:** 4-7% longer time to first result

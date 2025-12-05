@@ -1,20 +1,70 @@
 # Streaming Query Hive
 
-> Combining Multiple Streaming Queries to provide actionable insights. 
+Combining Multiple Streaming Queries to provide actionable insights.
 
-## Linting
+## Quick Start
 
-You run the linter via 
-```shell
+### Installation
+```bash
+npm install
+npm run build
+```
+
+### Run Experiments
+```bash
+# Setup experiment infrastructure
+npm run experiment:setup
+
+# Run quick test
+npm run experiment:quick-test
+
+# Run full experiments
+npm run experiment:run
+
+# Analyze results
+npm run experiment:analyze
+```
+
+## Documentation
+
+- **[Setup Guide](docs/SETUP_GUIDE.md)** - Configuration and getting started
+- **[Architecture](docs/ARCHITECTURE.md)** - System design and patterns
+- **[Approach Orchestrators](docs/APPROACH_ORCHESTRATORS.md)** - Detailed approach documentation
+- **[Approach Comparison](docs/APPROACH_COMPARISON.md)** - Performance and use cases
+- **[Performance Analysis](docs/PERFORMANCE_ANALYSIS.md)** - Benchmarks and optimization
+
+## Approaches
+
+The project implements three streaming query processing approaches:
+
+1. **Fetching Client Side** (`fetching-client-side`) - Ground truth baseline with centralized processing
+2. **Chunked Query Approach** (`chunked-query-approach`) - Scalable distributed chunk-based aggregation
+3. **Approximation Approach** (`approximation-approach`) - Fast approximate processing
+
+See [APPROACH_COMPARISON.md](docs/APPROACH_COMPARISON.md) for detailed comparison.
+
+## Development
+
+### Linting
+
+Run the linter:
+```bash
 npm run lint:ts
 ```
 
-You can automatically fix some issues via
-```shell
+Auto-fix issues:
+```bash
 npm run lint:ts:fix
 ```
 
-## Example Architecture
+### Testing
+
+Verify all approaches:
+```bash
+npx ts-node scripts/test-all-approaches.ts
+```
+
+## Architecture
 
 The Streaming Query Hive can handle multiple streaming queries from different sources, and utilizes different streaming operators to process the data. The architecture is designed to be modular, allowing for easy integration of new sources and operators. An example architecture combining three different sources and the results from the RDF Stream Processing Agents to solve for a specific Query is shown below:
 
@@ -33,20 +83,37 @@ The resultant query results for the parent query can be streamed to a different 
 
 This code is copyrighted by [Ghent University - imec](https://www.ugent.be/ea/idlab/en) and released under the [MIT Licence](./LICENCE) 
 
+## Project Structure
+
+```
+streaming-query-hive/
+├── src/
+│   ├── approaches/          # Approach orchestrators
+│   ├── orchestrator/        # Core orchestration logic
+│   ├── services/            # Worker factory and services
+│   ├── operators/           # Stream processing operators
+│   └── config/              # Configuration and mappings
+├── scripts/
+│   ├── benchmarks/          # Experiment scripts
+│   ├── setup/               # Setup scripts
+│   └── analysis/            # Analysis tools
+├── docs/                    # Documentation
+└── results/                 # Experiment results
+```
+
+## License
+
+This code is copyrighted by [Ghent University - imec](https://www.ugent.be/ea/idlab/en) and released under the [MIT License](./LICENCE.md)
+
 ## Contact
 
-For any questions, please contact [Kush](mailto:kushbisen@proton.me) or create an issue in the repository [here](https://github.com/SolidLabResearch/streaming-query-hive/issues). 
+For questions, please contact [Kush](mailto:kushbisen@proton.me) or create an issue [here](https://github.com/SolidLabResearch/streaming-query-hive/issues).
 
-### Footnotes
+## References
 
-[1]: <a href="https://link.springer.com/referenceworkentry/10.1007/978-0-387-39940-9_1269"> Query Containment </a>
-
-[2]: <a href="https://www.igi-global.com/article/rsp-ql-semantics/129761">RSP-QL Semantics: A Unifying Query Model to Explain Heterogeneity of RDF Stream Processing Systems </a>
-
-[3]: <a href="https://link.springer.com/content/pdf/10.1007/3-540-48005-6_3.pdf"> Matching RDF Graphs </a>
-
-[4]: <a href="https://github.com/SolidLabResearch/rspql-containment-checker"> RSP-QL Containment Checker </a>
-
-[5]: <a href="https://github.com/mirkospasic/SpeCS"> SPeCS Solver </a>
-
-[6]: <a href="https://github.com/eyereasoner/eye-js"> EYE-JS </a>
+1. [Query Containment](https://link.springer.com/referenceworkentry/10.1007/978-0-387-39940-9_1269)
+2. [RSP-QL Semantics: A Unifying Query Model](https://www.igi-global.com/article/rsp-ql-semantics/129761)
+3. [Matching RDF Graphs](https://link.springer.com/content/pdf/10.1007/3-540-48005-6_3.pdf)
+4. [RSP-QL Containment Checker](https://github.com/SolidLabResearch/rspql-containment-checker)
+5. [SPeCS Solver](https://github.com/mirkospasic/SpeCS)
+6. [EYE-JS](https://github.com/eyereasoner/eye-js)

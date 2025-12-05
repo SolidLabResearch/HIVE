@@ -35,22 +35,22 @@ class LogPerformanceAnalyzer:
         
     def analyze_all_logs(self) -> Dict:
         """Analyze logs for all approaches and frequencies"""
-        print("🔍 Starting comprehensive log analysis...")
+        print(" Starting comprehensive log analysis...")
         print("=" * 80)
         
         for approach in self.approaches:
-            print(f"\n📊 Analyzing {approach} approach...")
+            print(f"\n Analyzing {approach} approach...")
             self.results[approach] = {}
             
             approach_path = self.logs_base_path / approach
             if not approach_path.exists():
-                print(f"   ⚠️  No logs found for {approach}")
+                print(f"   [WARNING]  No logs found for {approach}")
                 continue
                 
             for frequency in self.frequencies:
                 frequency_path = approach_path / f"{frequency}_combined"
                 if not frequency_path.exists():
-                    print(f"   ⚠️  No logs found for {frequency}")
+                    print(f"   [WARNING]  No logs found for {frequency}")
                     continue
                     
                 print(f"   🔬 Processing {frequency}...")
@@ -69,7 +69,7 @@ class LogPerformanceAnalyzer:
                 continue
                 
             iteration_num = iteration_dir.name
-            print(f"      📁 Analyzing {iteration_num}...")
+            print(f"       Analyzing {iteration_num}...")
             
             iteration_data = self.analyze_iteration_logs(approach, iteration_dir)
             if iteration_data:
@@ -99,7 +99,7 @@ class LogPerformanceAnalyzer:
             }
             
         except Exception as e:
-            print(f"        ❌ Error analyzing iteration: {e}")
+            print(f"        [FAIL] Error analyzing iteration: {e}")
             return None
     
     def find_log_files(self, approach: str, iteration_path: Path) -> Dict[str, Path]:
@@ -375,7 +375,7 @@ class LogPerformanceAnalyzer:
         output_dir.mkdir(exist_ok=True)
         
         print(f"\n📝 Generating comprehensive performance report...")
-        print(f"📁 Output directory: {output_dir}")
+        print(f" Output directory: {output_dir}")
         
         # Save raw results as JSON
         json_path = output_dir / "raw_analysis_results.json"
@@ -386,19 +386,19 @@ class LogPerformanceAnalyzer:
         # Generate summary CSV
         csv_path = output_dir / "performance_summary.csv"
         self.generate_summary_csv(csv_path)
-        print(f"   📊 Summary CSV saved: {csv_path}")
+        print(f"    Summary CSV saved: {csv_path}")
         
         # Generate detailed report
         report_path = output_dir / "detailed_report.md"
         self.generate_markdown_report(report_path)
-        print(f"   📋 Detailed report saved: {report_path}")
+        print(f"    Detailed report saved: {report_path}")
         
         # Generate comparison charts data
         charts_path = output_dir / "charts_data.json"
         self.generate_charts_data(charts_path)
         print(f"   📈 Charts data saved: {charts_path}")
         
-        print(f"\n✅ Analysis complete! Reports generated in: {output_dir}")
+        print(f"\n[OK] Analysis complete! Reports generated in: {output_dir}")
         
         return output_dir
     
@@ -471,7 +471,7 @@ class LogPerformanceAnalyzer:
                     
                     data = self.results[approach][frequency]
                     if 'error' in data:
-                        f.write(f"**{frequency}:** ❌ {data['error']}\n\n")
+                        f.write(f"**{frequency}:** [FAIL] {data['error']}\n\n")
                         continue
                     
                     f.write(f"#### {frequency}\n\n")
@@ -614,7 +614,7 @@ def main():
     
     analyzer = LogPerformanceAnalyzer(logs_path)
     
-    print("🚀 Starting Streaming Query Performance Analysis")
+    print(" Starting Streaming Query Performance Analysis")
     print(f"📂 Analyzing logs in: {logs_path}")
     print("")
     
@@ -624,8 +624,8 @@ def main():
     # Generate reports
     output_dir = analyzer.generate_report()
     
-    print(f"\n🎉 Analysis completed successfully!")
-    print(f"📊 Check the generated reports in: {output_dir}")
+    print(f"\n Analysis completed successfully!")
+    print(f" Check the generated reports in: {output_dir}")
 
 
 if __name__ == "__main__":

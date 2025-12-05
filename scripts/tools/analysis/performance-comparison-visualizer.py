@@ -216,7 +216,7 @@ def create_comparison_plots():
 def create_detailed_metrics_table():
     """Create a detailed metrics comparison table"""
     print("\n" + "="*100)
-    print("📊 DETAILED PERFORMANCE METRICS COMPARISON")
+    print(" DETAILED PERFORMANCE METRICS COMPARISON")
     print("="*100)
     
     print(f"\n{'Approach':<25} {'Metric':<15} {'4Hz':<12} {'8Hz':<12} {'16Hz':<12} {'32Hz':<12} {'64Hz':<12} {'128Hz':<12}")
@@ -256,7 +256,7 @@ def create_detailed_metrics_table():
 def print_key_insights():
     """Print key insights from the analysis"""
     print("\n" + "="*80)
-    print("🔍 KEY INSIGHTS")
+    print(" KEY INSIGHTS")
     print("="*80)
     
     print("\n📈 LATENCY COMPARISON:")
@@ -274,7 +274,7 @@ def print_key_insights():
     print("   • Fetching-Client-Side: 34-51% CPU usage (moderate)")
     print("   • Streaming-Query-Hive: 85-99% CPU usage (high utilization)")
     
-    print("\n🎯 RECOMMENDATIONS:")
+    print("\n RECOMMENDATIONS:")
     print("   • For PRODUCTION: Use Approximation-Approach (best balance, works at all frequencies)")
     print("   • For LOW LATENCY: Use Streaming-Query-Hive (if frequency ≤ 32Hz)")
     print("   • For RELIABILITY: Use Fetching-Client-Side (most consistent)")
@@ -289,7 +289,7 @@ def main():
     # Save the plot
     output_path = '/Users/kushbisen/Code/streaming-query-hive/tools/analysis/performance_comparison.png'
     fig.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
-    print(f"📊 Visualization saved to: {output_path}")
+    print(f" Visualization saved to: {output_path}")
     
     # Show the plot
     plt.show()
@@ -300,8 +300,8 @@ def main():
     # Print key insights
     print_key_insights()
     
-    print(f"\n✅ Performance comparison analysis complete!")
-    print(f"📁 Graph saved as: {output_path}")
+    print(f"\n[OK] Performance comparison analysis complete!")
+    print(f" Graph saved as: {output_path}")
 
 if __name__ == "__main__":
     main()

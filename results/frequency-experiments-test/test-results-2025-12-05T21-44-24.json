@@ -1,0 +1,41 @@
+{
+  "timestamp": "2025-12-05T21:44:24.391Z",
+  "totalTests": 3,
+  "passedTests": 3,
+  "failedTests": 0,
+  "results": [
+    {
+      "approach": "fetching-client-side",
+      "frequency": "4Hz",
+      "device": "smartphone",
+      "success": true,
+      "metrics": {
+        "latency": 24,
+        "memoryUsage": 2.1706008911132812,
+        "throughput": 20000
+      }
+    },
+    {
+      "approach": "chunked-query-approach",
+      "frequency": "4Hz",
+      "device": "smartphone",
+      "success": true,
+      "metrics": {
+        "latency": 18,
+        "memoryUsage": 3.0902099609375,
+        "throughput": 26666.666666666668
+      }
+    },
+    {
+      "approach": "approximation-approach",
+      "frequency": "4Hz",
+      "device": "smartphone",
+      "success": true,
+      "metrics": {
+        "latency": 3,
+        "memoryUsage": 1.0039520263671875,
+        "throughput": 160000
+      }
+    }
+  ]
+}

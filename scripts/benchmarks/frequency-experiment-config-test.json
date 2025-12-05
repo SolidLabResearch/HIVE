@@ -1,0 +1,33 @@
+{
+  "experiment": {
+    "name": "Test Run - Frequency-Based Streaming Query Comparison",
+    "description": "Single iteration test to verify MQTT connections, SPARQL endpoints, and data flow",
+    "timestamp": "2025-12-05T19:17:16.176Z",
+    "iterations": 1,
+    "warmupIterations": 0,
+    "cooldownIterations": 0
+  },
+  "frequencies": ["4Hz"],
+  "deviceTypes": ["smartphone"],
+  "approaches": [
+    "fetching-client-side",
+    "chunked-query-approach",
+    "approximation-approach"
+  ],
+  "dataBasePath": "/Users/kushbisen/Code/streaming-query-hive/src/streamer/data/frequency_variants/2mins",
+  "outputPath": "/Users/kushbisen/Code/streaming-query-hive/results/frequency-experiments-test",
+  "saveIterationsSeparately": true,
+  "queries": {
+    "windowSize": 1000,
+    "avgAcceleration": {
+      "name": "Average Acceleration",
+      "sparql": "\n                            PREFIX saref: <https://saref.etsi.org/core/>\n                            PREFIX dahcc: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>\n                            SELECT (AVG(?value) as ?avgAcceleration)\n                            WHERE {\n                                ?obs saref:hasValue ?value .\n                                ?obs saref:relatesToProperty dahcc:smartphoneX .\n                            }\n                        "
+    }
+  },
+  "metrics": {
+    "latency": "Response time per query (ms)",
+    "memory": "Peak memory usage (MB)",
+    "accuracy": "Deviation from ground truth (%)",
+    "throughput": "Observations processed per second"
+  }
+}

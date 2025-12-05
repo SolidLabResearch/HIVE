@@ -57,12 +57,12 @@ function calculateStreamingQueryHiveLatency(logData) {
     console.log(`Found ${resultEvents.length} result events`);
     
     if (initEvents.length === 0) {
-        console.log('❌ No initialization events found');
+        console.log('[FAIL] No initialization events found');
         return null;
     }
     
     if (resultEvents.length === 0) {
-        console.log('❌ No result events found');
+        console.log('[FAIL] No result events found');
         return null;
     }
     
@@ -72,10 +72,10 @@ function calculateStreamingQueryHiveLatency(logData) {
     const latencyMs = firstResultTime - initTime;
     const latencySeconds = latencyMs / 1000;
     
-    console.log(`\n🎯 STREAMING QUERY HIVE LATENCY CALCULATION:`);
+    console.log(`\n STREAMING QUERY HIVE LATENCY CALCULATION:`);
     console.log(`   Operator initialized at: ${initTime}`);
     console.log(`   First result at: ${firstResultTime}`);
-    console.log(`   ✅ Latency: ${latencyMs}ms (${latencySeconds.toFixed(1)}s)`);
+    console.log(`   [OK] Latency: ${latencyMs}ms (${latencySeconds.toFixed(1)}s)`);
     
     return {
         initTime,
@@ -90,7 +90,7 @@ function analyzeAllStreamingQueryHiveLogs() {
     const streamingQueryHiveDir = path.join(baseLogDir, 'streaming-query-hive');
     
     if (!fs.existsSync(streamingQueryHiveDir)) {
-        console.log('❌ Streaming-query-hive logs directory not found');
+        console.log('[FAIL] Streaming-query-hive logs directory not found');
         return;
     }
     
@@ -110,7 +110,7 @@ function analyzeAllStreamingQueryHiveLogs() {
         const frequency = freqDir.match(/(\d+)Hz/)?.[1];
         if (!frequency) continue;
         
-        console.log(`\n📊 Processing ${frequency}Hz...`);
+        console.log(`\n Processing ${frequency}Hz...`);
         
         const freqPath = path.join(streamingQueryHiveDir, freqDir);
         const iterations = fs.readdirSync(freqPath)
@@ -122,7 +122,7 @@ function analyzeAllStreamingQueryHiveLogs() {
             const logFile = path.join(iterPath, 'streaming_query_chunk_aggregator_log.csv');
             
             if (!fs.existsSync(logFile)) {
-                console.log(`   ⚠️  Log file not found: ${logFile}`);
+                console.log(`   [WARNING]  Log file not found: ${logFile}`);
                 continue;
             }
             
@@ -140,13 +140,13 @@ function analyzeAllStreamingQueryHiveLogs() {
                         iteration: iterDir,
                         ...latency
                     });
-                    console.log(`   ✅ ${iterDir}: ${latency.latencySeconds.toFixed(1)}s latency`);
+                    console.log(`   [OK] ${iterDir}: ${latency.latencySeconds.toFixed(1)}s latency`);
                 } else {
-                    console.log(`   ❌ ${iterDir}: Could not calculate latency`);
+                    console.log(`   [FAIL] ${iterDir}: Could not calculate latency`);
                 }
                 
             } catch (error) {
-                console.log(`   ❌ Error processing ${iterDir}:`, error.message);
+                console.log(`   [FAIL] Error processing ${iterDir}:`, error.message);
             }
         }
     }
@@ -157,7 +157,7 @@ function analyzeAllStreamingQueryHiveLogs() {
 // Generate summary
 function generateSummary(results) {
     if (results.length === 0) {
-        console.log('\n❌ No valid results found');
+        console.log('\n[FAIL] No valid results found');
         return;
     }
     
@@ -195,21 +195,21 @@ function generateSummary(results) {
     const overallMax = Math.max(...allLatencies);
     const overallAvg = allLatencies.reduce((a, b) => a + b, 0) / allLatencies.length;
     
-    console.log('\n📊 Overall Statistics:');
+    console.log('\n Overall Statistics:');
     console.log(`   Total measurements: ${allLatencies.length}`);
     console.log(`   Min latency: ${overallMin.toFixed(1)}s`);
     console.log(`   Max latency: ${overallMax.toFixed(1)}s`);
     console.log(`   Average latency: ${overallAvg.toFixed(1)}s`);
     
-    console.log('\n✅ CONCLUSION: Streaming-query-hive IS working!');
+    console.log('\n[OK] CONCLUSION: Streaming-query-hive IS working!');
     console.log('   The approach successfully produces results with latencies similar to other approaches.');
     console.log('   Previous analysis incorrectly concluded it was not working due to pattern matching issues.');
 }
 
 // Main execution
-console.log('🔍 Correcting streaming-query-hive analysis...\n');
+console.log(' Correcting streaming-query-hive analysis...\n');
 
 const results = analyzeAllStreamingQueryHiveLogs();
 generateSummary(results);
 
-console.log('\n🎯 Analysis complete! The streaming-query-hive approach is fully functional.');
+console.log('\n Analysis complete! The streaming-query-hive approach is fully functional.');

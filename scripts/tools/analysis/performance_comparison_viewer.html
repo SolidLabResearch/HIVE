@@ -94,10 +94,10 @@
         </div>
         
         <div class="summary">
-            <h2>📊 Performance Analysis Summary</h2>
+            <h2> Performance Analysis Summary</h2>
             
             <div class="insight">
-                <h3>🚀 Latency Performance</h3>
+                <h3> Latency Performance</h3>
                 <ul>
                     <li><span class="approach-name">Streaming-Query-Hive</span>: <span class="metric-highlight">60.3s</span> (fastest, but fails at ≥64Hz)</li>
                     <li><span class="approach-name">Fetching-Client-Side</span>: <span class="metric-highlight">62.0s</span> (consistent across all frequencies)</li>
@@ -125,7 +125,7 @@
             </div>
             
             <div class="recommendation">
-                <h3>🎯 Recommendations</h3>
+                <h3> Recommendations</h3>
                 <ul>
                     <li><strong>For PRODUCTION:</strong> Use <span class="approach-name">Approximation-Approach</span> (best balance, works at all frequencies)</li>
                     <li><strong>For LOW LATENCY:</strong> Use <span class="approach-name">Streaming-Query-Hive</span> (if frequency ≤ 32Hz)</li>
@@ -134,7 +134,7 @@
             </div>
             
             <div class="warning">
-                <h3>⚠️ Performance Notes</h3>
+                <h3>[WARNING] Performance Notes</h3>
                 <p><strong>Missing Data:</strong> Streaming-Query-Hive shows no data at 64Hz and 128Hz because the experiments failed to complete at these higher frequencies, indicating stability issues.</p>
                 <p><strong>CPU Usage:</strong> All approaches show elevated CPU usage, with Streaming-Query-Hive being particularly resource-intensive.</p>
             </div>
