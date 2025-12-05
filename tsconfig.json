@@ -15,7 +15,18 @@
     "lib": ["es2015", "es2015.iterable", "dom"],
     "types": ["node", "jest"]
   },
-  "include": [, "scripts/benchmarks/run-all-approaches-35-iterations.js", "scripts/analysis/experiment-complex-oscillation-comparison.js", "scripts/legacy/experiment-rate-comparison-fetching.js", "scripts/benchmarks/run-rate-comparison-experiments.js", "scripts/legacy/experiment-evaluation-fetching-client-side-patterns.js", "scripts/legacy/experiment-rate-comparison-approximation.js", "scripts/benchmarks/run-exponential-rate-tests.js", "scripts/benchmarks/run-exponential-rate-tests-fetching.js", "scripts/legacy/experiment-evaluation-approximation-patterns.js", "scripts/benchmarks/run-all-rate-tests.js", "scripts/benchmarks/run-frequency-comparison-experiments.js"
+  "include": [
+    "scripts/benchmarks/run-all-approaches-35-iterations.js",
+    "scripts/analysis/experiment-complex-oscillation-comparison.js",
+    "scripts/legacy/experiment-rate-comparison-fetching.js",
+    "scripts/benchmarks/run-rate-comparison-experiments.js",
+    "scripts/legacy/experiment-evaluation-fetching-client-side-patterns.js",
+    "scripts/legacy/experiment-rate-comparison-approximation.js",
+    "scripts/benchmarks/run-exponential-rate-tests.js",
+    "scripts/benchmarks/run-exponential-rate-tests-fetching.js",
+    "scripts/legacy/experiment-evaluation-approximation-patterns.js",
+    "scripts/benchmarks/run-all-rate-tests.js",
+    "scripts/benchmarks/run-frequency-comparison-experiments.js",
     "./src",
     "src/streamer/src/publishing",
     "./scripts/setup",
