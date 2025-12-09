@@ -4,7 +4,7 @@ import { CSVLogger } from "../util/logger/CSVLogger";
 
 /**
  * Chunked Query Approach Orchestrator
- * This orchestrator uses chunk-based aggregation to process streaming queries
+ * This orchestrator uses chunk-based aggregation to process streaming queries.
  */
 export class ChunkedQueryApproachOrchestrator {
   private logger: CSVLogger;
@@ -12,6 +12,9 @@ export class ChunkedQueryApproachOrchestrator {
   private resourceLogStream?: fs.WriteStream;
   private resourceLogInterval?: ReturnType<typeof setInterval>;
 
+  /**
+   * Creates a new ChunkedQueryApproachOrchestrator instance.
+   */
   constructor() {
     this.logger = new CSVLogger("chunked_query_approach_log.csv");
     this.orchestrator = new Orchestrator(
@@ -20,16 +23,18 @@ export class ChunkedQueryApproachOrchestrator {
   }
 
   /**
-   * Get the name of this approach
+   * Get the name of this approach.
+   * @returns {string} The name of the approach.
    */
   public getName(): string {
     return "chunked-query-approach";
   }
 
   /**
-   * Initialize and run the experiment
+   * Initialize and run the experiment.
+   * @returns {Promise<any>} A promise that resolves with the experiment result.
    */
-  public async runExperiment(_dataPath: string, _config: any): Promise<any> {
+  public async runExperiment(): Promise<any> {
     console.log(`[ChunkedQueryApproach] Starting experiment`);
 
     try {
@@ -55,7 +60,8 @@ export class ChunkedQueryApproachOrchestrator {
   }
 
   /**
-   * Setup subqueries for the chunked query approach
+   * Setup subqueries for the chunked query approach.
+   * @returns {Promise<void>}
    */
   private async setupSubQueries(): Promise<void> {
     const query1 = `
@@ -98,7 +104,8 @@ WHERE {
   }
 
   /**
-   * Register the main query for the chunked query approach
+   * Register the main query for the chunked query approach.
+   * @returns {Promise<void>}
    */
   private async registerMainQuery(): Promise<void> {
     const registeredQuery = `
@@ -136,6 +143,9 @@ WHERE {
 
   /**
    * Logs CPU and memory usage to a CSV file at regular intervals.
+   * @param {string} filePath - Path to the log file.
+   * @param {number} intervalMs - Interval in milliseconds.
+   * @returns {void}
    */
   private startResourceUsageLogging(
     filePath: string = "chunked_query_approach_resource_log.csv",
@@ -172,7 +182,8 @@ WHERE {
   }
 
   /**
-   * Clean up resources
+   * Clean up resources.
+   * @returns {void}
    */
   public cleanup(): void {
     if (this.resourceLogInterval) {
@@ -186,13 +197,14 @@ WHERE {
 }
 
 /**
- * Standalone execution function (for backward compatibility with direct script execution)
+ * Standalone execution function (for backward compatibility with direct script execution).
+ * @returns {Promise<void>}
  */
 async function runStandaloneChunkedQueryApproach() {
   const orchestrator = new ChunkedQueryApproachOrchestrator();
 
   try {
-    await orchestrator.runExperiment("", {});
+    await orchestrator.runExperiment();
 
     // Add exit logic to ensure the process terminates after processing
     setTimeout(() => {

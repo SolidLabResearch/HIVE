@@ -4,7 +4,7 @@ import { CSVLogger } from "../util/logger/CSVLogger";
 
 /**
  * Approximation Approach Orchestrator
- * This orchestrator uses approximation techniques to process streaming queries
+ * This orchestrator uses approximation techniques to process streaming queries.
  */
 export class ApproximationApproachOrchestrator {
   private logger: CSVLogger;
@@ -12,22 +12,27 @@ export class ApproximationApproachOrchestrator {
   private resourceLogStream?: fs.WriteStream;
   private resourceLogInterval?: ReturnType<typeof setInterval>;
 
+  /**
+   * Creates a new ApproximationApproachOrchestrator instance.
+   */
   constructor() {
     this.logger = new CSVLogger("approximation_approach_log.csv");
     this.orchestrator = new Orchestrator("ApproximationApproachOperator");
   }
 
   /**
-   * Get the name of this approach
+   * Get the name of this approach.
+   * @returns {string} The name of the approach.
    */
   public getName(): string {
     return "approximation-approach";
   }
 
   /**
-   * Initialize and run the experiment
+   * Initialize and run the experiment.
+   * @returns {Promise<any>} A promise that resolves with the experiment result.
    */
-  public async runExperiment(_dataPath: string, _config: any): Promise<any> {
+  public async runExperiment(): Promise<any> {
     console.log(`[ApproximationApproach] Starting experiment`);
 
     try {
@@ -53,7 +58,8 @@ export class ApproximationApproachOrchestrator {
   }
 
   /**
-   * Setup subqueries for the approximation approach
+   * Setup subqueries for the approximation approach.
+   * @returns {Promise<void>}
    */
   private async setupSubQueries(): Promise<void> {
     const query1 = `
@@ -96,7 +102,8 @@ WHERE {
   }
 
   /**
-   * Register the main query for the approximation approach
+   * Register the main query for the approximation approach.
+   * @returns {Promise<void>}
    */
   private async registerMainQuery(): Promise<void> {
     const registeredQuery = `
@@ -130,6 +137,9 @@ WHERE {
 
   /**
    * Logs CPU and memory usage to a CSV file at regular intervals.
+   * @param {string} filePath - Path to the log file.
+   * @param {number} intervalMs - Interval in milliseconds.
+   * @returns {void}
    */
   private startResourceUsageLogging(
     filePath: string = "approximation_approach_resource_usage.csv",
@@ -166,7 +176,8 @@ WHERE {
   }
 
   /**
-   * Clean up resources
+   * Clean up resources.
+   * @returns {void}
    */
   public cleanup(): void {
     if (this.resourceLogInterval) {
@@ -180,13 +191,14 @@ WHERE {
 }
 
 /**
- * Standalone execution function (for backward compatibility with direct script execution)
+ * Standalone execution function (for backward compatibility with direct script execution).
+ * @returns {Promise<void>}
  */
 async function runStandaloneApproximationApproach() {
   const orchestrator = new ApproximationApproachOrchestrator();
 
   try {
-    await orchestrator.runExperiment("", {});
+    await orchestrator.runExperiment();
 
     // Add exit logic to ensure the process terminates after processing
     setTimeout(() => {

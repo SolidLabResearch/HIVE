@@ -9,7 +9,8 @@ const mqtt = require("mqtt");
 const { DataFactory } = N3;
 
 /**
- * FetchingAllDataClientSide processor
+ * FetchingAllDataClientSide processor.
+ * Fetches all necessary data from streams and processes it locally.
  */
 class FetchingAllDataClientSide {
   public query: string;
@@ -28,6 +29,12 @@ class FetchingAllDataClientSide {
   private lastValidResultTime: number = 0;
   private queryRegisteredTime: number = 0;
 
+  /**
+   * Creates a new FetchingAllDataClientSide instance.
+   * @param {string} query - The RSPQL query to execute.
+   * @param {string} r2s_topic - The MQTT topic to publish results to.
+   * @param {string} [logDirectory] - Optional directory for log files.
+   */
   constructor(query: string, r2s_topic: string, logDirectory?: string) {
     this.query = query;
     this.r2s_topic = r2s_topic;
@@ -43,6 +50,10 @@ class FetchingAllDataClientSide {
     this.subscribeRStream();
   }
 
+  /**
+   * Initializes logging mechanism.
+   * @param {string} [logDirectory] - Optional directory for log files.
+   */
   private initializeLogging(logDirectory?: string) {
     const baseName = "fetching_client_side_log.csv";
     const logFilePath = logDirectory
@@ -56,6 +67,10 @@ class FetchingAllDataClientSide {
     }
   }
 
+  /**
+   * Logs a message to the CSV file and console.
+   * @param {string} message - The message to log.
+   */
   public log(message: string) {
     const timestamp = Date.now();
     if (this.logStream) {
@@ -64,6 +79,10 @@ class FetchingAllDataClientSide {
     console.log(`LOG: ${timestamp} - ${message}`);
   }
 
+  /**
+   * Processes the streams defined in the query.
+   * Connects to MQTT brokers and subscribes to topics.
+   */
   process_streams() {
     const streams = this.returnStreams();
     console.log("Processing streams:", streams);
@@ -114,17 +133,33 @@ class FetchingAllDataClientSide {
     }
   }
 
+  /**
+   * Returns the list of streams from the parsed query.
+   * @returns {any[]} Array of stream objects.
+   */
   returnStreams(): any[] {
     const parsedQuery = this.rspql_parser.parse(this.query);
     const streams: any[] = [...parsedQuery.s2r];
     return streams;
   }
 
+  /**
+   * Extracts the MQTT broker URL from the stream name.
+   * @param {string} stream_name - The name/IRI of the stream.
+   * @returns {string} The MQTT broker URL.
+   */
   public returnMQTTBroker(stream_name: string): string {
     const url = new URL(stream_name);
     return `${url.protocol}//${url.hostname}:${url.port}/`;
   }
 
+  /**
+   * Adds an event store to the RSP engine.
+   * @param {any} event_store - The N3 store containing the event data.
+   * @param {RDFStream} stream_name - The RSP-JS RDFStream object.
+   * @param {number} timestamp - The timestamp of the event.
+   * @returns {Promise<void>}
+   */
   public async add_event_store_to_rsp_engine(
     event_store: any,
     stream_name: RDFStream,
@@ -150,11 +185,20 @@ class FetchingAllDataClientSide {
     }
   }
 
-  private isWithinExpectedWindowTiming(timestamp: number): boolean {
+  /**
+   * Checks if the timestamp is within the expected window timing.
+   * @param {number} _timestamp - The timestamp to check.
+   * @returns {boolean} True if within window (currently always true).
+   */
+  private isWithinExpectedWindowTiming(_timestamp: number): boolean {
     // Timing filter disabled to allow all results during experiment replay
     return true;
   }
 
+  /**
+   * Subscribes to the RStream emitter to handle query results.
+   * @returns {Promise<void>}
+   */
   public async subscribeRStream(): Promise<void> {
     console.log("Subscribing to RStream...");
     if (!this.rstream_emitter) {
@@ -225,6 +269,11 @@ class FetchingAllDataClientSide {
     });
   }
 
+  /**
+   * Generates an aggregation event string (RDF).
+   * @param {any} data - The data value.
+   * @returns {string} The RDF string representing the event.
+   */
   public generate_aggregation_event(data: any): string {
     const uuid_random = uuidv4();
 
@@ -234,6 +283,10 @@ class FetchingAllDataClientSide {
     return aggregation_event.trim();
   }
 
+  /**
+   * Cleans up resources.
+   * @returns {void}
+   */
   public cleanup(): void {
     if (this.logStream) {
       this.logStream.end();
@@ -243,20 +296,31 @@ class FetchingAllDataClientSide {
 
 /**
  * Fetching Client Side Approach Orchestrator
- * This orchestrator fetches all data on the client side for processing
+ * This orchestrator fetches all data on the client side for processing.
  */
 export class FetchingClientSideApproachOrchestrator {
   private client?: FetchingAllDataClientSide;
   private resourceLogStream?: fs.WriteStream;
   private resourceLogInterval?: ReturnType<typeof setInterval>;
 
+  /**
+   * Creates a new FetchingClientSideApproachOrchestrator instance.
+   */
   constructor() {}
 
+  /**
+   * Get the name of this approach.
+   * @returns {string} The name of the approach.
+   */
   public getName(): string {
     return "fetching-client-side";
   }
 
-  public async runExperiment(_dataPath: string, _config: any): Promise<any> {
+  /**
+   * Initialize and run the experiment.
+   * @returns {Promise<any>} A promise that resolves with the experiment status.
+   */
+  public async runExperiment(): Promise<any> {
     console.log(`[FetchingClientSide] Starting experiment`);
 
     try {
@@ -310,6 +374,12 @@ WHERE {
     }
   }
 
+  /**
+   * Logs CPU and memory usage to a CSV file.
+   * @param {string} filePath - Path to log file.
+   * @param {number} intervalMs - Logging interval in milliseconds.
+   * @returns {void}
+   */
   private startResourceUsageLogging(
     filePath = "fetching_client_side_resource_usage.csv",
     intervalMs = 100,
@@ -342,6 +412,10 @@ WHERE {
     }, intervalMs);
   }
 
+  /**
+   * Clean up resources.
+   * @returns {void}
+   */
   public cleanup(): void {
     if (this.resourceLogInterval) {
       clearInterval(this.resourceLogInterval);
@@ -356,6 +430,10 @@ WHERE {
   }
 }
 
+/**
+ * Runs the FetchingClientSide approach in standalone mode.
+ * @returns {Promise<void>}
+ */
 async function runStandaloneFetchingClientSide(): Promise<void> {
   const orchestrator = new FetchingClientSideApproachOrchestrator();
 
@@ -372,7 +450,7 @@ async function runStandaloneFetchingClientSide(): Promise<void> {
   });
 
   try {
-    await orchestrator.runExperiment("", {});
+    await orchestrator.runExperiment();
   } catch (error) {
     console.error("Error during client-side processing:", error);
     orchestrator.cleanup();

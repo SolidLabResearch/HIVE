@@ -6,14 +6,14 @@ import { NaiveApproximationApproachOperator } from "./operators/NaiveApproximati
 
 /**
  * Factory class for creating worker operators based on type
- * This centralizes operator instantiation and ensures type safety
+ * This centralizes operator instantiation and ensures type safety.
  */
 export class WorkerFactory {
   /**
-   * Create an operator instance based on the specified type
-   * @param operatorType The type of operator to create
-   * @returns An instance of the requested operator
-   * @throws Error if the operator type is not supported
+   * Create an operator instance based on the specified type.
+   * @param {OperatorType} operatorType - The type of operator to create.
+   * @returns {IStreamQueryOperator} An instance of the requested operator.
+   * @throws {Error} If the operator type is not supported.
    */
   static createOperator(operatorType: OperatorType): IStreamQueryOperator {
     switch (operatorType) {
@@ -36,10 +36,10 @@ export class WorkerFactory {
 
   /**
    * Create an operator instance from a string type
-   * This is useful when the operator type comes from environment variables or config
-   * @param operatorTypeString The string representation of the operator type
-   * @returns An instance of the requested operator
-   * @throws Error if the operator type string is invalid or not supported
+   * This is useful when the operator type comes from environment variables or config.
+   * @param {string} operatorTypeString - The string representation of the operator type.
+   * @returns {IStreamQueryOperator} An instance of the requested operator.
+   * @throws {Error} If the operator type string is invalid or not supported.
    */
   static createOperatorFromString(operatorTypeString: string): IStreamQueryOperator {
     // Validate that the string matches a known OperatorType
@@ -48,10 +48,10 @@ export class WorkerFactory {
   }
 
   /**
-   * Parse a string to an OperatorType enum value
-   * @param operatorTypeString The string to parse
-   * @returns The corresponding OperatorType enum value
-   * @throws Error if the string doesn't match any OperatorType
+   * Parse a string to an OperatorType enum value.
+   * @param {string} operatorTypeString - The string to parse.
+   * @returns {OperatorType} The corresponding OperatorType enum value.
+   * @throws {Error} If the string doesn't match any OperatorType.
    */
   private static parseOperatorType(operatorTypeString: string): OperatorType {
     // Check if it's a valid enum value
@@ -80,9 +80,9 @@ export class WorkerFactory {
   }
 
   /**
-   * Check if an operator type string is valid
-   * @param operatorTypeString The string to check
-   * @returns True if the string represents a valid operator type
+   * Check if an operator type string is valid.
+   * @param {string} operatorTypeString - The string to check.
+   * @returns {boolean} True if the string represents a valid operator type.
    */
   static isValidOperatorType(operatorTypeString: string): boolean {
     try {
@@ -94,8 +94,8 @@ export class WorkerFactory {
   }
 
   /**
-   * Get all available operator types
-   * @returns Array of all supported operator types
+   * Get all available operator types.
+   * @returns {OperatorType[]} Array of all supported operator types.
    */
   static getAvailableOperatorTypes(): OperatorType[] {
     return Object.values(OperatorType);

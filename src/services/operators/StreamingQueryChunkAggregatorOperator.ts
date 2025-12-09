@@ -9,7 +9,8 @@ import { IStreamQueryOperator } from "../../util/Interfaces";
 const N3 = require('n3');
 
 /**
- *
+ * Operator that aggregates streaming query results using chunk-based processing.
+ * It rewrites queries to operate on smaller time chunks and aggregates the partial results.
  */
 export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperator {
 
@@ -22,7 +23,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     private logger: CSVLogger;
     private mqttBroker: string = 'mqtt://localhost:1883'; // Default MQTT broker URL, can be changed if needed
     /**
-     *
+     * Creates a new StreamingQueryChunkAggregatorOperator instance.
      */
     constructor() {
         this.subQueries = [];
@@ -32,24 +33,26 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     }
 
     /**
-     *
+     * Initializes the operator by setting up the MQTT topic map.
+     * @returns {Promise<void>} A promise that resolves when initialization is complete.
      */
-    public async init() {
+    public async init(): Promise<void> {
         this.logger.log("init() called");
         await this.setMQTTTopicMap();
         this.logger.log("StreamingQueryChunkAggregatorOperator initialized.");
     }
 
     /**
-     *
-     * @param query
+     * Sets the output query for the aggregation.
+     * @param {string} query - The output query string.
      */
     addOutputQuery(query: string): void {
         this.outputQuery = query;
     }
 
     /**
-     *
+     * Fetches existing queries from the server and maps them to MQTT topics.
+     * @returns {Promise<void>} A promise that resolves when the topic map is set.
      */
     async setMQTTTopicMap(): Promise<void> {
         this.logger.log("setMQTTTopicMap() called");
@@ -75,7 +78,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
 
     /**
-     *
+     * Orchestrates the aggregation process by initializing sub-queries and processing results.
+     * @returns {Promise<void>} A promise that resolves when the aggregation process is set up.
      */
     async handleAggregation(): Promise<void> {
         this.logger.log("Starting aggregation process for subqueries.");
@@ -185,7 +189,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
                 const windowStart = now - outputQueryWidth;
                 
                 // Collect all chunks from all topics within the window
-                let allWindowChunks: string[] = [];
+                const allWindowChunks: string[] = [];
                 let totalTopicsWithData = 0;
                 
                 for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
@@ -222,8 +226,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
 
     /**
-     *
-     * @param chunks
+     * Executes the R2R operator on a set of data chunks.
+     * @param {string[]} chunks - The data chunks to process.
+     * @returns {Promise<void>} A promise that resolves when execution is complete.
      */
     async executeR2ROperator(chunks: string[]): Promise<void> {
         this.logger.log(`Executing the R2R Operator with results: ${chunks}`);
@@ -311,8 +316,9 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param data
+     * Generates a unique output query event string.
+     * @param {any} data - The data value to include in the event.
+     * @returns {string} The formatted event string.
      */
     generateOutputQueryEvent(data: any): string {
         const uuid_random = uuidv4();
@@ -320,7 +326,8 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
+     * Initializes the sub-query processes for chunked processing.
+     * @returns {Promise<void>} A promise that resolves when initialization is complete.
      */
     async initializeSubQueryProcesses(): Promise<void> {
         this.logger.log(`Initializing subquery processes.`);
@@ -368,9 +375,10 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param subQueries
-     * @param outputQuery
+     * Calculates the GCD of window parameters from sub-queries and output query.
+     * @param {string[]} subQueries - The list of sub-query strings.
+     * @param {string} outputQuery - The output query string.
+     * @returns {number} The greatest common divisor of the window sizes.
      */
     findGCDChunk(subQueries: string[], outputQuery: string): number {
         const window_parameters: number[] = [];
@@ -405,8 +413,9 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param arr
+     * Calculates the Greatest Common Divisor of an array of numbers.
+     * @param {number[]} arr - Array of numbers to process.
+     * @returns {number} The GCD of the numbers.
      */
     findGCD(arr: number[]): number {
         if (arr.length === 0) {
@@ -420,8 +429,9 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param arr
+     * Calculates the Least Common Multiple of an array of numbers.
+     * @param {number[]} arr - Array of numbers to process.
+     * @returns {number} The LCM of the numbers.
      */
     findLCM(arr: number[]): number {
         const lcm = (a: number, b: number): number => {
@@ -432,8 +442,8 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param query
+     * Adds a sub-query to the list.
+     * @param {string} query - The sub-query string to add.
      */
     addSubQuery(query: string): void {
         this.subQueries.push(query);
@@ -444,8 +454,8 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param query
+     * Sets the output query string.
+     * @param {string} query - The output query string.
      */
     setOutputQuery(query: string): void {
         this.outputQuery = query;
@@ -455,27 +465,31 @@ For example, the allResults object might look like this:
         }
     }
     /**
-     *
+     * Gets the current output query string.
+     * @returns {string} The output query string.
      */
     getOutputQuery(): string {
         return this.outputQuery ?? "";
     }
     /**
-     *
+     * Gets the list of sub-queries.
+     * @returns {string[]} An array of sub-query strings.
      */
     getSubQueries(): string[] {
         return this.subQueries;
     }
     /**
-     *
+     * Clears all registered sub-queries.
+     * @returns {void}
      */
     clearSubQueries(): void {
         this.subQueries = [];
     }
 
     /**
-     *
-     * @param query
+     * Detects the aggregation function used in a query string.
+     * @param {string} query - The query string to analyze.
+     * @returns {string | null} The detected aggregation function name or null if not found.
      */
     detectAggregationFunction(query: string): string | null {
         const aggregationFunctions = ['SUM', 'AVG', 'COUNT', 'MIN', 'MAX'];
@@ -488,9 +502,10 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param aggregationFunction
-     * @param variable
+     * Generates a SPARQL query for aggregating results.
+     * @param {string} aggregationFunction - The aggregation function to use (e.g., AVG, SUM).
+     * @param {string} variable - The variable name to aggregate.
+     * @returns {string} The generated SPARQL query string.
      */
     getAggregationSPARQLQuery(aggregationFunction: string, variable: string): string {
         const allowedFunctions = ['AVG', 'SUM', 'COUNT', 'MIN', 'MAX'];
@@ -514,17 +529,19 @@ For example, the allResults object might look like this:
     }
 
     /**
-     *
-     * @param ms
+     * Pauses execution for a specified duration.
+     * @param {number} ms - The duration to sleep in milliseconds.
+     * @returns {Promise<void>} A promise that resolves after the specified duration.
      */
     sleep(ms: number): Promise<void> {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     /**
-     * Execute R2R Operator for a specific topic's chunks
-     * @param topic
-     * @param chunks
+     * Execute R2R Operator for a specific topic's chunks.
+     * @param {string} topic - The topic associated with the chunks.
+     * @param {string[]} chunks - The data chunks to process.
+     * @returns {Promise<number | null>} A promise resolving to the numeric result or null on failure.
      */
     async executeR2ROperatorForTopic(topic: string, chunks: string[]): Promise<number | null> {
         this.logger.log(`Executing the R2R Operator for topic ${topic} with ${chunks.length} chunks`);
@@ -622,8 +639,8 @@ For example, the allResults object might look like this:
     }
 
     /**
-     * Publish combined results from all topics
-     * @param finalResult
+     * Publish combined results from all topics.
+     * @param {any} finalResult - The result object to publish.
      */
     publishCombinedResults(finalResult: any): void {
         const rsp_client = mqtt.connect(this.mqttBroker);
@@ -646,7 +663,8 @@ For example, the allResults object might look like this:
 }
 
 /**
- *
+ * Generates a random UUID v4 string.
+ * @returns {string} A random UUID string.
  */
 function uuidv4() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {

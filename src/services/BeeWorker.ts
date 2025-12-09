@@ -6,7 +6,7 @@ import { WorkerFactory } from "./WorkerFactory";
 
 /**
  * BeeWorker class responsible for processing streaming queries
- * Uses the WorkerFactory pattern to instantiate appropriate operators
+ * Uses the WorkerFactory pattern to instantiate appropriate operators.
  */
 export class BeeWorker {
   private query: string;
@@ -18,7 +18,7 @@ export class BeeWorker {
 
   /**
    * Constructor initializes the BeeWorker with environment variables
-   * and creates the appropriate operator using WorkerFactory
+   * and creates the appropriate operator using WorkerFactory.
    */
   constructor() {
     const operatorType = process.env.OPERATOR_TYPE;
@@ -61,10 +61,11 @@ export class BeeWorker {
   }
 
   /**
-   * Process the queries using the configured operator
-   * @param providedSubQueries Array of subqueries provided by the orchestrator
+   * Process the queries using the configured operator.
+   * @param {string[]} [providedSubQueries=[]] - Array of subqueries provided by the orchestrator.
+   * @returns {Promise<void>} - A promise that resolves when processing is initialized.
    */
-  async process(providedSubQueries: string[] = []) {
+  async process(providedSubQueries: string[] = []): Promise<void> {
     console.log(`process() method is called`);
 
     // If subqueries are provided from Orchestrator, use them directly
@@ -105,11 +106,11 @@ export class BeeWorker {
       console.log(
         `Combined query: ${this.queryCombiner.ParsedToString(this.queryCombiner.combine())}`,
       );
-      const combinedQuery = this.queryCombiner.ParsedToString(
+      const _combinedQuery = this.queryCombiner.ParsedToString(
         this.queryCombiner.combine(),
       );
 
-      // const isValid = await this.validateQueryContainment(this.query, combinedQuery);
+      // const isValid = await this.validateQueryContainment(this.query, _combinedQuery);
       const isValid = true; // Assuming the containment check is valid for now
       console.log(`Is the combined query valid? ${isValid}`);
       if (isValid) {
@@ -132,18 +133,19 @@ export class BeeWorker {
   }
 
   /**
-   *
-   * @param extractedQueries
+   * Finds queries from the extracted list that are contained within the main query.
+   * @param {ExtractedQuery[]} extractedQueries - The list of queries extracted from existing agents.
+   * @returns {Promise<string[]>} A promise resolving to a list of contained query strings.
    */
   async findContainedQueries(
     extractedQueries: ExtractedQuery[],
   ): Promise<string[]> {
     const containedQueries: string[] = [];
     for (const extractedQuery of extractedQueries) {
-      let removedAggregationFunctionQuery = this.removeAggregationFunctions(
+      const removedAggregationFunctionQuery = this.removeAggregationFunctions(
         this.query,
       );
-      let extractedQueryRspql = this.removeAggregationFunctions(
+      const extractedQueryRspql = this.removeAggregationFunctions(
         extractedQuery.rspql_query,
       );
 
@@ -167,8 +169,10 @@ export class BeeWorker {
   }
 
   /**
-   *
-   * @param location
+   * Fetches existing queries from a specified HTTP location.
+   * @param {string} location - The URL to fetch queries from.
+   * @returns {Promise<string>} A promise resolving to the fetched queries text.
+   * @throws {Error} If the location is not specified or no queries are found.
    */
   async fetchExistingQueries(location: string): Promise<string> {
     if (!location) {
@@ -188,14 +192,15 @@ export class BeeWorker {
   }
 
   /**
-   *
-   * @param data
+   * Extracts queries and their topics from a query map.
+   * @param {QueryMap} data - The map of query data to process.
+   * @returns {Promise<ExtractedQuery[]>} A promise resolving to an array of extracted queries with topics.
    */
   async extractQueriesWithTopics(data: QueryMap): Promise<ExtractedQuery[]> {
     const extractedQueries: ExtractedQuery[] = [];
 
     for (const key in data) {
-      if (data.hasOwnProperty(key)) {
+      if (Object.prototype.hasOwnProperty.call(data, key)) {
         const entry = data[key];
         if (entry.rspql_query && entry.r2s_topic) {
           extractedQueries.push({
@@ -210,9 +215,10 @@ export class BeeWorker {
   }
 
   /**
-   *
-   * @param queryOne
-   * @param queryTwo
+   * Validates if one query contains another using completeness and soundness checks.
+   * @param {string} queryOne - The first query.
+   * @param {string} queryTwo - The second query.
+   * @returns {Promise<boolean>} A promise resolving to true if containment relationship exists or invalid, false otherwise.
    */
   async validateQueryContainment(
     queryOne: string,
@@ -255,8 +261,9 @@ export class BeeWorker {
   }
 
   /**
-   *
-   * @param query
+   * Removes aggregation functions from a query string for containment checking.
+   * @param {string} query - The query string to process.
+   * @returns {string} The query string with aggregation functions replaced by variables.
    */
   removeAggregationFunctions(query: string): string {
     return query.replace(
@@ -266,7 +273,8 @@ export class BeeWorker {
   }
 
   /**
-   * Stop the BeeWorker and cleanup resources
+   * Stop the BeeWorker and cleanup resources.
+   * @returns {void}
    */
   stop() {
     console.log("BeeWorker stopping...");
@@ -274,7 +282,8 @@ export class BeeWorker {
 }
 
 // You can choose either "StreamingQueryChunkAggregatorOperator" or "ApproximationApproachOperator" as the argument
-const operatorType = process.argv[2] || "StreamingQueryChunkAggregatorOperator";
+const _operatorType =
+  process.argv[2] || "StreamingQueryChunkAggregatorOperator";
 const beeWorker = new BeeWorker();
 
 process.on("SIGINT", () => {

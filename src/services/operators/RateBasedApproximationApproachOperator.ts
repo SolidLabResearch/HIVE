@@ -6,21 +6,22 @@ import { CSVLogger } from "../../util/logger/CSVLogger";
 import mqtt from "mqtt";
 
 /**
- * Configuration interface for inactivity detection
+ * Configuration interface for inactivity detection.
  */
 interface InactivityConfig {
-  /** Minimum samples to calculate average interval */
+  /** Minimum samples to calculate average interval. */
   minSamplesForInterval?: number;
-  /** Multiplier for average interval to determine timeout (adaptive) */
+  /** Multiplier for average interval to determine timeout (adaptive). */
   inactivityMultiplier?: number;
-  /** Fallback timeout for when we can't calculate interval (ms) */
+  /** Fallback timeout for when we can't calculate interval (ms). */
   fallbackTimeoutMs?: number;
-  /** Maximum timeout to prevent infinite waiting (ms) */
+  /** Maximum timeout to prevent infinite waiting (ms). */
   maxTimeoutMs?: number;
 }
 
 /**
- *
+ * Operator implementation for the Approximation Approach.
+ * It subscribes to sub-query streams and approximates the result for the main query.
  */
 export class ApproximationApproachOperator implements IStreamQueryOperator {
   private logger: CSVLogger = new CSVLogger("approximation_approach_log.csv");
@@ -34,7 +35,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
   /**
    * The constructor class with optional inactivity configuration.
-   * @param inactivityConfig Optional configuration for data inactivity detection
+   * @param {InactivityConfig} [inactivityConfig] - Optional configuration for data inactivity detection.
    */
   constructor(inactivityConfig?: InactivityConfig) {
     // Set default configuration with optional overrides
@@ -54,9 +55,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   /**
-   *
-   * The method adds a query to the subQueries array.
-   * @param {string} query - The query to be added
+   * Adds a query to the subQueries array.
+   * @param {string} query - The query to be added.
    * @memberof ApproximationApproachOperator
    */
   addSubQuery(query: string): void {
@@ -65,8 +65,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   /**
-   * The method returns the string array containing the subQueries.
-   * @return {string[]} - The subQueries string array.
+   * Returns the array containing the subQueries.
+   * @returns {string[]} The subQueries string array.
    * @memberof ApproximationApproachOperator
    */
   getSubQueries(): string[] {
@@ -74,7 +74,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   /**
-   * The method assigns the outputQuery string to the variable.
+   * Assigns the outputQuery string to the variable.
    * @param {string} query - The output query.
    * @returns {void}
    */
@@ -83,10 +83,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   /**
-   * Initializes different variables related to the MQTT topics and extracted queries.
-   * It also initializes the method which fetches the existing queries and assigns the topic of their
-   * Results stream into the map.
-   * @returns {Promise<void>}
+   * Initializes variables related to MQTT topics and extracted queries.
+   * Fetches existing queries and assigns result stream topics.
+   * @returns {Promise<void>} A promise that resolves when initialization is complete.
    */
   async init(): Promise<void> {
     this.queryMQTTTopicMap = new Map<string, string>();
@@ -100,9 +99,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   /**
-   * The method creates a Record of the result R2S topic of each query with the width and the aggregation function used in the RSP-QL Query.
-   * @param {Array<{r2s_topic : string, rspql_query : string}>} topics - The topics array which contains the result topic where the results are being posted along with the RSP-QL Query.
-   * @returns {Record<string, {width: number, aggregation : string}} - A record containing the R2S topic, width of the query and the aggregation function.
+   * Creates a Record of result R2S topics with window width and aggregation function.
+   * @param {Array<{r2s_topic: string, rspql_query: string}>} topics - Array of topics containing the result topic and RSP-QL Query.
+   * @returns {Promise<Record<string, {width: number, aggregation: string}>>} A record containing the R2S topic, width, and aggregation function.
    */
   async createTopicWindowParameters(
     topics: Array<{ r2s_topic: string; rspql_query: string }>,
@@ -136,9 +135,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   /**
-   * The method does a GET request to the HTTP server to fetch the existing queries which are being executed
-   * In the Query Network.
-   * @returns {Promise<void>} - Returns nothing.
+   * Performs a GET request to the HTTP server to fetch existing queries being executed.
+   * @returns {Promise<void>} Returns nothing.
    */
   async setMQTTTopicMap(): Promise<void> {
     // Try to fetch with retries, but don't fail if HTTP server is not available
@@ -212,16 +210,16 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   /**
-   * The method extracts the RSP-QL queries with their respective R2S topics from the fetched data of the HTTP Server.
-   * @param {QueryMap} data - The fetched queries running in the network which are registered in the Query Service.
-   * @returns {ExtractedQuery[]} - Extracted Query Array with RSP-QL query and the R2S topic location.
+   * Extracts RSP-QL queries with their respective R2S topics from the fetched data.
+   * @param {QueryMap} data - The fetched queries running in the network.
+   * @returns {Promise<ExtractedQuery[]>} Array containing RSP-QL queries and R2S topic locations.
    */
   async extractQueriesWithTopics(data: QueryMap): Promise<ExtractedQuery[]> {
     const extractedQueries: ExtractedQuery[] = [];
     console.log(`Extracting queries with topics from data:`, data);
 
     for (const key in data) {
-      if (data.hasOwnProperty(key)) {
+      if (Object.prototype.hasOwnProperty.call(data, key)) {
         const entry = data[key];
         if (entry.rspql_query && entry.r2s_topic) {
           console.log(
@@ -239,9 +237,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     return extractedQueries;
   }
   /**
-   * The method handles the aggregation with the subqueries, and aggregated based on approximating the resultant window based on the
-   * Initial subqueries aggregation values.
-   * @returns {Promise<void>} - Returns a void Promise.
+   * Handles aggregation with subqueries, approximating the resultant window based on subquery aggregation values.
+   * @returns {Promise<void>} Returns a void Promise.
    */
   async handleAggregation(): Promise<void> {
     if (this.subQueries.length === 0) {
@@ -321,7 +318,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       this.logger.log("Reconnecting to MQTT broker");
     });
 
-    const that = this;
+    const _that = this;
 
     rsp_client.on("connect", () => {
       // Successfully connected to the MQTT broker
@@ -378,7 +375,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       let dataReceiveCount = 0; // Count data messages received
       let averageDataInterval = 0; // Average time between data messages
       let previousDataTime = Date.now();
-      let streamStartTime = Date.now(); // Track when the stream started
+      const streamStartTime = Date.now(); // Track when the stream started
       const MAX_STREAM_DURATION = 150000; // Maximum 150 seconds (2.5 minutes) total runtime
 
       rsp_client.on("message", (topic: string, message: any) => {
@@ -550,7 +547,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
             // Check how many topics have valid data in the current window BEFORE cleanup
             let topicsWithValidData = 0;
-            windowBuffers.forEach((buffer, topicKey) => {
+            windowBuffers.forEach((buffer, _topicKey) => {
               const validWindowData = buffer.filter(
                 (w) => w.end >= windowStartGlobal,
               );
@@ -660,7 +657,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             lastTriggerTime = Date.now();
 
             // Publish results if we have at least one valid buffer or latest values from multiple topics
-            const hasMultipleTopicData = Object.keys(latestValues).length >= 2;
+            const _hasMultipleTopicData = Object.keys(latestValues).length >= 2;
             const hasAnyValidData =
               totalValidBuffers > 0 || Object.keys(latestValues).length > 0;
 
@@ -817,23 +814,12 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
 /**
  * Merges two window results with overlap subtraction for sliding windows.
- * @param win1 - First window result {start, end, value}.
- * @param win2 - Second window result {start, end, value}.
- * @param overlap - Overlap window result {start, end, value}.
- * @param target - Target window {start, end}.
- * @param win1.start
- * @param win1.end
- * @param win1.value
- * @param agg - Aggregation function: 'SUM' | 'AVG' | 'COUNT' | 'MIN' | 'MAX'.
- * @param win2.start
- * @param win2.end
- * @param win2.value
- * @param overlap.start
- * @param overlap.end
- * @param overlap.value
- * @param target.start
- * @param target.end
- * @returns The approximate aggregation for the target window.
+ * @param {object} win1 - First window result containing start, end, and value.
+ * @param {object} win2 - Second window result containing start, end, and value.
+ * @param {object} overlap - Overlap window result containing start, end, and value.
+ * @param {object} target - Target window containing start and end.
+ * @param {"SUM" | "AVG" | "COUNT" | "MIN" | "MAX"} agg - Aggregation function to use.
+ * @returns {number | string} The approximate aggregation for the target window.
  */
 export function mergeSlidingWindowResults(
   win1: { start: number; end: number; value: number },
@@ -866,6 +852,13 @@ export function mergeSlidingWindowResults(
   }
 }
 
+/**
+ * Merges results from multiple sliding windows to approximate the value for a target window.
+ * @param {Array<{ start: number; end: number; value: number }>} windows - Array of window results.
+ * @param {object} target - Target window containing start and end.
+ * @param {"SUM" | "AVG" | "COUNT" | "MIN" | "MAX"} agg - Aggregation function to use.
+ * @returns {number | string} The approximate aggregation result.
+ */
 export function mergeMultipleSlidingWindowResults(
   windows: Array<{ start: number; end: number; value: number }>,
   target: { start: number; end: number },
