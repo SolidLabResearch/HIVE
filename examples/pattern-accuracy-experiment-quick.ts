@@ -44,9 +44,15 @@ interface ExperimentResult {
 
 // --- Experiment Runner ---
 
+/**
+ *
+ */
 class PatternAccuracyExperiment {
   private mqttClient: mqtt.MqttClient;
 
+  /**
+   *
+   */
   constructor() {
     this.mqttClient = mqtt.connect(MQTT_BROKER);
     this.mqttClient.on("connect", () =>
@@ -57,6 +63,9 @@ class PatternAccuracyExperiment {
     );
   }
 
+  /**
+   *
+   */
   public async runAllPatterns(): Promise<ExperimentResult[]> {
     console.log(
       "--- Starting Stream Pattern Accuracy Experiment (Quick Test) ---",
@@ -76,6 +85,10 @@ class PatternAccuracyExperiment {
     return allResults;
   }
 
+  /**
+   *
+   * @param pattern
+   */
   private async runSinglePattern(
     pattern: StreamPattern,
   ): Promise<ExperimentResult> {
@@ -200,6 +213,11 @@ class PatternAccuracyExperiment {
     };
   }
 
+  /**
+   *
+   * @param scriptPath
+   * @param name
+   */
   private spawnOrchestrator(
     scriptPath: string,
     name: string,
@@ -239,6 +257,11 @@ class PatternAccuracyExperiment {
     return child;
   }
 
+  /**
+   *
+   * @param wearablePath
+   * @param smartphonePath
+   */
   private async startDataPublishers(
     wearablePath: string,
     smartphonePath: string,
@@ -314,6 +337,11 @@ class PatternAccuracyExperiment {
     return processes;
   }
 
+  /**
+   *
+   * @param approx
+   * @param truth
+   */
   private calculateMape(approx: number[], truth: number[]): number | null {
     if (approx.length === 0 || truth.length === 0) {
       console.log(
@@ -340,6 +368,10 @@ class PatternAccuracyExperiment {
     return (errorSum / validPoints) * 100;
   }
 
+  /**
+   *
+   * @param results
+   */
   private printSummary(results: ExperimentResult[]) {
     console.log("\n--- Experiment Summary ---");
     console.log("Pattern\t\t\t\t| Approx | Ground | MAPE (%)");

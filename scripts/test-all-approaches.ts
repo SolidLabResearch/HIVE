@@ -1,11 +1,12 @@
 #!/usr/bin/env ts-node
 
 /**
- * Test script to verify all approaches can be imported and instantiated
+ * Test script to verify all approaches can be imported and instantiated.
  */
 
-import path from "path";
-
+/**
+ *
+ */
 async function testAllApproaches() {
   console.log("Testing all approach orchestrators...\n");
   console.log("=".repeat(70));

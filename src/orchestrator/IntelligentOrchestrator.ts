@@ -9,7 +9,7 @@ import { hash_string_md5 } from "../util/Util";
 /**
  * Enhanced Orchestrator with intelligent approach selection
  * Uses Hive Scout Bee to analyze stream patterns and recommend optimal approaches
- * Supports both automatic stream analysis and manual approach specification
+ * Supports both automatic stream analysis and manual approach specification.
  */
 export class IntelligentOrchestrator {
   private subQueriesToRun: string[];
@@ -51,8 +51,8 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Set analysis mode for approach selection
-   * @param { 'automatic' | 'manual' | 'hybrid' } mode - 'automatic' for stream analysis, 'manual' for specified approach, 'hybrid' for both
+   * Set analysis mode for approach selection.
+   * @param { 'automatic' | 'manual' | 'hybrid' } mode - 'automatic' for stream analysis, 'manual' for specified approach, 'hybrid' for both.
    * @returns {void} - No return value.
    */
   setAnalysisMode(mode: "automatic" | "manual" | "hybrid"): void {
@@ -61,8 +61,8 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Set manual approach to use (only effective in 'manual' or 'hybrid' mode)
-   * @param { 'approximation-approach' | 'fetching-client-side' | 'chunked-approach' | 'streaming-query-hive' | 'default' } approach - The approach to use manually for query execution
+   * Set manual approach to use (only effective in 'manual' or 'hybrid' mode).
+   * @param { 'approximation-approach' | 'fetching-client-side' | 'chunked-approach' | 'streaming-query-hive' | 'default' } approach - The approach to use manually for query execution.
    * @returns {void} - No return value.
    */
   setManualApproach(
@@ -78,24 +78,24 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Get current analysis mode
-   * @return { 'automatic' | 'manual' | 'hybrid' } - The current analysis mode being used for approach selection for query execution
+   * Get current analysis mode.
+   * @returns { 'automatic' | 'manual' | 'hybrid' } - The current analysis mode being used for approach selection for query execution.
    */
   getAnalysisMode(): "automatic" | "manual" | "hybrid" {
     return this.analysisMode;
   }
 
   /**
-   * Get current manual approach (if set)
-   * @return {string | null} - The current manual approach set, or null if none is set
+   * Get current manual approach (if set).
+   * @returns {string | null} - The current manual approach set, or null if none is set.
    */
   getManualApproach(): string | null {
     return this.manualApproach;
   }
 
   /**
-   * Enable or disable stream analysis for approach selection
-   * @param {boolean} enabled - True to enable stream analysis, false to disable
+   * Enable or disable stream analysis for approach selection.
+   * @param {boolean} enabled - True to enable stream analysis, false to disable.
    * @returns {void} - No return value.
    */
   toggleStreamAnalysis(enabled: boolean): void {
@@ -124,7 +124,7 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Register output query with intelligent approach selection
+   * Register output query with intelligent approach selection.
    * @param {string} query - The output query to register with the orchestrator.
    * @returns {void} - No return value.
    */
@@ -140,7 +140,7 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Analyze stream data and add to scout bee analysis window
+   * Analyze stream data and add to scout bee analysis window.
    * @param {number} timestamp - The timestamp of the data point.
    * @param {number} value - The value of the data point.
    * @param {string} topic - The topic/source of the data point.
@@ -154,9 +154,9 @@ export class IntelligentOrchestrator {
 
   /**
    * Pre-analyze streams and cache recommendation for later use
-   * Useful for getting approach recommendations before query execution
-   * @param {number} queryComplexity - Estimated complexity of the query to be executed (1-10 scale)
-   * @returns {Promise<ApproachRecommendation | null>} - The cached recommendation, or null if analysis failed
+   * Useful for getting approach recommendations before query execution.
+   * @param {number} queryComplexity - Estimated complexity of the query to be executed (1-10 scale).
+   * @returns {Promise<ApproachRecommendation | null>} - The cached recommendation, or null if analysis failed.
    */
   async preAnalyzeStreams(
     queryComplexity: number = 5,
@@ -188,7 +188,7 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Clear the cached recommendation from pre-analysis
+   * Clear the cached recommendation from pre-analysis.
    * @returns {void} - No return value.
    */
   clearCachedRecommendation(): void {
@@ -197,12 +197,13 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Get approach recommendation based on current stream analysis data
-   * @param {number} queryComplexity - Estimated complexity of the registered query (1-10 scale)
-   * @returns {Promise<ApproachRecommendation | null>} - The recommended approach and details, or null if no recommendation could be made
+   * Get approach recommendation based on current stream analysis data.
+   * @param {number} queryComplexity - Estimated complexity of the registered query (1-10 scale).
+   * @param _queryComplexity
+   * @returns {Promise<ApproachRecommendation | null>} - The recommended approach and details, or null if no recommendation could be made.
    */
   async getApproachRecommendation(
-    queryComplexity: number = 5,
+    _queryComplexity: number = 5,
   ): Promise<ApproachRecommendation | null> {
     if (!this.streamAnalysisEnabled) return null;
 
@@ -230,9 +231,9 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Run the registered query with intelligent approach selection based on analysis mode
-   * @param {string} [forceApproach] - Optional approach to force (overrides analysis mode)
-   * @returns {Promise<void>} - No return value and runs the registered query
+   * Run the registered query with intelligent approach selection based on analysis mode.
+   * @param {string} [forceApproach] - Optional approach to force (overrides analysis mode).
+   * @returns {Promise<void>} - No return value and runs the registered query.
    */
   async runRegisteredQueryIntelligent(forceApproach?: string): Promise<void> {
     if (this.registeredQuery === "") {
@@ -258,8 +259,8 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Select approach based on current analysis mode
-   * @returns {Promise<string>} - The selected approach to use for query execution
+   * Select approach based on current analysis mode.
+   * @returns {Promise<string>} - The selected approach to use for query execution.
    * @private
    */
   private async selectApproachBasedOnMode(): Promise<string> {
@@ -359,8 +360,8 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Get summary of current analysis state and history and recommendations
-   * @returns {AnalysisSummary} - Summary object containing current analysis settings and recent recommendation history
+   * Get summary of current analysis state and history and recommendations.
+   * @returns {AnalysisSummary} - Summary object containing current analysis settings and recent recommendation history.
    */
   getAnalysisSummary(): AnalysisSummary {
     const summary: AnalysisSummary = {
@@ -405,7 +406,7 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Clear sub-queries from the orchestrator
+   * Clear sub-queries from the orchestrator.
    * @returns {void} - No return value.
    */
   clearSubQueries(): void {
@@ -439,16 +440,16 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Legacy method for backward compatibility
+   * Legacy method for backward compatibility.
    */
   runRegisteredQuery(): void {
     this.runRegisteredQueryIntelligent();
   }
 
   /**
-   * Helper to get recent stream data for analysis
+   * Helper to get recent stream data for analysis.
    * @private
-   * @return {Array<{timestamp: number, value: number}>} - Recent stream data points
+   * @returns {Array<{timestamp: number, value: number}>} - Recent stream data points.
    * @memberof IntelligentOrchestrator
    */
   private getRecentStreamData(): Array<{ timestamp: number; value: number }> {
@@ -459,10 +460,10 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Estimate the complexity of a query
+   * Estimate the complexity of a query.
    * @private
-   * @param {string} query - The query to analyze
-   * @return {number} - The estimated complexity (1-10)
+   * @param {string} query - The query to analyze.
+   * @returns {number} - The estimated complexity (1-10).
    * @memberof IntelligentOrchestrator
    */
   private estimateQueryComplexity(query: string): number {
@@ -490,10 +491,10 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Map approach string to operator type
+   * Map approach string to operator type.
    * @private
-   * @param {string} approach - The approach string to map
-   * @return {string} - The corresponding operator type
+   * @param {string} approach - The approach string to map.
+   * @returns {string} - The corresponding operator type.
    * @memberof IntelligentOrchestrator
    */
   private mapApproachToOperatorType(approach: string): string {
@@ -508,9 +509,9 @@ export class IntelligentOrchestrator {
   }
 
   /**
-   * Log the approach recommendation details to console
+   * Log the approach recommendation details to console.
    * @private
-   * @param {ApproachRecommendation} recommendation - The recommendation to log
+   * @param {ApproachRecommendation} recommendation - The recommendation to log.
    * @returns {void} - No return value.
    * @memberof IntelligentOrchestrator
    */

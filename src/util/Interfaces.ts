@@ -1,5 +1,6 @@
+/* eslint-disable no-unused-vars */
 /**
- * Enum defining the types of approaches available for orchestration
+ * Enum defining the types of approaches available for orchestration.
  */
 export enum ApproachType {
   STREAMING_QUERY_CHUNKED = "StreamingQueryChunked",
@@ -9,16 +10,17 @@ export enum ApproachType {
 }
 
 /**
- * Enum defining the types of operators available for worker processing
+ * Enum defining the types of operators available for worker processing.
  */
 export enum OperatorType {
   STREAMING_QUERY_CHUNK_AGGREGATOR = "StreamingQueryChunkAggregatorOperator",
   RATE_BASED_APPROXIMATION = "RateBasedApproximationApproachOperator",
   NAIVE_APPROXIMATION = "NaiveApproximationApproachOperator",
 }
+/* eslint-enable no-unused-vars */
 
 /**
- * Interface for mapping approaches to their corresponding operators
+ * Interface for mapping approaches to their corresponding operators.
  */
 export interface ApproachOperatorMapping {
   approach: ApproachType;
@@ -27,18 +29,18 @@ export interface ApproachOperatorMapping {
 }
 
 /**
- * Interface for stream query operators
+ * Interface for stream query operators.
  */
 export interface IStreamQueryOperator {
-  addSubQuery(query: string): void;
-  addOutputQuery(query: string): void;
+  addSubQuery(_query: string): void;
+  addOutputQuery(_query: string): void;
   getSubQueries(): string[];
   init(): Promise<void>;
   handleAggregation(): Promise<void>;
 }
 
 /**
- * Interface for orchestrator approaches
+ * Interface for orchestrator approaches.
  */
 export interface IOrchestrationApproach {
   getApproachType(): ApproachType;

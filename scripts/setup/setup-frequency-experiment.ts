@@ -1,7 +1,7 @@
 #!/usr/bin/env ts-node
 
 /**
- * Setup and validation script for frequency-based streaming query experiments
+ * Setup and validation script for frequency-based streaming query experiments.
  *
  * This TypeScript script validates the environment and prepares for running
  * experiments across different approaches and frequencies.
@@ -25,6 +25,9 @@ interface ValidationResult {
   details?: any;
 }
 
+/**
+ *
+ */
 class FrequencyExperimentSetup {
   private readonly projectRoot: string;
   private readonly dataBasePath: string;
@@ -47,6 +50,9 @@ class FrequencyExperimentSetup {
     "approximation-approach",
   ];
 
+  /**
+   *
+   */
   constructor() {
     this.projectRoot = path.resolve(__dirname, "../..");
     this.dataBasePath = path.join(
@@ -56,7 +62,7 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Main setup and validation routine
+   * Main setup and validation routine.
    */
   public async run(): Promise<void> {
     console.log(" Frequency-Based Streaming Query Experiment Setup");
@@ -113,7 +119,7 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Validate basic project structure
+   * Validate basic project structure.
    */
   private validateProjectStructure(): ValidationResult {
     const requiredPaths = [
@@ -148,7 +154,7 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Validate frequency datasets exist and have expected structure
+   * Validate frequency datasets exist and have expected structure.
    */
   private validateFrequencyData(): ValidationResult {
     const dataInfo: FrequencyDataInfo[] = [];
@@ -220,7 +226,7 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Check if TypeScript can be compiled
+   * Check if TypeScript can be compiled.
    */
   private validateTypeScriptCompilation(): ValidationResult {
     try {
@@ -252,7 +258,7 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Validate that all approach files exist
+   * Validate that all approach files exist.
    */
   private validateApproaches(): ValidationResult {
     const approachFiles = [
@@ -285,7 +291,7 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Create necessary output directories for experiments
+   * Create necessary output directories for experiments.
    */
   private createOutputDirectories(): ValidationResult {
     try {
@@ -317,7 +323,7 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Generate experiment configuration file
+   * Generate experiment configuration file.
    */
   private generateExperimentConfig(): ValidationResult {
     try {
@@ -381,7 +387,8 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Count lines in a file
+   * Count lines in a file.
+   * @param filePath
    */
   private countLines(filePath: string): number {
     const content = fs.readFileSync(filePath, "utf8");
@@ -389,7 +396,9 @@ class FrequencyExperimentSetup {
   }
 
   /**
-   * Print validation result with formatting
+   * Print validation result with formatting.
+   * @param step
+   * @param result
    */
   private printResult(step: string, result: ValidationResult): void {
     const status = result.success ? "[OK]" : "[FAIL]";

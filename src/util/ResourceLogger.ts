@@ -9,10 +9,10 @@ export class ResourceLogger {
   private writeHeader : boolean;
   
   /**
-    * Constructor to initialize the ResourceLogger.
-    * @param {string} filePath - Path to the CSV file.
-    * @param {number} intervalMs - Interval in milliseconds for logging.
-  */
+   * Constructor to initialize the ResourceLogger.
+   * @param {string} filePath - Path to the CSV file.
+   * @param {number} intervalMs - Interval in milliseconds for logging.
+   */
   constructor(filePath: string, intervalMs: number){
     this.logFilePath = filePath;
     this.intervalMs = intervalMs;

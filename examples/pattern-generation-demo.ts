@@ -2,6 +2,9 @@ import { MockStreamGenerator } from '../src/util/MockStreamGenerator';
 import { CSPARQLWindow, ReportStrategy, Tick } from '../src/services/operators/s2r';
 import { QuadContainer } from '../src/services/operators/s2r';
 
+/**
+ *
+ */
 async function patternGenerationDemo() {
     console.log('--- Stream Pattern Generation Demo ---');
 

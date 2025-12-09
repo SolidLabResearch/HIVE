@@ -1,7 +1,7 @@
 #!/usr/bin/env ts-node
 
 /**
- * MQTT Infrastructure Test
+ * MQTT Infrastructure Test.
  * 
  * This script tests the MQTT broker connectivity and basic pub/sub functionality
  * required for the streaming query experiments.
@@ -9,9 +9,15 @@
 
 import * as mqtt from 'mqtt';
 
+/**
+ *
+ */
 class MQTTInfrastructureTest {
     private readonly brokerUrl = 'mqtt://localhost:1883';
     
+    /**
+     *
+     */
     public async testMQTTInfrastructure(): Promise<void> {
         console.log('🔌 Testing MQTT Infrastructure');
         console.log('=' .repeat(40));
@@ -41,7 +47,7 @@ class MQTTInfrastructureTest {
     }
     
     /**
-     * Test basic MQTT connectivity
+     * Test basic MQTT connectivity.
      */
     private async testConnectivity(): Promise<void> {
         return new Promise((resolve, reject) => {
@@ -71,7 +77,7 @@ class MQTTInfrastructureTest {
     }
     
     /**
-     * Test publish/subscribe functionality
+     * Test publish/subscribe functionality.
      */
     private async testPubSub(): Promise<void> {
         return new Promise((resolve, reject) => {

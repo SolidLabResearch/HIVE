@@ -2,13 +2,12 @@ import { StreamConsumer } from "./StreamConsumer";
 import * as fs from "fs";
 import * as mqtt from "mqtt";
 import * as path from "path";
-import { CSVLogger } from "../../../util/logger/CSVLogger";
 const N3 = require("n3");
 const { DataFactory } = N3;
-const { namedNode, literal } = DataFactory;
+const { namedNode } = DataFactory;
 
 /**
- *
+ * Streams data from a file to an MQTT broker.
  */
 export class StreamToMQTT {
   private stream_consumer: StreamConsumer;
@@ -27,11 +26,12 @@ export class StreamToMQTT {
   private failedPublishes: number = 0;
 
   /**
-   *
-   * @param mqtt_broker
-   * @param frequency
-   * @param file_location
-   * @param topic_to_publish
+   * Creates a new StreamToMQTT instance.
+   * @param {string} mqtt_broker - The MQTT broker URL to connect to.
+   * @param {number} frequency - The frequency at which to publish messages.
+   * @param {string} file_location - The location of the file to stream from.
+   * @param {string} topic_to_publish - The MQTT topic to publish messages to.
+   * @param {mqtt.IClientOptions} mqttOptions - Optional MQTT client options.
    */
   constructor(
     mqtt_broker: string,

@@ -2,7 +2,7 @@ import { ApproachType, OperatorType, ApproachOperatorMapping } from "../util/Int
 
 /**
  * Configuration mapping between Orchestrator Approaches and Worker Operators
- * This ensures that each approach in the orchestrator has a corresponding operator in the worker
+ * This ensures that each approach in the orchestrator has a corresponding operator in the worker.
  */
 export const APPROACH_OPERATOR_MAPPINGS: ApproachOperatorMapping[] = [
   {
@@ -28,10 +28,10 @@ export const APPROACH_OPERATOR_MAPPINGS: ApproachOperatorMapping[] = [
 ];
 
 /**
- * Get the operator type for a given approach type
- * @param approach The approach type
- * @returns The corresponding operator type
- * @throws Error if no mapping exists for the approach
+ * Get the operator type for a given approach type.
+ * @param approach - The approach type.
+ * @returns The corresponding operator type.
+ * @throws Error if no mapping exists for the approach.
  */
 export function getOperatorForApproach(approach: ApproachType): OperatorType {
   const mapping = APPROACH_OPERATOR_MAPPINGS.find((m) => m.approach === approach);
@@ -45,9 +45,9 @@ export function getOperatorForApproach(approach: ApproachType): OperatorType {
 }
 
 /**
- * Get the approach type for a given operator type
- * @param operator The operator type
- * @returns An array of approach types that use this operator
+ * Get the approach type for a given operator type.
+ * @param operator - The operator type.
+ * @returns An array of approach types that use this operator.
  */
 export function getApproachesForOperator(operator: OperatorType): ApproachType[] {
   return APPROACH_OPERATOR_MAPPINGS
@@ -56,10 +56,10 @@ export function getApproachesForOperator(operator: OperatorType): ApproachType[]
 }
 
 /**
- * Validate that an approach and operator combination is valid
- * @param approach The approach type
- * @param operator The operator type
- * @returns True if the combination is valid, false otherwise
+ * Validate that an approach and operator combination is valid.
+ * @param approach - The approach type.
+ * @param operator - The operator type.
+ * @returns True if the combination is valid, false otherwise.
  */
 export function isValidApproachOperatorCombination(
   approach: ApproachType,
@@ -71,8 +71,8 @@ export function isValidApproachOperatorCombination(
 }
 
 /**
- * Get all valid approach-operator mappings
- * @returns Array of all configured mappings
+ * Get all valid approach-operator mappings.
+ * @returns Array of all configured mappings.
  */
 export function getAllMappings(): ApproachOperatorMapping[] {
   return [...APPROACH_OPERATOR_MAPPINGS];

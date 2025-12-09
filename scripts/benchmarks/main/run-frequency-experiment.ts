@@ -1,7 +1,7 @@
 #!/usr/bin/env ts-node
 
 /**
- * Frequency-Based Streaming Query Experiment Runner
+ * Frequency-Based Streaming Query Experiment Runner.
  *
  * This script runs comprehensive experiments comparing different streaming query approaches
  * across multiple frequencies (4Hz, 8Hz, 16Hz, 32Hz, 64Hz, 128Hz) for both smartphone
@@ -51,11 +51,16 @@ interface ExperimentResult {
   error?: string;
 }
 
+ 
 interface ApproachOrchestrator {
-  runExperiment(dataPath: string, config: any): Promise<any>;
+  runExperiment(): Promise<any>;
   getName(): string;
 }
+ 
 
+/**
+ *
+ */
 class FrequencyExperimentRunner {
   private readonly projectRoot: string;
   private readonly config: ExperimentConfig;
@@ -65,6 +70,9 @@ class FrequencyExperimentRunner {
   private readonly cooldownIterations: number;
   private readonly validIterations: number;
 
+  /**
+   *
+   */
   constructor() {
     this.projectRoot = path.resolve(__dirname, "../..");
 
@@ -94,7 +102,7 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Run the complete frequency experiment suite
+   * Run the complete frequency experiment suite.
    */
   public async runExperiments(): Promise<void> {
     console.log("Starting Frequency-Based Streaming Query Experiments");
@@ -148,7 +156,7 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Generate ground truth using fetching-client-side approach
+   * Generate ground truth using fetching-client-side approach.
    */
   private async generateGroundTruth(): Promise<void> {
     console.log(
@@ -199,7 +207,7 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Run experiments for all approaches across all frequencies and device types
+   * Run experiments for all approaches across all frequencies and device types.
    */
   private async runAllApproaches(): Promise<void> {
     const totalExperiments =
@@ -320,7 +328,15 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Run a single experiment
+   * Run a single experiment.
+   * @param {string} approach - The approach name.
+   * @param {string} frequency - The data frequency.
+   * @param {string} deviceType - The device type.
+   * @param {number} iteration - The iteration number.
+   * @param {boolean} isWarmup - Whether this is a warmup iteration.
+   * @param {boolean} isCooldown - Whether this is a cooldown iteration.
+   * @param {string} dataPath - The path to the data file.
+   * @returns {Promise<ExperimentResult | null>} The experiment result or null if failed.
    */
   private async runSingleExperiment(
     approach: string,
@@ -342,10 +358,7 @@ class FrequencyExperimentRunner {
       const observationsCount = this.countObservations(dataPath);
 
       // Run the experiment
-      const queryResult = await orchestrator.runExperiment(dataPath, {
-        query: this.config.queries.avgAcceleration,
-        windowSize: this.config.queries.windowSize,
-      });
+      const queryResult = await orchestrator.runExperiment();
 
       const endTime = performance.now();
       const endMemory = process.memoryUsage().heapUsed;
@@ -397,7 +410,9 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Load the appropriate orchestrator for an approach
+   * Load the appropriate orchestrator for an approach.
+   * @param {string} approach - The approach name.
+   * @returns {Promise<ApproachOrchestrator>} The orchestrator instance.
    */
   private async loadOrchestrator(
     approach: string,
@@ -426,7 +441,9 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Count observations in a data file
+   * Count observations in a data file.
+   * @param {string} dataPath - The path to the data file.
+   * @returns {number} The number of observations.
    */
   private countObservations(dataPath: string): number {
     if (!fs.existsSync(dataPath)) {
@@ -438,7 +455,10 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Calculate accuracy compared to ground truth
+   * Calculate accuracy compared to ground truth.
+   * @param {any} groundTruth - The ground truth result.
+   * @param {any} result - The experiment result.
+   * @returns {number} The accuracy percentage.
    */
   private calculateAccuracy(groundTruth: any, result: any): number {
     try {
@@ -459,7 +479,9 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Save individual iteration result to separate folder
+   * Save individual iteration result to separate folder.
+   * @param {ExperimentResult} result - The experiment result to save.
+   * @returns {Promise<void>}
    */
   private async saveIterationResult(result: ExperimentResult): Promise<void> {
     // Create iteration folder structure: approach/frequency/deviceType/iteration_X/
@@ -482,7 +504,8 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Save experiment results to files
+   * Save experiment results to files.
+   * @returns {Promise<void>}
    */
   private async saveResults(): Promise<void> {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -535,7 +558,8 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Generate experiment summary
+   * Generate experiment summary.
+   * @returns {any} The summary object.
    */
   private generateSummary(): any {
     const validResults = this.results.filter(
@@ -566,7 +590,9 @@ class FrequencyExperimentRunner {
   }
 
   /**
-   * Generate CSV content from results
+   * Generate CSV content from results.
+   * @param {ExperimentResult[]} results - The experiment results.
+   * @returns {string} The CSV content.
    */
   private generateCSV(results: ExperimentResult[]): string {
     const headers = [

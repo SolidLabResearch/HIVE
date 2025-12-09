@@ -2,7 +2,7 @@ import { IntelligentOrchestrator } from '../src/orchestrator/IntelligentOrchestr
 
 /**
  * Example demonstrating the new preAnalyzeStreams functionality
- * This shows how to pre-analyze streams before query execution
+ * This shows how to pre-analyze streams before query execution.
  */
 async function demonstratePreAnalysis() {
     console.log('\nPre-Analysis Streams Demo');

@@ -2,9 +2,12 @@ import { StreamToMQTT } from './publishing/StreamToMQTT';
 
 /**
  * Experiment publisher that takes data file path and topic as command line arguments
- * Usage: node dist/streamer/src/experiment-publisher.js <dataFilePath> <topicName> [frequency]
+ * Usage: node dist/streamer/src/experiment-publisher.js <dataFilePath> <topicName> [frequency].
  */
 
+/**
+ *
+ */
 async function publishExperimentData() {
     const args = process.argv.slice(2);
     

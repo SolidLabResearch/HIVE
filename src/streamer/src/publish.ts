@@ -11,6 +11,9 @@ const logger = new CSVLogger('replayer-log.csv');
  *
  */
 
+/**
+ *
+ */
 async function replaySmartphoneXStream() {
     // Pass a unique clientId for persistent MQTT session
     const clientId = 'pub-' + Math.random().toString(16).substr(2, 8);

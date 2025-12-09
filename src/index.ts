@@ -4,14 +4,14 @@
  *
  * - Build: `npm run build` will compile this to `dist/index.js`
  * - Start (prod): `npm start` runs `node dist/index.js`
- * - Dev: `npx ts-node src/index.ts ...`
+ * - Dev: `npx ts-node src/index.ts ...`.
  *
  * Responsibilities:
  *  - Parse CLI args (commander)
  *  - Create an IntelligentOrchestrator with the requested operator and analysis flag
  *  - Optionally pre-analyze streams before running a registered query
  *  - Run the registered query intelligently (or force an approach)
- *  - Provide basic graceful shutdown handling
+ *  - Provide basic graceful shutdown handling.
  */
 
 import { program } from "commander";
@@ -148,6 +148,9 @@ async function main(): Promise<void> {
 }
 
 // Graceful shutdown
+/**
+ *
+ */
 function setupShutdown(): void {
   const shutdown = (signal: string) => {
     console.log(`Received ${signal}. Shutting down...`);

@@ -2,10 +2,10 @@
 
 /**
  * Test script to verify all approach orchestrators work as standalone executables
- * after the refactoring
+ * after the refactoring.
  */
 
-import { spawn, ChildProcess } from "child_process";
+import { spawn } from "child_process";
 import * as path from "path";
 
 interface TestResult {
@@ -26,6 +26,13 @@ console.log(
 console.log("Testing that they can start and initialize correctly...");
 console.log("");
 
+/**
+ *
+ * @param name
+ * @param scriptPath
+ * @param args
+ * @param timeoutMs
+ */
 async function testApproach(
   name: string,
   scriptPath: string,
@@ -122,6 +129,9 @@ async function testApproach(
   });
 }
 
+/**
+ *
+ */
 async function testIndependentStreamProcessing(): Promise<TestResult> {
   console.log("Testing: IndependentStreamProcessingApproach (as module)...");
 
@@ -148,6 +158,9 @@ async function testIndependentStreamProcessing(): Promise<TestResult> {
   }
 }
 
+/**
+ *
+ */
 async function runTests() {
   // Test 1: Independent Stream Processing (module-based)
   const independentResult = await testIndependentStreamProcessing();

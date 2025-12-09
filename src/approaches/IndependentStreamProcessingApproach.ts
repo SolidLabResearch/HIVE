@@ -9,7 +9,7 @@ const { DataFactory } = N3;
 
 /**
  * Independent stream processor that works like FetchingAllDataClientSide
- * Each processor independently fetches from MQTT, processes, and publishes results
+ * Each processor independently fetches from MQTT, processes, and publishes results.
  */
 class IndependentProcessor {
     public query: string;
@@ -25,6 +25,12 @@ class IndependentProcessor {
     private lastValidResultTime: number = 0;
     private queryRegisteredTime: number = 0;
 
+    /**
+     *
+     * @param query
+     * @param r2s_topic
+     * @param processorId
+     */
     constructor(query: string, r2s_topic: string, processorId: string) {
         this.query = query;
         this.r2s_topic = r2s_topic;
@@ -42,6 +48,9 @@ class IndependentProcessor {
         this.subscribeRStream();
     }
 
+    /**
+     *
+     */
     private initializeLogging() {
         const logFilePath = `${this.processorId}_log.csv`;
         const writeHeader = !fs.existsSync(logFilePath);
@@ -52,6 +61,10 @@ class IndependentProcessor {
         }
     }
 
+    /**
+     *
+     * @param message
+     */
     public log(message: string) {
         const timestamp = Date.now();
         if (this.logStream) {
@@ -60,6 +73,9 @@ class IndependentProcessor {
         console.log(`LOG [${this.processorId}]: ${timestamp} - ${message}`);
     }
 
+    /**
+     *
+     */
     public startProcessing() {
         const streams = this.returnStreams();
         console.log(`[${this.processorId}] Processing streams:`, streams);
@@ -101,17 +117,30 @@ class IndependentProcessor {
         }
     }
 
+    /**
+     *
+     */
     returnStreams() {
         const parsedQuery = this.rspql_parser.parse(this.query);
         const streams: any[] = [...parsedQuery.s2r];
         return streams;
     }
 
+    /**
+     *
+     * @param stream_name
+     */
     public returnMQTTBroker(stream_name: string): string {
         const url = new URL(stream_name);
         return `${url.protocol}//${url.hostname}:${url.port}/`;
     }
 
+    /**
+     *
+     * @param event_store
+     * @param stream_name
+     * @param timestamp
+     */
     public async add_event_store_to_rsp_engine(event_store: any, stream_name: RDFStream, timestamp: number) {
         const quads = event_store.getQuads(null, null, null, null);
         const graph = DataFactory.namedNode(stream_name.name);
@@ -129,6 +158,10 @@ class IndependentProcessor {
         stream_name.add(quadSet, timestamp);
     }
 
+    /**
+     *
+     * @param timestamp
+     */
     private isWithinExpectedWindowTiming(timestamp: number): boolean {
         if (this.startTime === 0) {
             this.startTime = timestamp;
@@ -154,6 +187,9 @@ class IndependentProcessor {
         return isValid;
     }
 
+    /**
+     *
+     */
     public async subscribeRStream() {
         console.log(`[${this.processorId}] Subscribing to RStream...`);
         if (!this.rstream_emitter) {
@@ -211,6 +247,10 @@ class IndependentProcessor {
         });
     }
 
+    /**
+     *
+     * @param data
+     */
     public generate_aggregation_event(data: any): string {
         const uuid_random = uuidv4();
         const aggregation_event = `
@@ -219,6 +259,9 @@ class IndependentProcessor {
         return aggregation_event.trim();
     }
 
+    /**
+     *
+     */
     public cleanup() {
         if (this.logStream) {
             this.logStream.end();
@@ -228,16 +271,22 @@ class IndependentProcessor {
 
 /**
  * Independent stream processing approach that creates separate processors
- * like FetchingAllDataClientSide but for subqueries and superquery independently
+ * like FetchingAllDataClientSide but for subqueries and superquery independently.
  */
 export class IndependentStreamProcessingApproach {
     private subQueryProcessors: IndependentProcessor[] = [];
     private superQueryProcessor: IndependentProcessor | null = null;
     
+    /**
+     *
+     */
     constructor() {}
 
     /**
-     * Create independent processors that work like FetchingAllDataClientSide
+     * Create independent processors that work like FetchingAllDataClientSide.
+     * @param subQueries
+     * @param superQuery
+     * @param outputTopics
      */
     public async createIndependentProcessors(
         subQueries: string[], 
@@ -295,7 +344,7 @@ export class IndependentStreamProcessingApproach {
     }
 
     /**
-     * Start all processors - they will independently fetch from MQTT and publish results
+     * Start all processors - they will independently fetch from MQTT and publish results.
      */
     public startAllProcessors(): void {
         console.log(' Starting all independent processors...');
@@ -314,7 +363,7 @@ export class IndependentStreamProcessingApproach {
     }
 
     /**
-     * Get processor statistics
+     * Get processor statistics.
      */
     public getProcessorStats() {
         return {
@@ -326,7 +375,8 @@ export class IndependentStreamProcessingApproach {
     }
 
     /**
-     * Monitor processing activity
+     * Monitor processing activity.
+     * @param duration
      */
     public async monitorProcessing(duration: number = 10000): Promise<void> {
         console.log(` Monitoring independent processing for ${duration}ms...`);
@@ -343,7 +393,7 @@ export class IndependentStreamProcessingApproach {
     }
 
     /**
-     * Stop all processors
+     * Stop all processors.
      */
     public stopAllProcessors(): void {
         console.log(' Stopping all independent processors...');

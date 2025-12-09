@@ -18,7 +18,7 @@ export class Orchestrator {
 
   /**
    * Constructor for the Orchestrator class.
-   * @param operatorType The type of operator to be used in the orchestrator.
+   * @param operatorType - The type of operator to be used in the orchestrator.
    */
   constructor(operatorType: string) {
     this.subQueriesToRun = [];
@@ -35,7 +35,7 @@ export class Orchestrator {
   /**
    * Adds a sub-query to the orchestrator.
    * @param {string} query - The sub-query to add.
-   * @return {void} - No return value.
+   * @returns {void} - No return value.
    */
   addSubQuery(query: string): void {
     this.subQueriesToRun.push(query);
@@ -73,7 +73,7 @@ export class Orchestrator {
   /**
    * Registers a query with the orchestrator.
    * @param {string} query - The query to register with the orchestrator.
-   * @return {void} - No return value.
+   * @returns {void} - No return value.
    */
   registerQuery(query: string): void {
     this.registeredQuery = query;

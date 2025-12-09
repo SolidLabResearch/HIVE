@@ -7,9 +7,12 @@ import path from "path";
 
 /**
  * Experiment to test Independent Stream Processing approach
- * across different frequencies with same queries as approximation approach
+ * across different frequencies with same queries as approximation approach.
  */
 
+/**
+ *
+ */
 class IndependentStreamProcessingExperiment {
   private approach: IndependentStreamProcessingApproach;
   private logDir: string;
@@ -22,6 +25,9 @@ class IndependentStreamProcessingExperiment {
   private queryRegisteredTime: number = 0;
   private publisherProcesses: ChildProcess[] = [];
 
+  /**
+   *
+   */
   constructor() {
     this.approach = new IndependentStreamProcessingApproach();
     // Use custom log directory if provided, otherwise use default
@@ -38,7 +44,7 @@ class IndependentStreamProcessingExperiment {
   }
 
   /**
-   * Same queries as approximation approach
+   * Same queries as approximation approach.
    */
   private getQueries() {
     const subQuery1 = `
@@ -105,7 +111,9 @@ WHERE {
   }
 
   /**
-   * Initialize logging for the experiment
+   * Initialize logging for the experiment.
+   * @param frequency
+   * @param iteration
    */
   private initializeLogging(frequency: string, iteration: number) {
     this.currentFrequency = frequency;
@@ -155,7 +163,8 @@ WHERE {
   }
 
   /**
-   * Log experiment events
+   * Log experiment events.
+   * @param message
    */
   private log(message: string) {
     const timestamp = Date.now();
@@ -168,7 +177,8 @@ WHERE {
   }
 
   /**
-   * Start resource usage monitoring
+   * Start resource usage monitoring.
+   * @param intervalMs
    */
   private startResourceUsageLogging(intervalMs: number = 100) {
     const logInterval = setInterval(() => {
@@ -200,7 +210,9 @@ WHERE {
   }
 
   /**
-   * Run experiment for a specific frequency
+   * Run experiment for a specific frequency.
+   * @param frequency
+   * @param iterations
    */
   public async runFrequencyExperiment(
     frequency: string,
@@ -226,7 +238,9 @@ WHERE {
   }
 
   /**
-   * Run a single iteration of the experiment
+   * Run a single iteration of the experiment.
+   * @param frequency
+   * @param iteration
    */
   private async runSingleIteration(
     frequency: string,
@@ -347,7 +361,8 @@ WHERE {
   }
 
   /**
-   * Start data publisher processes for streaming data to MQTT
+   * Start data publisher processes for streaming data to MQTT.
+   * @param frequency
    */
   private async startDataPublishers(frequency: string): Promise<void> {
     const freq = parseInt(frequency.replace("Hz", ""));
@@ -406,7 +421,7 @@ WHERE {
   }
 
   /**
-   * Stop all data publisher processes
+   * Stop all data publisher processes.
    */
   private async stopDataPublishers(): Promise<void> {
     this.log("Stopping data publishers...");
@@ -425,7 +440,7 @@ WHERE {
   }
 
   /**
-   * Ensure project is built before running experiments
+   * Ensure project is built before running experiments.
    */
   private async ensureProjectBuilt(): Promise<void> {
     const distPath = path.join(this.projectRoot, "dist");
@@ -458,7 +473,8 @@ WHERE {
   }
 
   /**
-   * Monitor for first result from the main query processor (SuperQuery)
+   * Monitor for first result from the main query processor (SuperQuery).
+   * @param timeoutMs
    */
   private async monitorForFirstResult(
     timeoutMs: number,
@@ -509,6 +525,10 @@ WHERE {
     });
   }
 
+  /**
+   *
+   * @param frequency
+   */
   private getMonitoringDuration(frequency: string): number {
     const baseTime = 180000; // 3 minutes base
     const freq = parseInt(frequency.replace("Hz", ""));
@@ -520,7 +540,9 @@ WHERE {
   }
 
   /**
-   * Run experiments across all frequencies
+   * Run experiments across all frequencies.
+   * @param frequencies
+   * @param iterations
    */
   public async runAllFrequencyExperiments(
     frequencies: string[] = ["4Hz", "8Hz", "16Hz", "32Hz", "64Hz", "128Hz"],
@@ -545,6 +567,9 @@ WHERE {
 }
 
 // Main execution
+/**
+ *
+ */
 async function main() {
   const args = process.argv.slice(2);
   const experiment = new IndependentStreamProcessingExperiment();

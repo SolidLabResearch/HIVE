@@ -1,7 +1,7 @@
 #!/usr/bin/env ts-node
 
 /**
- * Frequency Experiment Results Analyzer
+ * Frequency Experiment Results Analyzer.
  * 
  * This script analyzes the results from frequency-based streaming query experiments
  * and generates comprehensive reports with statistical analysis and visualizations.
@@ -80,18 +80,24 @@ interface AnalysisReport {
     recommendations: string[];
 }
 
+/**
+ *
+ */
 class FrequencyExperimentAnalyzer {
     private readonly projectRoot: string;
     private readonly resultsPath: string;
     private results: ExperimentResult[] = [];
 
+    /**
+     *
+     */
     constructor() {
         this.projectRoot = path.resolve(__dirname, '../..');
         this.resultsPath = path.join(this.projectRoot, 'results/frequency-experiments');
     }
 
     /**
-     * Run the complete analysis
+     * Run the complete analysis.
      */
     public async analyzeResults(): Promise<void> {
         console.log(' Analyzing Frequency Experiment Results');
@@ -123,7 +129,7 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Load the most recent experiment results
+     * Load the most recent experiment results.
      */
     private async loadLatestResults(): Promise<void> {
         if (!fs.existsSync(this.resultsPath)) {
@@ -153,7 +159,7 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Generate comprehensive analysis report
+     * Generate comprehensive analysis report.
      */
     private generateAnalysisReport(): AnalysisReport {
         const report: AnalysisReport = {
@@ -206,7 +212,7 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Calculate success rate
+     * Calculate success rate.
      */
     private calculateSuccessRate(): number {
         const successful = this.results.filter(r => !r.error).length;
@@ -214,7 +220,7 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Group results by approach
+     * Group results by approach.
      */
     private groupResultsByApproach(): { [approach: string]: ExperimentResult[] } {
         const groups: { [approach: string]: ExperimentResult[] } = {};
@@ -230,7 +236,8 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Calculate statistical summary for a dataset
+     * Calculate statistical summary for a dataset.
+     * @param values
      */
     private calculateStats(values: number[]): StatisticalSummary {
         const validValues = values.filter(v => v >= 0 && !isNaN(v));
@@ -268,7 +275,8 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Analyze results by frequency and device type
+     * Analyze results by frequency and device type.
+     * @param results
      */
     private analyzeByFrequency(results: ExperimentResult[]): { [frequency: string]: { [deviceType: string]: any } } {
         const analysis: { [frequency: string]: { [deviceType: string]: any } } = {};
@@ -304,7 +312,9 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Update best/worst performance tracking
+     * Update best/worst performance tracking.
+     * @param results
+     * @param comparisons
      */
     private updatePerformanceComparisons(results: ExperimentResult[], comparisons: any): void {
         for (const result of results) {
@@ -359,7 +369,8 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Generate recommendations based on analysis
+     * Generate recommendations based on analysis.
+     * @param report
      */
     private generateRecommendations(report: AnalysisReport): string[] {
         const recommendations: string[] = [];
@@ -391,7 +402,8 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Save analysis report to file
+     * Save analysis report to file.
+     * @param report
      */
     private async saveAnalysisReport(report: AnalysisReport): Promise<void> {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -411,7 +423,8 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Generate human-readable text summary
+     * Generate human-readable text summary.
+     * @param report
      */
     private generateTextSummary(report: AnalysisReport): string {
         let summary = 'FREQUENCY EXPERIMENT ANALYSIS SUMMARY\n';
@@ -449,7 +462,8 @@ class FrequencyExperimentAnalyzer {
     }
 
     /**
-     * Print summary to console
+     * Print summary to console.
+     * @param report
      */
     private printSummary(report: AnalysisReport): void {
         console.log('\n EXPERIMENT SUMMARY');

@@ -3,7 +3,7 @@ import { StreamToMQTT } from '../src/streamer/src/publishing/StreamToMQTT';
 
 /**
  * Complete demo showing both data publishers and independent processors
- * This demonstrates the full pipeline: Data Publishers → MQTT → Independent Processors → Results
+ * This demonstrates the full pipeline: Data Publishers → MQTT → Independent Processors → Results.
  */
 async function completePublisherAndProcessorDemo() {
     console.log('\n Complete Data Publisher + Independent Processor Demo');
@@ -184,6 +184,9 @@ WHERE {
 }
 
 // Simple demo showing what components are involved
+/**
+ *
+ */
 async function pipelineOverviewDemo() {
     console.log('\n Pipeline Component Overview');
     console.log('\n Complete Data Flow:');
@@ -208,6 +211,9 @@ async function pipelineOverviewDemo() {
 }
 
 // Main execution
+/**
+ *
+ */
 async function main() {
     try {
         await pipelineOverviewDemo();

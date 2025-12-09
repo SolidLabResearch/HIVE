@@ -1,7 +1,7 @@
 #!/usr/bin/env ts-node
 
 /**
- * Real-World Frequency Experiment Runner
+ * Real-World Frequency Experiment Runner.
  *
  * This script runs experiments using the actual MQTT-based streaming infrastructure.
  * It starts the data replayer and the processing approaches, measuring real performance.
@@ -50,6 +50,9 @@ interface ExperimentResult {
   error?: string;
 }
 
+/**
+ *
+ */
 class RealWorldFrequencyExperimentRunner {
   private readonly projectRoot: string;
   private readonly config: ExperimentConfig;
@@ -57,6 +60,9 @@ class RealWorldFrequencyExperimentRunner {
   private groundTruthResults: Map<string, any[]> = new Map();
   private mqttBroker = "mqtt://localhost:1883";
 
+  /**
+   *
+   */
   constructor() {
     this.projectRoot = path.resolve(__dirname, "../..");
 
@@ -73,7 +79,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Run the complete frequency experiment suite
+   * Run the complete frequency experiment suite.
    */
   public async runExperiments(): Promise<void> {
     console.log(
@@ -124,7 +130,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Build the TypeScript project
+   * Build the TypeScript project.
    */
   private async buildProject(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -155,7 +161,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Generate ground truth using fetching-client-side approach
+   * Generate ground truth using fetching-client-side approach.
    */
   private async generateGroundTruth(): Promise<void> {
     console.log(
@@ -200,7 +206,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Run experiments for all approaches across all frequencies with combined device data
+   * Run experiments for all approaches across all frequencies with combined device data.
    */
   private async runAllApproaches(): Promise<void> {
     const totalExperiments =
@@ -298,7 +304,11 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Run a single experiment with real MQTT infrastructure
+   * Run a single experiment with real MQTT infrastructure.
+   * @param approach
+   * @param frequency
+   * @param deviceType
+   * @param iteration
    */
   private async runSingleRealExperiment(
     approach: string,
@@ -409,7 +419,8 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Start approach process
+   * Start approach process.
+   * @param approach
    */
   private async startApproachProcess(approach: string): Promise<ChildProcess> {
     const approachScripts = {
@@ -440,7 +451,8 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Start publisher process with specific data path
+   * Start publisher process with specific data path.
+   * @param dataPath
    */
   private async startPublisherProcess(dataPath: string): Promise<ChildProcess> {
     // Determine device type from path to set appropriate topic
@@ -488,7 +500,9 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Set up MQTT result collector
+   * Set up MQTT result collector.
+   * @param topic
+   * @param results
    */
   private async setupResultCollector(
     topic: string,
@@ -530,7 +544,8 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Get result topic for approach
+   * Get result topic for approach.
+   * @param approach
    */
   private getResultTopic(approach: string): string {
     const topicMap = {
@@ -544,7 +559,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Get publisher statistics from log file
+   * Get publisher statistics from log file.
    */
   private async getPublisherStats(): Promise<any> {
     try {
@@ -575,7 +590,8 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Clean up processes
+   * Clean up processes.
+   * @param processes
    */
   private async cleanupProcesses(processes: ChildProcess[]): Promise<void> {
     for (const process of processes) {
@@ -593,7 +609,9 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Calculate accuracy compared to ground truth
+   * Calculate accuracy compared to ground truth.
+   * @param groundTruth
+   * @param results
    */
   private calculateAccuracy(groundTruth: any[], results: any[]): number {
     try {
@@ -616,7 +634,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Save experiment results to files
+   * Save experiment results to files.
    */
   private async saveResults(): Promise<void> {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -650,7 +668,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Generate experiment summary
+   * Generate experiment summary.
    */
   private generateSummary(): any {
     const summary = {
@@ -669,7 +687,7 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Generate CSV content from results
+   * Generate CSV content from results.
    */
   private generateCSV(): string {
     const headers = [
@@ -710,7 +728,8 @@ class RealWorldFrequencyExperimentRunner {
   }
 
   /**
-   * Sleep for specified milliseconds
+   * Sleep for specified milliseconds.
+   * @param ms
    */
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));

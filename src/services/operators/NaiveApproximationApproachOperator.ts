@@ -4,19 +4,18 @@ import { CSVLogger } from "../../util/logger/CSVLogger";
 import { ExtractedQuery, QueryMap } from "../../util/Types";
 import CONFIG from "../../config/httpServerConfig.json";
 import mqtt from "mqtt";
-import { time } from "console";
 
 /**
- * Configuration interface for inactivity detection
+ * Configuration interface for inactivity detection.
  */
 interface InactivityConfig {
-  /** Minimum samples to calculate average interval */
+  /** Minimum samples to calculate average interval. */
   minSamplesForInterval?: number;
-  /** Multiplier for average interval to determine timeout (adaptive) */
+  /** Multiplier for average interval to determine timeout (adaptive). */
   inactivityMultiplier?: number;
-  /** Fallback timeout for when we can't calculate interval (ms) */
+  /** Fallback timeout for when we can't calculate interval (ms). */
   fallbackTimeoutMs?: number;
-  /** Maximum timeout to prevent infinite waiting (ms) */
+  /** Maximum timeout to prevent infinite waiting (ms). */
   maxTimeoutMs?: number;
 }
 
@@ -41,6 +40,9 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
   private queryFetchLocation: string = CONFIG.queryFetchLocation;
   private inactivityConfig: InactivityConfig;
 
+  /**
+   *
+   */
   constructor(inactivityConfig?: InactivityConfig) {
     this.inactivityConfig = {
       minSamplesForInterval: 3,
@@ -50,24 +52,39 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
       ...inactivityConfig,
     };
   }
+  /**
+   *
+   */
   addSubQuery(query: string): void {
     this.subQueries.push(query);
   }
 
+  /**
+   *
+   */
   addOutputQuery(query: string): void {
     this.outputQuery = query;
   }
 
+  /**
+   *
+   */
   getSubQueries(): string[] {
     return this.subQueries;
   }
 
+  /**
+   *
+   */
   async init(): Promise<void> {
     this.queryMQTTTopicMap = new Map<string, string>();
     this.extractedQueries = [];
     await this.setMQTTTopicMap();
   }
 
+  /**
+   *
+   */
   async setMQTTTopicMap(): Promise<void> {
     const response = await fetch(this.queryFetchLocation);
     if (!response.ok) {
@@ -84,11 +101,14 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
     );
   }
 
+  /**
+   *
+   */
   async extractQueriesWithTopics(data: QueryMap): Promise<ExtractedQuery[]> {
     const extractedQueries: ExtractedQuery[] = [];
 
     for (const key in data) {
-      if (data.hasOwnProperty(key)) {
+      if (Object.prototype.hasOwnProperty.call(data, key)) {
         const entry = data[key];
 
         if (entry.rspql_query && entry.r2s_topic) {
@@ -103,6 +123,9 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
     return extractedQueries;
   }
 
+  /**
+   *
+   */
   async naiveApproximationApproach(
     windows: Array<{
       start: number;
@@ -146,6 +169,9 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
     }
   }
 
+  /**
+   *
+   */
   async createTopicWindowParameters(
     topics: Array<{ r2s_topic: string; rspql_query: string }>,
   ) {
@@ -177,6 +203,9 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
     return topicWindowParameters;
   }
 
+  /**
+   *
+   */
   async handleAggregation(): Promise<void> {
     if (this.subQueries.length === 0) {
       throw new Error("No subqueries are available to aggregate.");
@@ -188,7 +217,6 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
 
     if (this.queryMQTTTopicMap.size === 0) {
       throw new Error("No MQTT topics are available for the queries.");
-      return;
     }
 
     const outputQueryParsed = this.parser.parse(this.outputQuery);
@@ -288,7 +316,7 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
       let dataReceiveCount = 0;
       let averageDataInterval = 0;
       let previousDataTime = Date.now();
-      let streamStartTime = Date.now();
+      const streamStartTime = Date.now();
       const MAX_STREAM_DURATION = 150000;
 
       rsp_client.on("message", async (topic: string, message: Buffer) => {
@@ -439,7 +467,7 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
             const windowStartGlobal = now - outputQueryWidth;
             let topicsWithValidData = 0;
 
-            windowBuffers.forEach((buffer, topic) => {
+            windowBuffers.forEach((buffer, _topic) => {
               const validWindowData = buffer.filter(
                 (window) => window.end > windowStartGlobal,
               );

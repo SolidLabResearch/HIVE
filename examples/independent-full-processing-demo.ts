@@ -2,7 +2,7 @@ import { IndependentStreamProcessingApproach } from '../src/approaches/Independe
 
 /**
  * Demo showing how the independent approach works like FetchingAllDataClientSide
- * Each processor independently fetches from MQTT, processes, and publishes results
+ * Each processor independently fetches from MQTT, processes, and publishes results.
  */
 async function fullProcessingDemo() {
     console.log('\n Independent Full Processing Demo (Like Client-Side Approach)');
@@ -125,6 +125,9 @@ WHERE {
 }
 
 // Performance comparison with original approach
+/**
+ *
+ */
 async function performanceComparison() {
     console.log('\n Performance Comparison Demo');
     console.log('\n--- Independent Approach (Like Client-Side) ---');
@@ -154,6 +157,9 @@ async function performanceComparison() {
 }
 
 // Main execution
+/**
+ *
+ */
 async function main() {
     try {
         await fullProcessingDemo();
