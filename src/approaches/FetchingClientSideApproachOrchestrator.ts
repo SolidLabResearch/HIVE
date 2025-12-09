@@ -151,39 +151,8 @@ class FetchingAllDataClientSide {
   }
 
   private isWithinExpectedWindowTiming(timestamp: number): boolean {
-    if (this.startTime === 0) {
-      this.startTime = timestamp;
-      this.lastValidResultTime = timestamp;
-      return true;
-    }
-
-    const timeSinceStart = timestamp - this.startTime;
-    const timeSinceLastValid = timestamp - this.lastValidResultTime;
-
-    const expectedResultNumber = Math.floor(
-      timeSinceStart / this.expectedWindowInterval,
-    );
-    const expectedTime =
-      this.startTime + expectedResultNumber * this.expectedWindowInterval;
-    const timeDeviation = Math.abs(timestamp - expectedTime);
-
-    const isIntervalValid =
-      timeSinceLastValid >= this.expectedWindowInterval - this.tolerance;
-
-    const isValid = timeDeviation <= this.tolerance && isIntervalValid;
-
-    if (isValid) {
-      console.log(
-        `FILTER: VALID result at ${timestamp}, deviation: ${timeDeviation}ms, interval: ${timeSinceLastValid}ms`,
-      );
-      this.lastValidResultTime = timestamp;
-    } else {
-      console.log(
-        `FILTER: IGNORING extra window result at ${timestamp}, deviation: ${timeDeviation}ms, interval: ${timeSinceLastValid}ms`,
-      );
-    }
-
-    return isValid;
+    // Timing filter disabled to allow all results during experiment replay
+    return true;
   }
 
   public async subscribeRStream(): Promise<void> {

@@ -15,7 +15,9 @@ async function publishExperimentData() {
     
     const dataFilePath = args[0];
     const topicName = args[1];
+    console.log(`Debug: raw args: ${JSON.stringify(args)}`);
     const frequency = args[2] ? parseInt(args[2]) : 4; // Default to 4Hz
+    console.log(`Debug: parsed frequency: ${frequency}`);
     
     try {
         // Create unique client ID for each publisher
