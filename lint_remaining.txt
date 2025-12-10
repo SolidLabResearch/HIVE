@@ -1,0 +1,149 @@
+
+> stream-hive@1.0.0 lint:ts
+> eslint . --ext ts --report-unused-disable-directives --max-warnings 1000
+
+
+/Users/kushbisen/Code/streaming-query-hive/src/approaches/monitoring/ApproximationApproachParentProcess.ts
+  4:1  warning  Missing JSDoc block description  jsdoc/require-description
+
+/Users/kushbisen/Code/streaming-query-hive/src/approaches/monitoring/FetchingDataClientSideParentProcess.ts
+  4:1  warning  Missing JSDoc block description  jsdoc/require-description
+
+/Users/kushbisen/Code/streaming-query-hive/src/approaches/monitoring/StreamingQueryHiveParentProcess.ts
+  4:1  warning  Missing JSDoc block description  jsdoc/require-description
+
+/Users/kushbisen/Code/streaming-query-hive/src/config/approach-operator-mapping.ts
+  32:1  warning  Missing JSDoc @param "approach" type  jsdoc/require-param-type
+  33:1  warning  Missing JSDoc @returns type           jsdoc/require-returns-type
+  49:1  warning  Missing JSDoc @param "operator" type  jsdoc/require-param-type
+  50:1  warning  Missing JSDoc @returns type           jsdoc/require-returns-type
+  60:1  warning  Missing JSDoc @param "approach" type  jsdoc/require-param-type
+  61:1  warning  Missing JSDoc @param "operator" type  jsdoc/require-param-type
+  62:1  warning  Missing JSDoc @returns type           jsdoc/require-returns-type
+  75:1  warning  Missing JSDoc @returns type           jsdoc/require-returns-type
+
+/Users/kushbisen/Code/streaming-query-hive/src/index.ts
+  151:1  warning  Missing JSDoc block description  jsdoc/require-description
+
+/Users/kushbisen/Code/streaming-query-hive/src/orchestrator/IntelligentOrchestrator.ts
+  201:1  warning  Expected @param names to be "_queryComplexity". Got "queryComplexity, _queryComplexity"  jsdoc/check-param-names
+  202:1  warning  Missing JSDoc @param "_queryComplexity" description                                      jsdoc/require-param-description
+  202:1  warning  Missing JSDoc @param "_queryComplexity" type                                             jsdoc/require-param-type
+
+/Users/kushbisen/Code/streaming-query-hive/src/orchestrator/Orchestrator.ts
+  21:1  warning  Missing JSDoc @param "operatorType" type  jsdoc/require-param-type
+
+/Users/kushbisen/Code/streaming-query-hive/src/services/operators/NaiveApproximationApproachOperator.ts
+  27:1  warning  Invalid JSDoc tag name "export"  jsdoc/check-tag-names
+
+/Users/kushbisen/Code/streaming-query-hive/src/services/operators/RateBasedApproximationApproachOperator.ts
+  815:1  warning  Missing JSDoc @param "win1.start" declaration     jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "win1.end" declaration       jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "win1.value" declaration     jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "win2.start" declaration     jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "win2.end" declaration       jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "win2.value" declaration     jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "overlap.start" declaration  jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "overlap.end" declaration    jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "overlap.value" declaration  jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "target.start" declaration   jsdoc/require-param
+  815:1  warning  Missing JSDoc @param "target.end" declaration     jsdoc/require-param
+  817:1  warning  Missing @param "win1.start"                       jsdoc/check-param-names
+  817:1  warning  Missing @param "win1.end"                         jsdoc/check-param-names
+  817:1  warning  Missing @param "win1.value"                       jsdoc/check-param-names
+  855:1  warning  Missing JSDoc @param "target.start" declaration   jsdoc/require-param
+  855:1  warning  Missing JSDoc @param "target.end" declaration     jsdoc/require-param
+  857:1  warning  Missing @param "target.start"                     jsdoc/check-param-names
+  857:1  warning  Missing @param "target.end"                       jsdoc/check-param-names
+
+/Users/kushbisen/Code/streaming-query-hive/src/services/operators/r2r.ts
+  1:10  error  'QuadContainer' is defined but never used. Allowed unused vars must match /^_/u  no-unused-vars
+
+/Users/kushbisen/Code/streaming-query-hive/src/services/operators/s2r.ts
+  78:3  warning  Missing JSDoc block description  jsdoc/require-description
+
+/Users/kushbisen/Code/streaming-query-hive/src/services/server/GETHandler.ts
+  14:5  warning  Missing JSDoc block description                    jsdoc/require-description
+  16:1  warning  Missing JSDoc @param "request" description         jsdoc/require-param-description
+  16:1  warning  Missing JSDoc @param "request" type                jsdoc/require-param-type
+  17:1  warning  Missing JSDoc @param "response" description        jsdoc/require-param-description
+  17:1  warning  Missing JSDoc @param "response" type               jsdoc/require-param-type
+  18:1  warning  Missing JSDoc @param "rspAgentRecord" description  jsdoc/require-param-description
+  18:1  warning  Missing JSDoc @param "rspAgentRecord" type         jsdoc/require-param-type
+
+/Users/kushbisen/Code/streaming-query-hive/src/services/server/HTTPServer.ts
+  21:5  warning  Missing JSDoc block description               jsdoc/require-description
+  23:1  warning  Missing JSDoc @param "http_port" description  jsdoc/require-param-description
+  23:1  warning  Missing JSDoc @param "http_port" type         jsdoc/require-param-type
+  24:1  warning  Missing JSDoc @param "logger" description     jsdoc/require-param-description
+  24:1  warning  Missing JSDoc @param "logger" type            jsdoc/require-param-type
+  33:5  warning  Missing JSDoc block description               jsdoc/require-description
+  35:1  warning  Missing JSDoc @param "request" description    jsdoc/require-param-description
+  35:1  warning  Missing JSDoc @param "request" type           jsdoc/require-param-type
+  36:1  warning  Missing JSDoc @param "response" description   jsdoc/require-param-description
+  36:1  warning  Missing JSDoc @param "response" type          jsdoc/require-param-type
+
+/Users/kushbisen/Code/streaming-query-hive/src/services/server/POSTHandler.ts
+   9:5  warning  Missing JSDoc block description                    jsdoc/require-description
+  11:1  warning  Missing JSDoc @param "request" description         jsdoc/require-param-description
+  11:1  warning  Missing JSDoc @param "request" type                jsdoc/require-param-type
+  12:1  warning  Missing JSDoc @param "response" description        jsdoc/require-param-description
+  12:1  warning  Missing JSDoc @param "response" type               jsdoc/require-param-type
+  13:1  warning  Missing JSDoc @param "body" description            jsdoc/require-param-description
+  13:1  warning  Missing JSDoc @param "body" type                   jsdoc/require-param-type
+  14:1  warning  Missing JSDoc @param "rspAgentRecord" description  jsdoc/require-param-description
+  14:1  warning  Missing JSDoc @param "rspAgentRecord" type         jsdoc/require-param-type
+  65:5  warning  Missing JSDoc block description                    jsdoc/require-description
+  67:1  warning  Missing JSDoc @param "parsedBody" description      jsdoc/require-param-description
+  67:1  warning  Missing JSDoc @param "parsedBody" type             jsdoc/require-param-type
+  68:1  warning  Missing JSDoc @param "response" description        jsdoc/require-param-description
+  68:1  warning  Missing JSDoc @param "response" type               jsdoc/require-param-type
+  69:1  warning  Missing JSDoc @param "rspAgentRecord" description  jsdoc/require-param-description
+  69:1  warning  Missing JSDoc @param "rspAgentRecord" type         jsdoc/require-param-type
+
+/Users/kushbisen/Code/streaming-query-hive/src/streamer/src/experiment-publisher.ts
+  8:1  warning  Missing JSDoc block description  jsdoc/require-description
+
+/Users/kushbisen/Code/streaming-query-hive/src/streamer/src/publish.ts
+  14:1  warning  Missing JSDoc block description  jsdoc/require-description
+  33:1  warning  Missing JSDoc block description  jsdoc/require-description
+  51:1  warning  Missing JSDoc block description  jsdoc/require-description
+
+/Users/kushbisen/Code/streaming-query-hive/src/streamer/src/publishing/StreamToMQTT.ts
+   57:3  warning  Missing JSDoc block description                   jsdoc/require-description
+   72:3  warning  Missing JSDoc block description                   jsdoc/require-description
+   72:3  warning  Missing JSDoc @returns declaration                jsdoc/require-returns
+   74:1  warning  Missing JSDoc @param "store" description          jsdoc/require-param-description
+   74:1  warning  Missing JSDoc @param "store" type                 jsdoc/require-param-type
+   92:3  warning  Missing JSDoc block description                   jsdoc/require-description
+   92:3  warning  Missing JSDoc @returns declaration                jsdoc/require-returns
+   94:1  warning  Missing JSDoc @param "array" description          jsdoc/require-param-description
+   94:1  warning  Missing JSDoc @param "array" type                 jsdoc/require-param-type
+   95:1  warning  Missing JSDoc @param "store" description          jsdoc/require-param-description
+   95:1  warning  Missing JSDoc @param "store" type                 jsdoc/require-param-type
+  106:3  warning  Missing JSDoc block description                   jsdoc/require-description
+  106:3  warning  Missing JSDoc @returns declaration                jsdoc/require-returns
+  108:1  warning  Missing JSDoc @param "left" description           jsdoc/require-param-description
+  108:1  warning  Missing JSDoc @param "left" type                  jsdoc/require-param-type
+  109:1  warning  Missing JSDoc @param "right" description          jsdoc/require-param-description
+  109:1  warning  Missing JSDoc @param "right" type                 jsdoc/require-param-type
+  110:1  warning  Missing JSDoc @param "store" description          jsdoc/require-param-description
+  110:1  warning  Missing JSDoc @param "store" type                 jsdoc/require-param-type
+  134:3  warning  Missing JSDoc block description                   jsdoc/require-description
+  134:3  warning  Missing JSDoc @returns declaration                jsdoc/require-returns
+  136:1  warning  Missing JSDoc @param "file_location" description  jsdoc/require-param-description
+  136:1  warning  Missing JSDoc @param "file_location" type         jsdoc/require-param-type
+  155:3  warning  Missing JSDoc block description                   jsdoc/require-description
+  222:3  warning  Missing JSDoc block description                   jsdoc/require-description
+  222:3  warning  Missing JSDoc @returns declaration                jsdoc/require-returns
+  224:1  warning  Missing JSDoc @param "ms" description             jsdoc/require-param-description
+  224:1  warning  Missing JSDoc @param "ms" type                    jsdoc/require-param-type
+  230:3  warning  Missing JSDoc block description                   jsdoc/require-description
+  274:3  warning  Missing JSDoc block description                   jsdoc/require-description
+  274:3  warning  Missing JSDoc @returns declaration                jsdoc/require-returns
+  276:1  warning  Missing JSDoc @param "store" description          jsdoc/require-param-description
+  276:1  warning  Missing JSDoc @param "store" type                 jsdoc/require-param-type
+
+✖ 107 problems (1 error, 106 warnings)
+  0 errors and 13 warnings potentially fixable with the `--fix` option.
+

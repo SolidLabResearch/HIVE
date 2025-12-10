@@ -220,12 +220,6 @@ export class CSPARQLWindow {
    * @param {number} timestamp - The timestamp of the event.
    * @returns {void} - The function does not return anything.
    */
-
-  /**
-   *
-   * @param event
-   * @param timestamp
-   */
   add(event: Quad, timestamp: number): void {
     this.logger.info(`adding_event_to_the_window`, `CSPARQLWindow`);
     console.debug(
@@ -443,8 +437,9 @@ export class CSPARQLWindow {
   }
 
   /**
-   *
-   * @param timestamp
+   * Checks if an event is late based on the current window time.
+   * @param {number} timestamp - The timestamp of the event.
+   * @returns {boolean} - True if the event is late, else false.
    */
   if_event_late(timestamp: number) {
     return this.time > timestamp;
@@ -453,13 +448,8 @@ export class CSPARQLWindow {
   /**
    * Trigger the window content based on the current watermark.
    * @param {number} watermark - The current watermark which needs to be processed.
+   * @param {number} timestamp - The timestamp of the event that triggered the process.
    * @returns {void} - The function does not return anything.
-   */
-
-  /**
-   *
-   * @param watermark
-   * @param timestamp
    */
   trigger_window_content(watermark: number, timestamp: number): void {
     let max_window: WindowInstance | null = null;
@@ -515,8 +505,9 @@ export class CSPARQLWindow {
 
   // Helper to find the matching instance in the Map
   /**
-   *
-   * @param target
+   * Finds a window instance in the active windows map.
+   * @param {WindowInstance} target - The window instance to find.
+   * @returns {WindowInstance | undefined} - The found window instance or undefined.
    */
   private findWindowInstance(
     target: WindowInstance,
@@ -599,7 +590,7 @@ export class CSPARQLWindow {
   /**
    * Subscribe to the window based on the output stream and the callback function.
    * @param {'RStream' | 'IStream' | 'DStream'} output - The output stream to which the window is to be subscribed. The output stream can be one of {'RStream', 'IStream', 'DStream'}.
-   * @param {(QuadContainer) => void} call_back - The callback function to be called when the window emits the triggers.
+   * @param {(data: QuadContainer) => void} call_back - The callback function to be called when the window emits the triggers.
    * @returns {void} - The function does not return anything.
    */
   subscribe(
@@ -620,8 +611,9 @@ export class CSPARQLWindow {
   }
 
   /**
-   *
-   * @param delay
+   * Set the maximum delay allowed for an event to be considered in the window.
+   * @param {number} delay - The maximum delay to be set.
+   * @returns {void}
    */
   set_max_delay(delay: number) {
     this.max_delay = delay;
@@ -663,7 +655,8 @@ export class CSPARQLWindow {
  * Compute the window if absent based on the given window instance and the mapping function.
  * @param {Map<WindowInstance, QuadContainer>} map - The map of the active windows.
  * @param {WindowInstance} window - The window instance of the form {open, close, has_triggered}.
- * @param {mappingFunction} mappingFunction - The mapping function to be applied to the window instance.
+ * @param {Function} mappingFunction - The mapping function to be applied to the window instance.
+ * @returns {boolean} - True if the window was found, false otherwise.
  */
 export function computeWindowIfAbsent(
   map: Map<WindowInstance, QuadContainer>,
@@ -684,4 +677,3 @@ export function computeWindowIfAbsent(
 
   return found;
 }
-/* eslint-enable no-unused-vars */

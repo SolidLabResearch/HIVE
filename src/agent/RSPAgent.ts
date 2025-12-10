@@ -7,7 +7,8 @@ import { hash_string_md5, turtleStringToStore } from "../util/Util";
 const mqtt = require("mqtt");
 
 /**
- *
+ * Represents an RSP Agent that executes SPARQL/RSPQL queries.
+ * It manages query registration, stream processing, and result publication.
  */
 export class RSPAgent {
   public query: string;
@@ -18,9 +19,9 @@ export class RSPAgent {
   public http_server_location: string;
 
   /**
-   *
-   * @param query
-   * @param r2s_topic
+   * Creates a new RSPAgent instance.
+   * @param {string} query - The RSPQL query string to execute.
+   * @param {string} r2s_topic - The MQTT topic to publish results to.
    */
   constructor(query: string, r2s_topic: string) {
     this.query = query;
@@ -34,9 +35,11 @@ export class RSPAgent {
   }
 
   /**
-   *
+   * Registers the query with the central Query Registry via HTTP.
+   * @returns {Promise<any>} The response from the query registry.
+   * @throws {Error} If registration fails.
    */
-  public async registerToQueryRegistry() {
+  public async registerToQueryRegistry(): Promise<any> {
     console.log(`Registering query: ${this.query} to the query registry.`);
     const register_location = `${this.http_server_location}register`;
     const request = await fetch(register_location, {
@@ -65,9 +68,11 @@ export class RSPAgent {
   }
 
   /**
-   *
+   * Processes input streams defined in the query.
+   * Connects to MQTT brokers and feeds data into the RSP engine.
+   * @returns {Promise<void>}
    */
-  public async process_streams() {
+  public async process_streams(): Promise<void> {
     const streams = this.returnStreams();
     for (const stream of streams) {
       const stream_name = stream.stream_name;
@@ -124,8 +129,9 @@ export class RSPAgent {
   }
 
   /**
-   *
-   * @param stream_name
+   * Extracts the MQTT broker URL from a stream name (IRI).
+   * @param {string} stream_name - The stream name/IRI.
+   * @returns {string} The MQTT broker URL.
    */
   public returnMQTTBroker(stream_name: string): string {
     const url = new URL(stream_name);
@@ -133,18 +139,20 @@ export class RSPAgent {
   }
 
   /**
-   *
+   * Parses the query and returns the list of input streams.
+   * @returns {any[]} Array of stream objects.
    */
-  public returnStreams() {
+  public returnStreams(): any[] {
     const parsed_query = this.rspql_parser.parse(this.query);
     const streams: any[] = [...parsed_query.s2r];
     return streams;
   }
 
   /**
-   *
+   * Subscribes to the RSP engine's output stream and publishes results to MQTT.
+   * @returns {Promise<void>}
    */
-  public async subscribeRStream() {
+  public async subscribeRStream(): Promise<void> {
     const mqtt_broker = "mqtt://localhost:1883";
     const rstream_publisher = mqtt.connect(mqtt_broker);
 
@@ -173,11 +181,12 @@ export class RSPAgent {
   }
 
   /**
-   *
-   * @param data
-   * @param _timestamp
+   * Generates a unique aggregation event string.
+   * @param {any} data - The data value.
+   * @param {number} _timestamp - The timestamp (unused).
+   * @returns {string} The aggregation event RDF string.
    */
-  public generate_aggregation_event(data: any, _timestamp: number) {
+  public generate_aggregation_event(data: any, _timestamp: number): string {
     const uuid_random = uuidv4();
 
     const aggregation_event = `
@@ -187,16 +196,17 @@ export class RSPAgent {
   }
 
   /**
-   *
-   * @param event_store
-   * @param stream_name
-   * @param timestamp
+   * Adds an event store (set of quads) to the RSP engine's streams.
+   * @param {any} event_store - The N3 store containing event data.
+   * @param {RDFStream[]} stream_name - Array of RDFStream objects to add data to.
+   * @param {number} timestamp - The timestamp of the event.
+   * @returns {Promise<void>}
    */
   public async add_event_store_to_rsp_engine(
     event_store: any,
     stream_name: RDFStream[],
     timestamp: number,
-  ) {
+  ): Promise<void> {
     stream_name.forEach(async (stream: RDFStream) => {
       const quads = event_store.getQuads(null, null, null, null);
       for (const quad of quads) {

@@ -32,8 +32,7 @@ export class R2ROperator {
     }
     /**
      * Execute the R2R Operator on the given container of quads.
-     * @param {QuadContainer} container - The container of quads on which the operator is to be executed. The container contains a set of quads.
-     * @param streamStore
+     * @param {any} streamStore - The N3 store containing the stream data to query.
      * @returns {Promise<any>} - The promise of the result of the query execution.
      */
     async execute(streamStore: typeof N3.Store): Promise<any> {

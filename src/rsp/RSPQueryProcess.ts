@@ -7,7 +7,8 @@ import { RSPQLParser } from "rsp-js";
 import { turtleStringToStore } from "../util/Util";
 
 /**
- *
+ * Represents a process that executes an RSPQL query and streams the results.
+ * It connects to MQTT brokers for input streams and publishes output to a result stream.
  */
 export class RSPQueryProcess {
   public query: string;
@@ -17,9 +18,9 @@ export class RSPQueryProcess {
   public rspql_parser: RSPQLParser;
 
   /**
-   *
-   * @param query
-   * @param rstream_topic
+   * Creates a new RSPQueryProcess instance.
+   * @param {string} query - The RSPQL query to execute.
+   * @param {string} rstream_topic - The MQTT topic for the result stream.
    */
   constructor(query: string, rstream_topic: string) {
     this.query = query;
@@ -31,9 +32,10 @@ export class RSPQueryProcess {
   }
 
   /**
-   *
+   * Starts processing the query by connecting to input streams.
+   * @returns {Promise<void>}
    */
-  public async stream_process() {
+  public async stream_process(): Promise<void> {
     console.log(`Processing query in RSPQueryProcess: ${this.query}`);
     if (!this.query || this.query.trim() === "") {
       console.error(`Query is empty or undefined.`);
@@ -127,9 +129,10 @@ export class RSPQueryProcess {
   }
 
   /**
-   *
+   * Subscribes to the RSP engine's result emitter and publishes to MQTT.
+   * @returns {Promise<void>}
    */
-  public async subscribeToResultStream() {
+  public async subscribeToResultStream(): Promise<void> {
     console.log(`Subscribing to result stream: ${this.rstream_topic}`);
     if (!this.rstream_topic || this.rstream_topic.trim() === "") {
       console.error(`RStream topic is empty or undefined.`);
@@ -180,12 +183,12 @@ export class RSPQueryProcess {
   }
 
   /**
-   *
-   * @param data
-   * @param timestamp
-   * @param _timestamp
+   * Generates a unique aggregation event string.
+   * @param {any} data - The result data value.
+   * @param {number} _timestamp - The timestamp of the event (unused in RDF generation).
+   * @returns {string} The RDF string for the event.
    */
-  public generate_aggregation_event(data: any, _timestamp: number) {
+  public generate_aggregation_event(data: any, _timestamp: number): string {
     const uuid_random = uuidv4();
 
     const aggregation_event = `
@@ -195,16 +198,17 @@ export class RSPQueryProcess {
   }
 
   /**
-   *
-   * @param event_store
-   * @param stream_name
-   * @param timestamp
+   * Adds an event store to the RSP engine.
+   * @param {any} event_store - The N3 store containing event quads.
+   * @param {RDFStream[]} stream_name - Array of RDF streams to add to.
+   * @param {number} timestamp - The timestamp of the event.
+   * @returns {Promise<void>}
    */
   public async add_event_store_to_rsp_engine(
     event_store: any,
     stream_name: RDFStream[],
     timestamp: number,
-  ) {
+  ): Promise<void> {
     stream_name.forEach(async (stream: RDFStream) => {
       const quads = event_store.getQuads(null, null, null, null);
       for (const quad of quads) {
