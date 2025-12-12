@@ -3,12 +3,18 @@
 /**
  * 35-Iteration Multi-Run Verification Test
  * Runs all 3 streaming query approaches 35 times to verify stability and consistency.
+ *
+ * This script uses pre-recorded data from src/streamer/data/smartphone.acceleration.x
+ * and src/streamer/data/wearable.acceleration.x instead of generating synthetic data.
+ * The StreamToMQTT replayer publishes this data at 4Hz to simulate real-time streaming
+ * while maintaining exact reproducibility across all iterations.
  */
 
 import { spawn, ChildProcess } from "child_process";
 import * as mqtt from "mqtt";
 import * as path from "path";
 import * as fs from "fs";
+import { StreamToMQTT } from "../src/streamer/src/publishing/StreamToMQTT";
 
 const MQTT_BROKER = "mqtt://localhost:1883";
 
@@ -53,12 +59,17 @@ interface RunSummary {
 class SingleRunVerifier {
   private orchestrators: Map<string, ChildProcess> = new Map();
   private mqttClient?: mqtt.MqttClient;
-  private publisherClient?: mqtt.MqttClient;
   private approachResults: Map<string, ApproachResult> = new Map();
   private dataPublishCount = 0;
-  private allMessages: Array<{ topic: string; timestamp: number; content: string }> = [];
+  private allMessages: Array<{
+    topic: string;
+    timestamp: number;
+    content: string;
+  }> = [];
   private runNumber: number;
   private startTime: number = 0;
+  private wearablePublisher: StreamToMQTT | null = null;
+  private smartphonePublisher: StreamToMQTT | null = null;
 
   constructor(runNumber: number) {
     this.runNumber = runNumber;
@@ -101,12 +112,16 @@ class SingleRunVerifier {
       await this.setupMQTTMonitoring();
       await this.launchOrchestrators();
 
-      console.log(`  [RUN ${this.runNumber}] Waiting ${INIT_WAIT_S}s for initialization...`);
+      console.log(
+        `  [RUN ${this.runNumber}] Waiting ${INIT_WAIT_S}s for initialization...`,
+      );
       await this.sleep(INIT_WAIT_S * 1000);
 
       await this.publishTestData();
 
-      console.log(`  [RUN ${this.runNumber}] Waiting ${FINAL_WAIT_S}s for final results...`);
+      console.log(
+        `  [RUN ${this.runNumber}] Waiting ${FINAL_WAIT_S}s for final results...`,
+      );
       await this.sleep(FINAL_WAIT_S * 1000);
 
       const summary = this.generateSummary();
@@ -183,7 +198,10 @@ class SingleRunVerifier {
           this.recordResult("chunked", content);
         } else if (topic === OUTPUT_TOPICS.fetching) {
           this.recordResult("fetching", content);
-        } else if (topic.startsWith("chunked/") && topic !== OUTPUT_TOPICS.chunked) {
+        } else if (
+          topic.startsWith("chunked/") &&
+          topic !== OUTPUT_TOPICS.chunked
+        ) {
           // Chunked subquery result
           console.log(`    [CHUNKED SUBQUERY] Topic: ${topic}`);
         }
@@ -199,7 +217,9 @@ class SingleRunVerifier {
     const result = this.approachResults.get(approach);
     if (result) {
       result.results.push({ timestamp: Date.now(), content });
-      console.log(`    [${approach.toUpperCase()}] Result #${result.results.length}`);
+      console.log(
+        `    [${approach.toUpperCase()}] Result #${result.results.length}`,
+      );
     }
   }
 
@@ -207,26 +227,26 @@ class SingleRunVerifier {
     await this.launchOrchestrator(
       "approximation",
       "src/approaches/ApproximationApproachOrchestrator.ts",
-      { HTTP_PORT: "8081" }
+      { HTTP_PORT: "8081" },
     );
 
     await this.launchOrchestrator(
       "chunked",
       "src/approaches/ChunkedQueryApproachOrchestrator.ts",
-      { HTTP_PORT: "8082" }
+      { HTTP_PORT: "8082" },
     );
 
     await this.launchOrchestrator(
       "fetching",
       "src/approaches/FetchingClientSideApproachOrchestrator.ts",
-      { HTTP_PORT: "8083" }
+      { HTTP_PORT: "8083" },
     );
   }
 
   private launchOrchestrator(
     name: string,
     scriptPath: string,
-    env: Record<string, string>
+    env: Record<string, string>,
   ): Promise<void> {
     return new Promise((resolve) => {
       const fullPath = path.resolve(__dirname, scriptPath);
@@ -240,7 +260,10 @@ class SingleRunVerifier {
 
       proc.stdout?.on("data", (data: Buffer) => {
         // Only log significant events to reduce noise
-        const lines = data.toString().split("\n").filter((l: string) => l.trim());
+        const lines = data
+          .toString()
+          .split("\n")
+          .filter((l: string) => l.trim());
         for (const line of lines) {
           if (
             line.includes("error") ||
@@ -255,7 +278,11 @@ class SingleRunVerifier {
 
       proc.stderr?.on("data", (data: Buffer) => {
         const msg = data.toString().trim();
-        if (msg && !msg.includes("ExperimentalWarning") && !msg.includes("Watermark")) {
+        if (
+          msg &&
+          !msg.includes("ExperimentalWarning") &&
+          !msg.includes("Watermark")
+        ) {
           // Only log real errors
         }
       });
@@ -273,58 +300,59 @@ class SingleRunVerifier {
   }
 
   private async publishTestData(): Promise<void> {
-    return new Promise((resolve) => {
-      this.publisherClient = mqtt.connect(MQTT_BROKER, {
-        clientId: `publisher-${this.runNumber}-${Math.random().toString(16).substr(2, 8)}`,
-        clean: true,
-      });
+    console.log(
+      `  [Run #${this.runNumber}] Publishing pre-recorded data (${EXPERIMENT_DURATION_S}s, ${DATA_RATE_HZ}Hz)...`,
+    );
 
-      this.publisherClient.on("connect", () => {
-        const totalEvents = EXPERIMENT_DURATION_S * DATA_RATE_HZ;
-        const intervalMs = 1000 / DATA_RATE_HZ;
-        let count = 0;
+    const projectRoot = path.resolve(__dirname, "..");
+    const wearableDataPath = path.join(
+      projectRoot,
+      "src/streamer/data/wearable.acceleration.x/data.nt",
+    );
+    const smartphoneDataPath = path.join(
+      projectRoot,
+      "src/streamer/data/smartphone.acceleration.x/data.nt",
+    );
 
-        const interval = setInterval(() => {
-          if (count >= totalEvents) {
-            clearInterval(interval);
-            resolve();
-            return;
-          }
+    // Verify files exist
+    if (!fs.existsSync(wearableDataPath)) {
+      throw new Error(`Wearable data file not found: ${wearableDataPath}`);
+    }
+    if (!fs.existsSync(smartphoneDataPath)) {
+      throw new Error(`Smartphone data file not found: ${smartphoneDataPath}`);
+    }
 
-          const timestamp = new Date().toISOString();
-          const wearableValue = Math.sin(count * 0.1) * 10 + 20;
-          const smartphoneValue = Math.cos(count * 0.1) * 5 + 15;
+    console.log(
+      `  [Run #${this.runNumber}] Loading pre-recorded data files...`,
+    );
 
-          const wearableData = `
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasValue> "${wearableValue}"^^<http://www.w3.org/2001/XMLSchema#float> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasTimestamp> "${timestamp}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/wearableX> .
-          `.trim();
+    // Create publishers with unique client IDs
+    const wearableClientId = `pub-wearable-run${this.runNumber}-${Math.random().toString(16).substr(2, 8)}`;
+    const smartphoneClientId = `pub-smartphone-run${this.runNumber}-${Math.random().toString(16).substr(2, 8)}`;
 
-          const smartphoneData = `
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasValue> "${smartphoneValue}"^^<http://www.w3.org/2001/XMLSchema#float> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasTimestamp> "${timestamp}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/smartphoneX> .
-          `.trim();
+    this.wearablePublisher = new StreamToMQTT(
+      MQTT_BROKER,
+      DATA_RATE_HZ,
+      wearableDataPath,
+      WEARABLE_TOPIC,
+      { clientId: wearableClientId, clean: true },
+    );
 
-          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, { qos: 1 });
-          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, { qos: 1 });
+    this.smartphonePublisher = new StreamToMQTT(
+      MQTT_BROKER,
+      DATA_RATE_HZ,
+      smartphoneDataPath,
+      SMARTPHONE_TOPIC,
+      { clientId: smartphoneClientId, clean: true },
+    );
 
-          count++;
-          this.dataPublishCount = count;
+    // Replay streams concurrently
+    await Promise.all([
+      this.wearablePublisher.replay_streams(),
+      this.smartphonePublisher.replay_streams(),
+    ]);
 
-          if (count % (DATA_RATE_HZ * 30) === 0) {
-            const elapsed = count / DATA_RATE_HZ;
-            const approxResults = this.approachResults.get("approximation")?.results.length || 0;
-            const chunkedResults = this.approachResults.get("chunked")?.results.length || 0;
-            const fetchingResults = this.approachResults.get("fetching")?.results.length || 0;
-            console.log(
-              `    [${elapsed}s] A:${approxResults} C:${chunkedResults} F:${fetchingResults}`
-            );
-          }
-        }, intervalMs);
-      });
-    });
+    console.log(`  [Run #${this.runNumber}] Data replay completed`);
   }
 
   private generateSummary(): RunSummary {
@@ -353,7 +381,7 @@ class SingleRunVerifier {
   }
 
   private async cleanup(): Promise<void> {
-    for (const [name, proc] of this.orchestrators) {
+    for (const [_name, proc] of this.orchestrators) {
       try {
         proc.kill("SIGTERM");
         await this.sleep(500);
@@ -368,9 +396,8 @@ class SingleRunVerifier {
     if (this.mqttClient) {
       this.mqttClient.end(true);
     }
-    if (this.publisherClient) {
-      this.publisherClient.end(true);
-    }
+
+    // Note: StreamToMQTT publishers handle their own MQTT connection cleanup
 
     await this.sleep(2000);
   }
@@ -390,7 +417,9 @@ class MultiRunOrchestrator {
     console.log("\n" + "=".repeat(70));
     console.log(`MULTI-RUN VERIFICATION: ${numRuns} ITERATIONS`);
     console.log("=".repeat(70));
-    console.log(`Testing all 3 approaches ${numRuns} times to verify stability`);
+    console.log(
+      `Testing all 3 approaches ${numRuns} times to verify stability`,
+    );
     console.log("=".repeat(70));
 
     const startTime = Date.now();
@@ -432,10 +461,18 @@ class MultiRunOrchestrator {
     const chunkedIcon = summary.chunked.passed ? "[OK]" : "[X]";
     const fetchingIcon = summary.fetching.passed ? "[OK]" : "[X]";
 
-    console.log(`\n  Run ${summary.runNumber} Results (${(summary.duration / 1000).toFixed(1)}s):`);
-    console.log(`    ${approxIcon} Approximation: ${summary.approximation.resultCount} results`);
-    console.log(`    ${chunkedIcon} Chunked:       ${summary.chunked.resultCount} results`);
-    console.log(`    ${fetchingIcon} Fetching:      ${summary.fetching.resultCount} results`);
+    console.log(
+      `\n  Run ${summary.runNumber} Results (${(summary.duration / 1000).toFixed(1)}s):`,
+    );
+    console.log(
+      `    ${approxIcon} Approximation: ${summary.approximation.resultCount} results`,
+    );
+    console.log(
+      `    ${chunkedIcon} Chunked:       ${summary.chunked.resultCount} results`,
+    );
+    console.log(
+      `    ${fetchingIcon} Fetching:      ${summary.fetching.resultCount} results`,
+    );
   }
 
   private printFinalSummary(totalTime: number): void {
@@ -451,25 +488,40 @@ class MultiRunOrchestrator {
     console.log(`Total time: ${(totalTime / 1000 / 60).toFixed(1)} minutes`);
 
     console.log(`\nApproximation Approach:`);
-    console.log(`  Success rate: ${approxStats.successRate}% (${approxStats.passCount}/${this.summaries.length})`);
+    console.log(
+      `  Success rate: ${approxStats.successRate}% (${approxStats.passCount}/${this.summaries.length})`,
+    );
     console.log(`  Avg results per run: ${approxStats.avgResults.toFixed(1)}`);
-    console.log(`  Result range: ${approxStats.minResults}-${approxStats.maxResults}`);
+    console.log(
+      `  Result range: ${approxStats.minResults}-${approxStats.maxResults}`,
+    );
 
     console.log(`\nChunked Query Approach:`);
-    console.log(`  Success rate: ${chunkedStats.successRate}% (${chunkedStats.passCount}/${this.summaries.length})`);
+    console.log(
+      `  Success rate: ${chunkedStats.successRate}% (${chunkedStats.passCount}/${this.summaries.length})`,
+    );
     console.log(`  Avg results per run: ${chunkedStats.avgResults.toFixed(1)}`);
-    console.log(`  Result range: ${chunkedStats.minResults}-${chunkedStats.maxResults}`);
+    console.log(
+      `  Result range: ${chunkedStats.minResults}-${chunkedStats.maxResults}`,
+    );
 
     console.log(`\nFetching Client Side:`);
-    console.log(`  Success rate: ${fetchingStats.successRate}% (${fetchingStats.passCount}/${this.summaries.length})`);
-    console.log(`  Avg results per run: ${fetchingStats.avgResults.toFixed(1)}`);
-    console.log(`  Result range: ${fetchingStats.minResults}-${fetchingStats.maxResults}`);
+    console.log(
+      `  Success rate: ${fetchingStats.successRate}% (${fetchingStats.passCount}/${this.summaries.length})`,
+    );
+    console.log(
+      `  Avg results per run: ${fetchingStats.avgResults.toFixed(1)}`,
+    );
+    console.log(
+      `  Result range: ${fetchingStats.minResults}-${fetchingStats.maxResults}`,
+    );
 
     console.log("\n" + "-".repeat(70));
 
-    const allPassed = approxStats.passCount === this.summaries.length &&
-                      chunkedStats.passCount === this.summaries.length &&
-                      fetchingStats.passCount === this.summaries.length;
+    const allPassed =
+      approxStats.passCount === this.summaries.length &&
+      chunkedStats.passCount === this.summaries.length &&
+      fetchingStats.passCount === this.summaries.length;
 
     if (allPassed) {
       console.log("OVERALL: ALL APPROACHES PASSED ALL RUNS - STABLE AND READY");
@@ -477,11 +529,17 @@ class MultiRunOrchestrator {
       console.log("OVERALL: SOME RUNS FAILED - REVIEW NEEDED");
       console.log("\nFailed runs:");
       this.summaries.forEach((summary) => {
-        if (!summary.approximation.passed || !summary.chunked.passed || !summary.fetching.passed) {
-          console.log(`  Run ${summary.runNumber}: ` +
-            `A:${summary.approximation.passed ? 'OK' : 'FAIL'} ` +
-            `C:${summary.chunked.passed ? 'OK' : 'FAIL'} ` +
-            `F:${summary.fetching.passed ? 'OK' : 'FAIL'}`);
+        if (
+          !summary.approximation.passed ||
+          !summary.chunked.passed ||
+          !summary.fetching.passed
+        ) {
+          console.log(
+            `  Run ${summary.runNumber}: ` +
+              `A:${summary.approximation.passed ? "OK" : "FAIL"} ` +
+              `C:${summary.chunked.passed ? "OK" : "FAIL"} ` +
+              `F:${summary.fetching.passed ? "OK" : "FAIL"}`,
+          );
         }
       });
     }
@@ -494,7 +552,8 @@ class MultiRunOrchestrator {
     const passCount = results.filter((r) => r.passed).length;
     const successRate = Math.round((passCount / this.summaries.length) * 100);
     const resultCounts = results.map((r) => r.resultCount);
-    const avgResults = resultCounts.reduce((a, b) => a + b, 0) / resultCounts.length;
+    const avgResults =
+      resultCounts.reduce((a, b) => a + b, 0) / resultCounts.length;
     const minResults = Math.min(...resultCounts);
     const maxResults = Math.max(...resultCounts);
 
@@ -531,19 +590,13 @@ class MultiRunOrchestrator {
 
 // Run the 35-iteration multi-run verification
 const orchestrator = new MultiRunOrchestrator();
-orchestrator.runMultipleTests(NUM_RUNS).then(() => {
-  console.log("\n[INFO] 35-iteration multi-run verification complete");
-  process.exit(0);
-}).catch((err) => {
-  console.error("\n[ERROR] 35-iteration verification failed:", err);
-  process.exit(1);
-});
-```
-
-<file_path>
-streaming-query-hive/scripts/run-35-iterations.ts
-</file_path>
-
-<edit_description>
-Create the 35-iterations script
-</edit_description>
+orchestrator
+  .runMultipleTests(NUM_RUNS)
+  .then(() => {
+    console.log("\n[INFO] 35-iteration multi-run verification complete");
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("\n[ERROR] 35-iteration verification failed:", err);
+    process.exit(1);
+  });
