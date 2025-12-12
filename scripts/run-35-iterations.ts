@@ -109,8 +109,11 @@ class SingleRunVerifier {
 
     try {
       await this.clearPreviousRunData();
+      console.log(`  [RUN ${this.runNumber}] Setting up MQTT monitoring...`);
       await this.setupMQTTMonitoring();
+      console.log(`  [RUN ${this.runNumber}] Launching orchestrators...`);
       await this.launchOrchestrators();
+      console.log(`  [RUN ${this.runNumber}] All orchestrators launched`);
 
       console.log(
         `  [RUN ${this.runNumber}] Waiting ${INIT_WAIT_S}s for initialization...`,
@@ -250,6 +253,7 @@ class SingleRunVerifier {
   ): Promise<void> {
     return new Promise((resolve) => {
       const fullPath = path.resolve(__dirname, scriptPath);
+      console.log(`    [${name.toUpperCase()}] Starting at: ${fullPath}`);
 
       const proc = spawn("npx", ["ts-node", fullPath], {
         env: { ...process.env, ...env },
@@ -257,6 +261,9 @@ class SingleRunVerifier {
       });
 
       this.orchestrators.set(name, proc);
+      console.log(
+        `    [${name.toUpperCase()}] Process spawned (PID: ${proc.pid})`,
+      );
 
       proc.stdout?.on("data", (data: Buffer) => {
         // Log orchestrator output to diagnose startup issues
@@ -291,14 +298,27 @@ class SingleRunVerifier {
       });
 
       proc.on("error", (err) => {
+        console.error(
+          `    [${name.toUpperCase()}] Process error: ${err.message}`,
+        );
         const result = this.approachResults.get(name);
         if (result) result.errors.push(err.message);
+      });
+
+      proc.on("exit", (code, signal) => {
+        if (code !== null && code !== 0) {
+          console.error(`    [${name.toUpperCase()}] Exited with code ${code}`);
+        } else if (signal) {
+          console.error(
+            `    [${name.toUpperCase()}] Killed by signal ${signal}`,
+          );
+        }
       });
 
       const result = this.approachResults.get(name);
       if (result) result.started = true;
 
-      setTimeout(resolve, 1000);
+      setTimeout(resolve, 2000);
     });
   }
 
@@ -356,6 +376,21 @@ class SingleRunVerifier {
     ]);
 
     console.log(`  [Run #${this.runNumber}] Data replay completed`);
+
+    // Check if orchestrators are still running
+    let runningCount = 0;
+    for (const [name, proc] of this.orchestrators) {
+      if (proc.exitCode === null) {
+        runningCount++;
+      } else {
+        console.warn(
+          `    [${name.toUpperCase()}] Already exited with code ${proc.exitCode}`,
+        );
+      }
+    }
+    console.log(
+      `  [Run #${this.runNumber}] ${runningCount}/${this.orchestrators.size} orchestrators still running`,
+    );
   }
 
   private generateSummary(): RunSummary {
