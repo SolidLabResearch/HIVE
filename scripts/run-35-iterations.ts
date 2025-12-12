@@ -259,7 +259,7 @@ class SingleRunVerifier {
       this.orchestrators.set(name, proc);
 
       proc.stdout?.on("data", (data: Buffer) => {
-        // Only log significant events to reduce noise
+        // Log orchestrator output to diagnose startup issues
         const lines = data
           .toString()
           .split("\n")
@@ -269,9 +269,12 @@ class SingleRunVerifier {
             line.includes("error") ||
             line.includes("Error") ||
             line.includes("Failed") ||
-            line.includes("Registered query")
+            line.includes("Registered query") ||
+            line.includes("Starting") ||
+            line.includes("Listening") ||
+            line.includes("Connected")
           ) {
-            // Suppress verbose output during multi-run
+            console.log(`    [${name.toUpperCase()}] ${line}`);
           }
         }
       });
@@ -283,7 +286,7 @@ class SingleRunVerifier {
           !msg.includes("ExperimentalWarning") &&
           !msg.includes("Watermark")
         ) {
-          // Only log real errors
+          console.error(`    [${name.toUpperCase()} ERROR] ${msg}`);
         }
       });
 
