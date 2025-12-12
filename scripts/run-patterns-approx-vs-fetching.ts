@@ -2,14 +2,24 @@
 
 /**
  * 35-Iteration Pattern-Based Test for Approximation vs Ground Truth
- * Tests approximation and fetching approaches with 5 different stream patterns,
+ * Tests approximation and fetching approaches with pre-recorded stream patterns,
  * running 35 iterations for each pattern to verify stability and accuracy.
+ *
+ * This script uses pre-recorded data from src/streamer/data/pattern_experiments/
+ * instead of generating synthetic data on the fly. Each pattern directory contains:
+ * - wearable/data.nt: Pre-recorded wearable sensor data
+ * - smartphone/data.nt: Pre-recorded smartphone sensor data
+ * - metadata.json: Pattern metadata (duration, frequency, etc.)
+ *
+ * The StreamToMQTT replayer publishes this data at the specified frequency (4Hz)
+ * to simulate real-time streaming while maintaining exact reproducibility.
  */
 
 import { spawn, ChildProcess } from "child_process";
 import * as mqtt from "mqtt";
 import * as path from "path";
 import * as fs from "fs";
+import { StreamToMQTT } from "../src/streamer/src/publishing/StreamToMQTT";
 
 const MQTT_BROKER = "mqtt://localhost:1883";
 
@@ -31,85 +41,49 @@ const FINAL_WAIT_S = 20;
 const ITERATIONS_PER_PATTERN = 35; // 35 iterations per pattern
 
 /**
- * Data pattern generators based on the provided parameters
+ * Data pattern definitions mapping to pre-recorded data files
  */
 interface DataPattern {
   name: string;
   description: string;
-  wearableGenerator: (index: number, totalEvents: number) => number;
-  smartphoneGenerator: (index: number, totalEvents: number) => number;
+  directoryName: string;
 }
 
 const DATA_PATTERNS: DataPattern[] = [
   {
     name: "Low Variability",
     description: "Low variability with μ=-23.0, σ=0.25",
-    wearableGenerator: (_index: number, _totalEvents: number) => {
-      // Normal distribution around -23.0 with σ=0.25
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-      return -23.0 + z0 * 0.25;
-    },
-    smartphoneGenerator: (_index: number, _totalEvents: number) => {
-      // Same for smartphone
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-      return -23.0 + z0 * 0.25;
-    },
+    directoryName: "low_variability",
   },
   {
     name: "Step Pattern",
     description: "Step pattern with v1=-23.0, v2=-15.0, t_step=60s",
-    wearableGenerator: (index: number, totalEvents: number) => {
-      const stepPoint = (60 * DATA_RATE_HZ); // 60 seconds * 4Hz = 240 events
-      return index < stepPoint ? -23.0 : -15.0;
-    },
-    smartphoneGenerator: (index: number, totalEvents: number) => {
-      const stepPoint = (60 * DATA_RATE_HZ);
-      return index < stepPoint ? -23.0 : -15.0;
-    },
+    directoryName: "step_pattern",
   },
   {
     name: "Spike Pattern",
     description: "Spike pattern with v_base=-23.0, v_spike=-5.0, Δt=1.25s",
-    wearableGenerator: (index: number, totalEvents: number) => {
-      const spikeDuration = 1.25 * DATA_RATE_HZ; // 1.25s * 4Hz = 5 events
-      const spikeStart = Math.floor(totalEvents / 2) - Math.floor(spikeDuration / 2);
-      const spikeEnd = spikeStart + spikeDuration;
-      return (index >= spikeStart && index < spikeEnd) ? -5.0 : -23.0;
-    },
-    smartphoneGenerator: (index: number, totalEvents: number) => {
-      const spikeDuration = 1.25 * DATA_RATE_HZ;
-      const spikeStart = Math.floor(totalEvents / 2) - Math.floor(spikeDuration / 2);
-      const spikeEnd = spikeStart + spikeDuration;
-      return (index >= spikeStart && index < spikeEnd) ? -5.0 : -23.0;
-    },
+    directoryName: "spike_pattern",
+  },
+  {
+    name: "Gradual Drift",
+    description: "Gradual drift from v_start=-25.0 to v_end=-21.0 over 120s",
+    directoryName: "gradual_drift",
+  },
+  {
+    name: "Random Walk",
+    description: "Random walk starting from v0=-23.0 with σ_step=0.5",
+    directoryName: "random_walk",
   },
   {
     name: "Low Freq. Oscillation",
     description: "Low frequency oscillation with μ=-23.0, A=5.0, f=0.05Hz",
-    wearableGenerator: (index: number, _totalEvents: number) => {
-      const time = index / DATA_RATE_HZ; // Convert to seconds
-      return -23.0 + 5.0 * Math.sin(2 * Math.PI * 0.05 * time);
-    },
-    smartphoneGenerator: (index: number, _totalEvents: number) => {
-      const time = index / DATA_RATE_HZ;
-      return -23.0 + 5.0 * Math.cos(2 * Math.PI * 0.05 * time);
-    },
+    directoryName: "low_frequency_oscillation",
   },
   {
     name: "High Freq. Oscillation",
     description: "High frequency oscillation with μ=-23.0, A=3.0, f=0.5Hz",
-    wearableGenerator: (index: number, _totalEvents: number) => {
-      const time = index / DATA_RATE_HZ;
-      return -23.0 + 3.0 * Math.sin(2 * Math.PI * 0.5 * time);
-    },
-    smartphoneGenerator: (index: number, _totalEvents: number) => {
-      const time = index / DATA_RATE_HZ;
-      return -23.0 + 3.0 * Math.cos(2 * Math.PI * 0.5 * time);
-    },
+    directoryName: "high_frequency_oscillation",
   },
 ];
 
@@ -149,13 +123,14 @@ interface PatternSummary {
  */
 class SingleIterationRunner {
   private orchestrators: Map<string, ChildProcess> = new Map();
-  private mqttClient?: mqtt.MqttClient;
-  private publisherClient?: mqtt.MqttClient;
+  private mqttClient: mqtt.MqttClient | null = null;
   private approachResults: Map<string, ApproachResult> = new Map();
   private dataPublishCount = 0;
   private pattern: DataPattern;
   private iterationNumber: number;
   private startTime: number = 0;
+  private wearablePublisher: StreamToMQTT | null = null;
+  private smartphonePublisher: StreamToMQTT | null = null;
 
   constructor(pattern: DataPattern, iterationNumber: number) {
     this.pattern = pattern;
@@ -182,7 +157,9 @@ class SingleIterationRunner {
 
   async run(): Promise<IterationResult> {
     console.log(`\n${"=".repeat(70)}`);
-    console.log(`PATTERN: ${this.pattern.name} | ITERATION ${this.iterationNumber}`);
+    console.log(
+      `PATTERN: ${this.pattern.name} | ITERATION ${this.iterationNumber}`,
+    );
     console.log(`Description: ${this.pattern.description}`);
     console.log("=".repeat(70));
 
@@ -193,18 +170,25 @@ class SingleIterationRunner {
       await this.setupMQTTMonitoring();
       await this.launchOrchestrators();
 
-      console.log(`  [${this.pattern.name} #${this.iterationNumber}] Waiting ${INIT_WAIT_S}s for initialization...`);
+      console.log(
+        `  [${this.pattern.name} #${this.iterationNumber}] Waiting ${INIT_WAIT_S}s for initialization...`,
+      );
       await this.sleep(INIT_WAIT_S * 1000);
 
       await this.publishPatternData();
 
-      console.log(`  [${this.pattern.name} #${this.iterationNumber}] Waiting ${FINAL_WAIT_S}s for final results...`);
+      console.log(
+        `  [${this.pattern.name} #${this.iterationNumber}] Waiting ${FINAL_WAIT_S}s for final results...`,
+      );
       await this.sleep(FINAL_WAIT_S * 1000);
 
       const result = this.generateResult();
       return result;
     } catch (error) {
-      console.error(`  [${this.pattern.name} #${this.iterationNumber}] ERROR:`, error);
+      console.error(
+        `  [${this.pattern.name} #${this.iterationNumber}] ERROR:`,
+        error,
+      );
       throw error;
     } finally {
       await this.cleanup();
@@ -219,10 +203,7 @@ class SingleIterationRunner {
 
     await new Promise<void>((resolve) => {
       clearClient.on("connect", () => {
-        const topics = [
-          OUTPUT_TOPICS.approximation,
-          OUTPUT_TOPICS.fetching,
-        ];
+        const topics = [OUTPUT_TOPICS.approximation, OUTPUT_TOPICS.fetching];
 
         topics.forEach((topic) => {
           clearClient.publish(topic, "", { qos: 1, retain: true });
@@ -244,10 +225,7 @@ class SingleIterationRunner {
       });
 
       this.mqttClient.on("connect", () => {
-        const topics = [
-          OUTPUT_TOPICS.approximation,
-          OUTPUT_TOPICS.fetching,
-        ];
+        const topics = [OUTPUT_TOPICS.approximation, OUTPUT_TOPICS.fetching];
 
         this.mqttClient!.subscribe(topics, { qos: 1 }, (err) => {
           if (err) {
@@ -262,7 +240,7 @@ class SingleIterationRunner {
         const content = message.toString();
         if (!content || content.trim() === "") return;
 
-        const timestamp = Date.now();
+        const _timestamp = Date.now();
         let value: number | undefined;
 
         // Extract numeric value
@@ -291,7 +269,11 @@ class SingleIterationRunner {
     });
   }
 
-  private recordResult(approach: string, content: string, value?: number): void {
+  private recordResult(
+    approach: string,
+    content: string,
+    value?: number,
+  ): void {
     const result = this.approachResults.get(approach);
     if (result) {
       result.results.push({ timestamp: Date.now(), content, value });
@@ -302,20 +284,20 @@ class SingleIterationRunner {
     await this.launchOrchestrator(
       "approximation",
       "src/approaches/ApproximationApproachOrchestrator.ts",
-      { HTTP_PORT: "8081" }
+      { HTTP_PORT: "8081" },
     );
 
     await this.launchOrchestrator(
       "fetching",
       "src/approaches/FetchingClientSideApproachOrchestrator.ts",
-      { HTTP_PORT: "8082" }
+      { HTTP_PORT: "8082" },
     );
   }
 
   private launchOrchestrator(
     name: string,
     scriptPath: string,
-    env: Record<string, string>
+    env: Record<string, string>,
   ): Promise<void> {
     return new Promise((resolve) => {
       const fullPath = path.resolve(__dirname, scriptPath);
@@ -340,60 +322,65 @@ class SingleIterationRunner {
   }
 
   private async publishPatternData(): Promise<void> {
-    console.log(`  [${this.pattern.name} #${this.iterationNumber}] Publishing pattern data (${PATTERN_DURATION_S}s, ${DATA_RATE_HZ}Hz)...`);
+    console.log(
+      `  [${this.pattern.name} #${this.iterationNumber}] Publishing pre-recorded pattern data (${PATTERN_DURATION_S}s, ${DATA_RATE_HZ}Hz)...`,
+    );
 
-    return new Promise((resolve) => {
-      this.publisherClient = mqtt.connect(MQTT_BROKER, {
-        clientId: `publisher-${this.pattern.name}-${this.iterationNumber}-${Math.random().toString(16).substr(2, 8)}`,
-        clean: true,
-      });
+    const projectRoot = path.resolve(__dirname, "..");
+    const wearableDataPath = path.join(
+      projectRoot,
+      "src/streamer/data/pattern_experiments",
+      this.pattern.directoryName,
+      "wearable/data.nt",
+    );
+    const smartphoneDataPath = path.join(
+      projectRoot,
+      "src/streamer/data/pattern_experiments",
+      this.pattern.directoryName,
+      "smartphone/data.nt",
+    );
 
-      this.publisherClient.on("connect", () => {
-        const totalEvents = PATTERN_DURATION_S * DATA_RATE_HZ;
-        const intervalMs = 1000 / DATA_RATE_HZ;
-        let count = 0;
+    // Verify files exist
+    if (!fs.existsSync(wearableDataPath)) {
+      throw new Error(`Wearable data file not found: ${wearableDataPath}`);
+    }
+    if (!fs.existsSync(smartphoneDataPath)) {
+      throw new Error(`Smartphone data file not found: ${smartphoneDataPath}`);
+    }
 
-        const interval = setInterval(() => {
-          if (count >= totalEvents) {
-            clearInterval(interval);
-            console.log(`  [${this.pattern.name} #${this.iterationNumber}] Published ${count} events`);
-            resolve();
-            return;
-          }
+    console.log(
+      `  [${this.pattern.name} #${this.iterationNumber}] Loading data from ${this.pattern.directoryName}...`,
+    );
 
-          const timestamp = new Date().toISOString();
-          const wearableValue = this.pattern.wearableGenerator(count, totalEvents);
-          const smartphoneValue = this.pattern.smartphoneGenerator(count, totalEvents);
+    // Create publishers with unique client IDs
+    const wearableClientId = `pub-wearable-${this.pattern.directoryName}-${this.iterationNumber}-${Math.random().toString(16).substr(2, 8)}`;
+    const smartphoneClientId = `pub-smartphone-${this.pattern.directoryName}-${this.iterationNumber}-${Math.random().toString(16).substr(2, 8)}`;
 
-          const wearableData = `
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasValue> "${wearableValue.toFixed(3)}"^^<http://www.w3.org/2001/XMLSchema#float> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasTimestamp> "${timestamp}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/wearableX> .
-          `.trim();
+    this.wearablePublisher = new StreamToMQTT(
+      MQTT_BROKER,
+      DATA_RATE_HZ,
+      wearableDataPath,
+      WEARABLE_TOPIC,
+      { clientId: wearableClientId, clean: true },
+    );
 
-          const smartphoneData = `
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasValue> "${smartphoneValue.toFixed(3)}"^^<http://www.w3.org/2001/XMLSchema#float> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasTimestamp> "${timestamp}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
-<https://rsp.js/event/${count}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/smartphoneX> .
-          `.trim();
+    this.smartphonePublisher = new StreamToMQTT(
+      MQTT_BROKER,
+      DATA_RATE_HZ,
+      smartphoneDataPath,
+      SMARTPHONE_TOPIC,
+      { clientId: smartphoneClientId, clean: true },
+    );
 
-          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, { qos: 1 });
-          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, { qos: 1 });
+    // Replay streams concurrently
+    await Promise.all([
+      this.wearablePublisher.replay_streams(),
+      this.smartphonePublisher.replay_streams(),
+    ]);
 
-          count++;
-          this.dataPublishCount = count;
-
-          if (count % (DATA_RATE_HZ * 30) === 0) {
-            const elapsed = count / DATA_RATE_HZ;
-            const approxResults = this.approachResults.get("approximation")?.results.length || 0;
-            const fetchingResults = this.approachResults.get("fetching")?.results.length || 0;
-            console.log(
-              `    [${elapsed}s] Results - A:${approxResults} F:${fetchingResults}`
-            );
-          }
-        }, intervalMs);
-      });
-    });
+    console.log(
+      `  [${this.pattern.name} #${this.iterationNumber}] Data replay completed`,
+    );
   }
 
   private generateResult(): IterationResult {
@@ -402,7 +389,9 @@ class SingleIterationRunner {
     const fetching = this.approachResults.get("fetching")!;
 
     const calculateAvg = (results: typeof approx.results) => {
-      const values = results.map((r) => r.value).filter((v) => v !== undefined) as number[];
+      const values = results
+        .map((r) => r.value)
+        .filter((v) => v !== undefined) as number[];
       if (values.length === 0) return undefined;
       return values.reduce((a, b) => a + b, 0) / values.length;
     };
@@ -440,9 +429,8 @@ class SingleIterationRunner {
     if (this.mqttClient) {
       this.mqttClient.end(true);
     }
-    if (this.publisherClient) {
-      this.publisherClient.end(true);
-    }
+
+    // Note: StreamToMQTT publishers handle their own MQTT connection cleanup
 
     await this.sleep(2000);
   }
@@ -460,22 +448,40 @@ class PatternMultiIterationTester {
 
   async runAllPatterns(): Promise<void> {
     console.log("\n" + "=".repeat(70));
-    console.log("35-ITERATION PATTERN-BASED VERIFICATION: APPROXIMATION VS GROUND TRUTH");
+    console.log(
+      "35-ITERATION PATTERN-BASED VERIFICATION: APPROXIMATION VS GROUND TRUTH",
+    );
     console.log("=".repeat(70));
-    console.log(`Testing approximation and fetching approaches with ${DATA_PATTERNS.length} patterns × ${ITERATIONS_PER_PATTERN} iterations each`);
-    console.log(`Total iterations: ${DATA_PATTERNS.length * ITERATIONS_PER_PATTERN}`);
+    console.log(
+      `Testing approximation and fetching approaches with ${DATA_PATTERNS.length} patterns × ${ITERATIONS_PER_PATTERN} iterations each`,
+    );
+    console.log(
+      `Total iterations: ${DATA_PATTERNS.length * ITERATIONS_PER_PATTERN}`,
+    );
     console.log("=".repeat(70));
 
     const startTime = Date.now();
 
-    for (let patternIndex = 0; patternIndex < DATA_PATTERNS.length; patternIndex++) {
+    for (
+      let patternIndex = 0;
+      patternIndex < DATA_PATTERNS.length;
+      patternIndex++
+    ) {
       const pattern = DATA_PATTERNS[patternIndex];
-      console.log(`\n[INFO] Starting pattern ${patternIndex + 1}/${DATA_PATTERNS.length}: ${pattern.name}`);
+      console.log(
+        `\n[INFO] Starting pattern ${patternIndex + 1}/${DATA_PATTERNS.length}: ${pattern.name}`,
+      );
 
       const patternResults: IterationResult[] = [];
 
-      for (let iteration = 1; iteration <= ITERATIONS_PER_PATTERN; iteration++) {
-        console.log(`\n[INFO] Pattern ${pattern.name} - Iteration ${iteration}/${ITERATIONS_PER_PATTERN}...`);
+      for (
+        let iteration = 1;
+        iteration <= ITERATIONS_PER_PATTERN;
+        iteration++
+      ) {
+        console.log(
+          `\n[INFO] Pattern ${pattern.name} - Iteration ${iteration}/${ITERATIONS_PER_PATTERN}...`,
+        );
 
         try {
           const runner = new SingleIterationRunner(pattern, iteration);
@@ -487,7 +493,10 @@ class PatternMultiIterationTester {
             await this.sleep(3000);
           }
         } catch (error) {
-          console.error(`[ERROR] Pattern ${pattern.name} iteration ${iteration} failed:`, error);
+          console.error(
+            `[ERROR] Pattern ${pattern.name} iteration ${iteration} failed:`,
+            error,
+          );
           patternResults.push({
             iterationNumber: iteration,
             patternName: pattern.name,
@@ -498,7 +507,10 @@ class PatternMultiIterationTester {
         }
       }
 
-      const patternSummary = this.generatePatternSummary(pattern.name, patternResults);
+      const patternSummary = this.generatePatternSummary(
+        pattern.name,
+        patternResults,
+      );
       this.patternSummaries.push(patternSummary);
       this.printPatternSummary(patternSummary);
 
@@ -513,15 +525,21 @@ class PatternMultiIterationTester {
     this.saveResultsToFile();
   }
 
-  private generatePatternSummary(patternName: string, results: IterationResult[]): PatternSummary {
-    const approxResults = results.map(r => r.approximation);
-    const fetchingResults = results.map(r => r.fetching);
+  private generatePatternSummary(
+    patternName: string,
+    results: IterationResult[],
+  ): PatternSummary {
+    const approxResults = results.map((r) => r.approximation);
+    const fetchingResults = results.map((r) => r.fetching);
 
-    const approxSuccessCount = approxResults.filter(r => r.passed).length;
-    const fetchingSuccessCount = fetchingResults.filter(r => r.passed).length;
+    const approxSuccessCount = approxResults.filter((r) => r.passed).length;
+    const fetchingSuccessCount = fetchingResults.filter((r) => r.passed).length;
 
-    const approxAvgResults = approxResults.reduce((sum, r) => sum + r.resultCount, 0) / results.length;
-    const fetchingAvgResults = fetchingResults.reduce((sum, r) => sum + r.resultCount, 0) / results.length;
+    const approxAvgResults =
+      approxResults.reduce((sum, r) => sum + r.resultCount, 0) / results.length;
+    const fetchingAvgResults =
+      fetchingResults.reduce((sum, r) => sum + r.resultCount, 0) /
+      results.length;
 
     const approxAvgValue = this.calculateAverageValue(approxResults);
     const fetchingAvgValue = this.calculateAverageValue(fetchingResults);
@@ -542,8 +560,12 @@ class PatternMultiIterationTester {
     };
   }
 
-  private calculateAverageValue(results: Array<{ avgValue?: number }>): number | undefined {
-    const values = results.map(r => r.avgValue).filter(v => v !== undefined) as number[];
+  private calculateAverageValue(
+    results: Array<{ avgValue?: number }>,
+  ): number | undefined {
+    const values = results
+      .map((r) => r.avgValue)
+      .filter((v) => v !== undefined) as number[];
     if (values.length === 0) return undefined;
     return values.reduce((a, b) => a + b, 0) / values.length;
   }
@@ -553,18 +575,26 @@ class PatternMultiIterationTester {
     console.log(`PATTERN SUMMARY: ${summary.patternName}`);
     console.log("=".repeat(70));
 
-    console.log(`Iterations completed: ${summary.iterations.length}/${ITERATIONS_PER_PATTERN}`);
+    console.log(
+      `Iterations completed: ${summary.iterations.length}/${ITERATIONS_PER_PATTERN}`,
+    );
 
     console.log(`\nApproximation Approach:`);
-    console.log(`  Success rate: ${summary.approximation.successRate.toFixed(1)}%`);
-    console.log(`  Avg results per iteration: ${summary.approximation.avgResults.toFixed(1)}`);
+    console.log(
+      `  Success rate: ${summary.approximation.successRate.toFixed(1)}%`,
+    );
+    console.log(
+      `  Avg results per iteration: ${summary.approximation.avgResults.toFixed(1)}`,
+    );
     if (summary.approximation.avgValue !== undefined) {
       console.log(`  Avg value: ${summary.approximation.avgValue.toFixed(3)}`);
     }
 
     console.log(`\nFetching (Ground Truth):`);
     console.log(`  Success rate: ${summary.fetching.successRate.toFixed(1)}%`);
-    console.log(`  Avg results per iteration: ${summary.fetching.avgResults.toFixed(1)}`);
+    console.log(
+      `  Avg results per iteration: ${summary.fetching.avgResults.toFixed(1)}`,
+    );
     if (summary.fetching.avgValue !== undefined) {
       console.log(`  Avg value: ${summary.fetching.avgValue.toFixed(3)}`);
     }
@@ -578,27 +608,47 @@ class PatternMultiIterationTester {
     console.log("=".repeat(70));
 
     console.log(`\nTotal patterns tested: ${this.patternSummaries.length}`);
-    console.log(`Total iterations: ${this.patternSummaries.length * ITERATIONS_PER_PATTERN}`);
+    console.log(
+      `Total iterations: ${this.patternSummaries.length * ITERATIONS_PER_PATTERN}`,
+    );
     console.log(`Total time: ${(totalTime / 1000 / 60).toFixed(1)} minutes`);
 
     console.log(`\nPattern-by-Pattern Results:`);
-    console.log(`  ${"Pattern".padEnd(20)} | ${"Approx Success".padEnd(13)} | ${"Fetching Success".padEnd(15)} | ${"Approx Avg Val".padEnd(13)} | ${"Fetching Avg Val".padEnd(15)}`);
-    console.log(`  ${"-".repeat(20)} | ${"-".repeat(13)} | ${"-".repeat(15)} | ${"-".repeat(13)} | ${"-".repeat(15)}`);
+    console.log(
+      `  ${"Pattern".padEnd(20)} | ${"Approx Success".padEnd(13)} | ${"Fetching Success".padEnd(15)} | ${"Approx Avg Val".padEnd(13)} | ${"Fetching Avg Val".padEnd(15)}`,
+    );
+    console.log(
+      `  ${"-".repeat(20)} | ${"-".repeat(13)} | ${"-".repeat(15)} | ${"-".repeat(13)} | ${"-".repeat(15)}`,
+    );
 
     this.patternSummaries.forEach((summary) => {
       const approxSuccess = `${summary.approximation.successRate.toFixed(1)}%`;
       const fetchingSuccess = `${summary.fetching.successRate.toFixed(1)}%`;
-      const approxAvg = summary.approximation.avgValue !== undefined ? summary.approximation.avgValue.toFixed(3) : "N/A";
-      const fetchingAvg = summary.fetching.avgValue !== undefined ? summary.fetching.avgValue.toFixed(3) : "N/A";
+      const approxAvg =
+        summary.approximation.avgValue !== undefined
+          ? summary.approximation.avgValue.toFixed(3)
+          : "N/A";
+      const fetchingAvg =
+        summary.fetching.avgValue !== undefined
+          ? summary.fetching.avgValue.toFixed(3)
+          : "N/A";
       console.log(
-        `  ${summary.patternName.padEnd(20)} | ${approxSuccess.padEnd(13)} | ${fetchingSuccess.padEnd(15)} | ${approxAvg.padEnd(13)} | ${fetchingAvg.padEnd(15)}`
+        `  ${summary.patternName.padEnd(20)} | ${approxSuccess.padEnd(13)} | ${fetchingSuccess.padEnd(15)} | ${approxAvg.padEnd(13)} | ${fetchingAvg.padEnd(15)}`,
       );
     });
 
     console.log("\n" + "-".repeat(70));
 
-    const overallApproxSuccess = this.patternSummaries.reduce((sum, s) => sum + s.approximation.successRate, 0) / this.patternSummaries.length;
-    const overallFetchingSuccess = this.patternSummaries.reduce((sum, s) => sum + s.fetching.successRate, 0) / this.patternSummaries.length;
+    const overallApproxSuccess =
+      this.patternSummaries.reduce(
+        (sum, s) => sum + s.approximation.successRate,
+        0,
+      ) / this.patternSummaries.length;
+    const overallFetchingSuccess =
+      this.patternSummaries.reduce(
+        (sum, s) => sum + s.fetching.successRate,
+        0,
+      ) / this.patternSummaries.length;
 
     console.log(`Overall Success Rates:`);
     console.log(`  Approximation: ${overallApproxSuccess.toFixed(1)}%`);
@@ -617,10 +667,18 @@ class PatternMultiIterationTester {
       patternSummaries: this.patternSummaries,
       overallStats: {
         approximation: {
-          avgSuccessRate: this.patternSummaries.reduce((sum, s) => sum + s.approximation.successRate, 0) / this.patternSummaries.length,
+          avgSuccessRate:
+            this.patternSummaries.reduce(
+              (sum, s) => sum + s.approximation.successRate,
+              0,
+            ) / this.patternSummaries.length,
         },
         fetching: {
-          avgSuccessRate: this.patternSummaries.reduce((sum, s) => sum + s.fetching.successRate, 0) / this.patternSummaries.length,
+          avgSuccessRate:
+            this.patternSummaries.reduce(
+              (sum, s) => sum + s.fetching.successRate,
+              0,
+            ) / this.patternSummaries.length,
         },
       },
     };
@@ -644,7 +702,7 @@ class PatternMultiIterationTester {
           s.fetching.successRate.toFixed(2),
           s.fetching.avgResults.toFixed(2),
           s.fetching.avgValue?.toFixed(4) || "",
-        ].join(",")
+        ].join(","),
       );
     });
 
@@ -659,10 +717,15 @@ class PatternMultiIterationTester {
 
 // Run the 35-iteration pattern-based test for approximation vs fetching
 const tester = new PatternMultiIterationTester();
-tester.runAllPatterns().then(() => {
-  console.log("\n[INFO] 35-iteration pattern-based test for approximation vs fetching complete");
-  process.exit(0);
-}).catch((err) => {
-  console.error("\n[ERROR] Pattern test failed:", err);
-  process.exit(1);
-});
+tester
+  .runAllPatterns()
+  .then(() => {
+    console.log(
+      "\n[INFO] 35-iteration pattern-based test for approximation vs fetching complete",
+    );
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("\n[ERROR] Pattern test failed:", err);
+    process.exit(1);
+  });
