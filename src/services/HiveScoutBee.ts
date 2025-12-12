@@ -273,19 +273,24 @@ export class HiveScoutBeeWrapper {
 
     const startTime = Math.min(...timestamps);
     const endTime = Math.max(...timestamps);
+    const duration = endTime - startTime;
+    const dataRate = duration > 0 ? (this.dataBuffer.length / (duration / 1000)) : 0;
 
     return {
-      count: this.dataBuffer.length,
-      mean: mean,
-      min: min,
-      max: max,
+      bufferSize: this.dataBuffer.length,
+      valueRange: {
+        mean: mean.toFixed(2),
+        min: min,
+        max: max,
+      },
       variance: variance,
       topics: topics,
       timeRange: {
-        start: startTime,
-        end: endTime,
-        duration: endTime - startTime,
+        start: new Date(startTime).toISOString(),
+        end: new Date(endTime).toISOString(),
+        duration: `${duration}ms`,
       },
+      dataRate: dataRate,
       latest: this.dataBuffer[this.dataBuffer.length - 1],
       oldest: this.dataBuffer[0],
     };

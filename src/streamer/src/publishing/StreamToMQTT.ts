@@ -55,7 +55,7 @@ export class StreamToMQTT {
   }
 
   /**
-   *
+   * Initializes the StreamToMQTT instance by loading and sorting the dataset.
    */
   async initialize(): Promise<void> {
     try {
@@ -70,8 +70,9 @@ export class StreamToMQTT {
   }
 
   /**
-   *
-   * @param store
+   * Sorts the observations in the store by timestamp.
+   * @param {any} store - The N3 store containing the observations.
+   * @returns {Promise<string[]>} - A promise that resolves to an array of sorted observation subject IDs.
    */
   async sort_observations(store: any): Promise<string[]> {
     const temp: string[] = [];
@@ -90,9 +91,10 @@ export class StreamToMQTT {
   }
 
   /**
-   *
-   * @param array
-   * @param store
+   * Sorts the array of strings using merge sort algorithm.
+   * @param {string[]} array - The array to sort.
+   * @param {any} store - The store to use for comparison.
+   * @returns {string[]} - The sorted array.
    */
   merge_sort(array: string[], store: any): string[] {
     if (array.length <= 1) return array;
@@ -104,10 +106,11 @@ export class StreamToMQTT {
   }
 
   /**
-   *
-   * @param left
-   * @param right
-   * @param store
+   * Merges two sorted arrays.
+   * @param {string[]} left - The left array.
+   * @param {string[]} right - The right array.
+   * @param {any} store - The store to use for comparison.
+   * @returns {string[]} - The merged sorted array.
    */
   merge(left: string[], right: string[], store: any): string[] {
     const merged: string[] = [];
@@ -132,8 +135,9 @@ export class StreamToMQTT {
   }
 
   /**
-   *
-   * @param file_location
+   * Loads the dataset from the file location.
+   * @param {string} file_location - The location of the file to load.
+   * @returns {Promise<typeof N3.Store>} - A promise that resolves to the N3 store containing the dataset.
    */
   async load_dataset(file_location: string): Promise<typeof N3.Store> {
     const topic = path.basename(file_location);
@@ -153,7 +157,7 @@ export class StreamToMQTT {
   }
 
   /**
-   *
+   * Replays the streams by publishing observations to MQTT.
    */
   async replay_streams(): Promise<void> {
     await this.initialize();
@@ -220,15 +224,16 @@ export class StreamToMQTT {
   }
 
   /**
-   *
-   * @param ms
+   * Sleep for a specified amount of time.
+   * @param {number} ms - The number of milliseconds to sleep.
+   * @returns {Promise<void>} - A promise that resolves after the specified time.
    */
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
-   *
+   * Publishes a single observation to MQTT.
    */
   private async publish_one_observation() {
     if (this.number_of_publish >= this.sort_subject_length) {
@@ -272,8 +277,9 @@ export class StreamToMQTT {
   }
 
   /**
-   *
-   * @param store
+   * Converts a store to a string representation.
+   * @param {any} store - The store to convert.
+   * @returns {Promise<string>} - A promise that resolves to the string representation of the store.
    */
   private storeToString(store: any): Promise<string> {
     const writer = new N3.Writer();

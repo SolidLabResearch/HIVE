@@ -76,7 +76,7 @@ export class WindowInstance {
   }
 
   /**
-   *
+   * Sets the window instance as triggered.
    */
   set_triggered() {
     this.has_triggered = true;

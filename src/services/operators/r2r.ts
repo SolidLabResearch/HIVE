@@ -1,4 +1,3 @@
-import { QuadContainer } from "./s2r";
 import { DataFactory } from "rdf-data-factory";
 const N3 = require('n3');
 const DF = new DataFactory();

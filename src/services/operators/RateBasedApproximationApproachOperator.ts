@@ -3,7 +3,9 @@ import CONFIG from "../../config/httpServerConfig.json";
 import { RSPQLParser } from "rsp-js";
 import { ExtractedQuery, QueryMap } from "../../util/Types";
 import { CSVLogger } from "../../util/logger/CSVLogger";
+import { hash_string_md5 } from "../../util/Util";
 import mqtt from "mqtt";
+import * as fs from "fs";
 
 /**
  * Configuration interface for inactivity detection.
@@ -32,6 +34,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private extractedQueries: ExtractedQuery[] = [];
   private parser: RSPQLParser = new RSPQLParser();
   private inactivityConfig: InactivityConfig;
+  private resultsCsvStream?: fs.WriteStream;
+  private queryRegisteredTimestamp: number | null = null;
 
   /**
    * The constructor class with optional inactivity configuration.
@@ -52,6 +56,23 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       ? parseInt(process.env.HTTP_PORT)
       : CONFIG.port;
     this.queryFetchLocation = `http://localhost:${port}/fetchQueries`;
+
+    // Initialize results CSV in results/ folder
+    const resultsDir = "results";
+    if (!fs.existsSync(resultsDir)) {
+      fs.mkdirSync(resultsDir, { recursive: true });
+    }
+    const resultsFileName = "approximation_results.csv";
+    const resultsFilePath = `${resultsDir}/${resultsFileName}`;
+    const writeHeader = !fs.existsSync(resultsFilePath);
+    this.resultsCsvStream = fs.createWriteStream(resultsFilePath, {
+      flags: "a",
+    });
+    if (writeHeader) {
+      this.resultsCsvStream.write(
+        "query_registered_timestamp,result_timestamp,result\n",
+      );
+    }
   }
 
   /**
@@ -80,6 +101,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
    */
   addOutputQuery(query: string): void {
     this.outputQuery = query;
+    // Set query registration timestamp when output query is added
+    if (!this.queryRegisteredTimestamp) {
+      this.queryRegisteredTimestamp = Date.now();
+    }
   }
 
   /**
@@ -183,24 +208,36 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       "Continuing with locally added queries only (if any were added via addSubQuery)",
     );
 
-    // Build extractedQueries from subQueries that were added directly
+    // Build extractedQueries and queryMQTTTopicMap from subQueries that were added directly
     if (this.subQueries.length > 0) {
       console.log(
         `Using ${this.subQueries.length} locally added subqueries instead`,
       );
-      // We need to parse the subqueries to extract topics
-      // For now, we'll create a simple mapping - topics will be handled by the query parser
-      this.extractedQueries = this.subQueries.map((query, index) => {
-        // Try to extract the output topic from the RSPQL query
-        const outputMatch = query.match(/REGISTER\s+RStream\s+<([^>]+)>/i);
-        const r2s_topic = outputMatch ? outputMatch[1] : `output_${index}`;
+      // Use the same hashing logic as Orchestrator to compute chunked/${hash} topics
+      this.extractedQueries = this.subQueries.map((query) => {
+        // Compute the hash the same way as Orchestrator.addSubQuery()
+        const query_hash = hash_string_md5(query);
+        const r2s_topic = `chunked/${query_hash}`;
         return {
           rspql_query: query,
           r2s_topic: r2s_topic,
         };
       });
+
+      // CRITICAL FIX: Also populate queryMQTTTopicMap so handleAggregation doesn't exit early
+      for (const extracted of this.extractedQueries) {
+        const query_hash = hash_string_md5(extracted.rspql_query);
+        this.queryMQTTTopicMap.set(query_hash, extracted.r2s_topic);
+        console.log(
+          `Mapped query hash ${query_hash} to topic ${extracted.r2s_topic}`,
+        );
+      }
+
       console.log(
         `Created ${this.extractedQueries.length} extracted queries from local subqueries`,
+      );
+      console.log(
+        `queryMQTTTopicMap now has ${this.queryMQTTTopicMap.size} entries`,
       );
     } else {
       console.warn(
@@ -384,9 +421,11 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
         try {
           const data = message.toString();
           // Parse the RDF triple to extract the numeric value
-          // Look for patterns like: hasValue> "number"^^<type>
+          // Look for patterns like:
+          //   - saref:hasValue> "number"^^<type> (prefix notation)
+          //   - <https://saref.etsi.org/core/hasValue> "number"^^<type> (full URI from RSPAgent)
           const valueMatch = data.match(
-            /saref:hasValue>\s*"([^"]*)"(?:\^\^<[^>]*>)?/,
+            /(?:saref:hasValue>|<https:\/\/saref\.etsi\.org\/core\/hasValue>)\s*"([^"]*)"(?:\^\^<[^>]*>)?/,
           );
           let value: number;
 
@@ -783,6 +822,19 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                         `Successfully published unified cross-sensor ${outputAggregationType.toLowerCase()}: ${unifiedResult} (from ${allAvailableValues.length} topics)`,
                       );
                       this.logger.log(
+                        `Successfully published unified result: ${unifiedResult}`,
+                      );
+
+                      // Write to results CSV
+                      if (
+                        this.resultsCsvStream &&
+                        this.queryRegisteredTimestamp
+                      ) {
+                        const csvLine = `${this.queryRegisteredTimestamp},${now},${unifiedResult}\n`;
+                        this.resultsCsvStream.write(csvLine);
+                      }
+
+                      this.logger.log(
                         `Successfully published unified cross-sensor ${outputAggregationType.toLowerCase()}: ${unifiedResult} (from ${allAvailableValues.length} topics)`,
                       );
                     }
@@ -815,9 +867,20 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 /**
  * Merges two window results with overlap subtraction for sliding windows.
  * @param {object} win1 - First window result containing start, end, and value.
+ * @param {number} win1.start - Start time of first window.
+ * @param {number} win1.end - End time of first window.
+ * @param {number} win1.value - Value of first window.
  * @param {object} win2 - Second window result containing start, end, and value.
+ * @param {number} win2.start - Start time of second window.
+ * @param {number} win2.end - End time of second window.
+ * @param {number} win2.value - Value of second window.
  * @param {object} overlap - Overlap window result containing start, end, and value.
+ * @param {number} overlap.start - Start time of overlap window.
+ * @param {number} overlap.end - End time of overlap window.
+ * @param {number} overlap.value - Value of overlap window.
  * @param {object} target - Target window containing start and end.
+ * @param {number} target.start - Start time of target window.
+ * @param {number} target.end - End time of target window.
  * @param {"SUM" | "AVG" | "COUNT" | "MIN" | "MAX"} agg - Aggregation function to use.
  * @returns {number | string} The approximate aggregation for the target window.
  */
@@ -856,6 +919,8 @@ export function mergeSlidingWindowResults(
  * Merges results from multiple sliding windows to approximate the value for a target window.
  * @param {Array<{ start: number; end: number; value: number }>} windows - Array of window results.
  * @param {object} target - Target window containing start and end.
+ * @param {number} target.start - Start time of target window.
+ * @param {number} target.end - End time of target window.
  * @param {"SUM" | "AVG" | "COUNT" | "MIN" | "MAX"} agg - Aggregation function to use.
  * @returns {number | string} The approximate aggregation result.
  */

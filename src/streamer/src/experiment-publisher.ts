@@ -6,7 +6,7 @@ import { StreamToMQTT } from './publishing/StreamToMQTT';
  */
 
 /**
- *
+ * Publishes experiment data to MQTT.
  */
 async function publishExperimentData() {
     const args = process.argv.slice(2);

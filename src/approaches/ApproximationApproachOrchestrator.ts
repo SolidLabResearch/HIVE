@@ -1,6 +1,13 @@
 import { Orchestrator } from "../orchestrator/Orchestrator";
 import fs from "fs";
 import { CSVLogger } from "../util/logger/CSVLogger";
+import {
+  createOrchestratorLogger,
+  UnifiedLogger,
+} from "../util/logger/UnifiedLogger";
+import { HealthStatus } from "../util/health/HealthStatus";
+import { getTopicTracker } from "../util/topic/TopicTracker";
+import * as http from "http";
 
 /**
  * Approximation Approach Orchestrator
@@ -8,16 +15,29 @@ import { CSVLogger } from "../util/logger/CSVLogger";
  */
 export class ApproximationApproachOrchestrator {
   private logger: CSVLogger;
+  private unifiedLogger: UnifiedLogger;
+  private healthStatus: HealthStatus;
+  private topicTracker: ReturnType<typeof getTopicTracker>;
   private orchestrator: Orchestrator;
   private resourceLogStream?: fs.WriteStream;
   private resourceLogInterval?: ReturnType<typeof setInterval>;
+  private healthServer?: http.Server;
+  private healthPort: number = 9091;
 
   /**
    * Creates a new ApproximationApproachOrchestrator instance.
    */
   constructor() {
     this.logger = new CSVLogger("approximation_approach_log.csv");
+    this.unifiedLogger = createOrchestratorLogger("approximation");
+    this.healthStatus = new HealthStatus("approximation", "orchestrator");
+    this.topicTracker = getTopicTracker("approximation");
     this.orchestrator = new Orchestrator("ApproximationApproachOperator");
+
+    // Setup health check endpoint
+    this.setupHealthCheckEndpoint();
+
+    this.unifiedLogger.info("Approximation Approach Orchestrator initialized");
   }
 
   /**
@@ -34,13 +54,30 @@ export class ApproximationApproachOrchestrator {
    */
   public async runExperiment(): Promise<any> {
     console.log(`[ApproximationApproach] Starting experiment`);
+    this.unifiedLogger.info("Starting experiment");
 
     try {
+      // Register input topics
+      this.topicTracker.registerInputTopic(
+        "wearableX",
+        "Wearable sensor data stream",
+      );
+      this.topicTracker.registerInputTopic(
+        "smartphoneX",
+        "Smartphone sensor data stream",
+      );
+
       // Setup subqueries
       await this.setupSubQueries();
 
       // Register the main query
       await this.registerMainQuery();
+
+      // Register final result topic
+      this.topicTracker.registerResultTopic(
+        "approximation/output",
+        "Final approximation results",
+      );
 
       // Start resource usage logging
       this.startResourceUsageLogging();
@@ -49,10 +86,13 @@ export class ApproximationApproachOrchestrator {
       const result = await this.orchestrator.runRegisteredQuery();
 
       console.log(`[ApproximationApproach] Experiment completed`);
+      this.unifiedLogger.info("Experiment completed", { result });
 
       return result;
     } catch (error) {
       console.error(`[ApproximationApproach] Error during experiment:`, error);
+      this.unifiedLogger.error("Experiment failed", { error: String(error) });
+      this.healthStatus.recordError(String(error));
       throw error;
     }
   }
@@ -96,9 +136,29 @@ WHERE {
 
     await this.orchestrator.addSubQuery(query1);
     await this.orchestrator.addSubQuery(query2);
+
+    // Track subquery topics
+    const topic1 = this.topicTracker.registerSubqueryTopic(
+      query1,
+      "Wearable MAX subquery",
+    );
+    const topic2 = this.topicTracker.registerSubqueryTopic(
+      query2,
+      "Smartphone MAX subquery",
+    );
+
     this.logger.log(
       `Sub-queries added: ${JSON.stringify(this.orchestrator.getSubQueries())}`,
     );
+    this.unifiedLogger.info("Subqueries registered", {
+      count: 2,
+      topics: [topic1, topic2],
+    });
+
+    // Log topic mappings for debugging
+    console.log(`[ApproximationApproach] Subquery Topics:`);
+    console.log(`  Wearable: ${topic1}`);
+    console.log(`  Smartphone: ${topic2}`);
   }
 
   /**
@@ -133,6 +193,12 @@ WHERE {
 
     this.orchestrator.registerQuery(registeredQuery);
     this.logger.log(`Registered query: ${registeredQuery}`);
+
+    this.unifiedLogger.logQueryRegistration(
+      registeredQuery,
+      "approximation/output",
+    );
+    this.healthStatus.markQueryRegistered();
   }
 
   /**
@@ -176,6 +242,70 @@ WHERE {
   }
 
   /**
+   * Setup health check HTTP endpoint
+   * @returns {void}
+   */
+  private setupHealthCheckEndpoint(): void {
+    this.healthServer = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        const health = this.healthStatus.getHealthCheck();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(health, null, 2));
+      } else if (req.url === "/topics") {
+        const topicReport = this.topicTracker.generateReport();
+        const topicStats = this.topicTracker.getStats();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify(
+            {
+              report: topicReport,
+              stats: topicStats,
+              topics: this.topicTracker.getAllTopics(),
+            },
+            null,
+            2,
+          ),
+        );
+      } else if (req.url === "/status") {
+        const status = this.healthStatus.getStatusString();
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(status);
+      } else {
+        res.writeHead(404);
+        res.end("Not Found");
+      }
+    });
+
+    this.healthServer.listen(this.healthPort, () => {
+      console.log(
+        `[ApproximationApproach] Health check endpoint: http://localhost:${this.healthPort}/health`,
+      );
+      console.log(
+        `[ApproximationApproach] Topic tracker endpoint: http://localhost:${this.healthPort}/topics`,
+      );
+      console.log(
+        `[ApproximationApproach] Status endpoint: http://localhost:${this.healthPort}/status`,
+      );
+    });
+  }
+
+  /**
+   * Gets current health status
+   * @returns {object} Health check response
+   */
+  public getHealth(): any {
+    return this.healthStatus.getHealthCheck();
+  }
+
+  /**
+   * Gets topic tracker report
+   * @returns {string} Topic report
+   */
+  public getTopicReport(): string {
+    return this.topicTracker.generateReport();
+  }
+
+  /**
    * Clean up resources.
    * @returns {void}
    */
@@ -186,7 +316,14 @@ WHERE {
     if (this.resourceLogStream) {
       this.resourceLogStream.end();
     }
+    if (this.healthServer) {
+      this.healthServer.close();
+    }
+    this.unifiedLogger.close();
     console.log("[ApproximationApproach] Cleanup completed");
+
+    // Print final topic report
+    console.log(this.topicTracker.generateReport());
   }
 }
 

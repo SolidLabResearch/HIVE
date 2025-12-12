@@ -12,16 +12,16 @@ export type RSPAgentQuery = {
 export const RSPAgentQueryRecord: Record<string, RSPAgentQuery> = {};
 
 /**
- *
+ * HTTPServer class responsible for handling incoming HTTP requests.
  */
 export class HTTPServer {
     private readonly http_server: Server;
     public logger: any;
 
     /**
-     *
-     * @param http_port
-     * @param logger
+     * Creates an instance of HTTPServer.
+     * @param {number} http_port - The port number for the server to listen on.
+     * @param {any} logger - The logger instance.
      */
     constructor(http_port: number, logger: any) {
         this.http_server = createServer(this.request_handler.bind(this)).listen(http_port);
@@ -31,9 +31,9 @@ export class HTTPServer {
 
 
     /**
-     *
-     * @param request
-     * @param response
+     * Handles incoming requests.
+     * @param {IncomingMessage} request - The incoming HTTP request.
+     * @param {ServerResponse} response - The server response object.
      */
     private async request_handler(request: IncomingMessage, response: ServerResponse) {
         response.setHeader("Access-Control-Allow-Origin", "*");

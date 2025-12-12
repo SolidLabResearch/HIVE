@@ -149,7 +149,7 @@ async function main(): Promise<void> {
 
 // Graceful shutdown
 /**
- *
+ * Sets up the process signal handlers for graceful shutdown.
  */
 function setupShutdown(): void {
   const shutdown = (signal: string) => {

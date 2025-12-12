@@ -35,7 +35,7 @@ describe("HiveScoutBeeWrapper", () => {
       scoutBee.addDataPoint(timestamp, value, topic);
 
       const stats = scoutBee.getBufferStats();
-      expect(stats.count).toBe(1);
+      expect(stats.bufferSize).toBe(1);
       expect(stats.latest.value).toBe(value);
       expect(stats.latest.topic).toBe(topic);
     });
@@ -47,7 +47,7 @@ describe("HiveScoutBeeWrapper", () => {
       }
 
       const stats = scoutBee.getBufferStats();
-      expect(stats.count).toBe(100); // Should be limited to buffer size
+      expect(stats.bufferSize).toBe(100); // Should be limited to buffer size
     });
 
     test("should handle multiple topics", () => {
@@ -56,7 +56,7 @@ describe("HiveScoutBeeWrapper", () => {
       scoutBee.addDataPoint(3000, 30, "pressure");
 
       const stats = scoutBee.getBufferStats();
-      expect(stats.count).toBe(3);
+      expect(stats.bufferSize).toBe(3);
       expect(stats.topics).toEqual(["temperature", "humidity", "pressure"]);
     });
   });
@@ -301,19 +301,20 @@ describe("HiveScoutBeeWrapper", () => {
 
       const stats = scoutBee.getBufferStats();
 
-      expect(stats).toHaveProperty("count");
-      expect(stats).toHaveProperty("mean");
-      expect(stats).toHaveProperty("min");
-      expect(stats).toHaveProperty("max");
+      expect(stats).toHaveProperty("bufferSize");
+      expect(stats).toHaveProperty("valueRange");
+      expect(stats.valueRange).toHaveProperty("mean");
+      expect(stats.valueRange).toHaveProperty("min");
+      expect(stats.valueRange).toHaveProperty("max");
       expect(stats).toHaveProperty("variance");
       expect(stats).toHaveProperty("topics");
       expect(stats).toHaveProperty("timeRange");
       expect(stats).toHaveProperty("latest");
       expect(stats).toHaveProperty("oldest");
 
-      expect(stats.count).toBe(5);
-      expect(stats.min).toBe(10);
-      expect(stats.max).toBe(30);
+      expect(stats.bufferSize).toBe(5);
+      expect(stats.valueRange.min).toBe(10);
+      expect(stats.valueRange.max).toBe(30);
       expect(stats.topics).toEqual(["temp", "humidity", "pressure"]);
     });
 
@@ -326,9 +327,9 @@ describe("HiveScoutBeeWrapper", () => {
       scoutBee.addDataPoint(endTime, 30, "sensor1");
 
       const stats = scoutBee.getBufferStats();
-      expect(stats.timeRange.start).toBe(startTime);
-      expect(stats.timeRange.end).toBe(endTime);
-      expect(stats.timeRange.duration).toBe(endTime - startTime);
+      expect(stats.timeRange.start).toBe(new Date(startTime).toISOString());
+      expect(stats.timeRange.end).toBe(new Date(endTime).toISOString());
+      expect(stats.timeRange.duration).toBe(`${endTime - startTime}ms`);
     });
   });
 

@@ -2,7 +2,7 @@ import {fork, ChildProcess} from 'child_process';
 import * as path from 'path';
 
 /**
- *
+ * Starts the Fetching Data Client Side Orchestrator as a child process.
  */
 export async function startFetchingDataClientSide() : Promise<void> {
         const childPath = path.resolve(__dirname, '../FetchingAllDataClientSide.js');

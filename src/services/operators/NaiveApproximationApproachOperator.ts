@@ -2,6 +2,7 @@ import { RSPQLParser } from "rspql-containment-checker";
 import { IStreamQueryOperator } from "../../util/Interfaces";
 import { CSVLogger } from "../../util/logger/CSVLogger";
 import { ExtractedQuery, QueryMap } from "../../util/Types";
+import { hash_string_md5 } from "../../util/Util";
 import CONFIG from "../../config/httpServerConfig.json";
 import mqtt from "mqtt";
 
@@ -24,7 +25,6 @@ interface InactivityConfig {
  * The naive approximation approach approximates the results by not aligning the different
  * windows but rather by just combining the approximation results of
  * the different sized windows together.
- * @export
  * @class NaiveApproximationApproachOperator
  * @implements {IStreamQueryOperator}
  */
@@ -86,19 +86,85 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
    *
    */
   async setMQTTTopicMap(): Promise<void> {
-    const response = await fetch(this.queryFetchLocation);
-    if (!response.ok) {
-      throw new Error("Failed to fetch the subqueries.");
+    // Try to fetch with retries, but don't fail if HTTP server is not available
+    let retries = 3;
+    let lastError: Error | null = null;
+
+    while (retries > 0) {
+      try {
+        const response = await fetch(this.queryFetchLocation);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch subqueries: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        for (const [queryHash, mqttTopic] of Object.entries(data)) {
+          this.queryMQTTTopicMap.set(queryHash, mqttTopic as string);
+        }
+        this.extractedQueries = await this.extractQueriesWithTopics(
+          data as QueryMap,
+        );
+        console.log(
+          `Extracted ${this.extractedQueries.length} queries with topics.`,
+        );
+        return; // Success!
+      } catch (error) {
+        lastError = error as Error;
+        retries--;
+        if (retries > 0) {
+          console.log(
+            `Failed to fetch from HTTP server, retrying... (${retries} attempts left)`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1s before retry
+        }
+      }
     }
 
-    const data = await response.json();
-
-    for (const [queryHash, mqttTopic] of Object.entries(data)) {
-      this.queryMQTTTopicMap.set(queryHash, mqttTopic as string);
-    }
-    this.extractedQueries = await this.extractQueriesWithTopics(
-      data as QueryMap,
+    // If we get here, all retries failed
+    console.warn(
+      `Could not fetch queries from HTTP server at ${this.queryFetchLocation}: ${lastError?.message}`,
     );
+    console.warn(
+      "Continuing with locally added queries only (if any were added via addSubQuery)",
+    );
+
+    // Build extractedQueries and queryMQTTTopicMap from subQueries that were added directly
+    if (this.subQueries.length > 0) {
+      console.log(
+        `Using ${this.subQueries.length} locally added subqueries instead`,
+      );
+      // Use the same hashing logic as Orchestrator to compute chunked/${hash} topics
+      this.extractedQueries = this.subQueries.map((query) => {
+        // Compute the hash the same way as Orchestrator.addSubQuery()
+        const query_hash = hash_string_md5(query);
+        const r2s_topic = `chunked/${query_hash}`;
+        return {
+          rspql_query: query,
+          r2s_topic: r2s_topic,
+        };
+      });
+
+      // CRITICAL FIX: Also populate queryMQTTTopicMap so handleAggregation doesn't exit early
+      for (const extracted of this.extractedQueries) {
+        const query_hash = hash_string_md5(extracted.rspql_query);
+        this.queryMQTTTopicMap.set(query_hash, extracted.r2s_topic);
+        console.log(
+          `Mapped query hash ${query_hash} to topic ${extracted.r2s_topic}`,
+        );
+      }
+
+      console.log(
+        `Created ${this.extractedQueries.length} extracted queries from local subqueries`,
+      );
+      console.log(
+        `queryMQTTTopicMap now has ${this.queryMQTTTopicMap.size} entries`,
+      );
+    } else {
+      console.warn(
+        "No subqueries available - neither from HTTP server nor locally added",
+      );
+    }
   }
 
   /**
@@ -323,8 +389,12 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
         try {
           const data = message.toString();
 
+          // Parse the RDF triple to extract the numeric value
+          // Look for patterns like:
+          //   - saref:hasValue> "number"^^<type> (prefix notation)
+          //   - <https://saref.etsi.org/core/hasValue> "number"^^<type> (full URI from RSPAgent)
           const valueMatch = data.match(
-            /saref:hasValue>\s*"([^"]*)"(?:\^\^<[^>]*>)?/,
+            /(?:saref:hasValue>|<https:\/\/saref\.etsi\.org\/core\/hasValue>)\s*"([^"]*)"(?:\^\^<[^>]*>)?/,
           );
 
           let value: number;

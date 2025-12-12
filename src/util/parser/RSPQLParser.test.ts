@@ -2,7 +2,7 @@ import { RSPQLParser } from "./RSPQLParser";
 
 const simple_query = `PREFIX : <https://rsp.js/>
     REGISTER RStream <output> AS
-    SELECT AVG(?v) AS ?avgTemp
+    SELECT (AVG(?v) AS ?avgTemp)
     FROM NAMED WINDOW :w1 ON STREAM :stream1 [RANGE 10 STEP 2]
     WHERE{
         WINDOW :w1 { ?sensor :value ?v ; :measurement: ?m }
@@ -65,7 +65,7 @@ test("test_simple_sparql_extract", async () => {
   const parsed_query = parser.parse(simple_query);
 
   const expected_sparql = `PREFIX : <https://rsp.js/>
-SELECT AVG(?v) as ?avgTemp
+SELECT (AVG(?v) AS ?avgTemp)
 WHERE{
 GRAPH :w1 { ?sensor :value ?v ; :measurement: ?m }
 }`;

@@ -64,7 +64,7 @@ class RealWorldFrequencyExperimentRunner {
    *
    */
   constructor() {
-    this.projectRoot = path.resolve(__dirname, "../..");
+    this.projectRoot = this.findProjectRoot();
 
     // Load configuration
     const configPath = path.join(
@@ -76,6 +76,17 @@ class RealWorldFrequencyExperimentRunner {
     }
 
     this.config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  }
+
+  private findProjectRoot(): string {
+    let current = __dirname;
+    while (current !== path.dirname(current)) {
+      if (fs.existsSync(path.join(current, "package.json"))) {
+        return current;
+      }
+      current = path.dirname(current);
+    }
+    throw new Error("Could not find project root (package.json not found)");
   }
 
   /**

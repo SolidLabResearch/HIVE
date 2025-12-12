@@ -2,7 +2,7 @@ import { fork, ChildProcess } from 'child_process';
 import * as path from 'path';
 
 /**
- *
+ * Starts the Streaming Query Hive Orchestrator as a child process.
  */
 export async function startStreamingHiveApproach(): Promise<void> {
     const childPath = path.resolve(__dirname, '../StreamingQueryHiveApproachOrchestrator.js');

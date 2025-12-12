@@ -3,15 +3,15 @@ import { RSPAgentQuery } from "./HTTPServer";
 
 
 /**
- *
+ * POSTHandler class responsible for handling incoming POST requests.
  */
 export class POSTHandler {
     /**
-     *
-     * @param request
-     * @param response
-     * @param body
-     * @param rspAgentRecord
+     * Handles incoming POST requests.
+     * @param {IncomingMessage} request - The incoming HTTP request.
+     * @param {ServerResponse} response - The server response object.
+     * @param {string} body - The body of the request.
+     * @param {Record<string, RSPAgentQuery>} rspAgentRecord - The record of registered RSP Agent queries.
      */
     public static async handle(request: IncomingMessage, response: ServerResponse, body: string, rspAgentRecord: Record<string, RSPAgentQuery>) {
         response.setHeader("Content-Type", "application/json");
@@ -63,10 +63,10 @@ export class POSTHandler {
     }
 
     /**
-     *
-     * @param parsedBody
-     * @param response
-     * @param rspAgentRecord
+     * Registers a new RSP Agent query.
+     * @param {any} parsedBody - The parsed body of the request.
+     * @param {ServerResponse} response - The server response object.
+     * @param {any} rspAgentRecord - The record of registered RSP Agent queries.
      */
     private static async registerQueryAndAgent(parsedBody: any, response: ServerResponse, rspAgentRecord: any) {        
         

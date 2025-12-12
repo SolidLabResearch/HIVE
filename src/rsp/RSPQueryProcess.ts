@@ -161,23 +161,21 @@ export class RSPQueryProcess {
           data,
           event_timestamp,
         );
-        const aggregation_object_string = JSON.stringify(aggregation_event);
+        // Publish RDF as plain string, not JSON-wrapped (operators expect raw RDF)
         rstream_publisher.publish(
           this.rstream_topic,
-          aggregation_object_string,
+          aggregation_event,
           (err: any) => {
             if (err) {
               console.error(`Error publishing aggregation event: ${err}`);
             } else {
               console.log(
-                `Successfully published aggregation event: ${aggregation_object_string}`,
+                `Successfully published aggregation event: ${aggregation_event}`,
               );
             }
           },
         );
-        console.log(
-          `Published aggregation event: ${aggregation_object_string}`,
-        );
+        console.log(`Published aggregation event: ${aggregation_event}`);
       }
     });
   }
@@ -200,26 +198,28 @@ export class RSPQueryProcess {
   /**
    * Adds an event store to the RSP engine.
    * @param {any} event_store - The N3 store containing event quads.
-   * @param {RDFStream[]} stream_name - Array of RDF streams to add to.
+   * @param {RDFStream[]} streams - Array of RDF streams to add to.
    * @param {number} timestamp - The timestamp of the event.
    * @returns {Promise<void>}
    */
   public async add_event_store_to_rsp_engine(
     event_store: any,
-    stream_name: RDFStream[],
+    streams: RDFStream[],
     timestamp: number,
   ): Promise<void> {
-    stream_name.forEach(async (stream: RDFStream) => {
+    for (const stream of streams) {
       const quads = event_store.getQuads(null, null, null, null);
       for (const quad of quads) {
+        // Use the stream's name property for the graph component
+        const streamName = (stream as any).name || "default";
         const quadWithGraph = DataFactory.quad(
           quad.subject,
           quad.predicate,
           quad.object,
-          DataFactory.namedNode(stream_name),
+          DataFactory.namedNode(streamName),
         );
         stream.add(quadWithGraph, timestamp);
       }
-    });
+    }
   }
 }

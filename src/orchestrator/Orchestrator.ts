@@ -18,7 +18,7 @@ export class Orchestrator {
 
   /**
    * Constructor for the Orchestrator class.
-   * @param operatorType - The type of operator to be used in the orchestrator.
+   * @param {string} operatorType - The type of operator to be used in the orchestrator.
    */
   constructor(operatorType: string) {
     this.subQueriesToRun = [];
@@ -35,22 +35,30 @@ export class Orchestrator {
   /**
    * Adds a sub-query to the orchestrator.
    * @param {string} query - The sub-query to add.
-   * @returns {void} - No return value.
+   * @returns {Promise<void>} - Promise that resolves after agent setup delay.
    */
-  addSubQuery(query: string): void {
+  async addSubQuery(query: string): Promise<void> {
     this.subQueriesToRun.push(query);
     const query_hash = hash_string_md5(query);
 
     const queryAgent = new RSPAgent(query, `chunked/${query_hash}`);
+
+    // Fire off stream processing (non-blocking)
     queryAgent
       .process_streams()
       .then(() => {
-        console.log(`Added sub-query: ${query}`);
+        console.log(
+          `RSPAgent streams connected for: ${query.substring(0, 50)}...`,
+        );
       })
       .catch((error: Error) => {
         console.error(`Error processing sub-query "${query}":`, error);
       });
+
     console.log(`Sub-query added: ${query}`);
+
+    // Wait a bit for MQTT connection to establish
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
   /**

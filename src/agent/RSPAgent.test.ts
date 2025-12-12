@@ -1,5 +1,23 @@
 import { RSPAgent } from "./RSPAgent";
 
+// Mock mqtt
+jest.mock("mqtt", () => ({
+  connect: jest.fn().mockReturnValue({
+    on: jest.fn(),
+    subscribe: jest.fn(),
+    publish: jest.fn(),
+    end: jest.fn(),
+  }),
+}));
+
+// Mock fetch
+global.fetch = jest.fn(() =>
+  Promise.resolve({
+    ok: true,
+    json: () => Promise.resolve({}),
+  } as Response),
+);
+
 describe("RSPAgent", () => {
 
     test("should create an instance of RSPAgent", () => {

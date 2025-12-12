@@ -12,10 +12,10 @@ import { RSPAgentQuery } from "./HTTPServer";
  */
 export class GETHandler {
     /**
-     *
-     * @param request
-     * @param response
-     * @param rspAgentRecord
+     * Handles incoming GET requests.
+     * @param {IncomingMessage} request - The incoming HTTP request.
+     * @param {ServerResponse} response - The server response object.
+     * @param {Record<string, RSPAgentQuery>} rspAgentRecord - The record of registered RSP Agent queries.
      */
     public static async handle(request: IncomingMessage, response: ServerResponse, rspAgentRecord: Record<string, RSPAgentQuery>) {
         if (request.url === "/fetchQueries" && request.method === "GET") {

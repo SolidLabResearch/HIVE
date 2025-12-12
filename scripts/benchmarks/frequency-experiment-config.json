@@ -1,0 +1,41 @@
+{
+  "experiment": {
+    "name": "Frequency-Based Streaming Query Comparison",
+    "description": "Compare different streaming query approaches across multiple frequencies",
+    "timestamp": "2025-12-11T09:42:25.914Z",
+    "iterations": 5
+  },
+  "frequencies": [
+    "4Hz",
+    "8Hz",
+    "16Hz",
+    "32Hz",
+    "64Hz",
+    "128Hz"
+  ],
+  "deviceTypes": [
+    "smartphone",
+    "wearable"
+  ],
+  "approaches": [
+    "fetching-client-side",
+    "streaming-query-hive",
+    "chunked-approach",
+    "approximation-approach"
+  ],
+  "dataBasePath": "/Users/kushbisen/Code/streaming-query-hive/src/streamer/data/frequency_variants/2mins",
+  "outputPath": "/Users/kushbisen/Code/streaming-query-hive/results/frequency-experiments",
+  "queries": {
+    "windowSize": 1000,
+    "avgAcceleration": {
+      "name": "Average Acceleration",
+      "sparql": "\n                            PREFIX saref: <https://saref.etsi.org/core/>\n                            PREFIX dahcc: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>\n                            SELECT (AVG(?value) as ?avgAcceleration)\n                            WHERE {\n                                ?obs saref:hasValue ?value .\n                                ?obs saref:relatesToProperty dahcc:smartphoneX .\n                            }\n                        "
+    }
+  },
+  "metrics": {
+    "latency": "Response time per query (ms)",
+    "memory": "Peak memory usage (MB)",
+    "accuracy": "Deviation from ground truth (%)",
+    "throughput": "Observations processed per second"
+  }
+}

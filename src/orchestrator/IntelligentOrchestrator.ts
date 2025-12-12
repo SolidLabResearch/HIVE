@@ -198,8 +198,7 @@ export class IntelligentOrchestrator {
 
   /**
    * Get approach recommendation based on current stream analysis data.
-   * @param {number} queryComplexity - Estimated complexity of the registered query (1-10 scale).
-   * @param _queryComplexity
+   * @param {number} _queryComplexity - Estimated complexity of the registered query (1-10 scale). Currently unused but reserved for future logic.
    * @returns {Promise<ApproachRecommendation | null>} - The recommended approach and details, or null if no recommendation could be made.
    */
   async getApproachRecommendation(

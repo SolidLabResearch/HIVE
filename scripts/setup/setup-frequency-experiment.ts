@@ -54,11 +54,22 @@ class FrequencyExperimentSetup {
    *
    */
   constructor() {
-    this.projectRoot = path.resolve(__dirname, "../..");
+    this.projectRoot = this.findProjectRoot();
     this.dataBasePath = path.join(
       this.projectRoot,
       "src/streamer/data/frequency_variants/2mins",
     );
+  }
+
+  private findProjectRoot(): string {
+    let current = __dirname;
+    while (current !== path.dirname(current)) {
+      if (fs.existsSync(path.join(current, "package.json"))) {
+        return current;
+      }
+      current = path.dirname(current);
+    }
+    throw new Error("Could not find project root (package.json not found)");
   }
 
   /**

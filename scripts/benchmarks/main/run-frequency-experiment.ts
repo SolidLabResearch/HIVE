@@ -51,12 +51,10 @@ interface ExperimentResult {
   error?: string;
 }
 
- 
 interface ApproachOrchestrator {
   runExperiment(): Promise<any>;
   getName(): string;
 }
- 
 
 /**
  *
@@ -74,7 +72,7 @@ class FrequencyExperimentRunner {
    *
    */
   constructor() {
-    this.projectRoot = path.resolve(__dirname, "../..");
+    this.projectRoot = this.findProjectRoot();
 
     // Load configuration
     const configPath = path.join(
@@ -99,6 +97,17 @@ class FrequencyExperimentRunner {
     console.log(`Valid iterations: ${this.validIterations}`);
     console.log(`Cooldown iterations: ${this.cooldownIterations}`);
     console.log(`Total iterations: ${this.config.experiment.iterations}`);
+  }
+
+  private findProjectRoot(): string {
+    let current = __dirname;
+    while (current !== path.dirname(current)) {
+      if (fs.existsSync(path.join(current, "package.json"))) {
+        return current;
+      }
+      current = path.dirname(current);
+    }
+    throw new Error("Could not find project root (package.json not found)");
   }
 
   /**

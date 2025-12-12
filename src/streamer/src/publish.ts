@@ -2,17 +2,10 @@
 import { CSVLogger } from '../../util/logger/CSVLogger';
 import { StreamToMQTT } from './publishing/StreamToMQTT';
 
-/**
- *
- */
 const logger = new CSVLogger('replayer-log.csv');
 
 /**
- *
- */
-
-/**
- *
+ * Replays the Smartphone X acceleration stream.
  */
 async function replaySmartphoneXStream() {
     // Pass a unique clientId for persistent MQTT session
@@ -31,7 +24,7 @@ async function replaySmartphoneXStream() {
 }
 
 /**
- *
+ * Replays the Wearable X acceleration stream.
  */
 async function replayWearableXStream() {
     // Pass a unique clientId for persistent MQTT session
@@ -49,7 +42,7 @@ async function replayWearableXStream() {
 }
 
 /**
- *
+ * Replays all streams concurrently.
  */
 async function replayStreams() {
     await Promise.all([

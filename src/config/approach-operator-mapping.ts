@@ -29,8 +29,8 @@ export const APPROACH_OPERATOR_MAPPINGS: ApproachOperatorMapping[] = [
 
 /**
  * Get the operator type for a given approach type.
- * @param approach - The approach type.
- * @returns The corresponding operator type.
+ * @param {ApproachType} approach - The approach type.
+ * @returns {OperatorType} The corresponding operator type.
  * @throws Error if no mapping exists for the approach.
  */
 export function getOperatorForApproach(approach: ApproachType): OperatorType {
@@ -46,8 +46,8 @@ export function getOperatorForApproach(approach: ApproachType): OperatorType {
 
 /**
  * Get the approach type for a given operator type.
- * @param operator - The operator type.
- * @returns An array of approach types that use this operator.
+ * @param {OperatorType} operator - The operator type.
+ * @returns {ApproachType[]} An array of approach types that use this operator.
  */
 export function getApproachesForOperator(operator: OperatorType): ApproachType[] {
   return APPROACH_OPERATOR_MAPPINGS
@@ -57,9 +57,9 @@ export function getApproachesForOperator(operator: OperatorType): ApproachType[]
 
 /**
  * Validate that an approach and operator combination is valid.
- * @param approach - The approach type.
- * @param operator - The operator type.
- * @returns True if the combination is valid, false otherwise.
+ * @param {ApproachType} approach - The approach type.
+ * @param {OperatorType} operator - The operator type.
+ * @returns {boolean} True if the combination is valid, false otherwise.
  */
 export function isValidApproachOperatorCombination(
   approach: ApproachType,
@@ -72,7 +72,7 @@ export function isValidApproachOperatorCombination(
 
 /**
  * Get all valid approach-operator mappings.
- * @returns Array of all configured mappings.
+ * @returns {ApproachOperatorMapping[]} Array of all configured mappings.
  */
 export function getAllMappings(): ApproachOperatorMapping[] {
   return [...APPROACH_OPERATOR_MAPPINGS];

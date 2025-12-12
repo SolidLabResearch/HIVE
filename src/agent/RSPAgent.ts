@@ -29,8 +29,15 @@ export class RSPAgent {
     this.rspql_parser = new RSPQLParser();
     this.rsp_engine = new RSPEngine(query);
     this.rstream_emitter = this.rsp_engine.register();
-    this.http_server_location = "http://localhost:8080/";
-    this.registerToQueryRegistry();
+    // Use HTTP_PORT from environment if available, otherwise default to 8080
+    const httpPort = process.env.HTTP_PORT || "8080";
+    this.http_server_location = `http://localhost:${httpPort}/`;
+    // Register async but don't block - handle errors gracefully
+    this.registerToQueryRegistry().catch((error) => {
+      console.warn(
+        `[RSPAgent] Could not register query to registry: ${error.message}. Continuing without registration.`,
+      );
+    });
     this.subscribeRStream();
   }
 
@@ -42,29 +49,56 @@ export class RSPAgent {
   public async registerToQueryRegistry(): Promise<any> {
     console.log(`Registering query: ${this.query} to the query registry.`);
     const register_location = `${this.http_server_location}register`;
-    const request = await fetch(register_location, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        rspql_query: this.query,
-        r2s_topic: this.r2s_topic,
-        data_topic: this.r2s_topic,
-        id: hash_string_md5(this.query),
-      }),
-    });
-    if (!request.ok) {
-      throw new Error(
-        `Failed to register query: ${this.query}. Status: ${request.status}`,
-      );
+
+    // Try to register with retries
+    let retries = 3;
+    let lastError: Error | null = null;
+
+    while (retries > 0) {
+      try {
+        const request = await fetch(register_location, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            rspql_query: this.query,
+            r2s_topic: this.r2s_topic,
+            data_topic: this.r2s_topic,
+            id: hash_string_md5(this.query),
+          }),
+        });
+        if (!request.ok) {
+          throw new Error(
+            `Failed to register query: ${this.query}. Status: ${request.status}`,
+          );
+        }
+        const response = await request.json();
+        if (response.error) {
+          throw new Error(`Error registering query: ${response.error}`);
+        }
+        console.log(`Successfully registered query: ${this.query}`);
+        return response;
+      } catch (error) {
+        lastError = error as Error;
+        retries--;
+        if (retries > 0) {
+          console.log(
+            `[RSPAgent] Failed to register to query registry, retrying... (${retries} attempts left)`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
     }
-    const response = await request.json();
-    if (response.error) {
-      throw new Error(`Error registering query: ${response.error}`);
-    }
-    console.log(`Successfully registered query: ${this.query}`);
-    return response;
+
+    // If we get here, all retries failed - don't throw, just warn
+    console.warn(
+      `[RSPAgent] Could not register query to HTTP registry after retries: ${lastError?.message}`,
+    );
+    console.warn(
+      `[RSPAgent] Continuing without HTTP registration - agent will still function via MQTT.`,
+    );
+    return null;
   }
 
   /**
@@ -170,7 +204,16 @@ export class RSPAgent {
         for (const item of iterables) {
           const data = item.value;
           console.log("Binding data received:", data);
-          rstream_publisher.publish(this.r2s_topic, data);
+          // Format the output as RDF using generate_aggregation_event so operators can parse it
+          const rdfFormattedData = this.generate_aggregation_event(
+            data,
+            Date.now(),
+          );
+          console.log(
+            `Publishing RDF formatted data to ${this.r2s_topic}:`,
+            rdfFormattedData,
+          );
+          rstream_publisher.publish(this.r2s_topic, rdfFormattedData);
         }
       });
     });
@@ -204,20 +247,22 @@ export class RSPAgent {
    */
   public async add_event_store_to_rsp_engine(
     event_store: any,
-    stream_name: RDFStream[],
+    streams: RDFStream[],
     timestamp: number,
   ): Promise<void> {
-    stream_name.forEach(async (stream: RDFStream) => {
+    for (const stream of streams) {
       const quads = event_store.getQuads(null, null, null, null);
       for (const quad of quads) {
+        // Use the stream's name property for the graph component
+        const streamName = (stream as any).name || "default";
         const quadWithGraph = DataFactory.quad(
           quad.subject,
           quad.predicate,
           quad.object,
-          DataFactory.namedNode(stream_name),
+          DataFactory.namedNode(streamName),
         );
         stream.add(quadWithGraph, timestamp);
       }
-    });
+    }
   }
 }

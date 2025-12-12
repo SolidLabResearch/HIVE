@@ -4,6 +4,13 @@ import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
 import path from "path";
+import {
+  createOrchestratorLogger,
+  UnifiedLogger,
+} from "../util/logger/UnifiedLogger";
+import { HealthStatus } from "../util/health/HealthStatus";
+import { getTopicTracker } from "../util/topic/TopicTracker";
+import * as http from "http";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -18,16 +25,20 @@ class FetchingAllDataClientSide {
   public rspql_parser: RSPQLParser;
   public rsp_engine: RSPEngine;
   public rstream_emitter: EventEmitter;
-  private logStream!: fs.WriteStream;
+  private logStream?: fs.WriteStream;
+  private unifiedLogger: UnifiedLogger;
+  private healthStatus: HealthStatus;
+  private resultsCsvStream?: fs.WriteStream;
+  private queryRegisteredTimestamp: number | null = null;
   private windowStreamMap: { [key: string]: string } = {
     "mqtt://localhost:1883/wearableX": "https://rsp.jsw1",
     "mqtt://localhost:1883/smartphoneX": "https://rsp.jsw1",
   };
-  private expectedWindowInterval: number = 60000;
-  private tolerance: number = 5000;
-  private startTime: number = 0;
-  private lastValidResultTime: number = 0;
-  private queryRegisteredTime: number = 0;
+  private expectedWindowInterval: number;
+  private tolerance: number;
+  private startTime: number;
+  private lastValidResultTime: number | null;
+  private queryRegisteredTime: number | null;
 
   /**
    * Creates a new FetchingAllDataClientSide instance.
@@ -43,9 +54,23 @@ class FetchingAllDataClientSide {
     this.rstream_emitter = this.rsp_engine.register();
     this.startTime = Date.now();
     this.queryRegisteredTime = Date.now();
+    this.queryRegisteredTimestamp = Date.now();
+    this.expectedWindowInterval = 60000;
+    this.tolerance = 5000;
+    this.lastValidResultTime = null;
+
+    this.unifiedLogger = new UnifiedLogger({
+      component: "client_side",
+      logDirectory: logDirectory || path.join("logs", "fetching"),
+      enableConsole: false,
+      enableFile: true,
+    });
+    this.healthStatus = new HealthStatus("fetching", "client_side");
 
     this.initializeLogging(logDirectory);
     this.log("fetching_query_registered");
+    this.unifiedLogger.logQueryRegistration(query, r2s_topic);
+    this.healthStatus.markQueryRegistered();
 
     this.subscribeRStream();
   }
@@ -54,16 +79,32 @@ class FetchingAllDataClientSide {
    * Initializes logging mechanism.
    * @param {string} [logDirectory] - Optional directory for log files.
    */
-  private initializeLogging(logDirectory?: string) {
+  private initializeLogging(logDirectory?: string): void {
     const baseName = "fetching_client_side_log.csv";
     const logFilePath = logDirectory
       ? path.join(logDirectory, baseName)
       : baseName;
     const writeHeader = !fs.existsSync(logFilePath);
     this.logStream = fs.createWriteStream(logFilePath, { flags: "a" });
-
     if (writeHeader) {
       this.logStream.write("timestamp,message\n");
+    }
+
+    // Initialize results CSV in results/ folder
+    const resultsDir = "results";
+    if (!fs.existsSync(resultsDir)) {
+      fs.mkdirSync(resultsDir, { recursive: true });
+    }
+    const resultsFileName = "fetching_client_side_results.csv";
+    const resultsFilePath = path.join(resultsDir, resultsFileName);
+    const writeResultsHeader = !fs.existsSync(resultsFilePath);
+    this.resultsCsvStream = fs.createWriteStream(resultsFilePath, {
+      flags: "a",
+    });
+    if (writeResultsHeader) {
+      this.resultsCsvStream.write(
+        "query_registered_timestamp,result_timestamp,result\n",
+      );
     }
   }
 
@@ -124,10 +165,15 @@ class FetchingAllDataClientSide {
               rsp_stream_object,
               timestamp_epoch,
             );
+            this.healthStatus.recordDataProcessing(1);
           }
         } catch (error) {
           console.error("Error processing message:", error);
           this.log(`Error processing message: ${error}`);
+          this.unifiedLogger.error("Error processing message", {
+            error: String(error),
+          });
+          this.healthStatus.recordError(String(error));
         }
       });
     }
@@ -223,6 +269,8 @@ class FetchingAllDataClientSide {
         this.log(
           `RStream result generated: ${data} at timestamp: ${currentTimestamp}`,
         );
+        this.unifiedLogger.logResultGeneration(data, this.r2s_topic);
+        this.healthStatus.recordResult(data);
 
         if (!this.isWithinExpectedWindowTiming(currentTimestamp)) {
           this.log(`Filtered out result due to timing: ${data}`);
@@ -260,6 +308,13 @@ class FetchingAllDataClientSide {
               } else {
                 console.log("Aggregation event published with QoS 2");
                 this.log(`Successfully published result: ${data}`);
+                this.unifiedLogger.logResultPublication(this.r2s_topic, true);
+
+                // Write to results CSV
+                if (this.resultsCsvStream && this.queryRegisteredTimestamp) {
+                  const csvLine = `${this.queryRegisteredTimestamp},${currentTimestamp},${data}\n`;
+                  this.resultsCsvStream.write(csvLine);
+                }
               }
               pubClient.end();
             },
@@ -291,6 +346,18 @@ class FetchingAllDataClientSide {
     if (this.logStream) {
       this.logStream.end();
     }
+    if (this.resultsCsvStream) {
+      this.resultsCsvStream.end();
+    }
+    this.unifiedLogger.close();
+  }
+
+  /**
+   * Gets health status
+   * @returns {any} Health check response
+   */
+  public getHealth(): any {
+    return this.healthStatus.getHealthCheck();
   }
 }
 
@@ -302,11 +369,24 @@ export class FetchingClientSideApproachOrchestrator {
   private client?: FetchingAllDataClientSide;
   private resourceLogStream?: fs.WriteStream;
   private resourceLogInterval?: ReturnType<typeof setInterval>;
+  private unifiedLogger: UnifiedLogger;
+  private healthStatus: HealthStatus;
+  private topicTracker: ReturnType<typeof getTopicTracker>;
+  private healthServer?: http.Server;
+  private healthPort: number = 9092;
 
   /**
    * Creates a new FetchingClientSideApproachOrchestrator instance.
    */
-  constructor() {}
+  constructor() {
+    this.unifiedLogger = createOrchestratorLogger("fetching");
+    this.healthStatus = new HealthStatus("fetching", "orchestrator");
+    this.topicTracker = getTopicTracker("fetching");
+
+    this.setupHealthCheckEndpoint();
+
+    this.unifiedLogger.info("Fetching Client Side Orchestrator initialized");
+  }
 
   /**
    * Get the name of this approach.
@@ -322,6 +402,21 @@ export class FetchingClientSideApproachOrchestrator {
    */
   public async runExperiment(): Promise<any> {
     console.log(`[FetchingClientSide] Starting experiment`);
+    this.unifiedLogger.info("Starting experiment");
+
+    // Register topics
+    this.topicTracker.registerInputTopic(
+      "wearableX",
+      "Wearable sensor data stream",
+    );
+    this.topicTracker.registerInputTopic(
+      "smartphoneX",
+      "Smartphone sensor data stream",
+    );
+    this.topicTracker.registerResultTopic(
+      "client_operation_output",
+      "Fetching client side results",
+    );
 
     try {
       const query = `
@@ -352,12 +447,16 @@ WHERE {
       console.log(new RSPQLParser().parse(query).sparql);
 
       const r2s_topic = "client_operation_output";
-      const logDirectory = process.env.CUSTOM_LOG_DIR;
+      const logDirectory =
+        process.env.CUSTOM_LOG_DIR || path.join("logs", "fetching");
       this.client = new FetchingAllDataClientSide(
         query,
         r2s_topic,
         logDirectory,
       );
+
+      this.unifiedLogger.logQueryRegistration(query, r2s_topic);
+      this.healthStatus.markQueryRegistered();
 
       this.startResourceUsageLogging();
 
@@ -366,10 +465,20 @@ WHERE {
       console.log(
         `[FetchingClientSide] Experiment started, processing streams...`,
       );
+      console.log(
+        `[FetchingClientSide] Health check: http://localhost:${this.healthPort}/health`,
+      );
+      console.log(
+        `[FetchingClientSide] Topic tracker: http://localhost:${this.healthPort}/topics`,
+      );
+
+      this.unifiedLogger.info("Experiment started, streams processing");
 
       return { status: "running" };
     } catch (error) {
       console.error(`[FetchingClientSide] Error during experiment:`, error);
+      this.unifiedLogger.error("Experiment failed", { error: String(error) });
+      this.healthStatus.recordError(String(error));
       throw error;
     }
   }
@@ -413,6 +522,76 @@ WHERE {
   }
 
   /**
+   * Setup health check HTTP endpoint
+   * @returns {void}
+   */
+  private setupHealthCheckEndpoint(): void {
+    this.healthServer = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        const health = this.getHealth();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(health, null, 2));
+      } else if (req.url === "/topics") {
+        const topicReport = this.topicTracker.generateReport();
+        const topicStats = this.topicTracker.getStats();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify(
+            {
+              report: topicReport,
+              stats: topicStats,
+              topics: this.topicTracker.getAllTopics(),
+            },
+            null,
+            2,
+          ),
+        );
+      } else if (req.url === "/status") {
+        const status = this.healthStatus.getStatusString();
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(status);
+      } else {
+        res.writeHead(404);
+        res.end("Not Found");
+      }
+    });
+
+    this.healthServer.listen(this.healthPort, () => {
+      console.log(
+        `[FetchingClientSide] Health check endpoint: http://localhost:${this.healthPort}/health`,
+      );
+      console.log(
+        `[FetchingClientSide] Topic tracker endpoint: http://localhost:${this.healthPort}/topics`,
+      );
+      console.log(
+        `[FetchingClientSide] Status endpoint: http://localhost:${this.healthPort}/status`,
+      );
+    });
+  }
+
+  /**
+   * Gets current health status (includes client health if available)
+   * @returns {object} Combined health check response
+   */
+  public getHealth(): any {
+    const orchestratorHealth = this.healthStatus.getHealthCheck();
+    const clientHealth = this.client ? this.client.getHealth() : null;
+
+    return {
+      orchestrator: orchestratorHealth,
+      client: clientHealth,
+    };
+  }
+
+  /**
+   * Gets topic tracker report
+   * @returns {string} Topic report
+   */
+  public getTopicReport(): string {
+    return this.topicTracker.generateReport();
+  }
+
+  /**
    * Clean up resources.
    * @returns {void}
    */
@@ -426,7 +605,14 @@ WHERE {
     if (this.client) {
       this.client.cleanup();
     }
+    if (this.healthServer) {
+      this.healthServer.close();
+    }
+    this.unifiedLogger.close();
     console.log("[FetchingClientSide] Cleanup completed");
+
+    // Print final topic report
+    console.log(this.topicTracker.generateReport());
   }
 }
 
