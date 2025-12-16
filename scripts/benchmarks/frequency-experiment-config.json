@@ -2,7 +2,7 @@
   "experiment": {
     "name": "Frequency-Based Streaming Query Comparison",
     "description": "Compare different streaming query approaches across multiple frequencies",
-    "timestamp": "2025-12-11T09:42:25.914Z",
+    "timestamp": "2025-12-16T08:45:42.169Z",
     "iterations": 5
   },
   "frequencies": [

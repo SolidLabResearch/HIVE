@@ -252,7 +252,8 @@ class SingleRunVerifier {
     env: Record<string, string>,
   ): Promise<void> {
     return new Promise((resolve) => {
-      const fullPath = path.resolve(__dirname, scriptPath);
+      const projectRoot = path.resolve(__dirname, "..");
+      const fullPath = path.resolve(projectRoot, scriptPath);
       console.log(`    [${name.toUpperCase()}] Starting at: ${fullPath}`);
 
       const proc = spawn("npx", ["ts-node", fullPath], {

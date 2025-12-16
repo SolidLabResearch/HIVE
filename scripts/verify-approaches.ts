@@ -47,7 +47,11 @@ class ApproachVerifier {
   private publisherClient?: mqtt.MqttClient;
   private approachResults: Map<string, ApproachResult> = new Map();
   private dataPublishCount = 0;
-  private allMessages: Array<{ topic: string; timestamp: number; content: string }> = [];
+  private allMessages: Array<{
+    topic: string;
+    timestamp: number;
+    content: string;
+  }> = [];
 
   constructor() {
     this.initializeResults();
@@ -88,18 +92,24 @@ class ApproachVerifier {
     console.log("VERIFICATION TEST: ALL 3 STREAMING QUERY APPROACHES");
     console.log("=".repeat(70));
     console.log("Testing:");
-    console.log("  1. Approximation Approach -> " + OUTPUT_TOPICS.approximation);
+    console.log(
+      "  1. Approximation Approach -> " + OUTPUT_TOPICS.approximation,
+    );
     console.log("  2. Chunked Query Approach -> " + OUTPUT_TOPICS.chunked);
     console.log("  3. Fetching Client Side   -> " + OUTPUT_TOPICS.fetching);
     console.log("=".repeat(70));
-    console.log(`Duration: ${EXPERIMENT_DURATION_S}s data + ${FINAL_WAIT_S}s wait`);
+    console.log(
+      `Duration: ${EXPERIMENT_DURATION_S}s data + ${FINAL_WAIT_S}s wait`,
+    );
     console.log("=".repeat(70));
 
     try {
       await this.setupMQTTMonitoring();
       await this.launchOrchestrators();
 
-      console.log(`\n[WAIT] ${INIT_WAIT_S}s for orchestrators to initialize...`);
+      console.log(
+        `\n[WAIT] ${INIT_WAIT_S}s for orchestrators to initialize...`,
+      );
       await this.sleep(INIT_WAIT_S * 1000);
 
       await this.publishTestData();
@@ -163,7 +173,9 @@ class ApproachVerifier {
           this.recordResult("fetching", content);
         } else if (topic.startsWith("chunked/")) {
           // Subquery output for chunked approach
-          console.log(`  [CHUNKED SUBQUERY] ${topic}: ${content.substring(0, 80)}...`);
+          console.log(
+            `  [CHUNKED SUBQUERY] ${topic}: ${content.substring(0, 80)}...`,
+          );
         }
       });
 
@@ -181,7 +193,9 @@ class ApproachVerifier {
     const result = this.approachResults.get(approach);
     if (result) {
       result.results.push({ timestamp: Date.now(), content });
-      console.log(`  [${result.name.toUpperCase()}] Result #${result.results.length}: ${content.substring(0, 100)}...`);
+      console.log(
+        `  [${result.name.toUpperCase()}] Result #${result.results.length}: ${content.substring(0, 100)}...`,
+      );
     }
   }
 
@@ -195,21 +209,21 @@ class ApproachVerifier {
     await this.launchOrchestrator(
       "approximation",
       "src/approaches/ApproximationApproachOrchestrator.ts",
-      { HTTP_PORT: "8081" }
+      { HTTP_PORT: "8081" },
     );
 
     // Chunked Query Approach
     await this.launchOrchestrator(
       "chunked",
       "src/approaches/ChunkedQueryApproachOrchestrator.ts",
-      { HTTP_PORT: "8082" }
+      { HTTP_PORT: "8082" },
     );
 
     // Fetching Client Side Approach
     await this.launchOrchestrator(
       "fetching",
       "src/approaches/FetchingClientSideApproachOrchestrator.ts",
-      { HTTP_PORT: "8083" }
+      { HTTP_PORT: "8083" },
     );
 
     console.log("  All orchestrators launched");
@@ -221,10 +235,11 @@ class ApproachVerifier {
   private launchOrchestrator(
     name: string,
     scriptPath: string,
-    env: Record<string, string>
+    env: Record<string, string>,
   ): Promise<void> {
     return new Promise((resolve) => {
-      const fullPath = path.resolve(__dirname, scriptPath);
+      const projectRoot = path.resolve(__dirname, "..");
+      const fullPath = path.resolve(projectRoot, scriptPath);
 
       const proc = spawn("npx", ["ts-node", fullPath], {
         env: { ...process.env, ...env },
@@ -234,11 +249,18 @@ class ApproachVerifier {
       this.orchestrators.set(name, proc);
 
       proc.stdout?.on("data", (data: Buffer) => {
-        const lines = data.toString().split("\n").filter((l: string) => l.trim());
+        const lines = data
+          .toString()
+          .split("\n")
+          .filter((l: string) => l.trim());
         for (const line of lines) {
           if (line.includes("error") || line.includes("Error")) {
             console.log(`  [${name.toUpperCase()}:ERR] ${line}`);
-          } else if (line.includes("Result") || line.includes("output") || line.includes("Published")) {
+          } else if (
+            line.includes("Result") ||
+            line.includes("output") ||
+            line.includes("Published")
+          ) {
             console.log(`  [${name.toUpperCase()}] ${line}`);
           }
         }
@@ -247,7 +269,9 @@ class ApproachVerifier {
       proc.stderr?.on("data", (data: Buffer) => {
         const msg = data.toString().trim();
         if (msg && !msg.includes("ExperimentalWarning")) {
-          console.log(`  [${name.toUpperCase()}:STDERR] ${msg.substring(0, 100)}`);
+          console.log(
+            `  [${name.toUpperCase()}:STDERR] ${msg.substring(0, 100)}`,
+          );
         }
       });
 
@@ -279,7 +303,8 @@ class ApproachVerifier {
 
     return new Promise((resolve) => {
       this.publisherClient = mqtt.connect(MQTT_BROKER, {
-        clientId: "verifier-publisher-" + Math.random().toString(16).substr(2, 8),
+        clientId:
+          "verifier-publisher-" + Math.random().toString(16).substr(2, 8),
         clean: true,
       });
 
@@ -314,8 +339,12 @@ class ApproachVerifier {
 <https://rsp.js/event/${count}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/smartphoneX> .
           `.trim();
 
-          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, { qos: 1 });
-          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, { qos: 1 });
+          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, {
+            qos: 1,
+          });
+          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, {
+            qos: 1,
+          });
 
           count++;
           this.dataPublishCount = count;
@@ -323,11 +352,14 @@ class ApproachVerifier {
           // Progress update every 10 seconds
           if (count % (DATA_RATE_HZ * 10) === 0) {
             const elapsed = count / DATA_RATE_HZ;
-            const approxResults = this.approachResults.get("approximation")?.results.length || 0;
-            const chunkedResults = this.approachResults.get("chunked")?.results.length || 0;
-            const fetchingResults = this.approachResults.get("fetching")?.results.length || 0;
+            const approxResults =
+              this.approachResults.get("approximation")?.results.length || 0;
+            const chunkedResults =
+              this.approachResults.get("chunked")?.results.length || 0;
+            const fetchingResults =
+              this.approachResults.get("fetching")?.results.length || 0;
             console.log(
-              `  [${elapsed}s] Events: ${count} | Results: Approx=${approxResults}, Chunked=${chunkedResults}, Fetching=${fetchingResults}`
+              `  [${elapsed}s] Events: ${count} | Results: Approx=${approxResults}, Chunked=${chunkedResults}, Fetching=${fetchingResults}`,
             );
           }
         }, intervalMs);
@@ -362,7 +394,9 @@ class ApproachVerifier {
       }
 
       if (result.results.length > 0) {
-        console.log(`   Last result: ${result.results[result.results.length - 1].content.substring(0, 80)}...`);
+        console.log(
+          `   Last result: ${result.results[result.results.length - 1].content.substring(0, 80)}...`,
+        );
       }
     }
 
@@ -376,8 +410,12 @@ class ApproachVerifier {
       console.log("OVERALL: ALL APPROACHES VERIFIED SUCCESSFULLY");
     } else {
       console.log("OVERALL: SOME APPROACHES FAILED TO PRODUCE RESULTS");
-      console.log("\nNote: Window sizes are 60s/120s, so results require ~60-90s of data.");
-      console.log("If test ran for less time, this may be a timing issue rather than a bug.");
+      console.log(
+        "\nNote: Window sizes are 60s/120s, so results require ~60-90s of data.",
+      );
+      console.log(
+        "If test ran for less time, this may be a timing issue rather than a bug.",
+      );
     }
     console.log("=".repeat(70));
   }
@@ -386,7 +424,9 @@ class ApproachVerifier {
    * Cleanup resources
    */
   private async cleanup(): Promise<void> {
-    console.log("\n[CLEANUP] Stopping orchestrators and closing connections...");
+    console.log(
+      "\n[CLEANUP] Stopping orchestrators and closing connections...",
+    );
 
     // Kill orchestrator processes
     for (const [name, proc] of this.orchestrators) {
@@ -419,9 +459,12 @@ class ApproachVerifier {
 
 // Run the verification
 const verifier = new ApproachVerifier();
-verifier.run().then(() => {
-  process.exit(0);
-}).catch((err) => {
-  console.error("Verification failed:", err);
-  process.exit(1);
-});
+verifier
+  .run()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("Verification failed:", err);
+    process.exit(1);
+  });

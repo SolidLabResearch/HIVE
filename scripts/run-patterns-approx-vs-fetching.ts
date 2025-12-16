@@ -300,7 +300,8 @@ class SingleIterationRunner {
     env: Record<string, string>,
   ): Promise<void> {
     return new Promise((resolve) => {
-      const fullPath = path.resolve(__dirname, scriptPath);
+      const projectRoot = path.resolve(__dirname, "..");
+      const fullPath = path.resolve(projectRoot, scriptPath);
 
       const proc = spawn("npx", ["ts-node", fullPath], {
         env: { ...process.env, ...env },

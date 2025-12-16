@@ -7,6 +7,7 @@
 
 import { spawn, ChildProcess } from "child_process";
 import * as mqtt from "mqtt";
+import * as path from "path";
 import * as fs from "fs";
 
 const MQTT_BROKER = "mqtt://localhost:1883";
@@ -45,19 +46,22 @@ class ApproachTester {
       await this.launchOrchestrators();
 
       // Step 4: Wait for initialization
-      console.log("\n[INFO] Waiting 10 seconds for orchestrators to initialize...");
+      console.log(
+        "\n[INFO] Waiting 10 seconds for orchestrators to initialize...",
+      );
       await this.sleep(10000);
 
       // Step 5: Start publishing test data
       await this.publishTestData();
 
       // Step 6: Wait for results processing
-      console.log("\n[INFO] Waiting 30 seconds for final results processing...");
+      console.log(
+        "\n[INFO] Waiting 30 seconds for final results processing...",
+      );
       await this.sleep(30000);
 
       // Step 7: Show results summary
       this.showResults();
-
     } catch (error) {
       console.error("\n[ERROR] Test failed:", error);
     } finally {
@@ -76,7 +80,7 @@ class ApproachTester {
       "approximation_approach_log.csv",
       "approximation_approach_resource_usage.csv",
       "fetching_client_side_log.csv",
-      "fetching_client_side_resource_usage.csv"
+      "fetching_client_side_resource_usage.csv",
     ];
 
     for (const logFile of logFiles) {
@@ -101,24 +105,27 @@ class ApproachTester {
     return new Promise((resolve, reject) => {
       this.mqttClient = mqtt.connect(MQTT_BROKER, {
         clientId: "test-monitor-" + Math.random().toString(16).substr(2, 8),
-        clean: true
+        clean: true,
       });
 
       this.mqttClient.on("connect", () => {
         console.log("  Connected to MQTT broker");
 
         // Subscribe to result topics
-        this.mqttClient!.subscribe([APPROX_OUTPUT_TOPIC, FETCHING_OUTPUT_TOPIC], (err) => {
-          if (err) {
-            console.error("  Failed to subscribe to result topics:", err);
-            reject(err);
-          } else {
-            console.log(`  Subscribed to result topics:`);
-            console.log(`    - ${APPROX_OUTPUT_TOPIC}`);
-            console.log(`    - ${FETCHING_OUTPUT_TOPIC}`);
-            resolve();
-          }
-        });
+        this.mqttClient!.subscribe(
+          [APPROX_OUTPUT_TOPIC, FETCHING_OUTPUT_TOPIC],
+          (err) => {
+            if (err) {
+              console.error("  Failed to subscribe to result topics:", err);
+              reject(err);
+            } else {
+              console.log(`  Subscribed to result topics:`);
+              console.log(`    - ${APPROX_OUTPUT_TOPIC}`);
+              console.log(`    - ${FETCHING_OUTPUT_TOPIC}`);
+              resolve();
+            }
+          },
+        );
       });
 
       this.mqttClient.on("message", (topic, message) => {
@@ -129,7 +136,9 @@ class ApproachTester {
           try {
             const result = JSON.parse(messageStr);
             this.approxResults.push({ timestamp, result });
-            console.log(`\n[APPROX RESULT] Unified Result: ${result.unifiedResult}, Type: ${result.aggregationType}`);
+            console.log(
+              `\n[APPROX RESULT] Unified Result: ${result.unifiedResult}, Type: ${result.aggregationType}`,
+            );
           } catch (e) {
             console.log(`\n[APPROX RESULT] ${messageStr.substring(0, 100)}`);
           }
@@ -142,7 +151,9 @@ class ApproachTester {
               this.fetchingResults.push({ timestamp, value });
               console.log(`\n[FETCHING RESULT] Value: ${value}`);
             } else {
-              console.log(`\n[FETCHING RESULT] ${messageStr.substring(0, 100)}`);
+              console.log(
+                `\n[FETCHING RESULT] ${messageStr.substring(0, 100)}`,
+              );
             }
           } catch (e) {
             console.log(`\n[FETCHING RESULT] ${messageStr.substring(0, 100)}`);
@@ -170,12 +181,20 @@ class ApproachTester {
 
     // Launch Approximation Approach
     console.log("  Starting Approximation Approach...");
-    this.approxOrchestrator = spawn("npx", ["ts-node", "src/approaches/ApproximationApproachOrchestrator.ts"], {
-      env: { ...process.env, HTTP_PORT: "8081" }
+    const projectRoot = path.resolve(__dirname, "..");
+    const approxPath = path.resolve(
+      projectRoot,
+      "src/approaches/ApproximationApproachOrchestrator.ts",
+    );
+    this.approxOrchestrator = spawn("npx", ["ts-node", approxPath], {
+      env: { ...process.env, HTTP_PORT: "8081" },
     });
 
     this.approxOrchestrator.stdout?.on("data", (data) => {
-      const lines = data.toString().split('\n').filter((l: string) => l.trim());
+      const lines = data
+        .toString()
+        .split("\n")
+        .filter((l: string) => l.trim());
       lines.forEach((line: string) => console.log(`  [APPROX] ${line}`));
     });
 
@@ -185,10 +204,17 @@ class ApproachTester {
 
     // Launch Fetching Client Side Approach
     console.log("  Starting Fetching Client Side Approach...");
-    this.fetchingOrchestrator = spawn("npx", ["ts-node", "src/approaches/FetchingClientSideApproachOrchestrator.ts"]);
+    const fetchingPath = path.resolve(
+      projectRoot,
+      "src/approaches/FetchingClientSideApproachOrchestrator.ts",
+    );
+    this.fetchingOrchestrator = spawn("npx", ["ts-node", fetchingPath]);
 
     this.fetchingOrchestrator.stdout?.on("data", (data) => {
-      const lines = data.toString().split('\n').filter((l: string) => l.trim());
+      const lines = data
+        .toString()
+        .split("\n")
+        .filter((l: string) => l.trim());
       lines.forEach((line: string) => console.log(`  [FETCHING] ${line}`));
     });
 
@@ -213,8 +239,10 @@ class ApproachTester {
       const timestamp = new Date().toISOString();
 
       // Generate varying sensor values (simulating real sensor data)
-      const wearableValue = 10 + 5 * Math.sin((2 * Math.PI * i) / (DATA_RATE_HZ * 10));
-      const smartphoneValue = 15 + 3 * Math.cos((2 * Math.PI * i) / (DATA_RATE_HZ * 8));
+      const wearableValue =
+        10 + 5 * Math.sin((2 * Math.PI * i) / (DATA_RATE_HZ * 10));
+      const smartphoneValue =
+        15 + 3 * Math.cos((2 * Math.PI * i) / (DATA_RATE_HZ * 8));
 
       // Publish wearable data
       const wearableQuad = `<http://example.org/wearable/${i}> <https://saref.etsi.org/core/hasValue> "${wearableValue.toFixed(2)}"^^<http://www.w3.org/2001/XMLSchema#double> .
@@ -235,13 +263,17 @@ class ApproachTester {
 
       // Progress indicator every 10 seconds
       if ((i + 1) % (DATA_RATE_HZ * 10) === 0) {
-        console.log(`  Published ${this.dataPublishCount} data points (${i + 1}/${totalEvents} iterations, ${((i + 1) / totalEvents * 100).toFixed(1)}%)`);
+        console.log(
+          `  Published ${this.dataPublishCount} data points (${i + 1}/${totalEvents} iterations, ${(((i + 1) / totalEvents) * 100).toFixed(1)}%)`,
+        );
       }
 
       await this.sleep(intervalMs);
     }
 
-    console.log(`  Data publishing complete: ${this.dataPublishCount} total data points published.`);
+    console.log(
+      `  Data publishing complete: ${this.dataPublishCount} total data points published.`,
+    );
   }
 
   /**
@@ -254,27 +286,37 @@ class ApproachTester {
 
     console.log(`\nData Published: ${this.dataPublishCount} data points`);
 
-    console.log(`\nApproximation Approach Results: ${this.approxResults.length}`);
+    console.log(
+      `\nApproximation Approach Results: ${this.approxResults.length}`,
+    );
     if (this.approxResults.length > 0) {
       console.log("  Sample results:");
       this.approxResults.slice(0, 5).forEach((r, i) => {
-        console.log(`    ${i + 1}. Unified Result: ${r.result.unifiedResult}, Type: ${r.result.aggregationType}`);
+        console.log(
+          `    ${i + 1}. Unified Result: ${r.result.unifiedResult}, Type: ${r.result.aggregationType}`,
+        );
       });
       if (this.approxResults.length > 5) {
-        console.log(`    ... and ${this.approxResults.length - 5} more results`);
+        console.log(
+          `    ... and ${this.approxResults.length - 5} more results`,
+        );
       }
     } else {
       console.log("  ⚠️  NO RESULTS RECEIVED - Check logs for errors");
     }
 
-    console.log(`\nFetching Client Side Approach Results: ${this.fetchingResults.length}`);
+    console.log(
+      `\nFetching Client Side Approach Results: ${this.fetchingResults.length}`,
+    );
     if (this.fetchingResults.length > 0) {
       console.log("  Sample results:");
       this.fetchingResults.slice(0, 5).forEach((r, i) => {
         console.log(`    ${i + 1}. Value: ${r.value}`);
       });
       if (this.fetchingResults.length > 5) {
-        console.log(`    ... and ${this.fetchingResults.length - 5} more results`);
+        console.log(
+          `    ... and ${this.fetchingResults.length - 5} more results`,
+        );
       }
     } else {
       console.log("  ⚠️  NO RESULTS RECEIVED - Check logs for errors");
@@ -285,10 +327,10 @@ class ApproachTester {
       "approximation_approach_log.csv",
       "approximation_approach_resource_usage.csv",
       "fetching_client_side_log.csv",
-      "fetching_client_side_resource_usage.csv"
+      "fetching_client_side_resource_usage.csv",
     ];
 
-    logFiles.forEach(logFile => {
+    logFiles.forEach((logFile) => {
       if (fs.existsSync(logFile)) {
         const stats = fs.statSync(logFile);
         const sizeKB = (stats.size / 1024).toFixed(2);
@@ -329,20 +371,23 @@ class ApproachTester {
    * Sleep utility
    */
   private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
 
 // Run the test
 if (require.main === module) {
   const tester = new ApproachTester();
-  tester.run().then(() => {
-    console.log("\n✅ Test completed successfully!");
-    process.exit(0);
-  }).catch(error => {
-    console.error("\n❌ Test failed:", error);
-    process.exit(1);
-  });
+  tester
+    .run()
+    .then(() => {
+      console.log("\n✅ Test completed successfully!");
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error("\n❌ Test failed:", error);
+      process.exit(1);
+    });
 }
 
 export { ApproachTester };

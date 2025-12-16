@@ -56,7 +56,11 @@ class SingleRunVerifier {
   private publisherClient?: mqtt.MqttClient;
   private approachResults: Map<string, ApproachResult> = new Map();
   private dataPublishCount = 0;
-  private allMessages: Array<{ topic: string; timestamp: number; content: string }> = [];
+  private allMessages: Array<{
+    topic: string;
+    timestamp: number;
+    content: string;
+  }> = [];
   private runNumber: number;
   private startTime: number = 0;
 
@@ -101,12 +105,16 @@ class SingleRunVerifier {
       await this.setupMQTTMonitoring();
       await this.launchOrchestrators();
 
-      console.log(`  [RUN ${this.runNumber}] Waiting ${INIT_WAIT_S}s for initialization...`);
+      console.log(
+        `  [RUN ${this.runNumber}] Waiting ${INIT_WAIT_S}s for initialization...`,
+      );
       await this.sleep(INIT_WAIT_S * 1000);
 
       await this.publishTestData();
 
-      console.log(`  [RUN ${this.runNumber}] Waiting ${FINAL_WAIT_S}s for final results...`);
+      console.log(
+        `  [RUN ${this.runNumber}] Waiting ${FINAL_WAIT_S}s for final results...`,
+      );
       await this.sleep(FINAL_WAIT_S * 1000);
 
       const summary = this.generateSummary();
@@ -196,7 +204,9 @@ class SingleRunVerifier {
     const result = this.approachResults.get(approach);
     if (result) {
       result.results.push({ timestamp: Date.now(), content });
-      console.log(`    [${approach.toUpperCase()}] Result #${result.results.length}`);
+      console.log(
+        `    [${approach.toUpperCase()}] Result #${result.results.length}`,
+      );
     }
   }
 
@@ -204,29 +214,30 @@ class SingleRunVerifier {
     await this.launchOrchestrator(
       "approximation",
       "src/approaches/ApproximationApproachOrchestrator.ts",
-      { HTTP_PORT: "8081" }
+      { HTTP_PORT: "8081" },
     );
 
     await this.launchOrchestrator(
       "chunked",
       "src/approaches/ChunkedQueryApproachOrchestrator.ts",
-      { HTTP_PORT: "8082" }
+      { HTTP_PORT: "8082" },
     );
 
     await this.launchOrchestrator(
       "fetching",
       "src/approaches/FetchingClientSideApproachOrchestrator.ts",
-      { HTTP_PORT: "8083" }
+      { HTTP_PORT: "8083" },
     );
   }
 
   private launchOrchestrator(
     name: string,
     scriptPath: string,
-    env: Record<string, string>
+    env: Record<string, string>,
   ): Promise<void> {
     return new Promise((resolve) => {
-      const fullPath = path.resolve(__dirname, scriptPath);
+      const projectRoot = path.resolve(__dirname, "..");
+      const fullPath = path.resolve(projectRoot, scriptPath);
 
       const proc = spawn("npx", ["ts-node", fullPath], {
         env: { ...process.env, ...env },
@@ -237,7 +248,10 @@ class SingleRunVerifier {
 
       proc.stdout?.on("data", (data: Buffer) => {
         // Only log significant events to reduce noise
-        const lines = data.toString().split("\n").filter((l: string) => l.trim());
+        const lines = data
+          .toString()
+          .split("\n")
+          .filter((l: string) => l.trim());
         for (const line of lines) {
           if (
             line.includes("error") ||
@@ -252,7 +266,11 @@ class SingleRunVerifier {
 
       proc.stderr?.on("data", (data: Buffer) => {
         const msg = data.toString().trim();
-        if (msg && !msg.includes("ExperimentalWarning") && !msg.includes("Watermark")) {
+        if (
+          msg &&
+          !msg.includes("ExperimentalWarning") &&
+          !msg.includes("Watermark")
+        ) {
           // Only log real errors
         }
       });
@@ -304,19 +322,26 @@ class SingleRunVerifier {
 <https://rsp.js/event/${count}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/smartphoneX> .
           `.trim();
 
-          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, { qos: 1 });
-          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, { qos: 1 });
+          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, {
+            qos: 1,
+          });
+          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, {
+            qos: 1,
+          });
 
           count++;
           this.dataPublishCount = count;
 
           if (count % (DATA_RATE_HZ * 30) === 0) {
             const elapsed = count / DATA_RATE_HZ;
-            const approxResults = this.approachResults.get("approximation")?.results.length || 0;
-            const chunkedResults = this.approachResults.get("chunked")?.results.length || 0;
-            const fetchingResults = this.approachResults.get("fetching")?.results.length || 0;
+            const approxResults =
+              this.approachResults.get("approximation")?.results.length || 0;
+            const chunkedResults =
+              this.approachResults.get("chunked")?.results.length || 0;
+            const fetchingResults =
+              this.approachResults.get("fetching")?.results.length || 0;
             console.log(
-              `    [${elapsed}s] A:${approxResults} C:${chunkedResults} F:${fetchingResults}`
+              `    [${elapsed}s] A:${approxResults} C:${chunkedResults} F:${fetchingResults}`,
             );
           }
         }, intervalMs);
@@ -387,7 +412,9 @@ class MultiRunOrchestrator {
     console.log("\n" + "=".repeat(70));
     console.log(`MULTI-RUN VERIFICATION: ${numRuns} ITERATIONS`);
     console.log("=".repeat(70));
-    console.log(`Testing all 3 approaches ${numRuns} times to verify stability`);
+    console.log(
+      `Testing all 3 approaches ${numRuns} times to verify stability`,
+    );
     console.log("=".repeat(70));
 
     const startTime = Date.now();
@@ -429,10 +456,18 @@ class MultiRunOrchestrator {
     const chunkedIcon = summary.chunked.passed ? "[OK]" : "[X]";
     const fetchingIcon = summary.fetching.passed ? "[OK]" : "[X]";
 
-    console.log(`\n  Run ${summary.runNumber} Results (${(summary.duration / 1000).toFixed(1)}s):`);
-    console.log(`    ${approxIcon} Approximation: ${summary.approximation.resultCount} results`);
-    console.log(`    ${chunkedIcon} Chunked:       ${summary.chunked.resultCount} results`);
-    console.log(`    ${fetchingIcon} Fetching:      ${summary.fetching.resultCount} results`);
+    console.log(
+      `\n  Run ${summary.runNumber} Results (${(summary.duration / 1000).toFixed(1)}s):`,
+    );
+    console.log(
+      `    ${approxIcon} Approximation: ${summary.approximation.resultCount} results`,
+    );
+    console.log(
+      `    ${chunkedIcon} Chunked:       ${summary.chunked.resultCount} results`,
+    );
+    console.log(
+      `    ${fetchingIcon} Fetching:      ${summary.fetching.resultCount} results`,
+    );
   }
 
   private printFinalSummary(totalTime: number): void {
@@ -448,25 +483,40 @@ class MultiRunOrchestrator {
     console.log(`Total time: ${(totalTime / 1000 / 60).toFixed(1)} minutes`);
 
     console.log(`\nApproximation Approach:`);
-    console.log(`  Success rate: ${approxStats.successRate}% (${approxStats.passCount}/${this.summaries.length})`);
+    console.log(
+      `  Success rate: ${approxStats.successRate}% (${approxStats.passCount}/${this.summaries.length})`,
+    );
     console.log(`  Avg results per run: ${approxStats.avgResults.toFixed(1)}`);
-    console.log(`  Result range: ${approxStats.minResults}-${approxStats.maxResults}`);
+    console.log(
+      `  Result range: ${approxStats.minResults}-${approxStats.maxResults}`,
+    );
 
     console.log(`\nChunked Query Approach:`);
-    console.log(`  Success rate: ${chunkedStats.successRate}% (${chunkedStats.passCount}/${this.summaries.length})`);
+    console.log(
+      `  Success rate: ${chunkedStats.successRate}% (${chunkedStats.passCount}/${this.summaries.length})`,
+    );
     console.log(`  Avg results per run: ${chunkedStats.avgResults.toFixed(1)}`);
-    console.log(`  Result range: ${chunkedStats.minResults}-${chunkedStats.maxResults}`);
+    console.log(
+      `  Result range: ${chunkedStats.minResults}-${chunkedStats.maxResults}`,
+    );
 
     console.log(`\nFetching Client Side:`);
-    console.log(`  Success rate: ${fetchingStats.successRate}% (${fetchingStats.passCount}/${this.summaries.length})`);
-    console.log(`  Avg results per run: ${fetchingStats.avgResults.toFixed(1)}`);
-    console.log(`  Result range: ${fetchingStats.minResults}-${fetchingStats.maxResults}`);
+    console.log(
+      `  Success rate: ${fetchingStats.successRate}% (${fetchingStats.passCount}/${this.summaries.length})`,
+    );
+    console.log(
+      `  Avg results per run: ${fetchingStats.avgResults.toFixed(1)}`,
+    );
+    console.log(
+      `  Result range: ${fetchingStats.minResults}-${fetchingStats.maxResults}`,
+    );
 
     console.log("\n" + "-".repeat(70));
 
-    const allPassed = approxStats.passCount === this.summaries.length &&
-                      chunkedStats.passCount === this.summaries.length &&
-                      fetchingStats.passCount === this.summaries.length;
+    const allPassed =
+      approxStats.passCount === this.summaries.length &&
+      chunkedStats.passCount === this.summaries.length &&
+      fetchingStats.passCount === this.summaries.length;
 
     if (allPassed) {
       console.log("OVERALL: ALL APPROACHES PASSED ALL RUNS - STABLE AND READY");
@@ -474,11 +524,17 @@ class MultiRunOrchestrator {
       console.log("OVERALL: SOME RUNS FAILED - REVIEW NEEDED");
       console.log("\nFailed runs:");
       this.summaries.forEach((summary) => {
-        if (!summary.approximation.passed || !summary.chunked.passed || !summary.fetching.passed) {
-          console.log(`  Run ${summary.runNumber}: ` +
-            `A:${summary.approximation.passed ? 'OK' : 'FAIL'} ` +
-            `C:${summary.chunked.passed ? 'OK' : 'FAIL'} ` +
-            `F:${summary.fetching.passed ? 'OK' : 'FAIL'}`);
+        if (
+          !summary.approximation.passed ||
+          !summary.chunked.passed ||
+          !summary.fetching.passed
+        ) {
+          console.log(
+            `  Run ${summary.runNumber}: ` +
+              `A:${summary.approximation.passed ? "OK" : "FAIL"} ` +
+              `C:${summary.chunked.passed ? "OK" : "FAIL"} ` +
+              `F:${summary.fetching.passed ? "OK" : "FAIL"}`,
+          );
         }
       });
     }
@@ -491,7 +547,8 @@ class MultiRunOrchestrator {
     const passCount = results.filter((r) => r.passed).length;
     const successRate = Math.round((passCount / this.summaries.length) * 100);
     const resultCounts = results.map((r) => r.resultCount);
-    const avgResults = resultCounts.reduce((a, b) => a + b, 0) / resultCounts.length;
+    const avgResults =
+      resultCounts.reduce((a, b) => a + b, 0) / resultCounts.length;
     const minResults = Math.min(...resultCounts);
     const maxResults = Math.max(...resultCounts);
 
@@ -528,10 +585,13 @@ class MultiRunOrchestrator {
 
 // Run the multi-run verification
 const orchestrator = new MultiRunOrchestrator();
-orchestrator.runMultipleTests(NUM_RUNS).then(() => {
-  console.log("\n[INFO] Multi-run verification complete");
-  process.exit(0);
-}).catch((err) => {
-  console.error("\n[ERROR] Multi-run verification failed:", err);
-  process.exit(1);
-});
+orchestrator
+  .runMultipleTests(NUM_RUNS)
+  .then(() => {
+    console.log("\n[INFO] Multi-run verification complete");
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("\n[ERROR] Multi-run verification failed:", err);
+    process.exit(1);
+  });

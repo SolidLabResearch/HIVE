@@ -186,12 +186,16 @@ class PatternTestRunner {
       await this.setupMQTTMonitoring();
       await this.launchOrchestrators();
 
-      console.log(`  [${this.pattern.name}] Waiting ${INIT_WAIT_S}s for initialization...`);
+      console.log(
+        `  [${this.pattern.name}] Waiting ${INIT_WAIT_S}s for initialization...`,
+      );
       await this.sleep(INIT_WAIT_S * 1000);
 
       await this.publishPatternData();
 
-      console.log(`  [${this.pattern.name}] Waiting ${FINAL_WAIT_S}s for final results...`);
+      console.log(
+        `  [${this.pattern.name}] Waiting ${FINAL_WAIT_S}s for final results...`,
+      );
       await this.sleep(FINAL_WAIT_S * 1000);
 
       const result = this.generateResult();
@@ -291,7 +295,11 @@ class PatternTestRunner {
     });
   }
 
-  private recordResult(approach: string, content: string, value?: number): void {
+  private recordResult(
+    approach: string,
+    content: string,
+    value?: number,
+  ): void {
     const result = this.approachResults.get(approach);
     if (result) {
       result.results.push({ timestamp: Date.now(), content, value });
@@ -302,29 +310,30 @@ class PatternTestRunner {
     await this.launchOrchestrator(
       "approximation",
       "src/approaches/ApproximationApproachOrchestrator.ts",
-      { HTTP_PORT: "8081" }
+      { HTTP_PORT: "8081" },
     );
 
     await this.launchOrchestrator(
       "chunked",
       "src/approaches/ChunkedQueryApproachOrchestrator.ts",
-      { HTTP_PORT: "8082" }
+      { HTTP_PORT: "8082" },
     );
 
     await this.launchOrchestrator(
       "fetching",
       "src/approaches/FetchingClientSideApproachOrchestrator.ts",
-      { HTTP_PORT: "8083" }
+      { HTTP_PORT: "8083" },
     );
   }
 
   private launchOrchestrator(
     name: string,
     scriptPath: string,
-    env: Record<string, string>
+    env: Record<string, string>,
   ): Promise<void> {
     return new Promise((resolve) => {
-      const fullPath = path.resolve(__dirname, scriptPath);
+      const projectRoot = path.resolve(__dirname, "..");
+      const fullPath = path.resolve(projectRoot, scriptPath);
 
       const proc = spawn("npx", ["ts-node", fullPath], {
         env: { ...process.env, ...env },
@@ -346,7 +355,9 @@ class PatternTestRunner {
   }
 
   private async publishPatternData(): Promise<void> {
-    console.log(`  [${this.pattern.name}] Publishing data with pattern: ${this.pattern.description}`);
+    console.log(
+      `  [${this.pattern.name}] Publishing data with pattern: ${this.pattern.description}`,
+    );
 
     return new Promise((resolve) => {
       this.publisherClient = mqtt.connect(MQTT_BROKER, {
@@ -370,7 +381,10 @@ class PatternTestRunner {
 
           const timestamp = new Date().toISOString();
           const wearableValue = this.pattern.wearableGenerator(count, baseTime);
-          const smartphoneValue = this.pattern.smartphoneGenerator(count, baseTime);
+          const smartphoneValue = this.pattern.smartphoneGenerator(
+            count,
+            baseTime,
+          );
 
           const wearableData = `
 <https://rsp.js/event/${count}> <https://saref.etsi.org/core/hasValue> "${wearableValue}"^^<http://www.w3.org/2001/XMLSchema#float> .
@@ -384,19 +398,26 @@ class PatternTestRunner {
 <https://rsp.js/event/${count}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/smartphoneX> .
           `.trim();
 
-          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, { qos: 1 });
-          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, { qos: 1 });
+          this.publisherClient!.publish(WEARABLE_TOPIC, wearableData, {
+            qos: 1,
+          });
+          this.publisherClient!.publish(SMARTPHONE_TOPIC, smartphoneData, {
+            qos: 1,
+          });
 
           count++;
           this.dataPublishCount = count;
 
           if (count % (DATA_RATE_HZ * 30) === 0) {
             const elapsed = count / DATA_RATE_HZ;
-            const approxResults = this.approachResults.get("approximation")?.results.length || 0;
-            const chunkedResults = this.approachResults.get("chunked")?.results.length || 0;
-            const fetchingResults = this.approachResults.get("fetching")?.results.length || 0;
+            const approxResults =
+              this.approachResults.get("approximation")?.results.length || 0;
+            const chunkedResults =
+              this.approachResults.get("chunked")?.results.length || 0;
+            const fetchingResults =
+              this.approachResults.get("fetching")?.results.length || 0;
             console.log(
-              `    [${elapsed}s] Results - A:${approxResults} C:${chunkedResults} F:${fetchingResults}`
+              `    [${elapsed}s] Results - A:${approxResults} C:${chunkedResults} F:${fetchingResults}`,
             );
           }
         }, intervalMs);
@@ -411,7 +432,9 @@ class PatternTestRunner {
     const fetching = this.approachResults.get("fetching")!;
 
     const calculateAvg = (results: typeof approx.results) => {
-      const values = results.map((r) => r.value).filter((v) => v !== undefined) as number[];
+      const values = results
+        .map((r) => r.value)
+        .filter((v) => v !== undefined) as number[];
       if (values.length === 0) return undefined;
       return values.reduce((a, b) => a + b, 0) / values.length;
     };
@@ -476,14 +499,18 @@ class MultiPatternTester {
     console.log("COMPREHENSIVE PATTERN-BASED VERIFICATION TEST");
     console.log("=".repeat(70));
     console.log(`Testing ${DATA_PATTERNS.length} different data patterns`);
-    console.log(`Duration per pattern: ${PATTERN_DURATION_S}s + ${INIT_WAIT_S + FINAL_WAIT_S}s overhead`);
+    console.log(
+      `Duration per pattern: ${PATTERN_DURATION_S}s + ${INIT_WAIT_S + FINAL_WAIT_S}s overhead`,
+    );
     console.log("=".repeat(70));
 
     const startTime = Date.now();
 
     for (let i = 0; i < DATA_PATTERNS.length; i++) {
       const pattern = DATA_PATTERNS[i];
-      console.log(`\n[INFO] Testing pattern ${i + 1}/${DATA_PATTERNS.length}: ${pattern.name}`);
+      console.log(
+        `\n[INFO] Testing pattern ${i + 1}/${DATA_PATTERNS.length}: ${pattern.name}`,
+      );
 
       try {
         const runner = new PatternTestRunner(pattern);
@@ -517,18 +544,26 @@ class MultiPatternTester {
     const chunkedIcon = result.chunked.passed ? "[OK]" : "[X]";
     const fetchingIcon = result.fetching.passed ? "[OK]" : "[X]";
 
-    console.log(`\n  ${result.patternName} Results (${(result.duration / 1000).toFixed(1)}s):`);
+    console.log(
+      `\n  ${result.patternName} Results (${(result.duration / 1000).toFixed(1)}s):`,
+    );
     console.log(
       `    ${approxIcon} Approximation: ${result.approximation.resultCount} results` +
-        (result.approximation.avgValue ? ` (avg: ${result.approximation.avgValue.toFixed(2)})` : "")
+        (result.approximation.avgValue
+          ? ` (avg: ${result.approximation.avgValue.toFixed(2)})`
+          : ""),
     );
     console.log(
       `    ${chunkedIcon} Chunked:       ${result.chunked.resultCount} results` +
-        (result.chunked.avgValue ? ` (avg: ${result.chunked.avgValue.toFixed(2)})` : "")
+        (result.chunked.avgValue
+          ? ` (avg: ${result.chunked.avgValue.toFixed(2)})`
+          : ""),
     );
     console.log(
       `    ${fetchingIcon} Fetching:      ${result.fetching.resultCount} results` +
-        (result.fetching.avgValue ? ` (avg: ${result.fetching.avgValue.toFixed(2)})` : "")
+        (result.fetching.avgValue
+          ? ` (avg: ${result.fetching.avgValue.toFixed(2)})`
+          : ""),
     );
   }
 
@@ -540,25 +575,39 @@ class MultiPatternTester {
     console.log(`\nTotal patterns tested: ${this.results.length}`);
     console.log(`Total time: ${(totalTime / 1000 / 60).toFixed(1)} minutes`);
 
-    const approxSuccess = this.results.filter((r) => r.approximation.passed).length;
+    const approxSuccess = this.results.filter(
+      (r) => r.approximation.passed,
+    ).length;
     const chunkedSuccess = this.results.filter((r) => r.chunked.passed).length;
-    const fetchingSuccess = this.results.filter((r) => r.fetching.passed).length;
+    const fetchingSuccess = this.results.filter(
+      (r) => r.fetching.passed,
+    ).length;
 
     console.log(`\nSuccess Rates:`);
-    console.log(`  Approximation: ${approxSuccess}/${this.results.length} (${((approxSuccess / this.results.length) * 100).toFixed(0)}%)`);
-    console.log(`  Chunked:       ${chunkedSuccess}/${this.results.length} (${((chunkedSuccess / this.results.length) * 100).toFixed(0)}%)`);
-    console.log(`  Fetching:      ${fetchingSuccess}/${this.results.length} (${((fetchingSuccess / this.results.length) * 100).toFixed(0)}%)`);
+    console.log(
+      `  Approximation: ${approxSuccess}/${this.results.length} (${((approxSuccess / this.results.length) * 100).toFixed(0)}%)`,
+    );
+    console.log(
+      `  Chunked:       ${chunkedSuccess}/${this.results.length} (${((chunkedSuccess / this.results.length) * 100).toFixed(0)}%)`,
+    );
+    console.log(
+      `  Fetching:      ${fetchingSuccess}/${this.results.length} (${((fetchingSuccess / this.results.length) * 100).toFixed(0)}%)`,
+    );
 
     console.log(`\nPattern-by-Pattern Results:`);
-    console.log(`  ${"Pattern".padEnd(20)} | ${"Approx".padEnd(6)} | ${"Chunked".padEnd(7)} | ${"Fetching".padEnd(8)}`);
-    console.log(`  ${"-".repeat(20)} | ${"-".repeat(6)} | ${"-".repeat(7)} | ${"-".repeat(8)}`);
+    console.log(
+      `  ${"Pattern".padEnd(20)} | ${"Approx".padEnd(6)} | ${"Chunked".padEnd(7)} | ${"Fetching".padEnd(8)}`,
+    );
+    console.log(
+      `  ${"-".repeat(20)} | ${"-".repeat(6)} | ${"-".repeat(7)} | ${"-".repeat(8)}`,
+    );
 
     this.results.forEach((result) => {
       const approxStatus = result.approximation.passed ? "PASS" : "FAIL";
       const chunkedStatus = result.chunked.passed ? "PASS" : "FAIL";
       const fetchingStatus = result.fetching.passed ? "PASS" : "FAIL";
       console.log(
-        `  ${result.patternName.padEnd(20)} | ${approxStatus.padEnd(6)} | ${chunkedStatus.padEnd(7)} | ${fetchingStatus.padEnd(8)}`
+        `  ${result.patternName.padEnd(20)} | ${approxStatus.padEnd(6)} | ${chunkedStatus.padEnd(7)} | ${fetchingStatus.padEnd(8)}`,
       );
     });
 
@@ -570,7 +619,9 @@ class MultiPatternTester {
       fetchingSuccess === this.results.length;
 
     if (allPassed) {
-      console.log("OVERALL: ALL APPROACHES PASSED ALL PATTERNS - READY FOR DEPLOYMENT");
+      console.log(
+        "OVERALL: ALL APPROACHES PASSED ALL PATTERNS - READY FOR DEPLOYMENT",
+      );
     } else {
       console.log("OVERALL: SOME PATTERNS FAILED - REVIEW NEEDED");
     }
@@ -585,7 +636,8 @@ class MultiPatternTester {
       patternsCount: this.results.length,
       results: this.results,
       summary: {
-        approximationSuccess: this.results.filter((r) => r.approximation.passed).length,
+        approximationSuccess: this.results.filter((r) => r.approximation.passed)
+          .length,
         chunkedSuccess: this.results.filter((r) => r.chunked.passed).length,
         fetchingSuccess: this.results.filter((r) => r.fetching.passed).length,
       },
@@ -613,7 +665,7 @@ class MultiPatternTester {
           r.fetching.passed ? "1" : "0",
           r.fetching.resultCount,
           r.fetching.avgValue?.toFixed(2) || "",
-        ].join(",")
+        ].join(","),
       );
     });
 
@@ -628,10 +680,13 @@ class MultiPatternTester {
 
 // Run the comprehensive pattern test
 const tester = new MultiPatternTester();
-tester.runAllPatterns().then(() => {
-  console.log("\n[INFO] Comprehensive pattern test complete");
-  process.exit(0);
-}).catch((err) => {
-  console.error("\n[ERROR] Pattern test failed:", err);
-  process.exit(1);
-});
+tester
+  .runAllPatterns()
+  .then(() => {
+    console.log("\n[INFO] Comprehensive pattern test complete");
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("\n[ERROR] Pattern test failed:", err);
+    process.exit(1);
+  });
