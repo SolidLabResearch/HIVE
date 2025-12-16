@@ -439,6 +439,8 @@ class RealWorldFrequencyExperimentRunner {
         "dist/approaches/FetchingClientSideApproachOrchestrator.js",
       "chunked-query-approach":
         "dist/approaches/ChunkedQueryApproachOrchestrator.js",
+      "streaming-query-hive":
+        "dist/approaches/ChunkedQueryApproachOrchestrator.js", // Alias for chunked approach
       "approximation-approach":
         "dist/approaches/ApproximationApproachOrchestrator.js",
     };
@@ -560,10 +562,10 @@ class RealWorldFrequencyExperimentRunner {
    */
   private getResultTopic(approach: string): string {
     const topicMap = {
-      "fetching-client-side": "fetching_client_side_output",
-      "streaming-query-hive": "streaming_query_hive_output",
-      "chunked-approach": "chunked_approach_output",
-      "approximation-approach": "approximation_approach_output",
+      "fetching-client-side": "client_operation_output",
+      "streaming-query-hive": "output", // Alias for chunked approach
+      "chunked-approach": "output",
+      "approximation-approach": "approximation/output",
     };
 
     return topicMap[approach as keyof typeof topicMap] || "default_output";
