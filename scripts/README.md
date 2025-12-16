@@ -98,6 +98,33 @@ npm run experiment:quick-test
 npm run experiment:independent
 ```
 
+## Utility Scripts
+
+### Cleanup
+
+- **`cleanup-logs.ts`** - Removes all log files and experimental results
+- **`cleanup-logs.sh`** - Shell version of cleanup script
+
+Cleans up:
+- CSV log files (orchestrator logs, resource usage)
+- Results directories
+- Unified log directories
+- Publisher/replayer logs
+- Temporary experiment files
+
+### Usage
+
+```bash
+# Clean all logs and results for a fresh start
+npm run clean-logs
+```
+
+**When to use:**
+- Before starting new experiments
+- When troubleshooting issues
+- When switching between different experiment types
+- To free up disk space
+
 ## Analysis Scripts (`scripts/analysis/`)
 
 Scripts for analyzing experimental results and generating insights.
@@ -198,6 +225,9 @@ All npm scripts in `package.json` have been updated to reflect the new paths.
 To run a complete experiment workflow:
 
 ```bash
+# 0. Clean previous results (recommended for fresh start)
+npm run clean-logs
+
 # 1. Setup the environment
 npm run experiment:setup
 
@@ -223,11 +253,12 @@ npm run experiment:analyze
 
 If scripts fail to run:
 
-1. Ensure all dependencies are installed: `npm install`
-2. Build the TypeScript project: `npm run build`
-3. Check that MQTT infrastructure is running
-4. Verify configuration files are present
-5. Check logs for specific error messages
+1. Clean previous logs: `npm run clean-logs`
+2. Ensure all dependencies are installed: `npm install`
+3. Build the TypeScript project: `npm run build`
+4. Check that MQTT infrastructure is running
+5. Verify configuration files are present
+6. Check logs for specific error messages
 
 ## Contributing
 

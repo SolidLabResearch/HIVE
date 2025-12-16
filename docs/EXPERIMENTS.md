@@ -5,6 +5,9 @@ This document describes all available experiments in the Streaming Query Hive pr
 ## Quick Reference
 
 ```bash
+# Cleanup (run before experiments for fresh start)
+npm run clean-logs                                 # Remove all logs and results
+
 # Quick validation (5 iterations)
 npm run experiment:5-iterations                    # Multi-approach test (5 runs)
 npm run experiment:patterns-approx-vs-fetching-5   # Pattern-based test (5 runs)
@@ -141,7 +144,13 @@ npm run experiment:run-realworld
 
 ### Prerequisites
 
-1. **MQTT Broker Running:**
+1. **Clean Previous Results (Recommended):**
+   ```bash
+   npm run clean-logs
+   ```
+   This removes all previous log files, CSV outputs, and results for a fresh start.
+
+2. **MQTT Broker Running:**
    ```bash
    # Check if mosquitto is running
    pgrep -fl mosquitto
@@ -150,17 +159,17 @@ npm run experiment:run-realworld
    brew services start mosquitto  # macOS
    ```
 
-2. **Project Built:**
+3. **Project Built:**
    ```bash
    npm run build
    ```
 
-3. **Data Generated (for frequency experiments):**
+4. **Data Generated (for frequency experiments):**
    ```bash
    npm run experiment:setup
    ```
 
-4. **Test MQTT Infrastructure:**
+5. **Test MQTT Infrastructure:**
    ```bash
    npm run experiment:test-mqtt
    ```
@@ -224,9 +233,13 @@ Iteration 1: [OK] (1.31ms, 24.5MB, 2 results)
 2. Publishers not sending data (check `[PUBLISHER]` logs)
 3. Wrong MQTT topics (check topic configuration)
 4. Experiment duration too short (needs 60s+ for first result)
+5. Stale logs from previous runs interfering
 
 **Solutions:**
 ```bash
+# Clean all logs (recommended first step)
+npm run clean-logs
+
 # Check MQTT broker
 pgrep -fl mosquitto
 
@@ -321,13 +334,14 @@ node dist/src/approaches/FetchingClientSideApproachOrchestrator.js
 
 ## Tips for Success
 
-1. **Always build first:** `npm run build`
-2. **Start with 5 iterations** to validate everything works
-3. **Check MQTT broker** is running before starting
-4. **Monitor logs** for `[APPROACH]` and `[PUBLISHER]` messages
-5. **Kill orphaned processes** if experiments are interrupted
-6. **Use 35 iterations** only for final validation
-7. **Save results files** before running new experiments
+1. **Clean logs for fresh start:** `npm run clean-logs`
+2. **Always build first:** `npm run build`
+3. **Start with 5 iterations** to validate everything works
+4. **Check MQTT broker** is running before starting
+5. **Monitor logs** for `[APPROACH]` and `[PUBLISHER]` messages
+6. **Kill orphaned processes** if experiments are interrupted
+7. **Use 35 iterations** only for final validation
+8. **Save results files** before running new experiments (or run `clean-logs`)
 
 ---
 

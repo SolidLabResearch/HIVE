@@ -11,6 +11,7 @@
     "lint:ts": "eslint . --ext ts --report-unused-disable-directives --max-warnings 1000",
     "lint:ts:fix": "eslint . --ext ts --report-unused-disable-directives --max-warnings 0 --fix",
     "start:http:server": "npx ts-node src/startHTTPServer.ts",
+    "clean-logs": "npx ts-node scripts/cleanup-logs.ts",
     "experiment:setup": "npx ts-node scripts/setup/setup-frequency-experiment.ts",
     "experiment:test-mqtt": "npx ts-node scripts/setup/test-mqtt-infrastructure.ts",
     "experiment:run": "npx ts-node scripts/benchmarks/main/run-frequency-experiment.ts",
