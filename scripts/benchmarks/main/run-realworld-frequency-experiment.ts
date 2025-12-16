@@ -355,6 +355,7 @@ class RealWorldFrequencyExperimentRunner {
         resultTopic,
         queryResults,
       );
+      console.log(`      Result collector set up for topic: ${resultTopic}`);
 
       // Start the data publishers (one or more depending on device type)
       const publisherProcesses: ChildProcess[] = [];
@@ -363,9 +364,30 @@ class RealWorldFrequencyExperimentRunner {
         publisherProcesses.push(publisherProcess);
       }
 
+      console.log(`      Waiting for experiment to complete...`);
+      console.log(
+        `      Approach: ${approach}, Frequency: ${frequency}, Topic: ${resultTopic}`,
+      );
+
       // Wait for experiment to complete
-      const experimentDuration = 30000; // 30 seconds
+      // Data files contain 2 minutes of data (120s)
+      // Query window STEP is 60s (first result at 60s, second at 120s)
+      // Need to wait for full data publish (120s) plus buffer for processing
+      const experimentDuration = 130000; // 130 seconds (2min + 10s buffer)
+
+      // Log progress every 15 seconds
+      const progressInterval = setInterval(() => {
+        console.log(
+          `      ... still running (${queryResults.length} results so far)`,
+        );
+      }, 15000);
+
       await this.sleep(experimentDuration);
+      clearInterval(progressInterval);
+
+      console.log(
+        `      Experiment duration complete. Collected ${queryResults.length} results`,
+      );
 
       // Get publisher statistics
       const publisherStats = await this.getPublisherStats();
@@ -536,18 +558,27 @@ class RealWorldFrequencyExperimentRunner {
 
       client.on("message", (receivedTopic, message) => {
         if (receivedTopic === topic) {
+          console.log(
+            `        [RESULT] Received on ${topic}: ${message.toString().substring(0, 100)}`,
+          );
           try {
             const result = JSON.parse(message.toString());
             results.push({
               timestamp: new Date().toISOString(),
               data: result,
             });
+            console.log(
+              `        [RESULT] Parsed and stored (total: ${results.length})`,
+            );
           } catch (error) {
             // Handle non-JSON messages
             results.push({
               timestamp: new Date().toISOString(),
               data: message.toString(),
             });
+            console.log(
+              `        [RESULT] Stored as string (total: ${results.length})`,
+            );
           }
         }
       });
