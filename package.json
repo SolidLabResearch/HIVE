@@ -16,7 +16,9 @@
     "experiment:run": "npx ts-node scripts/benchmarks/main/run-frequency-experiment.ts",
     "experiment:run-realworld": "npx ts-node scripts/benchmarks/main/run-realworld-frequency-experiment.ts",
     "experiment:analyze": "npx ts-node scripts/analysis/analyze-frequency-results.ts",
+    "experiment:5-iterations": "npx ts-node scripts/run-5-iterations.ts",
     "experiment:35-iterations": "npx ts-node scripts/run-35-iterations.ts",
+    "experiment:patterns-approx-vs-fetching-5": "npx ts-node scripts/run-patterns-approx-vs-fetching-5.ts",
     "experiment:patterns-approx-vs-fetching": "npx ts-node scripts/run-patterns-approx-vs-fetching.ts"
   },
   "keywords": [],

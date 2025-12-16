@@ -39,6 +39,10 @@ Performance benchmarks and experimental evaluations.
 
 - **`run-frequency-experiment.ts`** - Main frequency experiment runner
 - **`run-realworld-frequency-experiment.ts`** - Real-world scenario frequency experiments
+- **`run-5-iterations.ts`** - 5-iteration multi-approach test (quick validation)
+- **`run-35-iterations.ts`** - 35-iteration multi-approach test (comprehensive)
+- **`run-patterns-approx-vs-fetching-5.ts`** - 5-iteration pattern test (quick)
+- **`run-patterns-approx-vs-fetching.ts`** - 35-iteration pattern test (comprehensive)
 - **`run-4hz-comparison-35-iterations.js`** - 4Hz frequency comparison benchmark
 - **`run-4hz-noise-experiments.js`** - Noise tolerance experiments at 4Hz
 - **`experiment-evaluation-independent-stream-processing.ts`** - Independent stream processing evaluation
@@ -72,6 +76,14 @@ npm run experiment:run
 
 # Run real-world frequency experiment
 npm run experiment:run-realworld
+
+# Multi-approach verification tests
+npm run experiment:5-iterations      # Quick (5 runs, ~15-20 min)
+npm run experiment:35-iterations     # Comprehensive (35 runs, ~1.5-2 hours)
+
+# Pattern-based approximation tests
+npm run experiment:patterns-approx-vs-fetching-5   # Quick (5 iterations/pattern)
+npm run experiment:patterns-approx-vs-fetching     # Comprehensive (35 iterations/pattern)
 
 # Run 4Hz comparison
 npm run experiment:4hz-comparison
@@ -192,15 +204,20 @@ npm run experiment:setup
 # 2. Test infrastructure
 npm run experiment:test-mqtt
 
-# 3. Run quick validation
-npm run experiment:quick-test
+# 3. Run quick validation (choose one)
+npm run experiment:5-iterations                   # Quick multi-approach test
+npm run experiment:patterns-approx-vs-fetching-5  # Quick pattern test
 
-# 4. Run full experiment
-npm run experiment:run
+# 4. Run comprehensive experiments (choose based on needs)
+npm run experiment:35-iterations                  # Full multi-approach test
+npm run experiment:patterns-approx-vs-fetching    # Full pattern test
+npm run experiment:run-realworld                  # Real-world frequency test
 
 # 5. Analyze results
 npm run experiment:analyze
 ```
+
+**Tip:** Always start with 5-iteration experiments for quick validation before running the comprehensive 35-iteration tests.
 
 ## Troubleshooting
 
