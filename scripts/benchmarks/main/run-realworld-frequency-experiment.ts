@@ -458,13 +458,13 @@ class RealWorldFrequencyExperimentRunner {
   private async startApproachProcess(approach: string): Promise<ChildProcess> {
     const approachScripts = {
       "fetching-client-side":
-        "dist/approaches/FetchingClientSideApproachOrchestrator.js",
+        "dist/src/approaches/FetchingClientSideApproachOrchestrator.js",
       "chunked-query-approach":
-        "dist/approaches/ChunkedQueryApproachOrchestrator.js",
+        "dist/src/approaches/ChunkedQueryApproachOrchestrator.js",
       "streaming-query-hive":
-        "dist/approaches/ChunkedQueryApproachOrchestrator.js", // Alias for chunked approach
+        "dist/src/approaches/ChunkedQueryApproachOrchestrator.js", // Alias for chunked approach
       "approximation-approach":
-        "dist/approaches/ApproximationApproachOrchestrator.js",
+        "dist/src/approaches/ApproximationApproachOrchestrator.js",
     };
 
     const scriptPath =
@@ -473,10 +473,46 @@ class RealWorldFrequencyExperimentRunner {
       throw new Error(`Unknown approach: ${approach}`);
     }
 
+    console.log(`      Starting approach process: ${scriptPath}`);
+
     const approachProcess = spawn("node", [scriptPath], {
       cwd: this.projectRoot,
       stdio: "pipe",
       env: { ...process.env },
+    });
+
+    // Log approach output for debugging
+    approachProcess.stdout?.on("data", (data) => {
+      const lines = data
+        .toString()
+        .split("\n")
+        .filter((l: string) => l.trim());
+      lines.forEach((line: string) => {
+        console.log(`      [APPROACH] ${line}`);
+      });
+    });
+
+    approachProcess.stderr?.on("data", (data) => {
+      const lines = data
+        .toString()
+        .split("\n")
+        .filter((l: string) => l.trim());
+      lines.forEach((line: string) => {
+        console.error(`      [APPROACH ERROR] ${line}`);
+      });
+    });
+
+    approachProcess.on("error", (error) => {
+      console.error(`      [APPROACH PROCESS ERROR] ${error.message}`);
+    });
+
+    approachProcess.on("exit", (code, signal) => {
+      if (code !== 0 && code !== null) {
+        console.error(`      [APPROACH] Process exited with code ${code}`);
+      }
+      if (signal) {
+        console.error(`      [APPROACH] Process killed with signal ${signal}`);
+      }
     });
 
     // Give process time to start
@@ -527,6 +563,33 @@ class RealWorldFrequencyExperimentRunner {
         env: { ...process.env },
       },
     );
+
+    // Log publisher output for debugging
+    publisherProcess.stdout?.on("data", (data) => {
+      const lines = data
+        .toString()
+        .split("\n")
+        .filter((l: string) => l.trim());
+      lines.forEach((line: string) => {
+        console.log(`      [PUBLISHER ${topicName}] ${line}`);
+      });
+    });
+
+    publisherProcess.stderr?.on("data", (data) => {
+      const lines = data
+        .toString()
+        .split("\n")
+        .filter((l: string) => l.trim());
+      lines.forEach((line: string) => {
+        console.error(`      [PUBLISHER ${topicName} ERROR] ${line}`);
+      });
+    });
+
+    publisherProcess.on("error", (error) => {
+      console.error(
+        `      [PUBLISHER ${topicName} PROCESS ERROR] ${error.message}`,
+      );
+    });
 
     // Give publisher time to start
     await this.sleep(1000);
