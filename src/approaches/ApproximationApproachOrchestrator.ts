@@ -22,12 +22,15 @@ export class ApproximationApproachOrchestrator {
   private resourceLogStream?: fs.WriteStream;
   private resourceLogInterval?: ReturnType<typeof setInterval>;
   private healthServer?: http.Server;
-  private healthPort: number = 9091;
+  private healthPort: number;
 
   /**
    * Creates a new ApproximationApproachOrchestrator instance.
    */
   constructor() {
+    this.healthPort = process.env.HEALTH_PORT
+      ? parseInt(process.env.HEALTH_PORT)
+      : 9091;
     this.logger = new CSVLogger("approximation_approach_log.csv");
     this.unifiedLogger = createOrchestratorLogger("approximation");
     this.healthStatus = new HealthStatus("approximation", "orchestrator");

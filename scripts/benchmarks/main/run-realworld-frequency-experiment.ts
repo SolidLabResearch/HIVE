@@ -475,10 +475,21 @@ class RealWorldFrequencyExperimentRunner {
 
     console.log(`      Starting approach process: ${scriptPath}`);
 
+    // Use unique health port for each approach to avoid conflicts
+    const healthPorts: { [key: string]: string } = {
+      "fetching-client-side": "9092",
+      "chunked-query-approach": "9093",
+      "streaming-query-hive": "9093",
+      "approximation-approach": "9094",
+    };
+
     const approachProcess = spawn("node", [scriptPath], {
       cwd: this.projectRoot,
       stdio: "pipe",
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        HEALTH_PORT: healthPorts[approach] || "9092",
+      },
     });
 
     // Log approach output for debugging
@@ -552,7 +563,7 @@ class RealWorldFrequencyExperimentRunner {
     const publisherProcess = spawn(
       "node",
       [
-        "dist/streamer/src/experiment-publisher.js",
+        "dist/src/streamer/src/experiment-publisher.js",
         fullDataPath,
         topicName,
         frequency.toString(),

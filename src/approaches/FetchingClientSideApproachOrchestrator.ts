@@ -373,12 +373,15 @@ export class FetchingClientSideApproachOrchestrator {
   private healthStatus: HealthStatus;
   private topicTracker: ReturnType<typeof getTopicTracker>;
   private healthServer?: http.Server;
-  private healthPort: number = 9092;
+  private healthPort: number;
 
   /**
    * Creates a new FetchingClientSideApproachOrchestrator instance.
    */
   constructor() {
+    this.healthPort = process.env.HEALTH_PORT
+      ? parseInt(process.env.HEALTH_PORT)
+      : 9092;
     this.unifiedLogger = createOrchestratorLogger("fetching");
     this.healthStatus = new HealthStatus("fetching", "orchestrator");
     this.topicTracker = getTopicTracker("fetching");
