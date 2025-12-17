@@ -6,17 +6,17 @@ Generated: results
 
 | Approach | Avg Latency (ms) | Avg Accuracy (%) |
 |----------|------------------|------------------|
-| approximation | 29776.00 | 100.00 |
-| chunked_query | 191.00 | N/A |
-| fetching_client_side | 57.33 | N/A |
+| approximation | 0.00 | 100.00 |
+| chunked_query | 0.00 | N/A |
+| fetching_client_side | 70.67 | N/A |
 
 ## Latency Details
 
 | Approach | Count | Mean | Median | Std Dev | Min | Max | P95 |
 |----------|-------|------|--------|---------|-----|-----|-----|
-| approximation | 2 | 29776.00 | 29776.00 | 41894.66 | 152.00 | 59400.00 | 59400.00 |
-| chunked_query | 1 | 191.00 | 191.00 | 0.00 | 191.00 | 191.00 | 191.00 |
-| fetching_client_side | 3 | 57.33 | 1.00 | 97.57 | 1.00 | 170.00 | 170.00 |
+| approximation | 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| chunked_query | 3 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| fetching_client_side | 3 | 70.67 | 24.00 | 80.83 | 24.00 | 164.00 | 164.00 |
 
 ## Accuracy Details
 
