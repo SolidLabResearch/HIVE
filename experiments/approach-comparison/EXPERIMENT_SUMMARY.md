@@ -1,248 +1,162 @@
-# Approach Comparison Experiment - Final Summary
+# Approach Comparison Experiment
 
-**Date**: December 17, 2024  
-**Branch**: `experimentation/approach-comparison`  
-**Experiment Duration**: 5 minutes  
-**Data Source**: Real sensor data from `src/streamer/data/noisy_datasets/noise_0.5`
+## Overview
 
-## Executive Summary
+This experiment compares the three streaming query processing approaches implemented in the Streaming Query Hive project:
 
-This experiment compared three approaches for processing streaming queries in the Streaming Query Hive system:
+1. **Client-Side Processing** (Ground Truth) - Fetches all data and processes client-side using RSP-JS
+2. **Chunked Query Approach** - Pre-computes chunks from sub-queries and reuses them
+3. **Approximation Approach** - Approximates results using sub-query outputs
 
-1. **Fetching Client-Side Approach** (Ground Truth)
-2. **Approximation Approach**
-3. **Chunked Query Approach**
+## Latency Definition
 
-### Key Findings
-
-| Approach | Avg Latency (ms) | Accuracy vs Ground Truth | Windows Processed |
-|----------|------------------|--------------------------|-------------------|
-| Fetching Client-Side | 70.67 | - (baseline) | 3 |
-| Approximation | 0.00 | 100% (0% error) | 2 |
-| Chunked Query | 0.00 | Mixed (0-606% error) | 3 |
-
-**Winner**: **Approximation Approach** - achieves perfect accuracy with minimal latency.
-
-## Detailed Results
-
-### 1. Latency Analysis
-
-**First Event Latency**: Time between last data arrival and result availability
+**Critical: Latency is measured as the time from window close to result availability.**
 
 ```
-Approach                  Count    Mean     Median   Std Dev   Min      Max
----------------------------------------------------------------------------
-Approximation               2      0.00ms   0.00ms   0.00ms    0.00ms   0.00ms
-Chunked Query               3      0.00ms   0.00ms   0.00ms    0.00ms   0.00ms
-Fetching Client-Side        3     70.67ms  24.00ms  80.83ms   24.00ms  164.00ms
+Latency = result_available_time - window_close_time
 ```
 
-**Analysis**:
-- **Approximation and Chunked** emit results immediately when data is complete (0ms latency)
-- **Fetching Client-Side** has higher latency (24-164ms) due to RSP-JS engine processing overhead
-- All approaches are fast enough for real-time applications
+Where:
+- `window_close_time` = `query_registered_time + (window_number * window_slide)`
+- `result_available_time` = timestamp when the result is received via MQTT
 
-### 2. Accuracy Analysis
+This definition matches the August 2024 benchmark methodology.
 
-**Accuracy Comparison** (vs Fetching Client-Side as Ground Truth):
+## August 2024 Benchmark Results (Reference)
 
-```
-Window   GT Value    Approximation        Chunked Query
-         (MAX)       Value    Error %     Value      Error %
-------------------------------------------------------------------
-1        4.234195    4.234195   0.00%    -21.449054  606.57%
-2        1.926378    4.234195  119.80%    4.234195   119.80%
-3        4.234195    (no data)    -       4.234195     0.00%
-```
+| Approach | Latency (ms) | CPU % | Memory (MB) | Accuracy |
+|----------|--------------|-------|-------------|----------|
+| Chunked Query | 414 +/- 12.3 | 0.21 | 45.68 +/- 2.3 | 100% |
+| Approximation | 359 +/- 31.2 | 0.20 | 53.92 +/- 1.2 | 89.5% |
+| Client-Side Processing | 2543 +/- 213.3 | 0.20 | 66.05 +/- 4.2 | 100% (GT) |
 
-**Key Observations**:
+## Running the Experiment
 
-1. **Window 1**: 
-   - Approximation: ✅ Perfect match (0% error)
-   - Chunked: ❌ Incorrect result (-21.449054 vs 4.234195) - **Major discrepancy**
+### Prerequisites
 
-2. **Window 2**:
-   - Both approaches: ❌ Incorrect (4.234195 vs 1.926378)
-   - Same error suggests both computed wrong window boundaries
+1. MQTT broker running on `localhost:1883`
+   ```bash
+   # macOS
+   brew services start mosquitto
+   
+   # Linux
+   sudo systemctl start mosquitto
+   
+   # Or run directly
+   mosquitto -v
+   ```
 
-3. **Window 3**:
-   - Chunked: ✅ Perfect match (0% error)
-   - Approximation: No result emitted
+2. Node.js and npm installed
 
-## Issues Discovered and Fixed
+3. Project dependencies installed
+   ```bash
+   npm install
+   ```
 
-### Issue 1: RSP-JS Duplicate Emissions (FIXED ✅)
-**Problem**: The UNION clause in the main query caused RSP-JS to emit duplicate results.
+### Using the Benchmark Script (Recommended)
 
-**Example**:
-```
-fetching_client_side,2,1765978831029,1765978831053,24,1.926378,1765978831053
-fetching_client_side,3,1765978831029,1765978831053,24,4.234195,1765978831053
-```
-Two results emitted at the exact same timestamp (1765978831053).
+The standalone benchmark script runs each approach independently with correct latency measurement:
 
-**Fix**: Added deduplication logic in `FetchingClientSideApproach`:
-```typescript
-private isDuplicateResult(value: number, timestamp: number): boolean {
-  // Check if we've seen this exact value within the last 1 second
-  // Filters out UNION-induced duplicates from RSP-JS
-}
-```
+```bash
+# Run all approaches sequentially
+npx ts-node experiments/approach-comparison/benchmark.ts all
 
-### Issue 2: Approximation Latency Spike (FIXED ✅)
-**Problem**: Originally showed 59,400ms latency spike due to waiting for timer tick.
-
-**Fix**: Changed from timer-only to data-driven emission:
-```typescript
-private tryEmitResult(): void {
-  // Emit immediately when window has enough data
-  // Don't wait for fixed timer interval
-}
+# Run a specific approach
+npx ts-node experiments/approach-comparison/benchmark.ts client-side
+npx ts-node experiments/approach-comparison/benchmark.ts chunked
+npx ts-node experiments/approach-comparison/benchmark.ts approximation
 ```
 
-**Result**: Latency reduced from 59,400ms to 0ms.
+### Using the Shell Script
 
-### Issue 3: Window Alignment (PARTIALLY FIXED ⚠️)
-**Problem**: Different approaches compute windows at different times, causing misalignment.
+```bash
+cd experiments/approach-comparison
+./run-experiment.sh
 
-**Attempted Fix**: All approaches now use window boundaries aligned to slide intervals.
-
-**Remaining Issue**: Chunked Query Window 1 has incorrect result (-21.449054), suggesting timing issue during startup.
-
-## Critical Discrepancies
-
-### Discrepancy 1: Chunked Query Window 1 Error (606.57% error)
-
-**Expected**: 4.234195  
-**Actual**: -21.449054  
-**Error**: 606.57%
-
-**Root Cause Analysis**:
-- The chunked approach emitted results at timestamp 1765978710893
-- This was ~30 seconds before the approximation/fetching approaches emitted Window 1
-- Likely cause: Chunked query started computing too early, before enough data arrived
-- The negative value suggests it captured data from before the experiment start
-
-**Impact**: This is a **critical bug** in the chunked approach initialization.
-
-### Discrepancy 2: Window 2 Mismatch (119.80% error)
-
-**Expected**: 1.926378  
-**Actual**: 4.234195 (both approximation and chunked)
-
-**Root Cause Analysis**:
-- Fetching approach produced 1.926378
-- Both approximation and chunked produced 4.234195
-- This suggests:
-  1. Either the fetching approach is using different window boundaries, OR
-  2. The approximation/chunked approaches are including wrong data in the window
-
-**Impact**: Moderate concern - needs investigation of window boundary calculation.
-
-### Discrepancy 3: Missing Approximation Window 3
-
-**Issue**: Approximation approach did not emit result for Window 3.
-
-**Possible Causes**:
-- Experiment ended before approximation timer triggered
-- Data collection stopped too early
-- Timer-based emission still has edge cases
-
-**Impact**: Minor - just needs longer experiment duration.
-
-## Queries Used
-
-### Sub-Query 1 (WearableX - 60s window, 60s slide):
-```sparql
-SELECT (MAX(?value) AS ?avgWearableX)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX 
-[RANGE 60000 STEP 60000]
+# Options:
+./run-experiment.sh --frequency 4      # Data frequency in Hz
+./run-experiment.sh --warmup 5000      # Warmup period in ms
+./run-experiment.sh --skip-mqtt-check  # Skip MQTT broker check
+./run-experiment.sh --compare          # Show August benchmark comparison
 ```
 
-### Sub-Query 2 (SmartphoneX - 60s window, 60s slide):
-```sparql
-SELECT (MAX(?value) AS ?avgSmartphoneX)
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX 
-[RANGE 60000 STEP 60000]
+### Using the Full Experiment
+
+```bash
+npx ts-node experiments/approach-comparison/ApproachComparisonExperiment.ts [output_dir]
 ```
 
-### Main Query (Combined - 120s window, 60s slide):
-```sparql
-SELECT (MAX(?value) AS ?avgValue)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX 
-[RANGE 120000 STEP 60000]
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX 
-[RANGE 120000 STEP 60000]
-WHERE {
-  { WINDOW <mqtt://localhost:1883/wearableX> { ... } }
-  UNION
-  { WINDOW <mqtt://localhost:1883/smartphoneX> { ... } }
-}
-```
+## Configuration
 
-## Recommendations
+Default configuration matches the August 2024 benchmark:
 
-### For Production Use
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Data Frequency | 4 Hz | Events per second per stream |
+| Window Width | 120000 ms | Main query window width (2 minutes) |
+| Window Slide | 60000 ms | Main query window slide (1 minute) |
+| Sub-query Window Width | 60000 ms | Sub-query window width (1 minute) |
+| Sub-query Window Slide | 30000 ms | Sub-query window slide (30 seconds) |
+| Warmup Period | 5000 ms | Ignored initial period |
 
-1. **Use Approximation Approach** when:
-   - Accuracy is critical (0% error when working correctly)
-   - Low latency required (0ms emission delay)
-   - Stable, predictable data streams
+## Output Files
 
-2. **Use Fetching Client-Side Approach** when:
-   - Absolute correctness required (serves as ground truth)
-   - Can tolerate 24-164ms latency
-   - Debugging or validation needed
+Results are saved to `experiments/approach-comparison/results/`:
 
-3. **Avoid Chunked Query Approach** until:
-   - Window 1 initialization bug is fixed
-   - Startup timing issues resolved
+- `summary_<timestamp>.csv` - Aggregate latency and resource statistics
+- `<approach>_results_<timestamp>.csv` - Per-window results for each approach
+- `accuracy_<timestamp>.csv` - Accuracy comparison vs ground truth
+- `benchmark_<timestamp>.json` - Full benchmark results in JSON format
 
-### For Further Investigation
+## How Each Approach Works
 
-1. **Fix Chunked Query Initialization**:
-   - Add startup delay to wait for sufficient data
-   - Validate chunk IDs are calculated correctly from experiment start
-   - Add sanity checking on result values before emission
+### Client-Side Processing (Ground Truth)
 
-2. **Investigate Window 2 Discrepancy**:
-   - Add detailed logging of window boundaries in all approaches
-   - Compare exact data points included in each window
-   - Verify RSP-JS window semantics match our implementation
+1. Subscribes to raw data streams via MQTT
+2. Feeds data into RSP-JS engine with the main query
+3. RSP-JS processes windows and emits results
+4. Results published to `client_operation_output` topic
 
-3. **Extend Experiment Duration**:
-   - Run for 10+ minutes to collect more windows
-   - Use smaller slide intervals (e.g., 30s) for more data points
-   - Test with different data patterns (noise levels)
+### Chunked Query Approach
 
-4. **Add Window Boundary Logging**:
-   - Log exact timestamp ranges for each window
-   - Track which data points are included/excluded
-   - Verify alignment across approaches
+1. Sub-queries are registered and process raw streams
+2. Sub-query results are published as chunks to MQTT
+3. The operator subscribes to chunk topics
+4. Chunks are aggregated to answer the main query
+5. Results published to `output` topic
 
-## Conclusion
+### Approximation Approach
 
-The experiment successfully:
-- ✅ Compared three approaches using real sensor data
-- ✅ Measured latency (fetching: 70ms, others: 0ms)
-- ✅ Measured accuracy (approximation: 0-119% error, chunked: 0-606% error)
-- ✅ Fixed RSP-JS duplicate emissions
-- ✅ Fixed approximation latency spikes
-- ✅ Used existing StreamToMQTT infrastructure
+1. Sub-queries process raw streams
+2. Sub-query aggregation results are published
+3. The operator combines sub-query results
+4. Approximates the main query result using latest values
+5. Results published to `approximation/output` topic
 
-**However, critical issues remain**:
-- ❌ Chunked Query has major accuracy problem in Window 1 (606% error)
-- ⚠️ Window 2 mismatch between fetching and other approaches (119% error)
-- ⚠️ Missing data from approximation approach in Window 3
+## Troubleshooting
 
-**Overall Assessment**:
-The **Approximation Approach** is the most promising, showing 0% error in Window 1 and minimal latency. The **Chunked Query Approach** needs significant debugging before production use. The **Fetching Client-Side Approach** works correctly as ground truth but has higher latency.
+### No results collected
 
----
+- Check that MQTT broker is running: `nc -z localhost 1883`
+- Check that the HTTP query server is accessible: `curl http://localhost:3001/queries`
+- Verify data files exist: `ls src/streamer/data/wearable.acceleration.x/data.nt`
 
-**Next Steps**:
-1. Debug chunked query initialization issue
-2. Extend experiment to 10 minutes
-3. Add detailed window boundary logging
-4. Test with multiple noise levels
-5. Implement per-window validation logic
+### Results don't match August benchmark
+
+- Ensure you're using the same data files
+- Verify data frequency is 4 Hz
+- Check that approaches run separately (not concurrently)
+- Verify latency calculation: `result_time - window_close_time` (not `result_time - last_data_arrival`)
+
+### High error in approximation
+
+- This is expected - approximation trades accuracy for speed
+- August benchmark showed 89.5% accuracy for approximation
+- Check if sub-queries are correctly registered before main query runs
+
+## Files
+
+- `ApproachComparisonExperiment.ts` - Full experiment runner
+- `benchmark.ts` - Standalone benchmark script
+- `run-experiment.sh` - Shell script wrapper
+- `EXPERIMENT_SUMMARY.md` - This documentation
