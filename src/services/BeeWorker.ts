@@ -278,6 +278,11 @@ export class BeeWorker {
    */
   stop() {
     console.log("BeeWorker stopping...");
+    // Call operator cleanup if available
+    if (this.operator && typeof (this.operator as any).cleanup === "function") {
+      console.log("Calling operator cleanup...");
+      (this.operator as any).cleanup();
+    }
   }
 }
 

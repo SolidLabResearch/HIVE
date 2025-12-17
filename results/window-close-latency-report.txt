@@ -1,0 +1,108 @@
+================================================================================
+WINDOW-CLOSE LATENCY ANALYSIS
+================================================================================
+
+Report Generated: 2025-12-17T12:48:33.534Z
+Window Configuration: RANGE 120000ms, STEP 60000ms
+
+Latency Definition: Time between window close and result emission
+  (NOT total query execution time)
+
+================================================================================
+RESULTS SUMMARY
+================================================================================
+
+Fetching Client-Side:
+  Total Results:        40
+  Unique Results:       34
+  Duplicates Removed:   6
+  Results/Iteration:
+    Average:            6.8
+    Min:                6
+    Max:                8
+
+Chunked Query:
+  Total Results:        38
+  Unique Results:       38
+  Duplicates Removed:   0
+  Results/Iteration:
+    Average:            7.6
+    Min:                2
+    Max:                13
+
+Approximation:
+  Total Results:        5
+  Unique Results:       5
+  Duplicates Removed:   0
+  Results/Iteration:
+    Average:            1.0
+    Min:                1
+    Max:                1
+
+================================================================================
+WINDOW-CLOSE LATENCY COMPARISON (milliseconds)
+================================================================================
+
+Fetching Client-Side:
+  Average Latency:      10911.79 ms
+  Median Latency:       10994.50 ms
+  Min Latency:          10502.00 ms
+  Max Latency:          11287.00 ms
+  Std Dev:              254.45 ms
+
+Chunked Query:
+  Average Latency:      52100.00 ms
+  Median Latency:       52098.00 ms
+  Min Latency:          52077.00 ms
+  Max Latency:          52140.00 ms
+  Std Dev:              15.20 ms
+
+Approximation:
+  Average Latency:      11452.40 ms
+  Median Latency:       11415.00 ms
+  Min Latency:          10965.00 ms
+  Max Latency:          11819.00 ms
+  Std Dev:              306.43 ms
+
+Latency Ranking (Fastest to Slowest):
+  1. Fetching Client-Side: 10911.79 ms
+  2. Approximation: 11452.40 ms
+  3. Chunked Query: 52100.00 ms
+
+================================================================================
+EXPECTED VS ACTUAL RESULTS
+================================================================================
+
+With 120-second data replay and window config:
+  RANGE: 120000ms (120s)
+  STEP:  60000ms (60s)
+
+Expected windows per iteration:
+  Window 1: [0, 120s] closes at 120s
+  Window 2: [60s, 180s] closes at 180s (but data ends at 120s)
+  Expected: 1-2 results per iteration (depending on flush timing)
+
+Fetching Client-Side:
+  Expected: 1-2 results/iteration
+  Actual:   6.8 results/iteration
+  Status:   ✗ EXCESSIVE (check for duplicates or accumulation)
+
+Chunked Query:
+  Expected: 1-2 results/iteration
+  Actual:   7.6 results/iteration
+  Status:   ✗ EXCESSIVE (check for duplicates or accumulation)
+
+Approximation:
+  Expected: 1-2 results/iteration
+  Actual:   1.0 results/iteration
+  Status:   ✓ CORRECT
+
+================================================================================
+ISSUES DETECTED
+================================================================================
+
+⚠️  Fetching Client-Side: 6 duplicate results detected
+⚠️  Fetching Client-Side: Excessive results per iteration (6.8, expected 1-2)
+⚠️  Chunked Query: Excessive results per iteration (7.6, expected 1-2)
+
+================================================================================

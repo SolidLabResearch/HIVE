@@ -25,7 +25,7 @@ const SMARTPHONE_TOPIC = "smartphoneX";
 // Output topics for each approach
 const OUTPUT_TOPICS = {
   approximation: "approximation/output",
-  chunked: "output",
+  chunked: "chunked/output", // Aggregated results from StreamingQueryChunkAggregatorOperator
   fetching: "client_operation_output",
 };
 

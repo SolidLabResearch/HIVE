@@ -24,6 +24,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private mqttBroker: string = "mqtt://localhost:1883"; // Default MQTT broker URL, can be changed if needed
   private resultsCsvStream?: fs.WriteStream;
   private queryRegisteredTimestamp: number | null = null;
+  // Timer and MQTT client references for proper cleanup
+  private windowEvaluationTimer?: NodeJS.Timeout;
+  private aggregationMqttClient?: mqtt.MqttClient;
   /**
    * Creates a new StreamingQueryChunkAggregatorOperator instance.
    */
@@ -279,25 +282,26 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
         );
 
-        rsp_client.on("message", (topic, message) => {
-          this.logger.log(
-            `Received message on topic ${topic}: ${message.toString()}`,
-          );
+        // Track last aggregation time for deduplication
+        let lastAggregationTime = 0;
+        const minAggregationInterval = 500; // Minimum 500ms between aggregations to avoid duplicates
+        let isAggregating = false; // Prevent concurrent aggregations
 
-          // Initialize topic array if it doesn't exist
-          if (!chunksByTopic.has(topic)) {
-            chunksByTopic.set(topic, []);
+        // Store MQTT client reference for cleanup
+        this.aggregationMqttClient = rsp_client;
+
+        // Event-driven aggregation function - triggers when conditions are met
+        const tryAggregation = async () => {
+          const now = Date.now();
+
+          // Prevent concurrent aggregations and respect minimum interval
+          if (
+            isAggregating ||
+            now - lastAggregationTime < minAggregationInterval
+          ) {
+            return;
           }
 
-          // Add chunk to the appropriate topic
-          chunksByTopic
-            .get(topic)!
-            .push({ data: message.toString(), timestamp: Date.now() });
-        });
-
-        // Sliding window: evaluate every outputQuerySlide ms, using last outputQueryWidth ms of data
-        setInterval(async () => {
-          const now = Date.now();
           const windowStart = now - outputQueryWidth;
 
           // Collect all chunks from all topics within the window
@@ -311,41 +315,74 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
             if (windowChunks.length > 0) {
               totalTopicsWithData++;
-              this.logger.log(
-                `Sliding window evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
-              );
-              this.logger.log(
-                `Window start timestamp: ${windowStart}, Current time: ${now}`,
-              );
-              this.logger.log(
-                `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
-              );
-
-              // Add this topic's chunks to the combined collection
               allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
             }
-
-            // Clean up old chunks for this topic
-            chunksByTopic.set(
-              topic,
-              chunks.filter((chunk) => chunk.timestamp >= windowStart),
-            );
           }
 
-          if (totalTopicsWithData > 0 && allWindowChunks.length > 0) {
+          // Check if we have enough data to aggregate
+          // Need data from all expected topics (subQueries.length)
+          const expectedTopics = this.subQueries.length;
+          const hasEnoughChunks = allWindowChunks.length >= chunksRequired;
+          const hasAllTopics = totalTopicsWithData >= expectedTopics;
+
+          if (hasAllTopics && hasEnoughChunks && allWindowChunks.length > 0) {
+            isAggregating = true;
+            lastAggregationTime = now;
+
             this.logger.log(
-              `Sliding window evaluation completed. Combined chunks from ${totalTopicsWithData} topics, total chunks: ${allWindowChunks.length}`,
-            );
-            this.logger.log(
-              "Sliding window evaluation. Aggregating and triggering R2R...",
+              `EVENT-DRIVEN aggregation triggered. Topics: ${totalTopicsWithData}/${expectedTopics}, Chunks: ${allWindowChunks.length}/${chunksRequired}`,
             );
 
-            // Process all chunks together like the client-side approach
-            await this.executeR2ROperator(allWindowChunks);
-          } else {
-            this.logger.log("Sliding window: no chunks to aggregate.");
+            try {
+              // Process all chunks together
+              await this.executeR2ROperator(allWindowChunks);
+
+              // Clean up old chunks after successful aggregation
+              for (const [topic, chunks] of Array.from(
+                chunksByTopic.entries(),
+              )) {
+                chunksByTopic.set(
+                  topic,
+                  chunks.filter((chunk) => chunk.timestamp >= windowStart),
+                );
+              }
+            } finally {
+              isAggregating = false;
+            }
           }
-        }, outputQuerySlide);
+        };
+
+        rsp_client.on("message", async (topic, message) => {
+          this.logger.log(
+            `Received message on topic ${topic}: ${message.toString()}`,
+          );
+
+          // Initialize topic array if it doesn't exist
+          if (!chunksByTopic.has(topic)) {
+            chunksByTopic.set(topic, []);
+          }
+
+          // Add chunk to the appropriate topic
+          chunksByTopic
+            .get(topic)!
+            .push({ data: message.toString(), timestamp: Date.now() });
+
+          // EVENT-DRIVEN: Try to aggregate immediately when new data arrives
+          await tryAggregation();
+        });
+
+        // Clear any existing timer before creating new one (prevents memory leak)
+        if (this.windowEvaluationTimer) {
+          clearInterval(this.windowEvaluationTimer);
+          this.windowEvaluationTimer = undefined;
+          this.logger.log("Cleared existing window evaluation timer");
+        }
+
+        // Backup timer: also check periodically in case event-driven misses edge cases
+        // Use a shorter interval for faster response
+        this.windowEvaluationTimer = setInterval(async () => {
+          await tryAggregation();
+        }, 1000); // Check every 1 second as backup
 
         resolve();
       });
@@ -436,7 +473,7 @@ For example, the allResults object might look like this:
       // Publish the output query event to the MQTT broker
       const rsp_client = mqtt.connect(this.mqttBroker);
       rsp_client.on("connect", () => {
-        const outputTopic = `output`;
+        const outputTopic = `chunked/output`;
         this.logger.log(`calculated result ${outputQueryEvent}`);
 
         rsp_client.publish(outputTopic, outputQueryEvent, (err: any) => {
@@ -729,6 +766,39 @@ For example, the allResults object might look like this:
    */
   sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Cleans up resources used by the operator.
+   * This should be called when the operator is no longer needed to prevent memory leaks.
+   */
+  public cleanup(): void {
+    this.logger.log(
+      "Cleaning up StreamingQueryChunkAggregatorOperator resources",
+    );
+
+    // Clear the window evaluation timer
+    if (this.windowEvaluationTimer) {
+      clearInterval(this.windowEvaluationTimer);
+      this.windowEvaluationTimer = undefined;
+      this.logger.log("Window evaluation timer cleared");
+    }
+
+    // Close MQTT client connection
+    if (this.aggregationMqttClient) {
+      this.aggregationMqttClient.end(true);
+      this.aggregationMqttClient = undefined;
+      this.logger.log("MQTT client connection closed");
+    }
+
+    // Close results CSV stream
+    if (this.resultsCsvStream) {
+      this.resultsCsvStream.end();
+      this.resultsCsvStream = undefined;
+      this.logger.log("Results CSV stream closed");
+    }
+
+    this.logger.log("StreamingQueryChunkAggregatorOperator cleanup completed");
   }
 
   /**

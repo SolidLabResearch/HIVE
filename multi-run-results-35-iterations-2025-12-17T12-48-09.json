@@ -1,107 +1,107 @@
 {
-  "timestamp": "2025-12-16T14:50:51.966Z",
+  "timestamp": "2025-12-17T12:48:09.417Z",
   "numRuns": 5,
   "summaries": [
     {
       "runNumber": 1,
       "approximation": {
         "passed": true,
-        "resultCount": 2
+        "resultCount": 1
       },
       "chunked": {
         "passed": true,
-        "resultCount": 2
+        "resultCount": 1
       },
       "fetching": {
         "passed": true,
         "resultCount": 8
       },
-      "totalMessages": 46,
-      "duration": 168448
+      "totalMessages": 28,
+      "duration": 168429
     },
     {
       "runNumber": 2,
       "approximation": {
         "passed": true,
-        "resultCount": 2
+        "resultCount": 1
       },
       "chunked": {
         "passed": true,
-        "resultCount": 5
+        "resultCount": 4
       },
       "fetching": {
         "passed": true,
         "resultCount": 8
       },
-      "totalMessages": 51,
-      "duration": 168424
+      "totalMessages": 33,
+      "duration": 168434
     },
     {
       "runNumber": 3,
       "approximation": {
         "passed": true,
-        "resultCount": 2
+        "resultCount": 1
       },
       "chunked": {
         "passed": true,
-        "resultCount": 8
+        "resultCount": 7
       },
       "fetching": {
         "passed": true,
         "resultCount": 8
       },
-      "totalMessages": 56,
-      "duration": 168452
+      "totalMessages": 38,
+      "duration": 168435
     },
     {
       "runNumber": 4,
       "approximation": {
         "passed": true,
-        "resultCount": 2
+        "resultCount": 1
       },
       "chunked": {
         "passed": true,
-        "resultCount": 11
+        "resultCount": 10
       },
       "fetching": {
         "passed": true,
         "resultCount": 8
       },
-      "totalMessages": 61,
-      "duration": 168483
+      "totalMessages": 43,
+      "duration": 168421
     },
     {
       "runNumber": 5,
       "approximation": {
         "passed": true,
-        "resultCount": 2
+        "resultCount": 1
       },
       "chunked": {
         "passed": true,
-        "resultCount": 14
+        "resultCount": 13
       },
       "fetching": {
         "passed": true,
         "resultCount": 8
       },
-      "totalMessages": 66,
-      "duration": 168456
+      "totalMessages": 48,
+      "duration": 168424
     }
   ],
   "statistics": {
     "approximation": {
       "passCount": 5,
       "successRate": 100,
-      "avgResults": 2,
-      "minResults": 2,
-      "maxResults": 2
+      "avgResults": 1,
+      "minResults": 1,
+      "maxResults": 1
     },
     "chunked": {
       "passCount": 5,
       "successRate": 100,
-      "avgResults": 8,
-      "minResults": 2,
-      "maxResults": 14
+      "avgResults": 7,
+      "minResults": 1,
+      "maxResults": 13
     },
     "fetching": {
       "passCount": 5,

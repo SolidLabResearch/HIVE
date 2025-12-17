@@ -586,26 +586,66 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
             // Check how many topics have valid data in the current window BEFORE cleanup
             let topicsWithValidData = 0;
-            windowBuffers.forEach((buffer, _topicKey) => {
+            const topicsWithData: string[] = [];
+            windowBuffers.forEach((buffer, topicKey) => {
               const validWindowData = buffer.filter(
                 (w) => w.end >= windowStartGlobal,
               );
               if (validWindowData.length > 0) {
                 topicsWithValidData++;
+                topicsWithData.push(topicKey);
               }
             });
 
-            // More flexible waiting strategy - wait a bit longer for all topics
-            const bufferTimeMs = 3000; // 3 second buffer to allow for timing differences
-            const shouldWaitForMoreTopics =
-              topicsWithValidData < r2sTopics.length &&
-              Date.now() - lastTriggerTime < outputQuerySlide + bufferTimeMs;
+            // Also count topics with recent global values (within the window)
+            let globalTopicsWithRecentData = 0;
+            const globalTopicsWithData: string[] = [];
+            globalLatestValues.forEach((valData, topicKey) => {
+              // Consider data "recent" if it arrived within the window duration
+              if (now - valData.timestamp <= outputQueryWidth) {
+                globalTopicsWithRecentData++;
+                if (!globalTopicsWithData.includes(topicKey)) {
+                  globalTopicsWithData.push(topicKey);
+                }
+              }
+            });
+
+            // Use the maximum of buffer-based and global-based topic counts
+            const effectiveTopicsWithData = Math.max(
+              topicsWithValidData,
+              globalTopicsWithRecentData,
+            );
+
+            // More robust waiting strategy with adaptive buffer time
+            // Use 20% of the window slide time, minimum 5 seconds, maximum 15 seconds
+            const adaptiveBufferMs = Math.min(
+              Math.max(outputQuerySlide * 0.2, 5000),
+              15000,
+            );
+
+            const timeSinceLastTrigger = Date.now() - lastTriggerTime;
+            const hasAllTopics = effectiveTopicsWithData >= r2sTopics.length;
+            const withinBufferPeriod =
+              timeSinceLastTrigger < outputQuerySlide + adaptiveBufferMs;
+
+            // Wait for more topics if we don't have all and we're still within buffer period
+            const shouldWaitForMoreTopics = !hasAllTopics && withinBufferPeriod;
 
             if (shouldWaitForMoreTopics) {
               this.logger.log(
-                `Waiting for more topics. Topics with valid data: ${topicsWithValidData}, Expected: ${r2sTopics.length}, Time since trigger: ${Date.now() - lastTriggerTime}ms`,
+                `Waiting for more topics. Topics with valid data: ${effectiveTopicsWithData} (buffer: ${topicsWithValidData}, global: ${globalTopicsWithRecentData}), Expected: ${r2sTopics.length}, Time since trigger: ${timeSinceLastTrigger}ms, Buffer: ${adaptiveBufferMs}ms`,
               );
               return; // Wait a bit more for other topics
+            }
+
+            // CRITICAL: Only produce unified result if we have data from ALL expected topics
+            // This prevents incorrect results from partial data
+            if (!hasAllTopics) {
+              this.logger.log(
+                `Skipping unified result: only have data from ${effectiveTopicsWithData}/${r2sTopics.length} topics. Topics with data: [${[...new Set([...topicsWithData, ...globalTopicsWithData])].join(", ")}], Expected: [${r2sTopics.join(", ")}]`,
+              );
+              lastTriggerTime = Date.now(); // Reset trigger time to avoid immediate re-trigger
+              return; // Don't produce partial results
             }
 
             this.logger.log(
@@ -701,25 +741,41 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
               totalValidBuffers > 0 || Object.keys(latestValues).length > 0;
 
             if (hasAnyValidData) {
-              // Calculate unified cross-sensor average using latest values from all available topics
-              // First priority: use the latest global values from all topics that have ever sent data
+              // Calculate unified cross-sensor aggregation using latest values from all topics
+              // IMPORTANT: Only use recent values (within window) to avoid stale data
               const allAvailableValuesFromGlobal: number[] = [];
-              const allTopicsWithData: string[] = [];
+              const allTopicsWithRecentData: string[] = [];
 
               globalLatestValues.forEach((valData, topicKey) => {
-                allAvailableValuesFromGlobal.push(valData.value);
-                allTopicsWithData.push(topicKey);
+                // Only use values that are recent (within 2x window width for safety margin)
+                const maxAge = outputQueryWidth * 2;
+                if (now - valData.timestamp <= maxAge) {
+                  allAvailableValuesFromGlobal.push(valData.value);
+                  allTopicsWithRecentData.push(topicKey);
+                } else {
+                  this.logger.log(
+                    `Skipping stale global value for topic ${topicKey}: age=${now - valData.timestamp}ms, maxAge=${maxAge}ms`,
+                  );
+                }
               });
 
-              // If we don't have global data, fallback to latestValues from windowing
+              // Verify we have data from all expected topics before proceeding
+              if (allAvailableValuesFromGlobal.length < r2sTopics.length) {
+                this.logger.log(
+                  `Insufficient recent data for unified result: have ${allAvailableValuesFromGlobal.length} topics, need ${r2sTopics.length}`,
+                );
+                return;
+              }
+
+              // If we don't have enough global data, fallback to latestValues from windowing
               const allAvailableValues =
-                allAvailableValuesFromGlobal.length >= 2
+                allAvailableValuesFromGlobal.length >= r2sTopics.length
                   ? allAvailableValuesFromGlobal
                   : Object.values(latestValues);
 
               const topicsUsedForAverage =
-                allAvailableValuesFromGlobal.length >= 2
-                  ? allTopicsWithData
+                allAvailableValuesFromGlobal.length >= r2sTopics.length
+                  ? allTopicsWithRecentData
                   : Object.keys(latestValues);
 
               // Calculate unified result based on output query aggregation type
