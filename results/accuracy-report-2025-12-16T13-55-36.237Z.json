@@ -1,0 +1,64 @@
+{
+  "timestamp": "2025-12-16T13:55:36.237Z",
+  "configuration": {
+    "windowRangeMs": 120000,
+    "windowStepMs": 60000,
+    "dataPath": "noisy_datasets/noise_0.5",
+    "timestampToleranceMs": 5000
+  },
+  "groundTruth": [
+    {
+      "windowStart": "2025-07-15T07:50:23.439Z",
+      "windowEnd": "2025-07-15T07:52:23.439Z",
+      "maxValue": 4.234195
+    },
+    {
+      "windowStart": "2025-07-15T08:47:23.439Z",
+      "windowEnd": "2025-07-15T08:49:23.439Z",
+      "maxValue": -8.69541
+    },
+    {
+      "windowStart": "2025-07-15T08:48:23.439Z",
+      "windowEnd": "2025-07-15T08:50:23.439Z",
+      "maxValue": -8.69541
+    }
+  ],
+  "accuracyMetrics": [
+    {
+      "approach": "Approximation",
+      "mae": 0,
+      "rmse": 0,
+      "mape": 0,
+      "maxError": 0,
+      "minError": 0,
+      "avgError": 0,
+      "totalGroundTruthWindows": 3,
+      "totalApproachResults": 0,
+      "matchedWindows": 0
+    },
+    {
+      "approach": "Chunked",
+      "mae": 0,
+      "rmse": 0,
+      "mape": 0,
+      "maxError": 0,
+      "minError": 0,
+      "avgError": 0,
+      "totalGroundTruthWindows": 3,
+      "totalApproachResults": 60,
+      "matchedWindows": 0
+    },
+    {
+      "approach": "Fetching",
+      "mae": 0,
+      "rmse": 0,
+      "mape": 0,
+      "maxError": 0,
+      "minError": 0,
+      "avgError": 0,
+      "totalGroundTruthWindows": 3,
+      "totalApproachResults": 20,
+      "matchedWindows": 0
+    }
+  ]
+}

@@ -20,7 +20,10 @@
     "experiment:5-iterations": "npx ts-node scripts/run-5-iterations.ts",
     "experiment:35-iterations": "npx ts-node scripts/run-35-iterations.ts",
     "experiment:patterns-approx-vs-fetching-5": "npx ts-node scripts/run-patterns-approx-vs-fetching-5.ts",
-    "experiment:patterns-approx-vs-fetching": "npx ts-node scripts/run-patterns-approx-vs-fetching.ts"
+    "experiment:patterns-approx-vs-fetching": "npx ts-node scripts/run-patterns-approx-vs-fetching.ts",
+    "test:orchestrator-lifecycle": "npx ts-node scripts/test-orchestrator-lifecycle.ts",
+    "experiment:calculate-accuracy": "npx ts-node scripts/calculate-accuracy.ts",
+    "data:generate-aligned": "npx ts-node scripts/generate-aligned-test-data.ts"
   },
   "keywords": [],
   "author": "Kushagra Singh Bisen",

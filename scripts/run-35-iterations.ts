@@ -32,7 +32,7 @@ const OUTPUT_TOPICS = {
 // Test parameters
 const DATA_RATE_HZ = 4;
 const EXPERIMENT_DURATION_S = 90;
-const INIT_WAIT_S = 10;
+const INIT_WAIT_S = 20;
 const FINAL_WAIT_S = 20;
 const NUM_RUNS = 35; // 35 iterations
 
@@ -378,6 +378,11 @@ class SingleRunVerifier {
 
     console.log(`  [Run #${this.runNumber}] Data replay completed`);
 
+    // Send flush events to trigger final window emissions
+    console.log(`  [Run #${this.runNumber}] Sending flush events...`);
+    await this.sendFlushEvents();
+    console.log(`  [Run #${this.runNumber}] Flush events sent`);
+
     // Check if orchestrators are still running
     let runningCount = 0;
     for (const [name, proc] of this.orchestrators) {
@@ -443,6 +448,77 @@ class SingleRunVerifier {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Send flush events with future timestamps to trigger window emissions
+   */
+  private async sendFlushEvents(): Promise<void> {
+    const flushClient = mqtt.connect(MQTT_BROKER, {
+      clientId: `flush-run${this.runNumber}-${Math.random().toString(16).substr(2, 8)}`,
+      clean: true,
+    });
+
+    return new Promise<void>((resolve, reject) => {
+      flushClient.on("connect", async () => {
+        try {
+          // Use a timestamp far in the future to ensure all windows close
+          const futureTimestamp = new Date(Date.now() + 300000).toISOString(); // 5 minutes in future
+
+          // Create flush events for both topics
+          const flushEventWearable = `
+<https://rsp.js/flush/wearable> <https://saref.etsi.org/core/hasValue> "0.0"^^<http://www.w3.org/2001/XMLSchema#float> .
+<https://rsp.js/flush/wearable> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/wearableX> .
+<https://rsp.js/flush/wearable> <https://saref.etsi.org/core/hasTimestamp> "${futureTimestamp}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+          `.trim();
+
+          const flushEventSmartphone = `
+<https://rsp.js/flush/smartphone> <https://saref.etsi.org/core/hasValue> "0.0"^^<http://www.w3.org/2001/XMLSchema#float> .
+<https://rsp.js/flush/smartphone> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/smartphoneX> .
+<https://rsp.js/flush/smartphone> <https://saref.etsi.org/core/hasTimestamp> "${futureTimestamp}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+          `.trim();
+
+          // Publish flush events with QoS 2 to ensure delivery
+          await new Promise<void>((res, rej) => {
+            flushClient.publish(
+              WEARABLE_TOPIC,
+              flushEventWearable,
+              { qos: 2 },
+              (err) => {
+                if (err) rej(err);
+                else res();
+              },
+            );
+          });
+
+          await new Promise<void>((res, rej) => {
+            flushClient.publish(
+              SMARTPHONE_TOPIC,
+              flushEventSmartphone,
+              { qos: 2 },
+              (err) => {
+                if (err) rej(err);
+                else res();
+              },
+            );
+          });
+
+          // Wait a moment for events to be processed
+          await this.sleep(1000);
+
+          flushClient.end(true);
+          resolve();
+        } catch (error) {
+          flushClient.end(true);
+          reject(error);
+        }
+      });
+
+      flushClient.on("error", (err) => {
+        flushClient.end(true);
+        reject(err);
+      });
+    });
   }
 }
 

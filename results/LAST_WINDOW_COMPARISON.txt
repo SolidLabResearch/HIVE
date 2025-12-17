@@ -1,0 +1,124 @@
+
+================================================================================
+LAST WINDOW COMPARISON - 5 ITERATION EXPERIMENT
+Comparing only the final result from each iteration
+================================================================================
+
+GROUND TRUTH (Last Window Results):
+--------------------------------------------------------------------------------
+
+Iteration 1:
+  Final result value: 0.9412997
+  Time to final result: 141.08s
+
+Iteration 2:
+  Final result value: 0.9412997
+  Time to final result: 141.08s
+
+Iteration 3:
+  Final result value: 0.9412997
+  Time to final result: 141.01s
+
+Iteration 4:
+  Final result value: 0.9412997
+  Time to final result: 141.03s
+
+Ground Truth Summary:
+  Total iterations: 4
+  Unique final values: [0.9412997]
+  Avg time to final result: 141.05s
+
+
+================================================================================
+APPROACH COMPARISON (Last Window Only)
+================================================================================
+
+
+### APPROXIMATION APPROACH ###
+
+Iteration 1:
+  Ground Truth: 0.9412997
+  Approach:     0.9412997
+  ✓ MATCH
+  Latency: 141.25s (GT: 141.08s)
+
+Iteration 2:
+  Ground Truth: 0.9412997
+  Approach:     0.9412997
+  ✓ MATCH
+  Latency: 141.31s (GT: 141.08s)
+
+Iteration 3:
+  Ground Truth: 0.9412997
+  Approach:     0.9412997
+  ✓ MATCH
+  Latency: 141.63s (GT: 141.01s)
+
+Iteration 4:
+  Ground Truth: 0.9412997
+  Approach:     0.9412997
+  ✓ MATCH
+  Latency: 141.73s (GT: 141.03s)
+
+Overall Summary:
+  Iterations compared: 4
+  Matches: 4/4
+  Accuracy: 100.0%
+  Unique final values: [0.9412997]
+  Avg time to final result: 141.48s
+  Latency vs GT: +0.43s
+
+### CHUNKED QUERY APPROACH ###
+
+Iteration 1:
+  Ground Truth: 0.9412997
+  Approach:     3.9639792
+  ✗ MISMATCH
+  Latency: 722.06s (GT: 141.08s)
+
+Iteration 2:
+  Ground Truth: 0.9412997
+  Approach:     3.9639792
+  ✗ MISMATCH
+  Latency: 542.06s (GT: 141.08s)
+
+Iteration 3:
+  Ground Truth: 0.9412997
+  Approach:     3.9639792
+  ✗ MISMATCH
+  Latency: 362.06s (GT: 141.01s)
+
+Iteration 4:
+  Ground Truth: 0.9412997
+  Approach:     3.9639792
+  ✗ MISMATCH
+  Latency: 182.05s (GT: 141.03s)
+
+Overall Summary:
+  Iterations compared: 4
+  Matches: 0/4
+  Accuracy: 0.0%
+  Unique final values: [3.9639792]
+  Avg time to final result: 452.06s
+  Latency vs GT: +311.01s
+
+  Mismatches:
+    Iteration 1: Expected 0.9412997, Got 3.9639792
+    Iteration 2: Expected 0.9412997, Got 3.9639792
+    Iteration 3: Expected 0.9412997, Got 3.9639792
+    Iteration 4: Expected 0.9412997, Got 3.9639792
+
+  Missing from GT: [0.9412997]
+  Extra (not in GT): [3.9639792]
+
+================================================================================
+FINAL SUMMARY TABLE (Last Window Only)
+================================================================================
+
+| Approach | Accuracy | Avg Latency | Latency vs GT | Unique Values |
+|----------|----------|-------------|---------------|---------------|
+| Ground Truth | 100.0% | 141.05s | - | 1 |
+| Approximation | 100.0% | 141.48s | +0.43s | 1 |
+| Chunked Query | 0.0% | 452.06s | +311.01s | 1 |
+
+

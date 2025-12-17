@@ -4,7 +4,7 @@ import * as mqtt from "mqtt";
 import * as path from "path";
 const N3 = require("n3");
 const { DataFactory } = N3;
-const { namedNode } = DataFactory;
+ const { namedNode, literal } = DataFactory;
 
 /**
  * Streams data from a file to an MQTT broker.
@@ -244,6 +244,23 @@ export class StreamToMQTT {
     try {
       const id = this.sorted_observation_subjects[this.observation_pointer];
       const node = namedNode(id);
+
+      // Remove old timestamp
+      const old = this.store.getQuads(
+        node,
+        namedNode("https://saref.etsi.org/core/hasTimestamp"),
+        null,
+        null,
+      );
+      this.store.removeQuads(old);
+
+      // Add new timestamp
+      const now = new Date().toISOString();
+      this.store.addQuad(
+        node,
+        namedNode("https://saref.etsi.org/core/hasTimestamp"),
+        literal(now),
+      );
 
       // Extract quads for this observation
       const quads = this.store.getQuads(node, null, null, null);

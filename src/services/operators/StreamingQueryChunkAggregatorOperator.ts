@@ -224,120 +224,140 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
     const that = this;
 
-    rsp_client.on("connect", () => {
-      this.logger.log(
-        `subQueryTopicMap : ${JSON.stringify(that.subQueryMQTTTopicMap)}`,
-      );
-      const topics = Array.from(that.subQueryMQTTTopicMap.values());
-      this.logger.log(`topics to subscribe: ${topics}`);
-      // TODO : Remove hardcoded topics, use the topics from subQueryMQTTTopicMap but currently there is a bug in the subQueryMQTTTopicMap that prevents it from being used correctly.
-      // TODO : Such that only one topic is subscribed to at a time.
-      let topicsOfProcesses: string[] = [
-        "chunked/f8eec45a01e39e93d117673df8915525",
-        "chunked/b22681cadced9975b3b35cb47f82bb40",
-      ];
+    // Wait for MQTT connection before proceeding
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("MQTT connection timeout after 10 seconds"));
+      }, 10000);
 
-      topicsOfProcesses = topics;
-
-      this.logger.log(
-        `DEBUG: topicsOfProcesses after loop: ${topicsOfProcesses}, length: ${topicsOfProcesses.length}`,
-      );
-      if (topicsOfProcesses.length === 0) {
+      rsp_client.on("connect", () => {
+        clearTimeout(timeout);
         this.logger.log(
-          "No valid MQTT topics to subscribe to. Please check the subQueryMQTTTopicMap.",
+          `subQueryTopicMap : ${JSON.stringify(that.subQueryMQTTTopicMap)}`,
         );
-        return;
-      }
-      for (const mqttTopic of topicsOfProcesses) {
-        rsp_client.subscribe(`${mqttTopic}`, (err) => {
-          if (err) {
-            this.logger.log(
-              `Failed to subscribe to topic ${mqttTopic}: ${err}`,
-            );
-          } else {
-            this.logger.log(`Subscribed to topic: ${mqttTopic}`);
-          }
-        });
-      }
+        const topics = Array.from(that.subQueryMQTTTopicMap.values());
+        this.logger.log(`topics to subscribe: ${topics}`);
+        // TODO : Remove hardcoded topics, use the topics from subQueryMQTTTopicMap but currently there is a bug in the subQueryMQTTTopicMap that prevents it from being used correctly.
+        // TODO : Such that only one topic is subscribed to at a time.
+        let topicsOfProcesses: string[] = [
+          "chunked/f8eec45a01e39e93d117673df8915525",
+          "chunked/b22681cadced9975b3b35cb47f82bb40",
+        ];
 
-      // Data structure to collect chunks by topic with timestamps
-      const chunksByTopic: Map<string, { data: string; timestamp: number }[]> =
-        new Map();
-      const chunksRequired =
-        Math.ceil(outputQueryWidth / this.chunkGCD) * this.subQueries.length;
-      this.logger.log(`Chunks required for aggregation: ${chunksRequired}`);
-      this.logger.log(
-        `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
-      );
+        topicsOfProcesses = topics;
 
-      rsp_client.on("message", (topic, message) => {
         this.logger.log(
-          `Received message on topic ${topic}: ${message.toString()}`,
+          `DEBUG: topicsOfProcesses after loop: ${topicsOfProcesses}, length: ${topicsOfProcesses.length}`,
         );
-
-        // Initialize topic array if it doesn't exist
-        if (!chunksByTopic.has(topic)) {
-          chunksByTopic.set(topic, []);
+        if (topicsOfProcesses.length === 0) {
+          this.logger.log(
+            "No valid MQTT topics to subscribe to. Please check the subQueryMQTTTopicMap.",
+          );
+          return;
+        }
+        for (const mqttTopic of topicsOfProcesses) {
+          rsp_client.subscribe(`${mqttTopic}`, (err) => {
+            if (err) {
+              this.logger.log(
+                `Failed to subscribe to topic ${mqttTopic}: ${err}`,
+              );
+            } else {
+              this.logger.log(`Subscribed to topic: ${mqttTopic}`);
+            }
+          });
         }
 
-        // Add chunk to the appropriate topic
-        chunksByTopic
-          .get(topic)!
-          .push({ data: message.toString(), timestamp: Date.now() });
+        // Data structure to collect chunks by topic with timestamps
+        const chunksByTopic: Map<
+          string,
+          { data: string; timestamp: number }[]
+        > = new Map();
+        const chunksRequired =
+          Math.ceil(outputQueryWidth / this.chunkGCD) * this.subQueries.length;
+        this.logger.log(`Chunks required for aggregation: ${chunksRequired}`);
+        this.logger.log(
+          `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
+        );
+
+        rsp_client.on("message", (topic, message) => {
+          this.logger.log(
+            `Received message on topic ${topic}: ${message.toString()}`,
+          );
+
+          // Initialize topic array if it doesn't exist
+          if (!chunksByTopic.has(topic)) {
+            chunksByTopic.set(topic, []);
+          }
+
+          // Add chunk to the appropriate topic
+          chunksByTopic
+            .get(topic)!
+            .push({ data: message.toString(), timestamp: Date.now() });
+        });
+
+        // Sliding window: evaluate every outputQuerySlide ms, using last outputQueryWidth ms of data
+        setInterval(async () => {
+          const now = Date.now();
+          const windowStart = now - outputQueryWidth;
+
+          // Collect all chunks from all topics within the window
+          const allWindowChunks: string[] = [];
+          let totalTopicsWithData = 0;
+
+          for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
+            const windowChunks = chunks.filter(
+              (chunk) => chunk.timestamp >= windowStart,
+            );
+
+            if (windowChunks.length > 0) {
+              totalTopicsWithData++;
+              this.logger.log(
+                `Sliding window evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
+              );
+              this.logger.log(
+                `Window start timestamp: ${windowStart}, Current time: ${now}`,
+              );
+              this.logger.log(
+                `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
+              );
+
+              // Add this topic's chunks to the combined collection
+              allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
+            }
+
+            // Clean up old chunks for this topic
+            chunksByTopic.set(
+              topic,
+              chunks.filter((chunk) => chunk.timestamp >= windowStart),
+            );
+          }
+
+          if (totalTopicsWithData > 0 && allWindowChunks.length > 0) {
+            this.logger.log(
+              `Sliding window evaluation completed. Combined chunks from ${totalTopicsWithData} topics, total chunks: ${allWindowChunks.length}`,
+            );
+            this.logger.log(
+              "Sliding window evaluation. Aggregating and triggering R2R...",
+            );
+
+            // Process all chunks together like the client-side approach
+            await this.executeR2ROperator(allWindowChunks);
+          } else {
+            this.logger.log("Sliding window: no chunks to aggregate.");
+          }
+        }, outputQuerySlide);
+
+        resolve();
       });
 
-      // Sliding window: evaluate every outputQuerySlide ms, using last outputQueryWidth ms of data
-      setInterval(async () => {
-        const now = Date.now();
-        const windowStart = now - outputQueryWidth;
-
-        // Collect all chunks from all topics within the window
-        const allWindowChunks: string[] = [];
-        let totalTopicsWithData = 0;
-
-        for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
-          const windowChunks = chunks.filter(
-            (chunk) => chunk.timestamp >= windowStart,
-          );
-
-          if (windowChunks.length > 0) {
-            totalTopicsWithData++;
-            this.logger.log(
-              `Sliding window evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
-            );
-            this.logger.log(
-              `Window start timestamp: ${windowStart}, Current time: ${now}`,
-            );
-            this.logger.log(
-              `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
-            );
-
-            // Add this topic's chunks to the combined collection
-            allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
-          }
-
-          // Clean up old chunks for this topic
-          chunksByTopic.set(
-            topic,
-            chunks.filter((chunk) => chunk.timestamp >= windowStart),
-          );
-        }
-
-        if (totalTopicsWithData > 0 && allWindowChunks.length > 0) {
-          this.logger.log(
-            `Sliding window evaluation completed. Combined chunks from ${totalTopicsWithData} topics, total chunks: ${allWindowChunks.length}`,
-          );
-          this.logger.log(
-            "Sliding window evaluation. Aggregating and triggering R2R...",
-          );
-
-          // Process all chunks together like the client-side approach
-          await this.executeR2ROperator(allWindowChunks);
-        } else {
-          this.logger.log("Sliding window: no chunks to aggregate.");
-        }
-      }, outputQuerySlide);
+      rsp_client.on("error", (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
     });
+
+    this.logger.log("MQTT connection established and subscriptions ready");
+    console.log("[CHUNKED] Connected to MQTT broker");
   }
 
   /**

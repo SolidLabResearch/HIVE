@@ -1,0 +1,141 @@
+{
+  "timestamp": "2025-12-16T13:57:24.614Z",
+  "configuration": {
+    "windowRangeMs": 120000,
+    "windowStepMs": 60000,
+    "dataPath": "noisy_datasets/noise_0.5",
+    "valueTolerance": 0.01,
+    "replayFrequencyHz": 4
+  },
+  "expectedMaxValue": 4.234195,
+  "groundTruth": [
+    {
+      "windowStartMs": 0,
+      "windowEndMs": 120000,
+      "windowStartS": "0.00",
+      "windowEndS": "120.00",
+      "maxValue": 4.234195,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 60000,
+      "windowEndMs": 180000,
+      "windowStartS": "60.00",
+      "windowEndS": "180.00",
+      "maxValue": 1.926378,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 120000,
+      "windowEndMs": 240000,
+      "windowStartS": "120.00",
+      "windowEndS": "240.00",
+      "maxValue": 1.219225,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 180000,
+      "windowEndMs": 300000,
+      "windowStartS": "180.00",
+      "windowEndS": "300.00",
+      "maxValue": -17.775304,
+      "observations": 242
+    },
+    {
+      "windowStartMs": 240000,
+      "windowEndMs": 360000,
+      "windowStartS": "240.00",
+      "windowEndS": "360.00",
+      "maxValue": -31.392803,
+      "observations": 2
+    }
+  ],
+  "accuracyMetrics": [
+    {
+      "approach": "Approximation",
+      "mae": 0,
+      "rmse": 0,
+      "mape": 0,
+      "maxError": 0,
+      "minError": 0,
+      "avgError": 0,
+      "totalGroundTruthWindows": 5,
+      "totalApproachResults": 0,
+      "matchedResults": 0,
+      "perfectMatches": 0,
+      "accuracy": 0
+    },
+    {
+      "approach": "Chunked",
+      "mae": 0.2702157999999995,
+      "rmse": 0.2702158000000001,
+      "mape": 6.381751430909541,
+      "maxError": 0.2702157999999999,
+      "minError": 0.2702157999999999,
+      "avgError": 0.2702157999999995,
+      "totalGroundTruthWindows": 5,
+      "totalApproachResults": 60,
+      "matchedResults": 60,
+      "perfectMatches": 0,
+      "accuracy": 0
+    },
+    {
+      "approach": "Fetching",
+      "mae": 0.2702157999999999,
+      "rmse": 0.2702157999999999,
+      "mape": 6.3817514309095325,
+      "maxError": 0.2702157999999999,
+      "minError": 0.2702157999999999,
+      "avgError": 0.2702157999999999,
+      "totalGroundTruthWindows": 5,
+      "totalApproachResults": 20,
+      "matchedResults": 20,
+      "perfectMatches": 0,
+      "accuracy": 0
+    }
+  ],
+  "ranking": {
+    "byAccuracy": [
+      {
+        "approach": "Approximation",
+        "accuracy": 0
+      },
+      {
+        "approach": "Chunked",
+        "accuracy": 0
+      },
+      {
+        "approach": "Fetching",
+        "accuracy": 0
+      }
+    ],
+    "byMAE": [
+      {
+        "approach": "Approximation",
+        "mae": 0
+      },
+      {
+        "approach": "Chunked",
+        "mae": 0.2702157999999995
+      },
+      {
+        "approach": "Fetching",
+        "mae": 0.2702157999999999
+      }
+    ],
+    "byRMSE": [
+      {
+        "approach": "Approximation",
+        "rmse": 0
+      },
+      {
+        "approach": "Fetching",
+        "rmse": 0.2702157999999999
+      },
+      {
+        "approach": "Chunked",
+        "rmse": 0.2702158000000001
+      }
+    ]
+  }
+}

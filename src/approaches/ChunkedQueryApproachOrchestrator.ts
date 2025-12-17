@@ -47,12 +47,19 @@ export class ChunkedQueryApproachOrchestrator {
       // Start resource usage logging
       this.startResourceUsageLogging();
 
-      // Run the registered query
-      const result = await this.orchestrator.runRegisteredQuery();
+      // Run the registered query (spawns BeeWorker child process)
+      this.orchestrator.runRegisteredQuery();
 
-      console.log(`[ChunkedQueryApproach] Experiment completed`);
+      console.log(
+        `[ChunkedQueryApproach] Query execution started, keeping process alive...`,
+      );
 
-      return result;
+      // Keep the process alive indefinitely - the experiment runner will terminate us
+      // This prevents the orchestrator from exiting before BeeWorker can produce results
+      return new Promise(() => {
+        // This promise never resolves, keeping the process alive
+        // The experiment runner script will kill this process when appropriate
+      });
     } catch (error) {
       console.error(`[ChunkedQueryApproach] Error during experiment:`, error);
       throw error;
@@ -71,7 +78,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
 SELECT (MAX(?value) AS ?avgWearableX)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 60000 STEP 30000]
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 60000 STEP 60000]
 WHERE {
     WINDOW <mqtt://localhost:1883/wearableX> {
         ?s1 saref:hasValue ?value .
@@ -87,7 +94,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
 SELECT (MAX(?value) AS ?avgSmartphoneX)
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 60000 STEP 30000]
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 60000 STEP 60000]
 WHERE {
     WINDOW <mqtt://localhost:1883/smartphoneX> {
         ?s2 saref:hasValue ?value .
@@ -204,14 +211,22 @@ async function runStandaloneChunkedQueryApproach() {
   const orchestrator = new ChunkedQueryApproachOrchestrator();
 
   try {
-    await orchestrator.runExperiment();
+    // Start the experiment (this will keep running)
+    orchestrator.runExperiment().catch((error) => {
+      console.error("Error in orchestrator:", error);
+      orchestrator.cleanup();
+      process.exit(1);
+    });
 
-    // Add exit logic to ensure the process terminates after processing
+    // Set a timeout to exit after processing window completes
+    // Query windows: RANGE 120000ms, STEP 60000ms means results at ~60s and ~120s
+    // Add buffer for processing
+    const experimentDuration = 150000; // 2.5 minutes
     setTimeout(() => {
       console.log("Chunked Query approach processing completed, exiting...");
       orchestrator.cleanup();
       process.exit(0);
-    }, 120000); // 2 minutes timeout
+    }, experimentDuration);
   } catch (error) {
     console.error("Error in orchestrator:", error);
     orchestrator.cleanup();

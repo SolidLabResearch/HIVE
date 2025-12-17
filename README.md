@@ -32,6 +32,8 @@ npm run experiment:analyze
 - **[Approach Orchestrators](docs/APPROACH_ORCHESTRATORS.md)** - Detailed approach documentation
 - **[Approach Comparison](docs/APPROACH_COMPARISON.md)** - Performance and use cases
 - **[Performance Analysis](docs/PERFORMANCE_ANALYSIS.md)** - Benchmarks and optimization
+- **[Accuracy Analysis](docs/ACCURACY_ANALYSIS.md)** - Ground truth comparison and error metrics
+- **[Known Issues](docs/KNOWN_ISSUES.md)** - Current limitations and fixes
 
 ## Approaches
 
@@ -42,6 +44,37 @@ The project implements three streaming query processing approaches:
 3. **Approximation Approach** (`approximation-approach`) - Fast approximate processing
 
 See [APPROACH_COMPARISON.md](docs/APPROACH_COMPARISON.md) for detailed comparison.
+
+## Experiments & Analysis
+
+### Running Experiments
+
+```bash
+# Quick test (5 iterations)
+npm run experiment:5-iterations
+
+# Full test (35 iterations)
+npm run experiment:35-iterations
+
+# Test orchestrator lifecycle
+npm run test:orchestrator-lifecycle
+```
+
+### Accuracy Analysis
+
+Compare the accuracy of all three approaches against ground truth:
+
+```bash
+# Run accuracy analysis on latest results
+npm run experiment:calculate-accuracy
+```
+
+**Current Accuracy Results:**
+- **Chunked:** 93.62% accuracy (6.38% MAPE), 60 results
+- **Fetching:** 93.62% accuracy (6.38% MAPE), 20 results  
+- **Approximation:** Requires debugging (0 results)
+
+See [ACCURACY_ANALYSIS.md](docs/ACCURACY_ANALYSIS.md) for detailed metrics and recommendations.
 
 ## Development
 

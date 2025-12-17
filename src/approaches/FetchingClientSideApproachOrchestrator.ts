@@ -477,7 +477,12 @@ WHERE {
 
       this.unifiedLogger.info("Experiment started, streams processing");
 
-      return { status: "running" };
+      // Keep the process alive indefinitely - the experiment runner will terminate us
+      // This prevents the orchestrator from exiting before results can be produced
+      return new Promise(() => {
+        // This promise never resolves, keeping the process alive
+        // The experiment runner script will kill this process when appropriate
+      });
     } catch (error) {
       console.error(`[FetchingClientSide] Error during experiment:`, error);
       this.unifiedLogger.error("Experiment failed", { error: String(error) });
@@ -639,7 +644,22 @@ async function runStandaloneFetchingClientSide(): Promise<void> {
   });
 
   try {
-    await orchestrator.runExperiment();
+    // Start the experiment (this will keep running)
+    orchestrator.runExperiment().catch((error) => {
+      console.error("Error during client-side processing:", error);
+      orchestrator.cleanup();
+      process.exit(1);
+    });
+
+    // Set a timeout to exit after processing window completes
+    // Query windows: RANGE 120000ms, STEP 60000ms means results at ~60s and ~120s
+    // Add buffer for processing
+    const experimentDuration = 150000; // 2.5 minutes
+    setTimeout(() => {
+      console.log("Fetching client side processing completed, exiting...");
+      orchestrator.cleanup();
+      process.exit(0);
+    }, experimentDuration);
   } catch (error) {
     console.error("Error during client-side processing:", error);
     orchestrator.cleanup();

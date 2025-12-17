@@ -1,0 +1,152 @@
+
+================================================================================
+DETAILED ACCURACY COMPARISON - 5 ITERATION EXPERIMENT
+================================================================================
+
+GROUND TRUTH ANALYSIS
+--------------------------------------------------------------------------------
+
+Iteration 1:
+  Total results: 8
+  Unique values: [3.9639792, 0.9412997, 0.7044244]
+  Time to first result: 80.50s
+
+Iteration 2:
+  Total results: 8
+  Unique values: [3.9639792, 0.9412997, 0.7044244]
+  Time to first result: 80.67s
+
+Iteration 3:
+  Total results: 8
+  Unique values: [3.9639792, 0.9412997, 0.7044244]
+  Time to first result: 80.64s
+
+Iteration 4:
+  Total results: 8
+  Unique values: [3.9639792, 0.9412997, 0.7044244]
+  Time to first result: 80.65s
+
+Iteration 5:
+  Total results: 8
+  Unique values: [3.9639792, 0.9412997, 0.7044244]
+  Time to first result: 80.59s
+
+Overall Ground Truth:
+  Total iterations: 5
+  Total results: 40
+  Unique values: [3.9639792, 0.9412997, 0.7044244]
+  Avg latency: 80.61s
+
+
+================================================================================
+APPROACH COMPARISON
+================================================================================
+
+
+### APPROXIMATION APPROACH ###
+
+Iteration 1:
+  Approach results: 2 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 81.19s (GT: 80.50s)
+
+Iteration 2:
+  Approach results: 2 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 81.69s (GT: 80.67s)
+
+Iteration 3:
+  Approach results: 2 (unique: [0.9412997, -9.0000000])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [0.9412997]
+  MISSING: [3.9639792, 0.7044244]
+  EXTRA: [-9.0000000]
+  Latency: 81.20s (GT: 80.64s)
+
+Iteration 4:
+  Approach results: 2 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 81.31s (GT: 80.65s)
+
+Iteration 5:
+  Approach results: 2 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 81.23s (GT: 80.59s)
+
+Overall Summary:
+  Total results: 10
+  Unique values: [3.9639792, 0.9412997, -9.0000000]
+  Matches with GT: [3.9639792, 0.9412997]
+  MISSING from GT: [0.7044244]
+  EXTRA (not in GT): [-9.0000000]
+  Accuracy (unique values): 66.7%
+  Avg latency: 81.32s (GT: 80.61s)
+  Latency overhead: +0.71s
+
+### CHUNKED QUERY APPROACH ###
+
+Iteration 1:
+  Approach results: 16 (unique: [3.9639792, 0.9412997, 0.0000000])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  EXTRA: [0.0000000]
+  Latency: 62.38s (GT: 80.50s)
+
+Iteration 2:
+  Approach results: 12 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 122.34s (GT: 80.67s)
+
+Iteration 3:
+  Approach results: 9 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 122.41s (GT: 80.64s)
+
+Iteration 4:
+  Approach results: 6 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 122.43s (GT: 80.65s)
+
+Iteration 5:
+  Approach results: 3 (unique: [3.9639792, 0.9412997])
+  Ground truth: 8 (unique: [3.9639792, 0.9412997, 0.7044244])
+  Matches: [3.9639792, 0.9412997]
+  MISSING: [0.7044244]
+  Latency: 122.41s (GT: 80.59s)
+
+Overall Summary:
+  Total results: 46
+  Unique values: [3.9639792, 0.9412997, 0.0000000]
+  Matches with GT: [3.9639792, 0.9412997]
+  MISSING from GT: [0.7044244]
+  EXTRA (not in GT): [0.0000000]
+  Accuracy (unique values): 66.7%
+  Avg latency: 110.39s (GT: 80.61s)
+  Latency overhead: +29.78s
+
+================================================================================
+FINAL SUMMARY TABLE
+================================================================================
+
+| Approach | Avg Latency | Latency vs GT | Unique Results | Accuracy |
+|----------|-------------|---------------|----------------|----------|
+| Ground Truth | 80.61s | - | 3 values | 100.0% |
+| Approximation Approach | 81.32s | +0.71s | 3 values | 66.7% |
+| Chunked Query Approach | 110.39s | +29.78s | 3 values | 66.7% |
+
+

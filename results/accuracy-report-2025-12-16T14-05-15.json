@@ -1,0 +1,357 @@
+{
+  "timestamp": "2025-12-16T14:05:15.475Z",
+  "configuration": {
+    "windowRangeMs": 120000,
+    "windowStepMs": 60000,
+    "dataPath": "aligned_test/continuous_120s",
+    "valueTolerance": 0.01,
+    "replayFrequencyHz": 4
+  },
+  "expectedMaxValue": 12.5,
+  "groundTruth": [
+    {
+      "windowStartMs": 0,
+      "windowEndMs": 120000,
+      "windowStartS": "0.00",
+      "windowEndS": "120.00",
+      "maxValue": 7.508225,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 60000,
+      "windowEndMs": 180000,
+      "windowStartS": "60.00",
+      "windowEndS": "180.00",
+      "maxValue": 8.352861,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 120000,
+      "windowEndMs": 240000,
+      "windowStartS": "120.00",
+      "windowEndS": "240.00",
+      "maxValue": 8.978832,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 180000,
+      "windowEndMs": 300000,
+      "windowStartS": "180.00",
+      "windowEndS": "300.00",
+      "maxValue": 8.978832,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 240000,
+      "windowEndMs": 360000,
+      "windowStartS": "240.00",
+      "windowEndS": "360.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 300000,
+      "windowEndMs": 420000,
+      "windowStartS": "300.00",
+      "windowEndS": "420.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 360000,
+      "windowEndMs": 480000,
+      "windowStartS": "360.00",
+      "windowEndS": "480.00",
+      "maxValue": 7.763236,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 420000,
+      "windowEndMs": 540000,
+      "windowStartS": "420.00",
+      "windowEndS": "540.00",
+      "maxValue": 12.5,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 480000,
+      "windowEndMs": 600000,
+      "windowStartS": "480.00",
+      "windowEndS": "600.00",
+      "maxValue": 12.5,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 540000,
+      "windowEndMs": 660000,
+      "windowStartS": "540.00",
+      "windowEndS": "660.00",
+      "maxValue": 8.954315,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 600000,
+      "windowEndMs": 720000,
+      "windowStartS": "600.00",
+      "windowEndS": "720.00",
+      "maxValue": 8.954315,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 660000,
+      "windowEndMs": 780000,
+      "windowStartS": "660.00",
+      "windowEndS": "780.00",
+      "maxValue": 8.330319,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 720000,
+      "windowEndMs": 840000,
+      "windowStartS": "720.00",
+      "windowEndS": "840.00",
+      "maxValue": 8.330319,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 780000,
+      "windowEndMs": 900000,
+      "windowStartS": "780.00",
+      "windowEndS": "900.00",
+      "maxValue": 7.781259,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 840000,
+      "windowEndMs": 960000,
+      "windowStartS": "840.00",
+      "windowEndS": "960.00",
+      "maxValue": 7.781259,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 900000,
+      "windowEndMs": 1020000,
+      "windowStartS": "900.00",
+      "windowEndS": "1020.00",
+      "maxValue": 6.305988,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 960000,
+      "windowEndMs": 1080000,
+      "windowStartS": "960.00",
+      "windowEndS": "1080.00",
+      "maxValue": 9.530735,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1020000,
+      "windowEndMs": 1140000,
+      "windowStartS": "1020.00",
+      "windowEndS": "1140.00",
+      "maxValue": 9.657336,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1080000,
+      "windowEndMs": 1200000,
+      "windowStartS": "1080.00",
+      "windowEndS": "1200.00",
+      "maxValue": 9.657336,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1140000,
+      "windowEndMs": 1260000,
+      "windowStartS": "1140.00",
+      "windowEndS": "1260.00",
+      "maxValue": 9.445751,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1200000,
+      "windowEndMs": 1320000,
+      "windowStartS": "1200.00",
+      "windowEndS": "1320.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1260000,
+      "windowEndMs": 1380000,
+      "windowStartS": "1260.00",
+      "windowEndS": "1380.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1320000,
+      "windowEndMs": 1440000,
+      "windowStartS": "1320.00",
+      "windowEndS": "1440.00",
+      "maxValue": 8.494307,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1380000,
+      "windowEndMs": 1500000,
+      "windowStartS": "1380.00",
+      "windowEndS": "1500.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1440000,
+      "windowEndMs": 1560000,
+      "windowStartS": "1440.00",
+      "windowEndS": "1560.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1500000,
+      "windowEndMs": 1620000,
+      "windowStartS": "1500.00",
+      "windowEndS": "1620.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1560000,
+      "windowEndMs": 1680000,
+      "windowStartS": "1560.00",
+      "windowEndS": "1680.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1620000,
+      "windowEndMs": 1740000,
+      "windowStartS": "1620.00",
+      "windowEndS": "1740.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1680000,
+      "windowEndMs": 1800000,
+      "windowStartS": "1680.00",
+      "windowEndS": "1800.00",
+      "maxValue": 10,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1740000,
+      "windowEndMs": 1860000,
+      "windowStartS": "1740.00",
+      "windowEndS": "1860.00",
+      "maxValue": 8.871377,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1800000,
+      "windowEndMs": 1920000,
+      "windowStartS": "1800.00",
+      "windowEndS": "1920.00",
+      "maxValue": 9.732542,
+      "observations": 480
+    },
+    {
+      "windowStartMs": 1860000,
+      "windowEndMs": 1980000,
+      "windowStartS": "1860.00",
+      "windowEndS": "1980.00",
+      "maxValue": 9.732542,
+      "observations": 240
+    }
+  ],
+  "accuracyMetrics": [
+    {
+      "approach": "Approximation",
+      "mae": 0,
+      "rmse": 0,
+      "mape": 0,
+      "maxError": 0,
+      "minError": 0,
+      "avgError": 0,
+      "totalGroundTruthWindows": 32,
+      "totalApproachResults": 0,
+      "matchedResults": 0,
+      "perfectMatches": 0,
+      "accuracy": 0
+    },
+    {
+      "approach": "Chunked",
+      "mae": 8.536020800000006,
+      "rmse": 8.536020800000003,
+      "mape": 68.28816640000005,
+      "maxError": 8.5360208,
+      "minError": 8.5360208,
+      "avgError": 8.536020800000006,
+      "totalGroundTruthWindows": 32,
+      "totalApproachResults": 60,
+      "matchedResults": 60,
+      "perfectMatches": 0,
+      "accuracy": 0
+    },
+    {
+      "approach": "Fetching",
+      "mae": 8.5360208,
+      "rmse": 8.536020800000001,
+      "mape": 68.2881664,
+      "maxError": 8.5360208,
+      "minError": 8.5360208,
+      "avgError": 8.5360208,
+      "totalGroundTruthWindows": 32,
+      "totalApproachResults": 20,
+      "matchedResults": 20,
+      "perfectMatches": 0,
+      "accuracy": 0
+    }
+  ],
+  "ranking": {
+    "byAccuracy": [
+      {
+        "approach": "Approximation",
+        "accuracy": 0
+      },
+      {
+        "approach": "Chunked",
+        "accuracy": 0
+      },
+      {
+        "approach": "Fetching",
+        "accuracy": 0
+      }
+    ],
+    "byMAE": [
+      {
+        "approach": "Approximation",
+        "mae": 0
+      },
+      {
+        "approach": "Fetching",
+        "mae": 8.5360208
+      },
+      {
+        "approach": "Chunked",
+        "mae": 8.536020800000006
+      }
+    ],
+    "byRMSE": [
+      {
+        "approach": "Approximation",
+        "rmse": 0
+      },
+      {
+        "approach": "Fetching",
+        "rmse": 8.536020800000001
+      },
+      {
+        "approach": "Chunked",
+        "rmse": 8.536020800000003
+      }
+    ]
+  }
+}

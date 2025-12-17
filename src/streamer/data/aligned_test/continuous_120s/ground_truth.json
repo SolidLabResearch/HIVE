@@ -1,0 +1,52 @@
+{
+  "metadata": {
+    "generatedAt": "2025-12-16T14:05:02.360Z",
+    "config": {
+      "durationSeconds": 120,
+      "samplingRateHz": 32,
+      "baseTimestamp": "2025-07-15T08:00:00.000Z",
+      "valueRangeMin": -15,
+      "valueRangeMax": 10,
+      "insertPeakValue": true,
+      "peakValue": 12.5,
+      "peakTimestampOffsetMs": 30000,
+      "peakStream": "smartphone",
+      "outputDir": "src/streamer/data/aligned_test",
+      "datasetName": "continuous_120s"
+    },
+    "totalObservations": 7680,
+    "smartphoneObservations": 3840,
+    "wearableObservations": 3840
+  },
+  "groundTruth": {
+    "global": {
+      "max": 12.5,
+      "min": -15,
+      "avg": -2.5441933898461704
+    },
+    "byStream": {
+      "smartphone": {
+        "max": 12.5,
+        "min": -15,
+        "avg": -2.625063213533975
+      },
+      "wearable": {
+        "max": 10,
+        "min": -15,
+        "avg": -2.4633235661583646
+      }
+    },
+    "expectedMainQueryResult": {
+      "aggregation": "MAX",
+      "expectedValue": 12.5,
+      "description": "MAX across both streams (smartphone and wearable) over 120s windows"
+    }
+  },
+  "validation": {
+    "peakValueInserted": true,
+    "expectedPeakValue": 12.5,
+    "peakFoundInSmartphone": true,
+    "peakFoundInWearable": false,
+    "globalMaxMatchesPeak": true
+  }
+}
