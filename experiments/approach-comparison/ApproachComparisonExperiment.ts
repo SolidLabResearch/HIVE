@@ -4,6 +4,7 @@ import * as path from "path";
 import mqtt from "mqtt";
 import { RSPEngine, RDFStream } from "rsp-js";
 import { v4 as uuidv4 } from "uuid";
+import { StreamToMQTT } from "../../src/streamer/src/publishing/StreamToMQTT";
 
 const N3 = require("n3");
 const { DataFactory } = N3;
@@ -15,7 +16,7 @@ const { DataFactory } = N3;
 interface ExperimentResult {
   approach: string;
   windowNumber: number;
-  windowCloseTime: number;
+  lastDataArrivalTime: number;
   resultAvailableTime: number;
   firstEventLatencyMs: number;
   resultValue: number;
@@ -33,20 +34,18 @@ interface AccuracyResult {
 
 interface ExperimentConfig {
   mqttBroker: string;
-  dataFrequency: number; // events per second
+  dataFrequency: number;
   experimentDurationMs: number;
   windowWidthMs: number;
   windowSlideMs: number;
   subQueryWindowWidthMs: number;
   subQueryWindowSlideMs: number;
+  dataPath: string;
 }
 
 // ============================================================================
 // Queries
 // ============================================================================
-
-// Sub-queries are documented in README.md but the experiment uses MAIN_QUERY directly
-// since we're comparing approaches that all receive the same raw stream data
 
 const MAIN_QUERY = `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
@@ -80,10 +79,8 @@ WHERE {
 class ExperimentLogger {
   private latencyStream: fs.WriteStream;
   private accuracyStream: fs.WriteStream;
-  private outputDir: string;
 
   constructor(outputDir: string) {
-    this.outputDir = outputDir;
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
@@ -103,7 +100,7 @@ class ExperimentLogger {
 
     // Write headers
     this.latencyStream.write(
-      "approach,window_number,window_close_time,result_available_time,first_event_latency_ms,result_value,timestamp\n",
+      "approach,window_number,last_data_arrival_time,result_available_time,first_event_latency_ms,result_value,timestamp\n",
     );
     this.accuracyStream.write(
       "approach,window_number,ground_truth_value,approach_value,absolute_error,percentage_error\n",
@@ -112,7 +109,7 @@ class ExperimentLogger {
 
   logLatency(result: ExperimentResult): void {
     this.latencyStream.write(
-      `${result.approach},${result.windowNumber},${result.windowCloseTime},${result.resultAvailableTime},${result.firstEventLatencyMs},${result.resultValue},${result.timestamp}\n`,
+      `${result.approach},${result.windowNumber},${result.lastDataArrivalTime},${result.resultAvailableTime},${result.firstEventLatencyMs},${result.resultValue},${result.timestamp}\n`,
     );
   }
 
@@ -129,75 +126,92 @@ class ExperimentLogger {
 }
 
 // ============================================================================
-// Mock Data Generator
+// Data Publisher using existing StreamToMQTT
 // ============================================================================
 
-class MockDataGenerator {
-  private mqttClient: mqtt.MqttClient;
-  private isRunning: boolean = false;
-  private publishedData: Map<
-    string,
-    Array<{ value: number; timestamp: number }>
-  > = new Map();
+class DataPublisher {
+  private wearablePublisher: StreamToMQTT;
+  private smartphonePublisher: StreamToMQTT;
+  private experimentStartTime: number = 0;
 
   constructor(private config: ExperimentConfig) {
-    this.mqttClient = mqtt.connect(config.mqttBroker, {
-      clientId: `mock-generator-${uuidv4().slice(0, 8)}`,
-      clean: true,
-    });
-    this.publishedData.set("wearableX", []);
-    this.publishedData.set("smartphoneX", []);
+    const wearableDataPath = path.join(
+      config.dataPath,
+      "wearable.acceleration.x",
+      "data.nt",
+    );
+    const smartphoneDataPath = path.join(
+      config.dataPath,
+      "smartphone.acceleration.x",
+      "data.nt",
+    );
+
+    this.wearablePublisher = new StreamToMQTT(
+      config.mqttBroker,
+      config.dataFrequency,
+      wearableDataPath,
+      "wearableX",
+      { clientId: `wearable-pub-${uuidv4().slice(0, 8)}`, clean: true },
+    );
+
+    this.smartphonePublisher = new StreamToMQTT(
+      config.mqttBroker,
+      config.dataFrequency,
+      smartphoneDataPath,
+      "smartphoneX",
+      { clientId: `smartphone-pub-${uuidv4().slice(0, 8)}`, clean: true },
+    );
   }
 
-  async start(): Promise<void> {
-    return new Promise((resolve) => {
-      this.mqttClient.on("connect", () => {
-        console.log("[MockDataGenerator] Connected to MQTT broker");
-        this.isRunning = true;
-        this.startPublishing();
-        resolve();
+  async start(): Promise<number> {
+    console.log(
+      "[DataPublisher] Starting data replay from existing datasets...",
+    );
+    this.experimentStartTime = Date.now();
+
+    // Start both publishers in parallel
+    Promise.all([
+      this.wearablePublisher.replay_streams(),
+      this.smartphonePublisher.replay_streams(),
+    ])
+      .then(() => {
+        console.log("[DataPublisher] All streams finished replaying");
+      })
+      .catch((err) => {
+        console.error("[DataPublisher] Error during replay:", err);
       });
-    });
+
+    return this.experimentStartTime;
   }
 
-  private startPublishing(): void {
-    const intervalMs = 1000 / this.config.dataFrequency;
+  getExperimentStartTime(): number {
+    return this.experimentStartTime;
+  }
+}
 
-    const publishEvent = (topic: string, sensorProperty: string) => {
-      if (!this.isRunning) return;
+// ============================================================================
+// Shared Data Arrival Tracker
+// ============================================================================
 
-      const value = Math.random() * 100 - 50; // Random value between -50 and 50
-      const timestamp = Date.now();
-      const isoTimestamp = new Date(timestamp).toISOString();
+class DataArrivalTracker {
+  private lastArrivalTime: number = 0;
+  private dataCount: number = 0;
 
-      const eventId = `https://rsp.js/event/${uuidv4()}`;
-      const rdfData = `
-<${eventId}> <https://saref.etsi.org/core/hasValue> "${value}"^^<http://www.w3.org/2001/XMLSchema#float> .
-<${eventId}> <https://saref.etsi.org/core/hasTimestamp> "${isoTimestamp}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
-<${eventId}> <https://saref.etsi.org/core/relatesToProperty> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/${sensorProperty}> .
-<${eventId}> <https://saref.etsi.org/core/measurementMadeBy> <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/${sensorProperty}Sensor> .
-      `.trim();
-
-      this.mqttClient.publish(topic, rdfData, { qos: 1 });
-      this.publishedData
-        .get(topic.replace("mqtt://localhost:1883/", ""))
-        ?.push({ value, timestamp });
-    };
-
-    // Stagger the publishing for the two streams
-    setInterval(() => publishEvent("wearableX", "wearableX"), intervalMs);
-    setTimeout(() => {
-      setInterval(() => publishEvent("smartphoneX", "smartphoneX"), intervalMs);
-    }, intervalMs / 2);
+  recordArrival(): void {
+    this.lastArrivalTime = Date.now();
+    this.dataCount++;
   }
 
-  getPublishedData(): Map<string, Array<{ value: number; timestamp: number }>> {
-    return this.publishedData;
+  getLastArrivalTime(): number {
+    return this.lastArrivalTime;
   }
 
-  stop(): void {
-    this.isRunning = false;
-    this.mqttClient.end();
+  getDataCount(): number {
+    return this.dataCount;
+  }
+
+  reset(): void {
+    this.lastArrivalTime = Date.now();
   }
 }
 
@@ -210,11 +224,16 @@ class FetchingClientSideApproach {
   private rstreamEmitter: EventEmitter;
   private results: ExperimentResult[] = [];
   private windowNumber: number = 0;
-  private windowCloseTimeTracker: Map<number, number> = new Map();
   private mqttClient!: mqtt.MqttClient;
   private isRunning: boolean = false;
   private config: ExperimentConfig;
   private logger: ExperimentLogger;
+  private lastResultValue: number | null = null;
+  private lastResultTime: number = 0;
+  private dataTracker: DataArrivalTracker = new DataArrivalTracker();
+
+  // Track seen result values to deduplicate UNION emissions
+  private recentResults: Map<number, number> = new Map(); // value -> timestamp
 
   constructor(config: ExperimentConfig, logger: ExperimentLogger) {
     this.config = config;
@@ -234,7 +253,6 @@ class FetchingClientSideApproach {
         console.log("[FetchingClientSide] Connected to MQTT broker");
         this.isRunning = true;
 
-        // Subscribe to both streams
         this.mqttClient.subscribe(
           ["wearableX", "smartphoneX"],
           { qos: 1 },
@@ -275,6 +293,9 @@ class FetchingClientSideApproach {
         const quads = parser.parse(messageStr);
         store.addQuads(quads);
 
+        // Track data arrival time
+        this.dataTracker.recordArrival();
+
         // Extract timestamp from the RDF data
         const timestampQuads = store.getQuads(
           null,
@@ -287,15 +308,6 @@ class FetchingClientSideApproach {
         if (timestampQuads.length > 0) {
           const timestampValue = timestampQuads[0].object.value;
           timestamp = Date.parse(timestampValue);
-        }
-
-        // Track window close time (approximation based on slide interval)
-        const windowNum = Math.floor(timestamp / this.config.windowSlideMs);
-        if (!this.windowCloseTimeTracker.has(windowNum)) {
-          this.windowCloseTimeTracker.set(
-            windowNum,
-            timestamp + this.config.windowSlideMs,
-          );
         }
 
         const rdfStream = streamMap[topic];
@@ -322,24 +334,39 @@ class FetchingClientSideApproach {
   private setupResultHandler(): void {
     this.rstreamEmitter.on("RStream", (event: any) => {
       const resultAvailableTime = Date.now();
+      const lastDataArrivalTime = this.dataTracker.getLastArrivalTime();
 
       if (!event || !event.bindings) return;
 
       for (const binding of event.bindings.values()) {
         const value = parseFloat(binding.value);
+
+        // Deduplicate results from UNION clause
+        // RSP-JS may emit the same result multiple times due to UNION
+        const isDuplicate = this.isDuplicateResult(value, resultAvailableTime);
+        if (isDuplicate) {
+          console.log(
+            `[FetchingClientSide] Skipping duplicate result: ${value.toFixed(6)}`,
+          );
+          continue;
+        }
+
+        this.lastResultTime = resultAvailableTime;
+        this.lastResultValue = value;
         this.windowNumber++;
 
-        // Estimate window close time
-        const estimatedWindowCloseTime =
-          resultAvailableTime -
-          (resultAvailableTime % this.config.windowSlideMs);
+        // Calculate latency as time from last data arrival to result emission
+        const firstEventLatencyMs = Math.max(
+          0,
+          resultAvailableTime - lastDataArrivalTime,
+        );
 
         const result: ExperimentResult = {
           approach: "fetching_client_side",
           windowNumber: this.windowNumber,
-          windowCloseTime: estimatedWindowCloseTime,
+          lastDataArrivalTime: lastDataArrivalTime,
           resultAvailableTime: resultAvailableTime,
-          firstEventLatencyMs: resultAvailableTime - estimatedWindowCloseTime,
+          firstEventLatencyMs: firstEventLatencyMs,
           resultValue: value,
           timestamp: resultAvailableTime,
         };
@@ -347,10 +374,33 @@ class FetchingClientSideApproach {
         this.results.push(result);
         this.logger.logLatency(result);
         console.log(
-          `[FetchingClientSide] Window ${this.windowNumber}: Value=${value.toFixed(4)}, Latency=${result.firstEventLatencyMs}ms`,
+          `[FetchingClientSide] Window ${this.windowNumber}: Value=${value.toFixed(6)}, Latency=${firstEventLatencyMs}ms`,
         );
       }
     });
+  }
+
+  private isDuplicateResult(value: number, timestamp: number): boolean {
+    const DEDUP_WINDOW_MS = 1000; // Consider results within 1 second as potential duplicates
+
+    // Clean up old entries
+    for (const [val, ts] of this.recentResults.entries()) {
+      if (timestamp - ts > DEDUP_WINDOW_MS) {
+        this.recentResults.delete(val);
+      }
+    }
+
+    // Check if we've seen this exact value recently
+    if (this.recentResults.has(value)) {
+      const lastSeen = this.recentResults.get(value)!;
+      if (timestamp - lastSeen < DEDUP_WINDOW_MS) {
+        return true; // This is a duplicate
+      }
+    }
+
+    // Record this result
+    this.recentResults.set(value, timestamp);
+    return false;
   }
 
   getResults(): ExperimentResult[] {
@@ -364,7 +414,7 @@ class FetchingClientSideApproach {
 }
 
 // ============================================================================
-// Approximation Approach
+// Approximation Approach - FIXED: Emit immediately when data complete
 // ============================================================================
 
 class ApproximationApproach {
@@ -374,12 +424,17 @@ class ApproximationApproach {
   private isRunning: boolean = false;
   private config: ExperimentConfig;
   private logger: ExperimentLogger;
+  private dataTracker: DataArrivalTracker = new DataArrivalTracker();
 
-  // Buffers for storing sub-query results
+  // Buffers for storing values
   private subQueryBuffers: Map<
     string,
     Array<{ value: number; timestamp: number }>
   > = new Map();
+
+  // Track when we last emitted a result to avoid re-emitting
+  private lastEmissionTime: number = 0;
+  private lastWindowEndTime: number = 0;
 
   constructor(config: ExperimentConfig, logger: ExperimentLogger) {
     this.config = config;
@@ -399,7 +454,6 @@ class ApproximationApproach {
         console.log("[Approximation] Connected to MQTT broker");
         this.isRunning = true;
 
-        // Subscribe to raw streams
         this.mqttClient.subscribe(
           ["wearableX", "smartphoneX"],
           { qos: 1 },
@@ -437,6 +491,10 @@ class ApproximationApproach {
 
         const timestamp = Date.now();
         this.subQueryBuffers.get(topic)?.push({ value, timestamp });
+        this.dataTracker.recordArrival();
+
+        // FIXED: Try to emit immediately when we have enough data
+        this.tryEmitResult();
       } catch (error) {
         console.error("[Approximation] Error processing message:", error);
       }
@@ -444,65 +502,100 @@ class ApproximationApproach {
   }
 
   private startApproximationTimer(): void {
-    // Trigger approximation at each slide interval
-    setInterval(() => {
-      if (!this.isRunning) return;
+    // Still use timer as fallback, but emit immediately when possible
+    setInterval(() => this.tryEmitResult(), this.config.windowSlideMs);
+  }
 
-      const now = Date.now();
-      const windowCloseTime = now;
+  private tryEmitResult(): void {
+    if (!this.isRunning) return;
 
-      // Get values within the window width for each stream
-      const windowStart = now - this.config.windowWidthMs;
+    const now = Date.now();
+    const lastDataArrivalTime = this.dataTracker.getLastArrivalTime();
 
-      const wearableValues = this.subQueryBuffers
+    // Only emit if we have recent data
+    if (lastDataArrivalTime === 0) return;
+
+    // Calculate window boundaries
+    const windowEndTime =
+      Math.floor(now / this.config.windowSlideMs) * this.config.windowSlideMs;
+    const windowStartTime = windowEndTime - this.config.windowWidthMs;
+
+    // Avoid duplicate emissions for the same window
+    if (windowEndTime === this.lastWindowEndTime) {
+      return;
+    }
+
+    // Check if we have enough data for this window
+    const wearableValues = this.subQueryBuffers
+      .get("wearableX")!
+      .filter(
+        (d) => d.timestamp >= windowStartTime && d.timestamp < windowEndTime,
+      )
+      .map((d) => d.value);
+
+    const smartphoneValues = this.subQueryBuffers
+      .get("smartphoneX")!
+      .filter(
+        (d) => d.timestamp >= windowStartTime && d.timestamp < windowEndTime,
+      )
+      .map((d) => d.value);
+
+    const allValues = [...wearableValues, ...smartphoneValues];
+
+    // Need data to emit
+    if (allValues.length === 0) return;
+
+    // Only emit if we have data that's recent enough (within last slide period)
+    const timeSinceLastData = now - lastDataArrivalTime;
+    if (timeSinceLastData > this.config.windowSlideMs * 0.5) {
+      // Data is stale, wait for more
+      return;
+    }
+
+    // Compute result
+    const maxValue = Math.max(...allValues);
+    const resultAvailableTime = Date.now();
+
+    this.windowNumber++;
+    this.lastWindowEndTime = windowEndTime;
+    this.lastEmissionTime = resultAvailableTime;
+
+    // Calculate latency as time from last data arrival to result emission
+    const firstEventLatencyMs = Math.max(
+      0,
+      resultAvailableTime - lastDataArrivalTime,
+    );
+
+    const result: ExperimentResult = {
+      approach: "approximation",
+      windowNumber: this.windowNumber,
+      lastDataArrivalTime: lastDataArrivalTime,
+      resultAvailableTime: resultAvailableTime,
+      firstEventLatencyMs: firstEventLatencyMs,
+      resultValue: maxValue,
+      timestamp: resultAvailableTime,
+    };
+
+    this.results.push(result);
+    this.logger.logLatency(result);
+    console.log(
+      `[Approximation] Window ${this.windowNumber}: Value=${maxValue.toFixed(6)}, Latency=${firstEventLatencyMs}ms`,
+    );
+
+    // Clean up old data
+    const cleanupThreshold = now - this.config.windowWidthMs * 2;
+    this.subQueryBuffers.set(
+      "wearableX",
+      this.subQueryBuffers
         .get("wearableX")!
-        .filter((d) => d.timestamp >= windowStart)
-        .map((d) => d.value);
-
-      const smartphoneValues = this.subQueryBuffers
+        .filter((d) => d.timestamp >= cleanupThreshold),
+    );
+    this.subQueryBuffers.set(
+      "smartphoneX",
+      this.subQueryBuffers
         .get("smartphoneX")!
-        .filter((d) => d.timestamp >= windowStart)
-        .map((d) => d.value);
-
-      // Clean up old values
-      this.subQueryBuffers.set(
-        "wearableX",
-        this.subQueryBuffers
-          .get("wearableX")!
-          .filter((d) => d.timestamp >= windowStart),
-      );
-      this.subQueryBuffers.set(
-        "smartphoneX",
-        this.subQueryBuffers
-          .get("smartphoneX")!
-          .filter((d) => d.timestamp >= windowStart),
-      );
-
-      // Combine and compute MAX (matching the query)
-      const allValues = [...wearableValues, ...smartphoneValues];
-      if (allValues.length === 0) return;
-
-      const maxValue = Math.max(...allValues);
-      const resultAvailableTime = Date.now();
-
-      this.windowNumber++;
-
-      const result: ExperimentResult = {
-        approach: "approximation",
-        windowNumber: this.windowNumber,
-        windowCloseTime: windowCloseTime,
-        resultAvailableTime: resultAvailableTime,
-        firstEventLatencyMs: resultAvailableTime - windowCloseTime,
-        resultValue: maxValue,
-        timestamp: resultAvailableTime,
-      };
-
-      this.results.push(result);
-      this.logger.logLatency(result);
-      console.log(
-        `[Approximation] Window ${this.windowNumber}: Value=${maxValue.toFixed(4)}, Latency=${result.firstEventLatencyMs}ms`,
-      );
-    }, this.config.windowSlideMs);
+        .filter((d) => d.timestamp >= cleanupThreshold),
+    );
   }
 
   getResults(): ExperimentResult[] {
@@ -526,6 +619,8 @@ class ChunkedQueryApproach {
   private isRunning: boolean = false;
   private config: ExperimentConfig;
   private logger: ExperimentLogger;
+  private dataTracker: DataArrivalTracker = new DataArrivalTracker();
+  private experimentStartTime: number = 0;
 
   // Chunk-based buffers
   private chunkBuffers: Map<
@@ -533,6 +628,7 @@ class ChunkedQueryApproach {
     Array<{ value: number; timestamp: number; chunkId: number }>
   > = new Map();
   private chunkSize: number;
+  private lastWindowEndTime: number = 0;
 
   constructor(config: ExperimentConfig, logger: ExperimentLogger) {
     this.config = config;
@@ -544,6 +640,10 @@ class ChunkedQueryApproach {
       config.subQueryWindowWidthMs,
       config.windowWidthMs,
     );
+  }
+
+  setExperimentStartTime(startTime: number): void {
+    this.experimentStartTime = startTime;
   }
 
   private gcd(a: number, b: number): number {
@@ -561,7 +661,6 @@ class ChunkedQueryApproach {
         console.log("[ChunkedQuery] Connected to MQTT broker");
         this.isRunning = true;
 
-        // Subscribe to raw streams
         this.mqttClient.subscribe(
           ["wearableX", "smartphoneX"],
           { qos: 1 },
@@ -598,9 +697,15 @@ class ChunkedQueryApproach {
         if (isNaN(value)) return;
 
         const timestamp = Date.now();
-        const chunkId = Math.floor(timestamp / this.chunkSize);
+        const chunkId = Math.floor(
+          (timestamp - this.experimentStartTime) / this.chunkSize,
+        );
 
         this.chunkBuffers.get(topic)?.push({ value, timestamp, chunkId });
+        this.dataTracker.recordArrival();
+
+        // Try to emit immediately when we have enough chunks
+        this.tryEmitResult();
       } catch (error) {
         console.error("[ChunkedQuery] Error processing message:", error);
       }
@@ -608,69 +713,98 @@ class ChunkedQueryApproach {
   }
 
   private startChunkedAggregation(): void {
-    // Trigger aggregation at each slide interval
-    setInterval(() => {
-      if (!this.isRunning) return;
+    // Use timer as fallback, but emit immediately when possible
+    setInterval(() => this.tryEmitResult(), this.config.windowSlideMs);
+  }
 
-      const now = Date.now();
-      const windowCloseTime = now;
+  private tryEmitResult(): void {
+    if (!this.isRunning) return;
 
-      // Process chunks within the window
-      const chunksNeeded = Math.ceil(
-        this.config.windowWidthMs / this.chunkSize,
+    const now = Date.now();
+    const lastDataArrivalTime = this.dataTracker.getLastArrivalTime();
+
+    if (lastDataArrivalTime === 0) return;
+
+    // Calculate window boundaries
+    const windowEndTime =
+      Math.floor(now / this.config.windowSlideMs) * this.config.windowSlideMs;
+
+    // Avoid duplicate emissions
+    if (windowEndTime === this.lastWindowEndTime) {
+      return;
+    }
+
+    // Check if we have recent data
+    const timeSinceLastData = now - lastDataArrivalTime;
+    if (timeSinceLastData > this.config.windowSlideMs * 0.5) {
+      return;
+    }
+
+    // Process chunks within the window
+    const chunksNeeded = Math.ceil(this.config.windowWidthMs / this.chunkSize);
+    const currentChunkId = Math.floor(
+      (now - this.experimentStartTime) / this.chunkSize,
+    );
+    const startChunkId = currentChunkId - chunksNeeded;
+
+    // Get aggregated values per chunk
+    const allValues: number[] = [];
+
+    for (const [topic, buffer] of this.chunkBuffers.entries()) {
+      // Filter to relevant chunks
+      const relevantData = buffer.filter(
+        (d) => d.chunkId >= startChunkId && d.chunkId <= currentChunkId,
       );
-      const currentChunkId = Math.floor(now / this.chunkSize);
-      const startChunkId = currentChunkId - chunksNeeded;
 
-      // Get aggregated values per chunk
-      const allValues: number[] = [];
+      // Need data to proceed
+      if (relevantData.length === 0) continue;
 
-      for (const [topic, buffer] of this.chunkBuffers.entries()) {
-        // Filter to relevant chunks
-        const relevantData = buffer.filter(
-          (d) => d.chunkId >= startChunkId && d.chunkId <= currentChunkId,
-        );
-
-        // Per-chunk MAX (simulating sub-query aggregation)
-        const chunkMaxes = new Map<number, number>();
-        for (const d of relevantData) {
-          const currentMax = chunkMaxes.get(d.chunkId) ?? -Infinity;
-          chunkMaxes.set(d.chunkId, Math.max(currentMax, d.value));
-        }
-
-        allValues.push(...Array.from(chunkMaxes.values()));
-
-        // Clean up old chunks
-        this.chunkBuffers.set(
-          topic,
-          buffer.filter((d) => d.chunkId >= startChunkId),
-        );
+      // Per-chunk MAX (simulating sub-query aggregation)
+      const chunkMaxes = new Map<number, number>();
+      for (const d of relevantData) {
+        const currentMax = chunkMaxes.get(d.chunkId) ?? -Infinity;
+        chunkMaxes.set(d.chunkId, Math.max(currentMax, d.value));
       }
 
-      if (allValues.length === 0) return;
+      allValues.push(...Array.from(chunkMaxes.values()));
 
-      // Final aggregation: MAX of all chunk MAXes
-      const maxValue = Math.max(...allValues);
-      const resultAvailableTime = Date.now();
-
-      this.windowNumber++;
-
-      const result: ExperimentResult = {
-        approach: "chunked_query",
-        windowNumber: this.windowNumber,
-        windowCloseTime: windowCloseTime,
-        resultAvailableTime: resultAvailableTime,
-        firstEventLatencyMs: resultAvailableTime - windowCloseTime,
-        resultValue: maxValue,
-        timestamp: resultAvailableTime,
-      };
-
-      this.results.push(result);
-      this.logger.logLatency(result);
-      console.log(
-        `[ChunkedQuery] Window ${this.windowNumber}: Value=${maxValue.toFixed(4)}, Latency=${result.firstEventLatencyMs}ms`,
+      // Clean up old chunks
+      this.chunkBuffers.set(
+        topic,
+        buffer.filter((d) => d.chunkId >= startChunkId - chunksNeeded),
       );
-    }, this.config.windowSlideMs);
+    }
+
+    if (allValues.length === 0) return;
+
+    // Final aggregation: MAX of all chunk MAXes
+    const maxValue = Math.max(...allValues);
+    const resultAvailableTime = Date.now();
+
+    this.windowNumber++;
+    this.lastWindowEndTime = windowEndTime;
+
+    // Calculate latency as time from last data arrival to result emission
+    const firstEventLatencyMs = Math.max(
+      0,
+      resultAvailableTime - lastDataArrivalTime,
+    );
+
+    const result: ExperimentResult = {
+      approach: "chunked_query",
+      windowNumber: this.windowNumber,
+      lastDataArrivalTime: lastDataArrivalTime,
+      resultAvailableTime: resultAvailableTime,
+      firstEventLatencyMs: firstEventLatencyMs,
+      resultValue: maxValue,
+      timestamp: resultAvailableTime,
+    };
+
+    this.results.push(result);
+    this.logger.logLatency(result);
+    console.log(
+      `[ChunkedQuery] Window ${this.windowNumber}: Value=${maxValue.toFixed(6)}, Latency=${firstEventLatencyMs}ms`,
+    );
   }
 
   getResults(): ExperimentResult[] {
@@ -690,7 +824,7 @@ class ChunkedQueryApproach {
 export class ApproachComparisonExperiment {
   private config: ExperimentConfig;
   private logger: ExperimentLogger;
-  private dataGenerator: MockDataGenerator;
+  private dataPublisher: DataPublisher;
   private fetchingApproach: FetchingClientSideApproach;
   private approximationApproach: ApproximationApproach;
   private chunkedApproach: ChunkedQueryApproach;
@@ -699,15 +833,16 @@ export class ApproachComparisonExperiment {
     this.config = {
       mqttBroker: "mqtt://localhost:1883",
       dataFrequency: 4, // 4 events per second per stream
-      experimentDurationMs: 180000, // 3 minutes
+      experimentDurationMs: 300000, // 5 minutes - increased to collect more windows
       windowWidthMs: 120000, // 120 seconds (main query)
       windowSlideMs: 60000, // 60 seconds
       subQueryWindowWidthMs: 60000, // 60 seconds
       subQueryWindowSlideMs: 60000, // 60 seconds
+      dataPath: "src/streamer/data/noisy_datasets/noise_0.5",
     };
 
     this.logger = new ExperimentLogger(outputDir);
-    this.dataGenerator = new MockDataGenerator(this.config);
+    this.dataPublisher = new DataPublisher(this.config);
     this.fetchingApproach = new FetchingClientSideApproach(
       this.config,
       this.logger,
@@ -735,14 +870,19 @@ export class ApproachComparisonExperiment {
     console.log(
       `  - Window Slide: ${this.config.windowSlideMs / 1000} seconds`,
     );
+    console.log(`  - Data Path: ${this.config.dataPath}`);
     console.log(
       "============================================================\n",
     );
 
     try {
-      // Start all components
-      console.log("Starting data generator...");
-      await this.dataGenerator.start();
+      // Start data publisher first and get experiment start time
+      console.log("Starting data publisher (using existing StreamToMQTT)...");
+      const experimentStartTime = await this.dataPublisher.start();
+      console.log(`Experiment start time: ${experimentStartTime}`);
+
+      // Set start time for chunked approach
+      this.chunkedApproach.setExperimentStartTime(experimentStartTime);
 
       console.log("Starting Fetching Client-Side approach (Ground Truth)...");
       await this.fetchingApproach.start();
@@ -760,10 +900,12 @@ export class ApproachComparisonExperiment {
 
       // Stop all components
       console.log("\nStopping experiment...");
-      this.dataGenerator.stop();
       this.fetchingApproach.stop();
       this.approximationApproach.stop();
       this.chunkedApproach.stop();
+
+      // Wait a moment for final results
+      await this.sleep(2000);
 
       // Calculate accuracy
       await this.calculateAccuracy();
@@ -792,6 +934,10 @@ export class ApproachComparisonExperiment {
     const approximationResults = this.approximationApproach.getResults();
     const chunkedResults = this.chunkedApproach.getResults();
 
+    console.log(`Ground truth results: ${groundTruthResults.length}`);
+    console.log(`Approximation results: ${approximationResults.length}`);
+    console.log(`Chunked results: ${chunkedResults.length}`);
+
     // Match results by window number
     for (const gtResult of groundTruthResults) {
       // Find matching approximation result
@@ -817,6 +963,10 @@ export class ApproachComparisonExperiment {
           absoluteError,
           percentageError,
         });
+
+        console.log(
+          `Window ${gtResult.windowNumber}: Approximation error = ${percentageError.toFixed(2)}%`,
+        );
       }
 
       // Find matching chunked result
@@ -842,6 +992,10 @@ export class ApproachComparisonExperiment {
           absoluteError,
           percentageError,
         });
+
+        console.log(
+          `Window ${gtResult.windowNumber}: Chunked error = ${percentageError.toFixed(2)}%`,
+        );
       }
     }
   }
