@@ -2,6 +2,26 @@
 
 > Combining Multiple Streaming Queries to provide actionable insights. 
 
+## Project Structure
+
+- **📁 src/**: Core source code and implementation
+- **📁 experiments/**: Experimental scripts and test scenarios
+  - **frequency-comparison/**: Frequency-based experiments
+  - **rate-comparison/**: Data rate comparison tests
+  - **pattern-analysis/**: Pattern analysis experiments (complex oscillations, exponential patterns)
+  - **accuracy-analysis/**: Accuracy analysis experiments
+- **📁 analysis/**: Data analysis and processing scripts
+  - **accuracy/**: Accuracy analysis tools
+  - **comparison/**: Result comparison and extraction tools
+  - **visualization/**: Plotting and visualization scripts (Python)
+  - **data-generation/**: Test data generation scripts
+- **📁 examples/**: Example implementations and demos
+- **📁 tests/**: Test scripts and examples
+- **📁 docs/**: Documentation and reports
+- **📁 logs/**: Experimental results and logs
+- **📁 scripts/**: Utility scripts
+- **📁 temp-data/**: Temporary data files
+
 ## Linting
 
 You run the linter via 
