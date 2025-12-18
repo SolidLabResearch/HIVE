@@ -1,5 +1,5 @@
-import { Orchestrator } from "../orchestrator/Orchestrator";
 import fs from "fs";
+import { Orchestrator } from "../orchestrator/Orchestrator";
 
 import { CSVLogger } from "../util/logger/CSVLogger";
 /**
@@ -17,7 +17,7 @@ async function StreamingQueryHiveApproachOrchestrator() {
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
-SELECT (MAX(?value) AS ?avgWearableX)
+SELECT (AVG(?value) AS ?avgWearableX)
 FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 60000 STEP 30000]
 WHERE {
     WINDOW <mqtt://localhost:1883/wearableX> {
@@ -32,7 +32,7 @@ WHERE {
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
-SELECT (MAX(?value) AS ?avgSmartphoneX)
+SELECT (AVG(?value) AS ?avgSmartphoneX)
 FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 60000 STEP 30000]
 WHERE {
     WINDOW <mqtt://localhost:1883/smartphoneX> {
@@ -55,7 +55,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
-SELECT (MAX(?value) AS ?avgValue)
+SELECT (AVG(?value) AS ?avgValue)
 FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
 FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
 WHERE {

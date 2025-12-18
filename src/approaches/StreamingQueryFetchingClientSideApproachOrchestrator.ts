@@ -1,8 +1,8 @@
 import { EventEmitter } from "events";
-import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
-import { hash_string_md5, turtleStringToStore } from "../util/Util";
-import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
+import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
+import { v4 as uuidv4 } from "uuid";
+import { hash_string_md5, turtleStringToStore } from "../util/Util";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -474,7 +474,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
-SELECT (MAX(?value) AS ?avgValue)
+SELECT (AVG(?value) AS ?avgValue)
 FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
 FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
 WHERE {

@@ -64,6 +64,43 @@ class FirstResultLatencyExperiment {
     this.results = {};
   }
 
+  async getProcessStats(pid) {
+    return new Promise((resolve) => {
+      // Use standard ps command which works on both Linux and macOS
+      // Output format: %CPU RSS (in KB)
+      const cmd = `ps -p ${pid} -o %cpu,rss`;
+      
+      const { exec } = require('child_process');
+      exec(cmd, (error, stdout, stderr) => {
+        if (error || stderr) {
+          resolve(null);
+          return;
+        }
+
+        try {
+          // Parse output (skip header line)
+          const lines = stdout.trim().split('\n');
+          if (lines.length < 2) {
+            resolve(null);
+            return;
+          }
+
+          const values = lines[lines.length - 1].trim().split(/\s+/);
+          if (values.length >= 2) {
+            resolve({
+              cpu: parseFloat(values[0]), // %CPU
+              memory: parseInt(values[1], 10) * 1024 // RSS in bytes (convert from KB)
+            });
+          } else {
+            resolve(null);
+          }
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    });
+  }
+
   log(message) {
     const timestamp = new Date().toISOString();
     const logLine = `[${timestamp}] ${message}`;
@@ -270,7 +307,26 @@ class FirstResultLatencyExperiment {
           this.log(`  Value: ${value}`);
 
           resolved = true;
+          
+          clearInterval(monitorInterval);
           this.cleanup();
+
+          // Calculate resource usage stats
+          const avgCpu = stats.cpuSamples.length > 0 
+            ? stats.cpuSamples.reduce((a, b) => a + b, 0) / stats.cpuSamples.length 
+            : 0;
+          
+          const maxCpu = stats.cpuSamples.length > 0 
+            ? Math.max(...stats.cpuSamples) 
+            : 0;
+
+          const avgMemory = stats.memorySamples.length > 0 
+            ? stats.memorySamples.reduce((a, b) => a + b, 0) / stats.memorySamples.length 
+            : 0;
+          
+          const maxMemory = stats.memorySamples.length > 0 
+            ? Math.max(...stats.memorySamples) 
+            : 0;
 
           resolve({
             approach: approachName,
@@ -278,9 +334,18 @@ class FirstResultLatencyExperiment {
             firstResultTime,
             latency,
             value: firstResultValue,
+            resources: {
+              avgCpu,
+              maxCpu,
+              avgMemory,
+              maxMemory,
+              samples: stats.cpuSamples.length
+            }
           });
         }
       });
+
+
 
       // Start orchestrator
       this.log(`Starting ${approachName} orchestrator...`);
@@ -298,6 +363,27 @@ class FirstResultLatencyExperiment {
       });
 
       this.processes.push(orchestratorProc);
+      const orchestratorPid = orchestratorProc.pid;
+
+      // Start resource monitoring for this approach
+      const stats = {
+        cpuSamples: [],
+        memorySamples: [],
+        timestamps: []
+      };
+
+      const monitorInterval = setInterval(async () => {
+        if (resolved) { // Don't collect if already finished
+          return; 
+        }
+        
+        const procStats = await this.getProcessStats(orchestratorPid);
+        if (procStats) {
+          stats.cpuSamples.push(procStats.cpu);
+          stats.memorySamples.push(procStats.memory);
+          stats.timestamps.push(Date.now());
+        }
+      }, 500); // Poll every 500ms
 
       const orchLogFile = fs.createWriteStream(
         path.join(this.logsDir, `${approachName}_orchestrator.log`),
@@ -362,6 +448,7 @@ class FirstResultLatencyExperiment {
             `TIMEOUT: No result received for ${approachName} within ${CONFIG.timeout / 1000}s`,
           );
           resolved = true;
+          clearInterval(monitorInterval);
           this.cleanup();
           resolve({
             approach: approachName,
@@ -440,7 +527,31 @@ class FirstResultLatencyExperiment {
         const value = result.value
           ? result.value.toFixed(6).padEnd(13)
           : "N/A".padEnd(13);
+        
         summary += `${name} | ${latencyMs} | ${latencyS} | ${value}\n`;
+      }
+    }
+
+    // Resource Usage summary
+    summary += "\n";
+    summary += "-".repeat(70) + "\n";
+    summary += "RESOURCE USAGE (Orchestrator)\n";
+    summary += "-".repeat(70) + "\n\n";
+    summary += "Approach        | Avg CPU (%)   | Max Mem (MB)  | Avg Mem (MB)\n";
+    summary += "----------------|---------------|---------------|---------------\n";
+    
+    for (const approach of approaches) {
+      const result = this.results[approach];
+      const name = approach.padEnd(15);
+      
+      if (!result || result.error || !result.resources) {
+        summary += `${name} | N/A           | N/A           | N/A\n`;
+      } else {
+        const avgCpu = result.resources.avgCpu.toFixed(1).padEnd(13);
+        const maxMem = (result.resources.maxMemory / 1024 / 1024).toFixed(1).padEnd(13);
+        const avgMem = (result.resources.avgMemory / 1024 / 1024).toFixed(1).padEnd(13);
+        
+        summary += `${name} | ${avgCpu} | ${maxMem} | ${avgMem}\n`;
       }
     }
 
