@@ -1,8 +1,7 @@
-import { StreamConsumer } from "./StreamConsumer";
 import * as fs from 'fs';
 import * as mqtt from 'mqtt';
 import * as path from 'path';
-import { CSVLogger } from "../../../util/logger/CSVLogger";
+import { StreamConsumer } from "./StreamConsumer";
 const N3 = require('n3');
 const { DataFactory } = N3;
 const { namedNode, literal } = DataFactory;
@@ -146,8 +145,17 @@ export class StreamToMQTT {
         }
 
         const delay = 1000 / this.frequency;
+        const durationSeconds = 300; // Run for 5 minutes
+        const startTime = Date.now();
 
-        for (let i = 0; i < this.sorted_observation_subjects.length; i++) {
+        while ((Date.now() - startTime) < durationSeconds * 1000) {
+            if (this.observation_pointer >= this.sorted_observation_subjects.length) {
+                // Reset pointer to loop data
+                this.observation_pointer = 0;
+                this.number_of_publish = 0; // Reset publish count for next loop logic check if needed
+                console.log('Looping data stream...');
+            }
+
             await this.publish_one_observation();
             await this.sleep(delay);
         }
@@ -186,8 +194,9 @@ export class StreamToMQTT {
      */
     private async publish_one_observation() {
         if (this.number_of_publish >= this.sort_subject_length) {
-            console.log('No more observations to publish.');
-            process.exit();
+            // Logic handled in replay_streams loop
+            // console.log('No more observations to publish.');
+            // process.exit();
         }
 
         try {

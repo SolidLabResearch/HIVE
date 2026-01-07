@@ -45,8 +45,12 @@ const APPROACHES = [
   }
 ];
 
-const ITERATIONS = 3; // Number of times to run each approach for statistical significance
-const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const ITERATIONS = 1; // Run once for now as per user request (was 3)
+const TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes
+
+// ... (skipping to summary fix)
+
+
 const LOGS_DIR = 'logs/real_data_comparison';
 
 class RealDataComparisonRunner {
@@ -56,6 +60,27 @@ class RealDataComparisonRunner {
     if (!fs.existsSync(LOGS_DIR)) {
       fs.mkdirSync(LOGS_DIR, { recursive: true });
     }
+  }
+
+  async getProcessStats(pid) {
+    return new Promise((resolve) => {
+      const cmd = `ps -p ${pid} -o %cpu,rss`;
+      const { exec } = require('child_process');
+      exec(cmd, (error, stdout, stderr) => {
+        if (error || stderr) { resolve(null); return; }
+        try {
+          const lines = stdout.trim().split('\n');
+          if (lines.length < 2) { resolve(null); return; }
+          const values = lines[lines.length - 1].trim().split(/\s+/);
+          if (values.length >= 2) {
+            resolve({
+              cpu: parseFloat(values[0]),
+              memory: parseInt(values[1], 10) * 1024 // RSS in bytes
+            });
+          } else { resolve(null); }
+        } catch (e) { resolve(null); }
+      });
+    });
   }
 
   async runSingleTest(approach, iteration) {
@@ -88,6 +113,19 @@ class RealDataComparisonRunner {
           env: env
         });
 
+        const orchestratorPid = orchestrator.pid;
+        const stats = { cpuSamples: [], memorySamples: [], timestamps: [] };
+
+        // Start resource monitoring
+        const monitorInterval = setInterval(async () => {
+          const procStats = await this.getProcessStats(orchestratorPid);
+          if (procStats) {
+            stats.cpuSamples.push(procStats.cpu);
+            stats.memorySamples.push(procStats.memory);
+            stats.timestamps.push(Date.now());
+          }
+        }, 1000); // Poll every 1s
+
         // Start publisher after a short delay
         setTimeout(() => {
           console.log('Starting data publisher...');
@@ -106,7 +144,19 @@ class RealDataComparisonRunner {
           // Wait for publisher to finish
           publisher.on('close', (code) => {
             clearTimeout(timeout);
+            clearInterval(monitorInterval); // Stop monitoring
             orchestrator.kill();
+
+            // Calculate resource stats
+            const avgCpu = stats.cpuSamples.length > 0 
+              ? stats.cpuSamples.reduce((a, b) => a + b, 0) / stats.cpuSamples.length 
+              : 0;
+            const maxMem = stats.memorySamples.length > 0 
+              ? Math.max(...stats.memorySamples) 
+              : 0;
+            const avgMem = stats.memorySamples.length > 0 
+              ? stats.memorySamples.reduce((a, b) => a + b, 0) / stats.memorySamples.length 
+              : 0;
 
             const endTime = Date.now();
             const duration = (endTime - startTime) / 1000;
@@ -121,7 +171,8 @@ class RealDataComparisonRunner {
               iteration,
               duration,
               success: code === 0,
-              logDir
+              logDir,
+              resources: { avgCpu, maxMem, avgMem }
             });
           });
 
@@ -246,7 +297,12 @@ class RealDataComparisonRunner {
 
     try {
       const content = fs.readFileSync(logPath, 'utf8');
-      const records = parse(content, { columns: true, skip_empty_lines: true });
+      const records = parse(content, { 
+        columns: true, 
+        skip_empty_lines: true,
+        relax_quotes: true,
+        relax_column_count: true
+      });
 
       // Extract window close events and result values
       const windowCloseEvents = [];
@@ -264,19 +320,42 @@ class RealDataComparisonRunner {
           }
         }
 
-        // Extract result values
-        if (record.message && (
-          record.message.includes('avgWearableX') ||
-          record.message.includes('avgSmartphoneX') ||
-          record.message.includes('Result:')
-        )) {
-          const valueMatch = record.message.match(/(\d+\.?\d*)/);
-          if (valueMatch) {
-            resultValues.push({
-              timestamp: parseInt(record.timestamp),
-              value: parseFloat(valueMatch[1])
-            });
+        // Extract result values using various patterns
+        let val = null;
+        if (record.message) {
+          // Fetching approach pattern
+          const rstreamMatch = record.message.match(/RStream result generated:\s*([-0-9.]+)/);
+          if (rstreamMatch) val = parseFloat(rstreamMatch[1]);
+
+          // Approximation/Chunked unified pattern
+          if (!val) {
+            const unifiedMatch = record.message.match(/unified cross-sensor (?:max|avg):\s*([-0-9.]+)/);
+            if (unifiedMatch) val = parseFloat(unifiedMatch[1]);
           }
+
+          // Chunked/Approx event pattern
+          if (!val) {
+             const eventMatch = record.message.match(/Generated Output Query Event:.*hasValue>\s*(?:\\"|")?([-0-9.]+)(?:\\"|")?/);
+             if (eventMatch) val = parseFloat(eventMatch[1]);
+          }
+          
+           // Chunked/Approx calculated pattern
+          if (!val) {
+             const calcMatch = record.message.match(/calculated result.*hasValue>\s*(?:\\"|")?([-0-9.]+)(?:\\"|")?/);
+             if (calcMatch) val = parseFloat(calcMatch[1]);
+          }
+        }
+
+        if (val !== null && !isNaN(val)) {
+             // Avoid duplicates if multiple logs capture the same event (e.g. Generated + Calculated)
+             // Simple dedup by timestamp + value if exactly same
+             const last = resultValues[resultValues.length - 1];
+             if (!last || last.value !== val || (parseInt(record.timestamp) - last.timestamp > 100)) {
+                resultValues.push({
+                  timestamp: parseInt(record.timestamp),
+                  value: val
+                });
+             }
         }
       });
 
@@ -375,7 +454,8 @@ class RealDataComparisonRunner {
         minLatency: latencies.length > 0 ? Math.min(...latencies) : null,
         maxLatency: latencies.length > 0 ? Math.max(...latencies) : null,
         windowCloseCount: latencies.length,
-        resultValues: allResultValues.length > 0 ? allResultValues[0] : [] // Use first iteration for comparison
+        resultValues: allResultValues.length > 0 ? allResultValues[0] : [], // Use first iteration for comparison
+        resources: approachResults[0].resources // Use first iteration resources
       };
     }
 
@@ -391,11 +471,11 @@ class RealDataComparisonRunner {
 
     const fetchingResults = analysis.byApproach.fetching?.resultValues || [];
 
-    console.log('| Approach              | Iterations | Avg Latency | Min Latency | Max Latency | Windows | Accuracy | MAE      | MAPE     |');
-    console.log('|----------------------|------------|-------------|-------------|-------------|---------|----------|----------|----------|');
+    console.log('| Approach              | Avg Latency | Avg CPU | Max Mem | Avg Mem | Accuracy | MAE      | MAPE     |');
+    console.log('|----------------------|-------------|---------|---------|---------|----------|----------|----------|');
 
     const csvRows = [];
-    csvRows.push('Approach,Iterations,Avg_Latency_ms,Min_Latency_ms,Max_Latency_ms,Window_Count,Accuracy_%,MAE,MAPE_%');
+    csvRows.push('Approach,Iterations,Avg_Latency_ms,Avg_CPU_%,Max_Mem_MB,Avg_Mem_MB,Accuracy_%,MAE,MAPE_%');
 
     for (const approach of APPROACHES) {
       const data = analysis.byApproach[approach.name];
@@ -428,20 +508,23 @@ class RealDataComparisonRunner {
         }
       }
 
+      const cpuStr = data.resources?.avgCpu.toFixed(1) + '%';
+      const maxMemStr = (data.resources?.maxMem / 1024 / 1024).toFixed(1) + ' MB';
+      const avgMemStr = (data.resources?.avgMem / 1024 / 1024).toFixed(1) + ' MB';
+
       const label = approach.label.padEnd(20);
-      const iterStr = iterations.toString().padEnd(10);
       const avgLatStr = (avgLat + ' ms').padEnd(11);
-      const minLatStr = (minLat + ' ms').padEnd(11);
-      const maxLatStr = (maxLat + ' ms').padEnd(11);
-      const winStr = winCount.toString().padEnd(7);
+      const cpuPad = cpuStr.padEnd(7);
+      const maxMemPad = maxMemStr.padEnd(7);
+      const avgMemPad = avgMemStr.padEnd(7);
       const accStr = accuracy.padEnd(8);
       const maeStr = mae.padEnd(8);
       const mapeStr = mape.padEnd(8);
 
-      console.log(`| ${label} | ${iterStr} | ${avgLatStr} | ${minLatStr} | ${maxLatStr} | ${winStr} | ${accStr} | ${maeStr} | ${mapeStr} |`);
+      console.log(`| ${label} | ${avgLatStr} | ${cpuPad} | ${maxMemPad} | ${avgMemPad} | ${accStr} | ${maeStr} | ${mapeStr} |`);
 
       csvRows.push(
-        `${approach.label},${iterations},${avgLat},${minLat},${maxLat},${winCount},` +
+        `${approach.label},${iterations},${avgLat},${data.resources?.avgCpu},${data.resources?.maxMem},${data.resources?.avgMem},` +
         `${accuracy.replace('%', '').replace(' (baseline)', '')},${mae},${mape.replace('%', '')}`
       );
     }
@@ -506,9 +589,13 @@ class RealDataComparisonRunner {
 
     if (latencies.length > 0) {
       const fastest = latencies.reduce((min, curr) =>
-        curr.latency < min.latency ? curr : min
+        (curr.latency !== null && (min.latency === null || curr.latency < min.latency)) ? curr : min
       );
-      console.log(`🏆 Fastest approach: ${fastest.name} (${fastest.latency.toFixed(2)} ms avg)`);
+      if (fastest && fastest.latency !== null) {
+        console.log(`🏆 Fastest approach: ${fastest.name} (${fastest.latency.toFixed(2)} ms avg)`);
+      } else {
+        console.log(`🏆 Fastest approach: N/A`);
+      }
     }
 
     console.log('\n' + '='.repeat(100));
@@ -523,16 +610,7 @@ class RealDataComparisonRunner {
     console.log('  ✓ Data files exist in src/streamer/data/');
     console.log('  ✓ Project is built (npm run build)\n');
 
-    await new Promise(resolve => {
-      const readline = require('readline').createInterface({
-        input: process.stdin,
-        output: process.stdout
-      });
-      readline.question('Press Enter to continue or Ctrl+C to abort...', () => {
-        readline.close();
-        resolve();
-      });
-    });
+
 
     await this.runAllTests();
     const analysis = this.analyzeResults();
@@ -552,6 +630,23 @@ async function main() {
   if (args.length > 0 && args[0] === 'analyze-only') {
     console.log('📊 Running analysis only (skipping experiments)...\n');
     const runner = new RealDataComparisonRunner();
+    
+    // Load existing results from JSON log if available
+    const jsonPath = path.join(LOGS_DIR, 'real_data_comparison_results.json');
+    if (fs.existsSync(jsonPath)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+            if (data.rawResults) {
+                runner.results = data.rawResults;
+                console.log(`Loaded ${runner.results.length} previous results from ${jsonPath}`);
+            }
+        } catch (e) {
+            console.error('Failed to load existing results dictionary:', e.message);
+        }
+    } else {
+        console.warn('No existing results JSON found. Analysis may be incomplete.');
+    }
+
     // Load existing results from logs
     const analysis = runner.analyzeResults();
     runner.generateReport(analysis);

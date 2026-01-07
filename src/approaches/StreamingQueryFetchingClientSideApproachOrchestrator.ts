@@ -319,19 +319,56 @@ export class FetchingAllDataClientSide {
       console.error("Error in RStream emitter:", err);
     });
     this.rstream_emitter.on("RStream", (object: any) => {
+      console.log("DEBUG: RStream event received:", JSON.stringify(object));
       if (!object || !object.bindings) {
         console.error("Received invalid RStream object:", object);
         return;
       }
 
-      const iterables = object.bindings.values();
+      // Handle bindings (rsp-js returns array of bindings or single binding map)
+      // Since we have multiple variables now (?avgValue, ?countValue), we need to extract them by name.
+      // object.bindings is an array of Map<string, Term> or similar.
+      
+      for (const binding of object.bindings) {
+          // binding should be a Map-like object where keys are variable names
+          let avgValue = null;
+          let countValue = null;
+          
+          if (binding instanceof Map) {
+              avgValue = binding.get("?avgValue")?.value;
+              countValue = binding.get("?countValue")?.value;
+          } else if (Array.isArray(binding)) {
+              // Sometimes it's [ [Var, Term], ... ]
+              for (const [v, t] of binding) {
+                  if (v.value === "avgValue") avgValue = t.value;
+                  if (v.value === "countValue") countValue = t.value;
+              }
+          } else {
+             // Try property access if it's a plain object
+             // based on previous debugging, it's complex. Let's try to assume variable names match.
+             // Usually it's an Iterable of entries.
+             try {
+                for (const pair of binding) {
+                    if (pair[0].value === "avgValue") avgValue = pair[1].value;
+                    if (pair[0].value === "countValue") countValue = pair[1].value;
+                }
+             } catch(e) {
+                 console.log("Error parsing binding:", e);
+             }
+          }
 
-      for (const item of iterables) {
-        const data = item.value;
+        if (!avgValue) { 
+             // Fallback if parsing failed or structure different
+             console.log("DEBUG: Could not parse avgValue from:", binding);
+             continue; 
+        }
+
+        const data = avgValue;
+        const count = countValue || "N/A";
         const currentTimestamp = Date.now();
 
         this.log(
-          `RStream result generated: ${data} at timestamp: ${currentTimestamp}`,
+          `RStream result generated: ${data} (count: ${count}) at timestamp: ${currentTimestamp}`,
         );
 
         // Apply timing filter to ignore extra dynamic windows
@@ -341,7 +378,7 @@ export class FetchingAllDataClientSide {
           continue;
         }
 
-        this.log(`Processing valid result: ${data}`);
+        this.log(`Processing valid result: ${data} with count: ${count}`);
 
         // Calculate and log latency with multiple metrics
         this.windowCount++;
@@ -358,7 +395,9 @@ export class FetchingAllDataClientSide {
         );
 
         // Debug: print the full binding object
-        console.log("DEBUG: RStream binding:", item);
+        // console.log("DEBUG: RStream binding:", binding);
+        
+        // ... rest of publication logic using 'data' (avg)
         const aggregation_event = this.generate_aggregation_event(data);
         const aggregation_object_string = JSON.stringify(aggregation_event);
         console.log(
@@ -474,7 +513,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
-SELECT (AVG(?value) AS ?avgValue)
+SELECT (AVG(?value) AS ?avgValue) (COUNT(?value) AS ?countValue)
 FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
 FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
 WHERE {

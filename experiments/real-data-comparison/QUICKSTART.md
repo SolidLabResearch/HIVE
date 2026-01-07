@@ -10,7 +10,7 @@ npm run build
 
 # 2. Start required services
 brew services start mosquitto
-brew services start mongodb-community
+
 
 # 3. Verify data exists
 ls -lh src/streamer/data/smartphone.acceleration.x/data.nt
@@ -66,7 +66,7 @@ cat ../../logs/real_data_comparison/real_data_comparison_results.json
 ```bash
 brew services list
 brew services restart mosquitto
-brew services restart mongodb-community
+
 ```
 
 **Need help?** See full README.md in this directory.

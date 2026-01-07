@@ -66,14 +66,9 @@ Before running the experiment:
    mosquitto -v
    ```
 
-3. **Start MongoDB**:
-   ```bash
-   brew services start mongodb-community
-   # or
-   mongod --config /usr/local/etc/mongod.conf
-   ```
 
-4. **Verify data files exist**:
+
+3. **Verify data files exist**:
    ```bash
    ls -lh src/streamer/data/smartphone.acceleration.x/data.nt
    ls -lh src/streamer/data/wearable.acceleration.x/data.nt
@@ -206,14 +201,7 @@ ps aux | grep mosquitto
 brew services restart mosquitto
 ```
 
-### "MongoDB connection refused"
-```bash
-# Check if MongoDB is running
-ps aux | grep mongod
 
-# Restart if needed
-brew services restart mongodb-community
-```
 
 ### "Data file not found"
 Ensure data files exist:

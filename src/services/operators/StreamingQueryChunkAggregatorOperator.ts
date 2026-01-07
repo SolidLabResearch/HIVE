@@ -1,12 +1,12 @@
-import { RSPQLParser } from "rsp-js";
+import fs from "fs";
 import { RewriteChunkQuery } from "hive-thought-rewriter";
+import mqtt from "mqtt";
+import { RSPQLParser } from "rsp-js";
 import { RSPQueryProcess } from "../../rsp/RSPQueryProcess";
+import { IStreamQueryOperator } from "../../util/Interfaces";
+import { CSVLogger } from "../../util/logger/CSVLogger";
 import { hash_string_md5, storeToString } from "../../util/Util";
 import { R2ROperator } from "./r2r";
-import mqtt from "mqtt";
-import { CSVLogger } from "../../util/logger/CSVLogger";
-import { IStreamQueryOperator } from "../../util/Interfaces";
-import fs from "fs";
 const N3 = require("n3");
 
 /**
@@ -804,7 +804,7 @@ For example, the allResults object might look like this:
    * @param aggregationFunction
    * @param variable
    */
-  getAggregationSPARQLQuery(
+    getAggregationSPARQLQuery(
     aggregationFunction: string,
     variable: string,
   ): string {
@@ -825,7 +825,27 @@ For example, the allResults object might look like this:
       variable = "?" + variable;
     }
 
-    return `SELECT (${aggregationFunction}(${variable}) AS ?result) WHERE { ?s ?p ${variable} }`;
+    // Weighted Average Logic for AVG
+    if (aggregationFunction === "AVG") {
+       return `
+        PREFIX saref: <https://saref.etsi.org/core/>
+        SELECT ((SUM(?val * ?cnt) / SUM(?cnt)) AS ?result)
+        WHERE {
+          ?s saref:hasValue ?val .
+          ?s saref:hasCount ?cnt .
+        }
+       `;
+    }
+
+    // Default behavior for other functions (assuming simple hasValue for now, but really only AVG is critical here)
+    // Note: This simplifies the dynamic variable name usage because the RDF data is now consistently using saref:hasValue
+    return `
+      PREFIX saref: <https://saref.etsi.org/core/>
+      SELECT (${aggregationFunction}(?val) AS ?result)
+      WHERE {
+        ?s saref:hasValue ?val .
+      }
+    `;
   }
 
   /**

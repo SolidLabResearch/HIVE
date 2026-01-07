@@ -1,10 +1,9 @@
 import { EventEmitter } from 'events';
-import { RDFStream, RSPEngine } from 'rsp-js';
+import { RDFStream, RSPEngine, RSPQLParser } from 'rsp-js';
+import { v4 as uuidv4 } from 'uuid';
+import { turtleStringToStore } from '../util/Util';
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
-import { v4 as uuidv4 } from 'uuid';
-import { RSPQLParser } from 'rsp-js';
-import { turtleStringToStore } from '../util/Util';
 
 /**
  *
@@ -123,17 +122,39 @@ export class RSPQueryProcess {
         this.rstream_emitter.on("RStream", async (object: any) => {
             console.log(`Received RStream object: ${JSON.stringify(object)}`);
 
-            if (!object || !object.bindings) {
+            if (!object || !object.bindings || object.bindings.length === 0) {
                 console.log(`No bindings found in the RStream object.`);
                 return;
             }
 
-            const iterables = object.bindings.values();
-            for await (const iterable of iterables) {
-                const event_timestamp = new Date().getTime();
-                const data = iterable.value;
-                console.log(`Processing data: ${data} at timestamp: ${event_timestamp}`);
-                const aggregation_event = this.generate_aggregation_event(data, event_timestamp);
+            // Merge all bindings into one object.
+            // rsp-js returns bindings as an iterable of entries [Variable, Term] (effectively a Map).
+            // We need to flatten this into a { varName: varValue } object.
+            let mergedBinding: {[key: string]: any} = {};
+            
+            // Check if object.bindings is iterable
+            if (object.bindings && typeof object.bindings[Symbol.iterator] === 'function') {
+                for (const binding of object.bindings) {
+                     // binding is expected to be [Variable, Term]
+                     if (Array.isArray(binding) && binding.length >= 2) {
+                         const varName = binding[0].value;
+                         const varValue = binding[1].value;
+                         console.log(`DEBUG: Extracted binding: ${varName} = ${varValue}`);
+                         mergedBinding[varName] = varValue;
+                     } else {
+                         console.log(`DEBUG: Unexpected binding format: ${JSON.stringify(binding)}`);
+                     }
+                }
+            } else {
+                 console.log(`DEBUG: object.bindings is not iterable: ${typeof object.bindings}`);
+            }
+            
+            console.log(`DEBUG: Final Merged Binding: ${JSON.stringify(mergedBinding)}`);
+
+            const event_timestamp = new Date().getTime();
+            const aggregation_event = this.generate_aggregation_event(mergedBinding, event_timestamp);
+            
+            if (aggregation_event) {
                 const aggregation_object_string = JSON.stringify(aggregation_event);
                 rstream_publisher.publish(this.rstream_topic, aggregation_object_string, (err: any) => {
                     if (err) {
@@ -150,17 +171,32 @@ export class RSPQueryProcess {
 
     /**
      *
-     * @param data
+     * @param bindings Map of variable names to values
      * @param timestamp
      */
-    public generate_aggregation_event(data: any, timestamp: number) {
+    public generate_aggregation_event(bindings: any, timestamp: number) {
         const uuid_random = uuidv4();
+        let triples = "";
 
-        const aggregation_event = `
-    <https://rsp.js/aggregation_event/${uuid_random}> <https://saref.etsi.org/core/hasValue> "${data}"^^<http://www.w3.org/2001/XMLSchema#float> .
-    `;
-        return aggregation_event.trim();
-
+        // Iterate over keys in the binding object (e.g. avgWearableX, countWearableX)
+        // Note: rsp-js bindings might be a Map or an Object. Adjusting for Object behavior based on JSON.stringify output.
+        // Assuming binding is { varName: value, ... } based on previous logs.
+        
+        for (const [key, value] of Object.entries(bindings)) {
+             console.log(`DEBUG: Generating triple for key: ${key}, value: ${value}`);
+             let predicate = "";
+             if (key.startsWith("avg")) {
+                 predicate = "<https://saref.etsi.org/core/hasValue>";
+             } else if (key.startsWith("count")) {
+                 predicate = "<https://saref.etsi.org/core/hasCount>";
+             } else {
+                 continue; // specific interest only
+             }
+             
+             triples += `<https://rsp.js/aggregation_event/${uuid_random}> ${predicate} "${value}"^^<http://www.w3.org/2001/XMLSchema#float> .\n`;
+        }
+        
+        return triples.trim();
     }
 
     /**
