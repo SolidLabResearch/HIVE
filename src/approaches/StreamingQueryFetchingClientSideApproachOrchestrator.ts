@@ -327,40 +327,60 @@ export class FetchingAllDataClientSide {
 
       // Handle bindings (rsp-js returns array of bindings or single binding map)
       // Since we have multiple variables now (?avgValue, ?countValue), we need to extract them by name.
-      // object.bindings is an array of Map<string, Term> or similar.
-      
-      for (const binding of object.bindings) {
-          // binding should be a Map-like object where keys are variable names
-          let avgValue = null;
-          let countValue = null;
-          
-          if (binding instanceof Map) {
-              avgValue = binding.get("?avgValue")?.value;
-              countValue = binding.get("?countValue")?.value;
-          } else if (Array.isArray(binding)) {
-              // Sometimes it's [ [Var, Term], ... ]
-              for (const [v, t] of binding) {
-                  if (v.value === "avgValue") avgValue = t.value;
-                  if (v.value === "countValue") countValue = t.value;
-              }
-          } else {
-             // Try property access if it's a plain object
-             // based on previous debugging, it's complex. Let's try to assume variable names match.
-             // Usually it's an Iterable of entries.
-             try {
-                for (const pair of binding) {
-                    if (pair[0].value === "avgValue") avgValue = pair[1].value;
-                    if (pair[0].value === "countValue") countValue = pair[1].value;
-                }
-             } catch(e) {
-                 console.log("Error parsing binding:", e);
-             }
-          }
+      // object.bindings can be a single binding object or array of binding objects
 
-        if (!avgValue) { 
-             // Fallback if parsing failed or structure different
-             console.log("DEBUG: Could not parse avgValue from:", binding);
-             continue; 
+      // Normalize to array
+      const bindings = Array.isArray(object.bindings)
+        ? object.bindings
+        : [object.bindings];
+
+      for (const binding of bindings) {
+        // binding should be a Map-like object where keys are variable names
+        let avgValue = null;
+        let countValue = null;
+
+        if (binding instanceof Map) {
+          avgValue = binding.get("?avgValue")?.value;
+          countValue = binding.get("?countValue")?.value;
+        } else if (Array.isArray(binding)) {
+          // Sometimes it's [ [Var, Term], ... ]
+          for (const [v, t] of binding) {
+            if (v.value === "avgValue") avgValue = t.value;
+            if (v.value === "countValue") countValue = t.value;
+          }
+        } else if (binding.entries) {
+          // Has entries property - could be Immutable.js Map or plain object
+          try {
+            // Check if it's an Immutable.js Map with .get() method
+            if (typeof binding.entries.get === "function") {
+              const avgTerm = binding.entries.get("avgValue");
+              const countTerm = binding.entries.get("countValue");
+              if (avgTerm) avgValue = avgTerm.value;
+              if (countTerm) countValue = countTerm.value;
+            } else {
+              // Plain object
+              for (const [key, value] of Object.entries(binding.entries)) {
+                if (key === "avgValue") avgValue = (value as any).value;
+                if (key === "countValue") countValue = (value as any).value;
+              }
+            }
+          } catch (e) {
+            console.log("Error parsing binding entries:", e);
+          }
+        } else {
+          // Try direct property access as fallback
+          try {
+            if (binding.avgValue) avgValue = binding.avgValue.value;
+            if (binding.countValue) countValue = binding.countValue.value;
+          } catch (e) {
+            console.log("Error parsing binding:", e);
+          }
+        }
+
+        if (!avgValue) {
+          // Fallback if parsing failed or structure different
+          console.log("DEBUG: Could not parse avgValue from:", binding);
+          continue;
         }
 
         const data = avgValue;
@@ -396,7 +416,7 @@ export class FetchingAllDataClientSide {
 
         // Debug: print the full binding object
         // console.log("DEBUG: RStream binding:", binding);
-        
+
         // ... rest of publication logic using 'data' (avg)
         const aggregation_event = this.generate_aggregation_event(data);
         const aggregation_object_string = JSON.stringify(aggregation_event);

@@ -1,0 +1,13 @@
+{
+  "pattern": "high_freq_oscillation",
+  "description": "High Frequency Oscillation",
+  "parameters": {
+    "mu": -23,
+    "A": 3,
+    "f": 0.5
+  },
+  "duration_seconds": 120,
+  "sampling_rate_hz": 4,
+  "total_points": 480,
+  "generated_at": "2026-01-07T15:54:54.817Z"
+}

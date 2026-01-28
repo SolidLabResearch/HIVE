@@ -1,0 +1,12 @@
+{
+  "pattern": "low_variability",
+  "description": "Low Variability Pattern",
+  "parameters": {
+    "mu": -23,
+    "sigma": 0.25
+  },
+  "duration_seconds": 120,
+  "sampling_rate_hz": 4,
+  "total_points": 480,
+  "generated_at": "2026-01-07T15:54:54.808Z"
+}

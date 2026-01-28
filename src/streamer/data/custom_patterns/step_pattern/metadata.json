@@ -1,0 +1,13 @@
+{
+  "pattern": "step_pattern",
+  "description": "Step Pattern",
+  "parameters": {
+    "v1": -23,
+    "v2": -15,
+    "t_step": 60
+  },
+  "duration_seconds": 120,
+  "sampling_rate_hz": 4,
+  "total_points": 480,
+  "generated_at": "2026-01-07T15:54:54.810Z"
+}
