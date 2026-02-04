@@ -277,8 +277,13 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       }
 
       // Data structure to collect chunks by topic with timestamps
-      const chunksByTopic: Map<string, { data: string; timestamp: number }[]> =
-        new Map();
+      const chunksByTopic: Map<string, { 
+        data: string; 
+        arrivalTime: number;
+        dataTimestamp: number;
+        dataWindowStart: number;
+        dataWindowEnd: number;
+      }[]> = new Map();
       const chunksRequired =
         Math.ceil(outputQueryWidth / this.chunkGCD) * this.subQueries.length;
       this.logger.log(`Chunks required for aggregation: ${chunksRequired}`);
@@ -350,8 +355,11 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         let totalTopicsWithData = 0;
 
         for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
+          // Filter chunks based on data time overlap with target window
+          // A chunk overlaps if its data window [dataWindowStart, dataWindowEnd] 
+          // intersects with target window [windowStart, now]
           const windowChunks = chunks.filter(
-            (chunk) => chunk.timestamp >= windowStart,
+            (chunk) => chunk.dataWindowEnd > windowStart && chunk.dataWindowStart <= now,
           );
 
           if (windowChunks.length > 0) {
@@ -363,17 +371,17 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               `Window start timestamp: ${windowStart}, Current time: ${now}`,
             );
             this.logger.log(
-              `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
+              `Window chunks for ${topic}: ${JSON.stringify(windowChunks.map(c => ({dataTimestamp: c.dataTimestamp, dataWindowStart: c.dataWindowStart, dataWindowEnd: c.dataWindowEnd})))}`,
             );
 
             // Add this topic's chunks to the combined collection
             allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
           }
 
-          // Clean up old chunks for this topic
+          // Clean up old chunks for this topic (based on data window end time)
           chunksByTopic.set(
             topic,
-            chunks.filter((chunk) => chunk.timestamp >= windowStart),
+            chunks.filter((chunk) => chunk.dataWindowEnd > windowStart),
           );
         }
 
@@ -429,10 +437,20 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           chunksByTopic.set(topic, []);
         }
 
-        // Add chunk to the appropriate topic
+        // Extract the data timestamp from the chunk RDF
+        const dataTimestamp = this.extractDataTimestampFromChunk(message.toString());
+        
+        // Add chunk to the appropriate topic with both arrival time and data timestamp
         chunksByTopic
           .get(topic)!
-          .push({ data: message.toString(), timestamp: Date.now() });
+          .push({ 
+            data: message.toString(), 
+            arrivalTime: Date.now(),
+            dataTimestamp: dataTimestamp,
+            // Each chunk covers chunkGCD ms of data ending at dataTimestamp
+            dataWindowStart: dataTimestamp - this.chunkGCD,
+            dataWindowEnd: dataTimestamp
+          });
 
         // IMMEDIATE TRIGGER OPTIMIZATION:
         // Check if we should process immediately instead of waiting for interval
@@ -737,6 +755,37 @@ For example, the allResults object might look like this:
     };
 
     return arr.reduce((acc, val) => lcm(acc, val), 1);
+  }
+
+  /**
+   * Extract the hasTimestamp value from chunk RDF data
+   * @param chunkData RDF data containing hasTimestamp triple
+   * @returns timestamp in milliseconds
+   */
+  private extractDataTimestampFromChunk(chunkData: string): number {
+    try {
+      // Remove quotes if the data is JSON-stringified
+      let cleanData = chunkData;
+      if (cleanData.startsWith('"') && cleanData.endsWith('"')) {
+        cleanData = JSON.parse(cleanData);
+      }
+      
+      // Extract timestamp using regex
+      // Format: <...> <https://saref.etsi.org/core/hasTimestamp> "TIMESTAMP"^^<...>
+      const timestampMatch = cleanData.match(/hasTimestamp>\s*"(\d+)"/);
+      
+      if (timestampMatch && timestampMatch[1]) {
+        const timestamp = parseInt(timestampMatch[1], 10);
+        this.logger.log(`Extracted data timestamp from chunk: ${timestamp}`);
+        return timestamp;
+      } else {
+        this.logger.log(`Could not extract timestamp from chunk, using current time as fallback`);
+        return Date.now();
+      }
+    } catch (error) {
+      this.logger.log(`Error extracting timestamp from chunk: ${error}, using current time`);
+      return Date.now();
+    }
   }
 
   /**
