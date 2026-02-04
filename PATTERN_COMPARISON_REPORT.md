@@ -26,21 +26,20 @@ This report presents a comprehensive comparison of three streaming query process
 
 | Pattern | Approach | Result Value | MAPE vs Fetching (%) | Absolute Error |
 |---------|----------|--------------|----------------------|----------------|
-| low_variability | Fetching | -22.987 | 0.00 | 0.000 |
-| low_variability | Approximation | -22.993 | -0.03 | 0.006 |
-| step_pattern | Fetching | -17.684 | 0.00 | 0.000 |
-| step_pattern | Approximation | -17.032 | -3.69 | 0.652 |
-| spike_pattern | Fetching | -22.930 | 0.00 | 0.000 |
-| spike_pattern | Approximation | -22.741 | -0.82 | 0.189 |
-| low_freq_oscillation | Fetching | -23.002 | 0.00 | 0.000 |
-| low_freq_oscillation | Approximation | -23.003 | -0.01 | 0.002 |
-| high_freq_oscillation | Fetching | -23.000 | 0.00 | 0.000 |
-| high_freq_oscillation | Approximation | -22.989 | -0.05 | 0.011 |
-| low_variability | Chunked | -22.987 | 0.00 | 0.000 |
-| step_pattern | Chunked | -19.441 | 9.94 | 1.758 |
-| spike_pattern | Chunked | -22.870 | 0.26 | 0.060 |
-| low_freq_oscillation | Chunked | -22.886 | 0.50 | 0.116 |
-| high_freq_oscillation | Chunked | -22.994 | 0.03 | 0.006 |
+| step_pattern | Fetching |  cleaning up..." | 0.00 | 0.000 |
+| step_pattern | Chunked | -19.577 |  |  |
+| spike_pattern | Fetching |  cleaning up..." | 0.00 | 0.000 |
+| spike_pattern | Chunked | -22.833 |  |  |
+| low_variability | Fetching |  cleaning up..." | 0.00 | 0.000 |
+| low_variability | Approximation | -22.993 |  |  |
+| low_variability | Chunked | -22.991 |  |  |
+| low_freq_oscillation | Fetching |  cleaning up..." | 0.00 | 0.000 |
+| low_freq_oscillation | Approximation | -22.997 |  |  |
+| low_freq_oscillation | Chunked | -22.747 |  |  |
+| high_freq_oscillation | Fetching |  cleaning up..." | 0.00 | 0.000 |
+| high_freq_oscillation | Approximation | -22.989 |  |  |
+| high_freq_oscillation | Chunked | -22.994 |  |  |
+
 
 
 
@@ -50,21 +49,20 @@ This report presents a comprehensive comparison of three streaming query process
 
 | Pattern | Approach | Avg CPU User | Avg CPU System | Avg Memory (MB) | Peak Memory (MB) |
 |---------|----------|--------------|----------------|-----------------|------------------|
-| low_variability | Fetching | 3936.61 | 1149.97 | 45.23 | 45.58 |
-| low_variability | Approximation | 4523.14 | 1208.91 | 47.43 | 42.32 |
-| step_pattern | Fetching | 4003.88 | 1162.75 | 45.35 | 41.23 |
-| step_pattern | Approximation | 4200.70 | 1146.08 | 48.66 | 41.98 |
-| spike_pattern | Fetching | 3944.82 | 1091.13 | 44.23 | 39.06 |
-| spike_pattern | Approximation | 4548.93 | 1167.90 | 47.12 | 42.16 |
-| low_freq_oscillation | Fetching | 3912.92 | 1097.71 | 45.52 | 42.74 |
-| low_freq_oscillation | Approximation | 4261.94 | 1160.81 | 48.69 | 42.14 |
-| high_freq_oscillation | Fetching | 4023.16 | 1192.15 | 45.50 | 45.43 |
-| high_freq_oscillation | Approximation | 4398.86 | 1216.76 | 48.36 | 42.26 |
-| low_variability | Chunked | 4507.48 | 1261.40 | 48.23 | 42.15 |
-| step_pattern | Chunked | 4587.61 | 1227.81 | 48.28 | 42.27 |
-| spike_pattern | Chunked | 4383.96 | 1168.35 | 48.64 | 42.31 |
-| low_freq_oscillation | Chunked | 4763.17 | 1256.17 | 47.30 | 41.95 |
-| high_freq_oscillation | Chunked | 4476.21 | 1213.59 | 48.45 | 42.32 |
+| step_pattern | Fetching | 0.00 | 0.00 | 0.00 | 0.00 |
+| step_pattern | Chunked | 2458.19 | 601.92 | 147895348.63 | 187891712.00 |
+| spike_pattern | Fetching | 0.00 | 0.00 | 0.00 | 0.00 |
+| spike_pattern | Chunked | 2541.68 | 636.06 | 147949118.73 | 187990016.00 |
+| low_variability | Fetching | 0.00 | 0.00 | 0.00 | 0.00 |
+| low_variability | Approximation | 0.00 | 0.00 | 0.00 | 0.00 |
+| low_variability | Chunked | 2319.17 | 590.16 | 107586832.20 | 156516352.00 |
+| low_freq_oscillation | Fetching | 0.00 | 0.00 | 0.00 | 0.00 |
+| low_freq_oscillation | Approximation | 0.00 | 0.00 | 0.00 | 0.00 |
+| low_freq_oscillation | Chunked | 2554.33 | 621.08 | 116981993.50 | 156352512.00 |
+| high_freq_oscillation | Fetching | 0.00 | 0.00 | 0.00 | 0.00 |
+| high_freq_oscillation | Approximation | 0.00 | 0.00 | 0.00 | 0.00 |
+| high_freq_oscillation | Chunked | 2461.08 | 587.55 | 118872828.76 | 156188672.00 |
+
 
 
 
@@ -86,9 +84,10 @@ This report presents a comprehensive comparison of three streaming query process
 
 | Approach | Windows | Result Value | MAPE (%) | Absolute Error | CPU User | CPU System | Memory (MB) | Peak Mem (MB) |
 |----------|---------|--------------|----------|----------------|----------|------------|-------------|---------------|
-| Fetching | 3 | -22.987 | 0.00 | 0.000 | 3936.6 | 1150.0 | 45.2 | 45.6 |
-| Approximation | 2 | -22.993 | -0.03 | 0.006 | 4523.1 | 1208.9 | 47.4 | 42.3 |
-| Chunked | 2 | -22.987 | 0.00 | 0.000 | 4507.5 | 1261.4 | 48.2 | 42.1 |
+| Fetching |        3 |  cleaning up..." | 0.00 | 0.000 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Approximation |        2 | -22.993 |  |  | 0.0 | 0.0 | 0.0 | 0.0 |
+| Chunked |        2 | -22.991 |  |  | 2319.2 | 590.2 | 107586832.2 | 156516352.0 |
+
 
 
 
@@ -113,9 +112,9 @@ This report presents a comprehensive comparison of three streaming query process
 
 | Approach | Windows | Result Value | MAPE (%) | Absolute Error | CPU User | CPU System | Memory (MB) | Peak Mem (MB) |
 |----------|---------|--------------|----------|----------------|----------|------------|-------------|---------------|
-| Fetching | 2 | -17.684 | 0.00 | 0.000 | 4003.9 | 1162.8 | 45.4 | 41.2 |
-| Approximation | 2 | -17.032 | -3.69 | 0.652 | 4200.7 | 1146.1 | 48.7 | 42.0 |
-| Chunked | 2 | -19.441 | 9.94 | 1.758 | 4587.6 | 1227.8 | 48.3 | 42.3 |
+| Fetching |        3 |  cleaning up..." | 0.00 | 0.000 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Chunked |        2 | -19.577 |  |  | 2458.2 | 601.9 | 147895348.6 | 187891712.0 |
+
 
 
 
@@ -141,9 +140,9 @@ This report presents a comprehensive comparison of three streaming query process
 
 | Approach | Windows | Result Value | MAPE (%) | Absolute Error | CPU User | CPU System | Memory (MB) | Peak Mem (MB) |
 |----------|---------|--------------|----------|----------------|----------|------------|-------------|---------------|
-| Fetching | 2 | -22.930 | 0.00 | 0.000 | 3944.8 | 1091.1 | 44.2 | 39.1 |
-| Approximation | 2 | -22.741 | -0.82 | 0.189 | 4548.9 | 1167.9 | 47.1 | 42.2 |
-| Chunked | 2 | -22.870 | 0.26 | 0.060 | 4384.0 | 1168.3 | 48.6 | 42.3 |
+| Fetching |        3 |  cleaning up..." | 0.00 | 0.000 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Chunked |        2 | -22.833 |  |  | 2541.7 | 636.1 | 147949118.7 | 187990016.0 |
+
 
 
 
@@ -170,9 +169,10 @@ This report presents a comprehensive comparison of three streaming query process
 
 | Approach | Windows | Result Value | MAPE (%) | Absolute Error | CPU User | CPU System | Memory (MB) | Peak Mem (MB) |
 |----------|---------|--------------|----------|----------------|----------|------------|-------------|---------------|
-| Fetching | 2 | -23.002 | 0.00 | 0.000 | 3912.9 | 1097.7 | 45.5 | 42.7 |
-| Approximation | 2 | -23.003 | -0.01 | 0.002 | 4261.9 | 1160.8 | 48.7 | 42.1 |
-| Chunked | 2 | -22.886 | 0.50 | 0.116 | 4763.2 | 1256.2 | 47.3 | 42.0 |
+| Fetching |        3 |  cleaning up..." | 0.00 | 0.000 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Approximation |        2 | -22.997 |  |  | 0.0 | 0.0 | 0.0 | 0.0 |
+| Chunked |        2 | -22.747 |  |  | 2554.3 | 621.1 | 116981993.5 | 156352512.0 |
+
 
 
 
@@ -199,9 +199,10 @@ This report presents a comprehensive comparison of three streaming query process
 
 | Approach | Windows | Result Value | MAPE (%) | Absolute Error | CPU User | CPU System | Memory (MB) | Peak Mem (MB) |
 |----------|---------|--------------|----------|----------------|----------|------------|-------------|---------------|
-| Fetching | 2 | -23.000 | 0.00 | 0.000 | 4023.2 | 1192.2 | 45.5 | 45.4 |
-| Approximation | 2 | -22.989 | -0.05 | 0.011 | 4398.9 | 1216.8 | 48.4 | 42.3 |
-| Chunked | 2 | -22.994 | 0.03 | 0.006 | 4476.2 | 1213.6 | 48.5 | 42.3 |
+| Fetching |        3 |  cleaning up..." | 0.00 | 0.000 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Approximation |        2 | -22.989 |  |  | 0.0 | 0.0 | 0.0 | 0.0 |
+| Chunked |        2 | -22.994 |  |  | 2461.1 | 587.5 | 118872828.8 | 156188672.0 |
+
 
 
 

@@ -151,7 +151,11 @@ export class RSPQueryProcess {
             
             console.log(`DEBUG: Final Merged Binding: ${JSON.stringify(mergedBinding)}`);
 
-            const event_timestamp = new Date().getTime();
+            // Use the window close timestamp from the RStream object if available
+            // This represents the actual window close time, not the current wall-clock time
+            const event_timestamp = object.timestamp || Date.now();
+            console.log(`DEBUG: Using timestamp for chunk: ${event_timestamp} (from object: ${object.timestamp}, fallback: ${object.timestamp ? 'no' : 'yes'})`);
+            
             const aggregation_event = this.generate_aggregation_event(mergedBinding, event_timestamp);
             
             if (aggregation_event) {
@@ -195,6 +199,10 @@ export class RSPQueryProcess {
              
              triples += `<https://rsp.js/aggregation_event/${uuid_random}> ${predicate} "${value}"^^<http://www.w3.org/2001/XMLSchema#float> .\n`;
         }
+        
+        // Add hasTimestamp with the window close time
+        // This is CRITICAL for chunked approach to correctly filter chunks by data time
+        triples += `<https://rsp.js/aggregation_event/${uuid_random}> <https://saref.etsi.org/core/hasTimestamp> "${timestamp}"^^<http://www.w3.org/2001/XMLSchema#long> .\n`;
         
         return triples.trim();
     }

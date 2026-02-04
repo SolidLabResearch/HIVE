@@ -348,7 +348,25 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         // Record when processing is triggered (before any processing)
         this.intervalTriggerTime = now;
 
-        const windowStart = now - outputQueryWidth;
+        // Calculate the expected window close time
+        // Window 1: queryReg + RANGE (first window fills up the full range)
+        // Window 2: queryReg + RANGE + STEP, Window 3: queryReg + RANGE + 2*STEP, etc.
+        const windowNumber = this.windowCount + 1;
+        const expectedWindowClose = this.queryRegisteredTime + outputQueryWidth + ((windowNumber - 1) * outputQuerySlide);
+        
+        // Window start is RANGE before the window close
+        const windowStart = expectedWindowClose - outputQueryWidth;
+        
+        console.log(
+          `!!!!! Computing Window ${windowNumber}: queryReg=${this.queryRegisteredTime}, STEP=${outputQuerySlide}, RANGE=${outputQueryWidth}`,
+        );
+        console.log(
+          `!!!!! Window ${windowNumber} time range: [${windowStart}, ${expectedWindowClose}] (duration: ${expectedWindowClose - windowStart}ms)`,
+        );
+        
+        this.logger.log(
+          `${triggerSource}: Window ${windowNumber} calculation: expectedClose=${expectedWindowClose}, windowStart=${windowStart}, now=${now}`,
+        );
 
         // Collect all chunks from all topics within the window
         const allWindowChunks: string[] = [];
@@ -357,9 +375,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
           // Filter chunks based on data time overlap with target window
           // A chunk overlaps if its data window [dataWindowStart, dataWindowEnd] 
-          // intersects with target window [windowStart, now]
+          // intersects with target window [windowStart, expectedWindowClose]
           const windowChunks = chunks.filter(
-            (chunk) => chunk.dataWindowEnd > windowStart && chunk.dataWindowStart <= now,
+            (chunk) => chunk.dataWindowEnd > windowStart && chunk.dataWindowStart <= expectedWindowClose,
           );
 
           if (windowChunks.length > 0) {
@@ -367,15 +385,53 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             this.logger.log(
               `${triggerSource} evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
             );
-            this.logger.log(
-              `Window start timestamp: ${windowStart}, Current time: ${now}`,
+            console.log(
+              `!!!!! Window ${windowNumber} boundaries: start=${windowStart}, expectedClose=${expectedWindowClose}`,
             );
-            this.logger.log(
-              `Window chunks for ${topic}: ${JSON.stringify(windowChunks.map(c => ({dataTimestamp: c.dataTimestamp, dataWindowStart: c.dataWindowStart, dataWindowEnd: c.dataWindowEnd})))}`,
+            console.log(
+              `!!!!! Window chunks for ${topic}: ${JSON.stringify(windowChunks.map(c => ({dataTimestamp: c.dataTimestamp, dataWindowStart: c.dataWindowStart, dataWindowEnd: c.dataWindowEnd, hasValue: c.data.match(/hasValue\s+"([^"]+)"/)?.[1]})))}`,
             );
 
-            // Add this topic's chunks to the combined collection
-            allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
+            // CRITICAL FIX: Adjust chunk counts based on overlap with target window
+            // This ensures weighted average uses correct weights when chunks partially overlap
+            const adjustedChunks = windowChunks.map((chunk) => {
+              // Calculate overlap between chunk window and target window
+              const overlapStart = Math.max(chunk.dataWindowStart, windowStart);
+              const overlapEnd = Math.min(chunk.dataWindowEnd, expectedWindowClose);
+              const overlapDuration = overlapEnd - overlapStart;
+              const chunkDuration = chunk.dataWindowEnd - chunk.dataWindowStart;
+              
+              // Calculate what fraction of the chunk overlaps with target window
+              const overlapRatio = overlapDuration / chunkDuration;
+              
+              // Extract original count from chunk data
+              const countMatch = chunk.data.match(/hasCount\s+"([^"]+)"/);
+              if (!countMatch) {
+                this.logger.log(`WARNING: Chunk missing hasCount, using as-is`);
+                return chunk.data;
+              }
+              
+              const originalCount = parseFloat(countMatch[1]);
+              const adjustedCount = originalCount * overlapRatio;
+              
+              this.logger.log(
+                `Chunk overlap adjustment: window=[${windowStart},${expectedWindowClose}], ` +
+                `chunk=[${chunk.dataWindowStart},${chunk.dataWindowEnd}], ` +
+                `overlap=[${overlapStart},${overlapEnd}] (${overlapDuration}ms), ` +
+                `ratio=${overlapRatio.toFixed(3)}, count: ${originalCount} -> ${adjustedCount.toFixed(2)}`
+              );
+              
+              // Replace the count in the chunk data with adjusted count
+              const adjustedData = chunk.data.replace(
+                /hasCount\s+"[^"]+"/,
+                `hasCount "${adjustedCount}"`
+              );
+              
+              return adjustedData;
+            });
+
+            // Add adjusted chunks to the combined collection
+            allWindowChunks.push(...adjustedChunks);
           }
 
           // Clean up old chunks for this topic (based on data window end time)

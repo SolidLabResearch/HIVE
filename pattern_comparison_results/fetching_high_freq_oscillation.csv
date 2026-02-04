@@ -1,3 +1,4 @@
-window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_obs_ms,result_value
-1,1770208736637,1770208738232,1770208856637,1770208798396,1770208798544,-58093,-59688,148,-22.996064269874477
-2,1770208736637,1770208738232,1770208916637,1770208858503,1770208858689,-57948,-59543,186,-22.999891700557104
+timestamp,message
+1770215288234,"fetching_query_registered"
+1770215296019,"First data received at wall-clock time: 1770215296018"
+1770215305857,"Process terminated, cleaning up..."
