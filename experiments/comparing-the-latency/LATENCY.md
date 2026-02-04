@@ -1,1 +1,0 @@
-## Comparing the Latency of Different Approaches

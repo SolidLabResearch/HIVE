@@ -1,1 +1,0 @@
-## Comparing the Accuracy with Different Stream Patterns

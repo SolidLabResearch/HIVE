@@ -1,3 +1,0 @@
-window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_obs_ms,result_value
-1,1769608866026,1769608867717,1769608986026,1769608927904,1769608928056,-57970,-59661,152,-10.767084449790795
-2,1769608866026,1769608867717,1769609046026,1769608987999,1769608988187,-57839,-59530,188,-17.060891633704735

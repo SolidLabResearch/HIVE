@@ -10,9 +10,9 @@ const path = require("path");
 
 // Configuration
 const FREQUENCIES = ["0.1", "0.5", "1", "1.0", "1.5", "2", "2.0"];
-const LOG_BASE_DIR = "./logs";
-const APPROXIMATION_LOG_DIR = "frequency-comparison-approximation";
-const FETCHING_LOG_DIR = "frequency-comparison-fetching";
+const LOG_BASE_DIR = "experiments/frequency-comparison/logs";
+const APPROXIMATION_LOG_DIR = "approximation";
+const FETCHING_LOG_DIR = "fetching";
 const DATASET_TYPE = "complex_oscillation";
 
 /**
@@ -418,7 +418,7 @@ function main() {
   }
 
   // Export results to CSV
-  const csvFilePath = "./logs/accuracy_comparison_results.csv";
+  const csvFilePath = "experiments/frequency-comparison/logs/accuracy_comparison_results.csv";
   let csvContent =
     "Frequency_Hz,Data_Points,MAPE_Percent,MAE,RMSE,Correlation\n";
 
