@@ -1,2 +1,1 @@
 window_number,query_registered_at,first_data_received_at,expected_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,interval_wait_ms,computation_ms,result_value
-1,1770223978617,1770223981189,1770224098617,1770224038973,1770224038652,1770224038981,-59636,-62208,-321,329,-23.132228654825028

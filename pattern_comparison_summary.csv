@@ -1,6 +1,2 @@
-Pattern,Chunked_Result,Fetching_Result,Accuracy_Diff_%,Chunked_Latency_ms,Fetching_Latency_ms,Latency_Diff_ms,Latency_Diff_%
-step_pattern,-23,-23,0.0000,60390,63267,-2877.00,-4.55
-spike_pattern,-20.944406779661016,-22.92468619246862,9.4549,60359,63070,-2711.00,-4.30
-low_freq_oscillation,-22.519537682926828,-22.99835859832636,2.1262,60358,63064,-2706.00,-4.29
-high_freq_oscillation,-23.132228654825028,-22.991124184100418,0.6100,60364,63090,-2726.00,-4.32
-low_variability,-22.99156573169077,-23.010711887029288,0.0833,60407,62996,-2589.00,-4.11
+Pattern,Chunked_Window1,Fetching_Window1,Accuracy_Diff_%,Chunked_Latency_ms,Fetching_Latency_ms,Latency_Diff_ms,Latency_Diff_%
+low_variability,-22.999330577900974,-23.006866168316833,0.0328,60380,60483,-103.00,-0.17

@@ -1,10 +1,10 @@
 {
   "approach": "chunked",
   "frequency": "NaN",
-  "startTime": 1770209224368,
+  "startTime": 1770226114517,
   "firstResultTime": null,
   "totalResults": 0,
   "firstEventLatency": null,
   "resultTopic": "chunked/output",
-  "captureDate": "2026-02-04T12:47:09.383Z"
+  "captureDate": "2026-02-04T17:28:39.525Z"
 }

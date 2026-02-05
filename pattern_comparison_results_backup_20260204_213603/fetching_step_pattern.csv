@@ -1,0 +1,10 @@
+timestamp,message
+1770236342286,"fetching_query_registered"
+1770236344351,"First data received at wall-clock time: 1770236344351"
+1770236404655,"RStream result generated: -23 (count: 478) at timestamp: 1770236404655"
+1770236404655,"Processing valid result: -23 with count: 478"
+1770236404656,"Generated aggregation event for result: -23"
+1770236404657,"RStream result generated: -23 (count: 479) at timestamp: 1770236404657"
+1770236404657,"Filtered out result due to timing: -23"
+1770236404658,"Successfully published result: -23, publish latency: 0ms"
+1770236441222,"Process terminated, cleaning up..."

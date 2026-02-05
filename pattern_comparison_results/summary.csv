@@ -1,14 +1,13 @@
 Pattern,Approach,Windows,Result_Value,MAPE_vs_Fetching,Absolute_Error,Avg_CPU_User,Avg_CPU_System,Avg_Memory_MB,Peak_Memory_MB
-step_pattern,Fetching,       3, cleaning up...",0.00,0.00,0,0,0,0
-step_pattern,Chunked,       2,-19.577441911150864,,,2458.19,601.92,147895348.63,187891712.00
+step_pattern,Fetching,       2,"First data received at wall-clock time: 1770237372639",0.00,0.00,0,0,0,0
+high_freq_oscillation,fetching,9,,N/A,N/A,N/A,0.00% (baseline),2261.12,781.07,112533362.90,174850048.00
+high_freq_oscillation,approximation,1,-22.995562092050207,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
+high_freq_oscillation,chunked,1,-22.99429127457265,N/A,N/A,N/A,N/A,2746.33,898.33,152915122.27,201162752.00
+low_variability,fetching,3,,N/A,N/A,N/A,0.00% (baseline),1599.83,513.17,107747017.70,173162496.00
 spike_pattern,Fetching,       3, cleaning up...",0.00,0.00,0,0,0,0
-spike_pattern,Chunked,       2,-22.833490288667992,,,2541.68,636.06,147949118.73,187990016.00
+low_variability,approximation,1,-23.003832485722086,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
+low_variability,chunked,0,,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
 low_variability,Fetching,       3, cleaning up...",0.00,0.00,0,0,0,0
-low_variability,Approximation,       2,-22.993191113445377,,,0,0,0,0
-low_variability,Chunked,       2,-22.991039780944398,,,2319.17,590.16,107586832.20,156516352.00
 low_freq_oscillation,Fetching,       3, cleaning up...",0.00,0.00,0,0,0,0
-low_freq_oscillation,Approximation,       2,-22.997267448595338,,,0,0,0,0
-low_freq_oscillation,Chunked,       2,-22.747129504628585,,,2554.33,621.08,116981993.50,156352512.00
+low_freq_oscillation,Chunked,       2,-23.008695761204482,,,2496.95,645.31,128420042.84,171491328.00
 high_freq_oscillation,Fetching,       3, cleaning up...",0.00,0.00,0,0,0,0
-high_freq_oscillation,Approximation,       2,-22.988834993249185,,,0,0,0,0
-high_freq_oscillation,Chunked,       2,-22.9941764270754,,,2461.08,587.55,118872828.76,156188672.00
