@@ -482,6 +482,7 @@ class UnifiedBenchmark {
         SUB_WINDOW_RANGE: CONFIG.subWindowRange,
         SUB_WINDOW_STEP: CONFIG.subWindowStep,
         WEARABLE_FREQUENCY: CONFIG.wearableFrequency,
+        SESSION_ID: `${approachName}-${iterationNum}-${Date.now()}`,
       };
 
       const orchestratorProc = spawn("node", [orchestratorPath], {

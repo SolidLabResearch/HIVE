@@ -21,6 +21,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private chunkGCD: number;
   private logger: CSVLogger;
   private mqttBroker: string = "mqtt://localhost:1883"; // Default MQTT broker URL, can be changed if needed
+  private sessionId: string; // Unique session ID to isolate MQTT topics across iterations
   private latencyLogStream!: fs.WriteStream;
   private windowCount: number = 0; // Track window count for latency logging
   private queryRegisteredTime: number = 0; // Track when query was registered
@@ -40,6 +41,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.parser = new RSPQLParser();
     this.chunkGCD = 0;
     this.logger = new CSVLogger("streaming_query_chunk_aggregator_log.csv");
+    this.sessionId = process.env.SESSION_ID || Date.now().toString(36);
     this.initializeLatencyLogging();
     this.queryRegisteredTime = Date.now(); // Record when query is registered
   }
@@ -721,22 +723,20 @@ For example, the allResults object might look like this:
       const allPromises: Promise<void>[] = [];
       for (let i = 0; i < rewrittenChunkQueries.length; i++) {
         const hash_subQuery = hash_string_md5(rewrittenChunkQueries[i]);
+        const topicName = `chunked/${this.sessionId}/${hash_subQuery}`;
         this.logger.log(
-          `DEBUG: Setting subQueryMQTTTopicMap[${hash_subQuery}] = chunked/${hash_subQuery}`,
+          `DEBUG: Setting subQueryMQTTTopicMap[${hash_subQuery}] = ${topicName}`,
         );
-        this.subQueryMQTTTopicMap.set(
-          hash_subQuery,
-          `chunked/${hash_subQuery}`,
-        );
+        this.subQueryMQTTTopicMap.set(hash_subQuery, topicName);
         this.logger.log(
           `DEBUG: subQueryMQTTTopicMap after set: ${JSON.stringify(Array.from(this.subQueryMQTTTopicMap.entries()))}`,
         );
         const rspQueryProcess = new RSPQueryProcess(
           rewrittenChunkQueries[i],
-          `chunked/${hash_subQuery}`,
+          topicName,
         );
         this.logger.log(
-          `chunked/${hash_subQuery} topic created for rewrittenChunkQueries: ${rewrittenChunkQueries[i]}: ${rewrittenChunkQueries[i]}`,
+          `${topicName} topic created for rewrittenChunkQueries: ${rewrittenChunkQueries[i]}: ${rewrittenChunkQueries[i]}`,
         );
         const p = rspQueryProcess
           .stream_process()
