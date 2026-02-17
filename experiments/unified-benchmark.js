@@ -449,15 +449,17 @@ class UnifiedBenchmark {
         this.mqttClient.publish("output", "", { retain: true });
         this.mqttClient.publish("wearableX", "", { retain: true });
         this.mqttClient.publish("smartphoneX", "", { retain: true });
-        // Unsubscribe from drain-only topics so they don't interfere
-        // with result collection during the actual run
+        // Unsubscribe from ALL topics after drain.
+        // Output topics will be re-subscribed AFTER the publisher starts,
+        // ensuring any late-arriving stale results from the previous
+        // iteration's dying orchestrator are never seen.
         this.mqttClient.unsubscribe("chunked/#");
         this.mqttClient.unsubscribe("wearableX");
         this.mqttClient.unsubscribe("smartphoneX");
-        // Re-subscribe to output topics with proper QoS for result collection
         for (const topic of topics) {
-          this.mqttClient.subscribe(topic, { qos: 1 });
+          this.mqttClient.unsubscribe(topic);
         }
+        this.mqttClient.unsubscribe("output");
         this.log(
           `MQTT drain phase complete: discarded ${staleMessagesDrained} stale messages`,
         );
@@ -652,6 +654,14 @@ class UnifiedBenchmark {
       });
 
       this.processes.push(publisherProc);
+
+      // NOW subscribe to output topics — after the publisher has started.
+      // Any stale messages from a previous iteration's dying orchestrator
+      // will have been delivered (and dropped, since we were unsubscribed).
+      for (const topic of topics) {
+        this.mqttClient.subscribe(topic, { qos: 1 });
+      }
+      this.log(`Subscribed to output topics: ${topics.join(", ")}`);
 
       let publishCount = 0;
       publisherProc.stdout.on("data", (data) => {
