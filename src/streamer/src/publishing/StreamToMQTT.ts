@@ -1,8 +1,8 @@
-import * as fs from 'fs';
-import * as mqtt from 'mqtt';
-import * as path from 'path';
+import * as fs from "fs";
+import * as mqtt from "mqtt";
+import * as path from "path";
 import { StreamConsumer } from "./StreamConsumer";
-const N3 = require('n3');
+const N3 = require("n3");
 const { DataFactory } = N3;
 const { namedNode, literal } = DataFactory;
 
@@ -10,241 +10,289 @@ const { namedNode, literal } = DataFactory;
  *
  */
 export class StreamToMQTT {
+  private stream_consumer: StreamConsumer;
+  private store: any;
+  private mqtt_client: mqtt.MqttClient;
+  private file_location: string;
+  private initialize_promise: Promise<void>;
+  private sorted_observation_subjects!: string[];
+  private observation_pointer: number = 0;
+  private number_of_publish: number = 0;
+  private queue: any[] = [];
+  private topic_to_publish: string;
+  private sort_subject_length: number = 0;
+  private frequency: number;
+  private successfulPublishes: number = 0;
+  private failedPublishes: number = 0;
+  private publishMode: string;
 
-    private stream_consumer: StreamConsumer;
-    private store: any;
-    private mqtt_client: mqtt.MqttClient;
-    private file_location: string;
-    private initialize_promise: Promise<void>;
-    private sorted_observation_subjects!: string[];
-    private observation_pointer: number = 0;
-    private number_of_publish: number = 0;
-    private queue: any[] = [];
-    private topic_to_publish: string;
-    private sort_subject_length: number = 0;
-    private frequency: number;
-    private successfulPublishes: number = 0;
-    private failedPublishes: number = 0;
+  /**
+   *
+   * @param mqtt_broker
+   * @param frequency
+   * @param file_location
+   * @param topic_to_publish
+   * @param mqttOptions
+   * @param publishMode - "uniform" (default) or "gap" (15s gap at 45-60s elapsed)
+   */
+  constructor(
+    mqtt_broker: string,
+    frequency: number,
+    file_location: string,
+    topic_to_publish: string,
+    mqttOptions?: mqtt.IClientOptions,
+    publishMode: string = "uniform",
+  ) {
+    this.publishMode = publishMode;
+    this.store = new N3.Store();
+    this.stream_consumer = new StreamConsumer(this.store);
+    this.file_location = file_location;
+    this.frequency = frequency;
+    this.topic_to_publish = topic_to_publish;
+    // Set clean:false for persistent session, allow custom clientId
+    if (mqttOptions) {
+      this.mqtt_client = mqtt.connect(mqtt_broker, mqttOptions);
+    } else {
+      this.mqtt_client = mqtt.connect(mqtt_broker, { clean: false });
+    }
+    this.initialize_promise = this.initialize();
+  }
 
-    /**
-     *
-     * @param mqtt_broker
-     * @param frequency
-     * @param file_location
-     * @param topic_to_publish
-     */
-    constructor(mqtt_broker: string, frequency: number, file_location: string, topic_to_publish: string, mqttOptions?: mqtt.IClientOptions) {
-        this.store = new N3.Store();
-        this.stream_consumer = new StreamConsumer(this.store);
-        this.file_location = file_location;
-        this.frequency = frequency;
-        this.topic_to_publish = topic_to_publish;
-        // Set clean:false for persistent session, allow custom clientId
-        if (mqttOptions) {
-            this.mqtt_client = mqtt.connect(mqtt_broker, mqttOptions);
-        } else {
-            this.mqtt_client = mqtt.connect(mqtt_broker, { clean: false });
-        }
-        this.initialize_promise = this.initialize();
+  /**
+   *
+   */
+  async initialize(): Promise<void> {
+    try {
+      const store: typeof N3.Store = await this.load_dataset(
+        this.file_location,
+      );
+      this.sorted_observation_subjects = await this.sort_observations(store);
+    } catch (error) {
+      console.error("Error initializing StreamToMQTT:", error);
+      throw error;
+    }
+  }
+
+  /**
+   *
+   * @param store
+   */
+  async sort_observations(store: any): Promise<string[]> {
+    const temp: string[] = [];
+
+    for (const quad of store.match(
+      null,
+      "https://saref.etsi.org/core/measurementMadeBy",
+      null,
+    )) {
+      temp.push(quad.subject.id);
     }
 
-    /**
-     *
-     */
-    async initialize(): Promise<void> {
-        try {
-            const store: typeof N3.Store = await this.load_dataset(this.file_location);
-            this.sorted_observation_subjects = await this.sort_observations(store);
-        } catch (error) {
-            console.error('Error initializing StreamToMQTT:', error);
-            throw error;
-        }
+    const sorted = this.merge_sort(temp, store).reverse();
+    this.sort_subject_length = sorted.length;
+    return sorted;
+  }
+
+  /**
+   *
+   * @param array
+   * @param store
+   */
+  merge_sort(array: string[], store: any): string[] {
+    if (array.length <= 1) return array;
+
+    const mid = Math.floor(array.length / 2);
+    const left = this.merge_sort(array.slice(0, mid), store);
+    const right = this.merge_sort(array.slice(mid), store);
+    return this.merge(left, right, store);
+  }
+
+  /**
+   *
+   * @param left
+   * @param right
+   * @param store
+   */
+  merge(left: string[], right: string[], store: any): string[] {
+    const merged: string[] = [];
+    let i = 0,
+      j = 0;
+
+    while (i < left.length && j < right.length) {
+      const t1 = store.getObjects(
+        namedNode(left[i]).id,
+        namedNode("https://saref.etsi.org/core/hasTimestamp"),
+      );
+      const t2 = store.getObjects(
+        namedNode(right[j]).id,
+        namedNode("https://saref.etsi.org/core/hasTimestamp"),
+      );
+
+      if (t1 > t2) merged.push(left[i++]);
+      else merged.push(right[j++]);
     }
 
-    /**
-     *
-     * @param store
-     */
-    async sort_observations(store: any): Promise<string[]> {
-        const temp: string[] = [];
+    return merged.concat(left.slice(i)).concat(right.slice(j));
+  }
 
-        for (const quad of store.match(null, 'https://saref.etsi.org/core/measurementMadeBy', null)) {
-            temp.push(quad.subject.id);
-        }
+  /**
+   *
+   * @param file_location
+   */
+  async load_dataset(file_location: string): Promise<typeof N3.Store> {
+    const topic = path.basename(file_location);
+    console.log(`Loading file: ${topic}`);
 
-        const sorted = this.merge_sort(temp, store).reverse();
-        this.sort_subject_length = sorted.length;
-        return sorted;
+    return new Promise((resolve, reject) => {
+      const parser = new N3.StreamParser();
+      const stream = fs.createReadStream(file_location);
+      const writer = this.stream_consumer.get_writer();
+
+      parser.on("data", (quad: any) => writer.write(quad));
+      parser.on("end", () => resolve(this.store));
+      parser.on("error", reject);
+
+      stream.pipe(parser);
+    });
+  }
+
+  /**
+   *
+   */
+  async replay_streams(): Promise<void> {
+    await this.initialize();
+
+    if (!this.store || this.sorted_observation_subjects.length === 0) {
+      console.log("No observations to replay.");
+      return;
     }
 
-    /**
-     *
-     * @param array
-     * @param store
-     */
-    merge_sort(array: string[], store: any): string[] {
-        if (array.length <= 1) return array;
+    const delay = 1000 / this.frequency;
+    const durationSeconds = 300; // Run for 5 minutes
+    const startTime = Date.now();
 
-        const mid = Math.floor(array.length / 2);
-        const left = this.merge_sort(array.slice(0, mid), store);
-        const right = this.merge_sort(array.slice(mid), store);
-        return this.merge(left, right, store);
+    while (Date.now() - startTime < durationSeconds * 1000) {
+      if (this.observation_pointer >= this.sorted_observation_subjects.length) {
+        // Reset pointer to loop data
+        this.observation_pointer = 0;
+        this.number_of_publish = 0; // Reset publish count for next loop logic check if needed
+        console.log("Looping data stream...");
+      }
+
+      // Gap mode: skip publishing between 55s-60s elapsed (simulates brief BLE dropout)
+      const elapsed = Date.now() - startTime;
+      if (this.publishMode === "gap" && elapsed >= 55000 && elapsed < 60000) {
+        await this.sleep(delay);
+        continue;
+      }
+
+      await this.publish_one_observation();
+      await this.sleep(delay);
     }
 
-    /**
-     *
-     * @param left
-     * @param right
-     * @param store
-     */
-    merge(left: string[], right: string[], store: any): string[] {
-        const merged: string[] = [];
-        let i = 0, j = 0;
+    // Wait a moment for all async publishes to complete
+    await this.sleep(500);
+    console.log("All observations published.");
+    const summary = `Summary: Intended: ${this.sort_subject_length}, Successful: ${this.successfulPublishes}, Failed: ${this.failedPublishes}`;
+    console.log(summary);
+    // Write summary to replayer-log.csv
+    try {
+      const logPath = path.resolve(process.cwd(), "replayer-log.csv");
+      const header = "timestamp,intended,successful,failed\n";
+      const line = `${Date.now()},${this.sort_subject_length},${this.successfulPublishes},${this.failedPublishes}\n`;
+      let writeHeader = false;
+      if (!fs.existsSync(logPath)) writeHeader = true;
+      const logStream = fs.createWriteStream(logPath, { flags: "a" });
+      if (writeHeader) logStream.write(header);
+      logStream.write(line);
+      logStream.end();
+    } catch (err) {
+      console.error("Error writing summary to replayer-log.csv:", err);
+    }
+  }
 
-        while (i < left.length && j < right.length) {
-            const t1 = store.getObjects(namedNode(left[i]).id, namedNode('https://saref.etsi.org/core/hasTimestamp'));
-            const t2 = store.getObjects(namedNode(right[j]).id, namedNode('https://saref.etsi.org/core/hasTimestamp'));
+  /**
+   *
+   * @param ms
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
 
-            if (t1 > t2) merged.push(left[i++]);
-            else merged.push(right[j++]);
-        }
-
-        return merged.concat(left.slice(i)).concat(right.slice(j));
+  /**
+   *
+   */
+  private async publish_one_observation() {
+    if (this.number_of_publish >= this.sort_subject_length) {
+      // Logic handled in replay_streams loop
+      // console.log('No more observations to publish.');
+      // process.exit();
     }
 
-    /**
-     *
-     * @param file_location
-     */
-    async load_dataset(file_location: string): Promise<typeof N3.Store> {
-        const topic = path.basename(file_location);
-        console.log(`Loading file: ${topic}`);
+    try {
+      const id = this.sorted_observation_subjects[this.observation_pointer];
+      const node = namedNode(id);
 
-        return new Promise((resolve, reject) => {
-            const parser = new N3.StreamParser();
-            const stream = fs.createReadStream(file_location);
-            const writer = this.stream_consumer.get_writer();
+      // Remove old timestamp
+      const old = this.store.getQuads(
+        node,
+        namedNode("https://saref.etsi.org/core/hasTimestamp"),
+        null,
+        null,
+      );
+      this.store.removeQuads(old);
 
-            parser.on('data', (quad: any) => writer.write(quad));
-            parser.on('end', () => resolve(this.store));
-            parser.on('error', reject);
+      // Add new timestamp
+      const now = new Date().toISOString();
+      this.store.addQuad(
+        node,
+        namedNode("https://saref.etsi.org/core/hasTimestamp"),
+        literal(now),
+      );
 
-            stream.pipe(parser);
-        });
-    }
+      // Extract quads for this observation
+      const quads = this.store.getQuads(node, null, null, null);
+      const subStore = new N3.Store(quads);
+      const data = await this.storeToString(subStore);
 
-    /**
-     *
-     */
-    async replay_streams(): Promise<void> {
-        await this.initialize();
-
-        if (!this.store || this.sorted_observation_subjects.length === 0) {
-            console.log('No observations to replay.');
-            return;
-        }
-
-        const delay = 1000 / this.frequency;
-        const durationSeconds = 300; // Run for 5 minutes
-        const startTime = Date.now();
-
-        while ((Date.now() - startTime) < durationSeconds * 1000) {
-            if (this.observation_pointer >= this.sorted_observation_subjects.length) {
-                // Reset pointer to loop data
-                this.observation_pointer = 0;
-                this.number_of_publish = 0; // Reset publish count for next loop logic check if needed
-                console.log('Looping data stream...');
+      if (data && data.trim() !== "") {
+        this.mqtt_client.publish(
+          this.topic_to_publish,
+          data,
+          { qos: 2 },
+          (err: any) => {
+            if (err) {
+              this.failedPublishes++;
+              console.error("Error publishing observation with QoS 2:", err);
+            } else {
+              this.successfulPublishes++;
+              console.log(
+                `Published observation: ${id} at ${this.file_location} with QoS 2`,
+              );
             }
-
-            await this.publish_one_observation();
-            await this.sleep(delay);
-        }
-
-        // Wait a moment for all async publishes to complete
-        await this.sleep(500);
-        console.log('All observations published.');
-        const summary = `Summary: Intended: ${this.sort_subject_length}, Successful: ${this.successfulPublishes}, Failed: ${this.failedPublishes}`;
-        console.log(summary);
-        // Write summary to replayer-log.csv
-        try {
-            const logPath = path.resolve(process.cwd(), 'replayer-log.csv');
-            const header = 'timestamp,intended,successful,failed\n';
-            const line = `${Date.now()},${this.sort_subject_length},${this.successfulPublishes},${this.failedPublishes}\n`;
-            let writeHeader = false;
-            if (!fs.existsSync(logPath)) writeHeader = true;
-            const logStream = fs.createWriteStream(logPath, { flags: 'a' });
-            if (writeHeader) logStream.write(header);
-            logStream.write(line);
-            logStream.end();
-        } catch (err) {
-            console.error('Error writing summary to replayer-log.csv:', err);
-        }
+          },
+        );
+        this.number_of_publish++;
+        this.observation_pointer++;
+      }
+    } catch (error) {
+      this.failedPublishes++;
+      console.error("Error publishing observation:", error);
     }
+  }
 
-    /**
-     *
-     * @param ms
-     */
-    private sleep(ms: number): Promise<void> {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
+  /**
+   *
+   * @param store
+   */
+  private storeToString(store: any): Promise<string> {
+    const writer = new N3.Writer();
+    writer.addQuads(store.getQuads(null, null, null, null));
 
-    /**
-     *
-     */
-    private async publish_one_observation() {
-        if (this.number_of_publish >= this.sort_subject_length) {
-            // Logic handled in replay_streams loop
-            // console.log('No more observations to publish.');
-            // process.exit();
-        }
-
-        try {
-            const id = this.sorted_observation_subjects[this.observation_pointer];
-            const node = namedNode(id);
-
-            // Remove old timestamp
-            const old = this.store.getQuads(node, namedNode('https://saref.etsi.org/core/hasTimestamp'), null, null);
-            this.store.removeQuads(old);
-
-            // Add new timestamp
-            const now = new Date().toISOString();
-            this.store.addQuad(node, namedNode('https://saref.etsi.org/core/hasTimestamp'), literal(now));
-
-            // Extract quads for this observation
-            const quads = this.store.getQuads(node, null, null, null);
-            const subStore = new N3.Store(quads);
-            const data = await this.storeToString(subStore);
-
-            if (data && data.trim() !== '') {
-                this.mqtt_client.publish(this.topic_to_publish, data, { qos: 2 }, (err: any) => {
-                    if (err) {
-                        this.failedPublishes++;
-                        console.error('Error publishing observation with QoS 2:', err);
-                    } else {
-                        this.successfulPublishes++;
-                        console.log(`Published observation: ${id} at ${this.file_location} with QoS 2`);
-                    }
-                });
-                this.number_of_publish++;
-                this.observation_pointer++;
-            }
-        } catch (error) {
-            this.failedPublishes++;
-            console.error('Error publishing observation:', error);
-        }
-    }
-
-    /**
-     *
-     * @param store
-     */
-    private storeToString(store: any): Promise<string> {
-        const writer = new N3.Writer();
-        writer.addQuads(store.getQuads(null, null, null, null));
-
-        return new Promise((resolve, reject) => {
-            writer.end((err: any, result: string) => err ? reject(err) : resolve(result));
-        });
-    }
+    return new Promise((resolve, reject) => {
+      writer.end((err: any, result: string) =>
+        err ? reject(err) : resolve(result),
+      );
+    });
+  }
 }

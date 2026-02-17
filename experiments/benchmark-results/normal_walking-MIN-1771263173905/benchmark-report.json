@@ -1,0 +1,121 @@
+{
+  "config": {
+    "mqttBroker": "mqtt://localhost:1883",
+    "windowWidth": 120000,
+    "windowSlide": 60000,
+    "timeout": 300000,
+    "startupDelay": 5000,
+    "pattern": "normal_walking",
+    "iterations": 1,
+    "aggregationFunc": "MIN",
+    "dataPath": "pattern_comparison/normal_walking"
+  },
+  "byIteration": {
+    "1": {
+      "timestamp": "2026-02-16T17:32:53.908Z",
+      "results": {
+        "fetching": {
+          "approach": "fetching",
+          "iteration": 1,
+          "queryRegistrationTime": 1771263182454,
+          "firstResultTime": 1771263242911,
+          "latency": 60457,
+          "value": -25.052145,
+          "resources": {
+            "avgCpu": 3.185384615384616,
+            "maxCpu": 49.9,
+            "avgMemory": 97271303.87692308,
+            "maxMemory": 114589696,
+            "samples": 130
+          }
+        },
+        "approximation": {
+          "approach": "approximation",
+          "iteration": 1,
+          "queryRegistrationTime": 1771263253467,
+          "firstResultTime": 1771263313801,
+          "latency": 60334,
+          "value": -25.052145,
+          "resources": {
+            "avgCpu": 3.8969230769230756,
+            "maxCpu": 75.8,
+            "avgMemory": 148737480.86153847,
+            "maxMemory": 172146688,
+            "samples": 130
+          }
+        },
+        "chunked": {
+          "approach": "chunked",
+          "iteration": 1,
+          "queryRegistrationTime": 1771263324352,
+          "firstResultTime": 1771263385050,
+          "latency": 60698,
+          "value": -25.052145,
+          "resources": {
+            "avgCpu": 4.875572519083969,
+            "maxCpu": 68,
+            "avgMemory": 131337145.64885496,
+            "maxMemory": 163102720,
+            "samples": 131
+          }
+        }
+      }
+    }
+  },
+  "summary": {
+    "fetching": {
+      "successCount": 1,
+      "failureCount": 0,
+      "latency": {
+        "avg": 60457,
+        "stdDev": 0,
+        "min": 60457,
+        "max": 60457,
+        "median": 60457
+      },
+      "resources": {
+        "avgCpu": 3.185384615384616,
+        "maxMemoryMB": 109.28125
+      },
+      "values": [
+        -25.052145
+      ]
+    },
+    "approximation": {
+      "successCount": 1,
+      "failureCount": 0,
+      "latency": {
+        "avg": 60334,
+        "stdDev": 0,
+        "min": 60334,
+        "max": 60334,
+        "median": 60334
+      },
+      "resources": {
+        "avgCpu": 3.8969230769230756,
+        "maxMemoryMB": 164.171875
+      },
+      "values": [
+        -25.052145
+      ]
+    },
+    "chunked": {
+      "successCount": 1,
+      "failureCount": 0,
+      "latency": {
+        "avg": 60698,
+        "stdDev": 0,
+        "min": 60698,
+        "max": 60698,
+        "median": 60698
+      },
+      "resources": {
+        "avgCpu": 4.875572519083969,
+        "maxMemoryMB": 155.546875
+      },
+      "values": [
+        -25.052145
+      ]
+    }
+  }
+}

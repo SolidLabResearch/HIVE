@@ -526,6 +526,7 @@ export class FetchingAllDataClientSide {
  *
  */
 async function clientSideProcessing() {
+  const aggFunc = process.env.AGGREGATION_FUNC || "AVG";
   const query = `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
@@ -533,7 +534,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
-SELECT (AVG(?value) AS ?avgValue) (COUNT(?value) AS ?countValue)
+SELECT (${aggFunc}(?value) AS ?avgValue) (COUNT(?value) AS ?countValue)
 FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
 FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
 WHERE {

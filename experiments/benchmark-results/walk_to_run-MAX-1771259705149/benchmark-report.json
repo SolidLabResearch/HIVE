@@ -1,0 +1,83 @@
+{
+  "config": {
+    "mqttBroker": "mqtt://localhost:1883",
+    "windowWidth": 120000,
+    "windowSlide": 60000,
+    "timeout": 300000,
+    "startupDelay": 5000,
+    "pattern": "walk_to_run",
+    "iterations": 1,
+    "aggregationFunc": "MAX",
+    "dataPath": "pattern_comparison/walk_to_run"
+  },
+  "byIteration": {
+    "1": {
+      "timestamp": "2026-02-16T16:35:05.150Z",
+      "results": {
+        "fetching": {
+          "approach": "fetching",
+          "iteration": 1,
+          "queryRegistrationTime": 1771259769810,
+          "firstResultTime": 1771259881765,
+          "latency": 111955,
+          "value": -21.918799,
+          "resources": {
+            "avgCpu": 5.078571428571429,
+            "maxCpu": 50.1,
+            "avgMemory": 106870491.42857143,
+            "maxMemory": 114114560,
+            "samples": 14
+          }
+        },
+        "approximation": {
+          "approach": "approximation",
+          "iteration": 1,
+          "queryRegistrationTime": 1771259892328,
+          "firstResultTime": null,
+          "latency": null,
+          "value": null,
+          "error": "TIMEOUT"
+        },
+        "chunked": {
+          "approach": "chunked",
+          "iteration": 1,
+          "queryRegistrationTime": 1771261237742,
+          "firstResultTime": null,
+          "latency": null,
+          "value": null,
+          "error": "TIMEOUT"
+        }
+      }
+    }
+  },
+  "summary": {
+    "fetching": {
+      "successCount": 1,
+      "failureCount": 0,
+      "latency": {
+        "avg": 111955,
+        "stdDev": 0,
+        "min": 111955,
+        "max": 111955,
+        "median": 111955
+      },
+      "resources": {
+        "avgCpu": 5.078571428571429,
+        "maxMemoryMB": 108.828125
+      },
+      "values": [
+        -21.918799
+      ]
+    },
+    "approximation": {
+      "successCount": 0,
+      "failureCount": 1,
+      "error": "No successful runs"
+    },
+    "chunked": {
+      "successCount": 0,
+      "failureCount": 1,
+      "error": "No successful runs"
+    }
+  }
+}

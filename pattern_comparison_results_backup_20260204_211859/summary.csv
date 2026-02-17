@@ -1,4 +1,0 @@
-Pattern,Approach,Windows,Result_Value,MAPE_vs_Fetching,Absolute_Error,Avg_CPU_User,Avg_CPU_System,Avg_Memory_MB,Peak_Memory_MB
-low_variability,Fetching,10,-22.98755571548117,0.0,0.0,4854.77,1386.35,42.9631,39.24
-low_variability,Approximation,1,-22.98053452208856,-.030500,.00702119339215,4418.46,1154.98,47.0815,42.38
-step_pattern,Fetching,0,result_value,0.0,0.0,1375.92,464.73,39.5189,41.34

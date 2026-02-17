@@ -6,6 +6,9 @@ import { CSVLogger } from "../util/logger/CSVLogger";
  *
  */
 async function StreamingQueryHiveApproachOrchestrator() {
+  const aggFunc = process.env.AGGREGATION_FUNC || "AVG";
+  const subRange = process.env.SUB_WINDOW_RANGE || "60000";
+  const subStep = process.env.SUB_WINDOW_STEP || "30000";
   const logger = new CSVLogger("streaming_query_chunk_aggregator_log.csv");
   const orchestrator = new Orchestrator(
     "StreamingQueryChunkAggregatorOperator",
@@ -17,8 +20,8 @@ async function StreamingQueryHiveApproachOrchestrator() {
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
-SELECT (AVG(?value) AS ?avgWearableX) (COUNT(?value) AS ?countWearableX)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 60000 STEP 30000]
+SELECT (${aggFunc}(?value) AS ?avgWearableX) (COUNT(?value) AS ?countWearableX)
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${subRange} STEP ${subStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/wearableX> {
         ?s1 saref:hasValue ?value .
@@ -32,8 +35,8 @@ WHERE {
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
-SELECT (AVG(?value) AS ?avgSmartphoneX) (COUNT(?value) AS ?countSmartphoneX)
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 60000 STEP 30000]
+SELECT (${aggFunc}(?value) AS ?avgSmartphoneX) (COUNT(?value) AS ?countSmartphoneX)
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${subRange} STEP ${subStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/smartphoneX> {
         ?s2 saref:hasValue ?value .
@@ -55,7 +58,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
-SELECT (AVG(?value) AS ?avgValue)
+SELECT (${aggFunc}(?value) AS ?avgValue)
 FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
 FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
 WHERE {

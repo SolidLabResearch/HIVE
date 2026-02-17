@@ -8,14 +8,20 @@
     "step_pattern",
     "spike_pattern",
     "low_freq_oscillation",
-    "high_freq_oscillation"
+    "high_freq_oscillation",
+    "activity_transition",
+    "walking_cadence",
+    "impact_event"
   ],
   "pattern_descriptions": {
     "low_variability": "Low variability with Gaussian noise",
     "step_pattern": "Step change from v1 to v2 at t=60s",
     "spike_pattern": "Brief spike from base to spike value",
     "low_freq_oscillation": "Low frequency oscillation (0.05 Hz)",
-    "high_freq_oscillation": "High frequency oscillation (0.5 Hz)"
+    "high_freq_oscillation": "High frequency oscillation (0.5 Hz)",
+    "activity_transition": "Realistic activity transition with chaotic transition period",
+    "walking_cadence": "Quasi-periodic walking gait with cycle-to-cycle variability",
+    "impact_event": "Short high-amplitude impact events (stumbles, falls)"
   },
   "pattern_parameters": {
     "low_variability": {
@@ -41,6 +47,25 @@
       "mu": -23.0,
       "A": 3.0,
       "f": 0.5
+    },
+    "activity_transition": {
+      "v1": -23.0,
+      "v2": -15.0,
+      "t_trans": 60.0,
+      "sigma_trans": 5.0,
+      "delta_t_trans": 10.0
+    },
+    "walking_cadence": {
+      "mu": -23.0,
+      "A": 8.0,
+      "f": 1.7,
+      "sigma_cycle": 2.0
+    },
+    "impact_event": {
+      "v_base": -23.0,
+      "v_impact": -5.0,
+      "delta_t": 0.25,
+      "n_impacts": 3
     }
   },
   "data_paths": {
@@ -48,6 +73,9 @@
     "step_pattern": "pattern_comparison/step_pattern",
     "spike_pattern": "pattern_comparison/spike_pattern",
     "low_freq_oscillation": "pattern_comparison/low_freq_oscillation",
-    "high_freq_oscillation": "pattern_comparison/high_freq_oscillation"
+    "high_freq_oscillation": "pattern_comparison/high_freq_oscillation",
+    "activity_transition": "pattern_comparison/activity_transition",
+    "walking_cadence": "pattern_comparison/walking_cadence",
+    "impact_event": "pattern_comparison/impact_event"
   }
 }
