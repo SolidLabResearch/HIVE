@@ -277,13 +277,16 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       }
 
       // Data structure to collect chunks by topic with timestamps
-      const chunksByTopic: Map<string, { 
-        data: string; 
-        arrivalTime: number;
-        dataTimestamp: number;
-        dataWindowStart: number;
-        dataWindowEnd: number;
-      }[]> = new Map();
+      const chunksByTopic: Map<
+        string,
+        {
+          data: string;
+          arrivalTime: number;
+          dataTimestamp: number;
+          dataWindowStart: number;
+          dataWindowEnd: number;
+        }[]
+      > = new Map();
       const chunksRequired =
         Math.ceil(outputQueryWidth / this.chunkGCD) * this.subQueries.length;
       this.logger.log(`Chunks required for aggregation: ${chunksRequired}`);
@@ -352,18 +355,21 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         // Window 1: queryReg + RANGE (first window fills up the full range)
         // Window 2: queryReg + RANGE + STEP, Window 3: queryReg + RANGE + 2*STEP, etc.
         const windowNumber = this.windowCount + 1;
-        const expectedWindowClose = this.queryRegisteredTime + outputQueryWidth + ((windowNumber - 1) * outputQuerySlide);
-        
+        const expectedWindowClose =
+          this.queryRegisteredTime +
+          outputQueryWidth +
+          (windowNumber - 1) * outputQuerySlide;
+
         // Window start is RANGE before the window close
         const windowStart = expectedWindowClose - outputQueryWidth;
-        
+
         console.log(
           `!!!!! Computing Window ${windowNumber}: queryReg=${this.queryRegisteredTime}, STEP=${outputQuerySlide}, RANGE=${outputQueryWidth}`,
         );
         console.log(
           `!!!!! Window ${windowNumber} time range: [${windowStart}, ${expectedWindowClose}] (duration: ${expectedWindowClose - windowStart}ms)`,
         );
-        
+
         this.logger.log(
           `${triggerSource}: Window ${windowNumber} calculation: expectedClose=${expectedWindowClose}, windowStart=${windowStart}, now=${now}`,
         );
@@ -374,10 +380,12 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
         for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
           // Filter chunks based on data time overlap with target window
-          // A chunk overlaps if its data window [dataWindowStart, dataWindowEnd] 
+          // A chunk overlaps if its data window [dataWindowStart, dataWindowEnd]
           // intersects with target window [windowStart, expectedWindowClose]
           const windowChunks = chunks.filter(
-            (chunk) => chunk.dataWindowEnd > windowStart && chunk.dataWindowStart <= expectedWindowClose,
+            (chunk) =>
+              chunk.dataWindowEnd > windowStart &&
+              chunk.dataWindowStart <= expectedWindowClose,
           );
 
           if (windowChunks.length > 0) {
@@ -389,7 +397,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               `!!!!! Window ${windowNumber} boundaries: start=${windowStart}, expectedClose=${expectedWindowClose}`,
             );
             console.log(
-              `!!!!! Window chunks for ${topic}: ${JSON.stringify(windowChunks.map(c => ({dataTimestamp: c.dataTimestamp, dataWindowStart: c.dataWindowStart, dataWindowEnd: c.dataWindowEnd, hasValue: c.data.match(/hasValue\s+"([^"]+)"/)?.[1]})))}`,
+              `!!!!! Window chunks for ${topic}: ${JSON.stringify(windowChunks.map((c) => ({ dataTimestamp: c.dataTimestamp, dataWindowStart: c.dataWindowStart, dataWindowEnd: c.dataWindowEnd, hasValue: c.data.match(/hasValue\s+"([^"]+)"/)?.[1] })))}`,
             );
 
             // CRITICAL FIX: Adjust chunk counts based on overlap with target window
@@ -397,36 +405,39 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             const adjustedChunks = windowChunks.map((chunk) => {
               // Calculate overlap between chunk window and target window
               const overlapStart = Math.max(chunk.dataWindowStart, windowStart);
-              const overlapEnd = Math.min(chunk.dataWindowEnd, expectedWindowClose);
+              const overlapEnd = Math.min(
+                chunk.dataWindowEnd,
+                expectedWindowClose,
+              );
               const overlapDuration = overlapEnd - overlapStart;
               const chunkDuration = chunk.dataWindowEnd - chunk.dataWindowStart;
-              
+
               // Calculate what fraction of the chunk overlaps with target window
               const overlapRatio = overlapDuration / chunkDuration;
-              
+
               // Extract original count from chunk data
               const countMatch = chunk.data.match(/hasCount\s+"([^"]+)"/);
               if (!countMatch) {
                 this.logger.log(`WARNING: Chunk missing hasCount, using as-is`);
                 return chunk.data;
               }
-              
+
               const originalCount = parseFloat(countMatch[1]);
               const adjustedCount = originalCount * overlapRatio;
-              
+
               this.logger.log(
                 `Chunk overlap adjustment: window=[${windowStart},${expectedWindowClose}], ` +
-                `chunk=[${chunk.dataWindowStart},${chunk.dataWindowEnd}], ` +
-                `overlap=[${overlapStart},${overlapEnd}] (${overlapDuration}ms), ` +
-                `ratio=${overlapRatio.toFixed(3)}, count: ${originalCount} -> ${adjustedCount.toFixed(2)}`
+                  `chunk=[${chunk.dataWindowStart},${chunk.dataWindowEnd}], ` +
+                  `overlap=[${overlapStart},${overlapEnd}] (${overlapDuration}ms), ` +
+                  `ratio=${overlapRatio.toFixed(3)}, count: ${originalCount} -> ${adjustedCount.toFixed(2)}`,
               );
-              
+
               // Replace the count in the chunk data with adjusted count
               const adjustedData = chunk.data.replace(
                 /hasCount\s+"[^"]+"/,
-                `hasCount "${adjustedCount}"`
+                `hasCount "${adjustedCount}"`,
               );
-              
+
               return adjustedData;
             });
 
@@ -494,19 +505,29 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
 
         // Extract the data timestamp from the chunk RDF
-        const dataTimestamp = this.extractDataTimestampFromChunk(message.toString());
-        
+        const dataTimestamp = this.extractDataTimestampFromChunk(
+          message.toString(),
+        );
+
+        // Guard: ignore stale chunks from previous runs.
+        // Any chunk with a data timestamp before this operator was created
+        // is leftover from a prior iteration and must be discarded.
+        if (dataTimestamp < this.queryRegisteredTime) {
+          this.logger.log(
+            `Discarding stale chunk on ${topic}: dataTimestamp=${dataTimestamp} < queryRegisteredTime=${this.queryRegisteredTime}`,
+          );
+          return;
+        }
+
         // Add chunk to the appropriate topic with both arrival time and data timestamp
-        chunksByTopic
-          .get(topic)!
-          .push({ 
-            data: message.toString(), 
-            arrivalTime: Date.now(),
-            dataTimestamp: dataTimestamp,
-            // Each chunk covers chunkGCD ms of data ending at dataTimestamp
-            dataWindowStart: dataTimestamp - this.chunkGCD,
-            dataWindowEnd: dataTimestamp
-          });
+        chunksByTopic.get(topic)!.push({
+          data: message.toString(),
+          arrivalTime: Date.now(),
+          dataTimestamp: dataTimestamp,
+          // Each chunk covers chunkGCD ms of data ending at dataTimestamp
+          dataWindowStart: dataTimestamp - this.chunkGCD,
+          dataWindowEnd: dataTimestamp,
+        });
 
         // IMMEDIATE TRIGGER OPTIMIZATION:
         // Check if we should process immediately instead of waiting for interval
@@ -825,21 +846,25 @@ For example, the allResults object might look like this:
       if (cleanData.startsWith('"') && cleanData.endsWith('"')) {
         cleanData = JSON.parse(cleanData);
       }
-      
+
       // Extract timestamp using regex
       // Format: <...> <https://saref.etsi.org/core/hasTimestamp> "TIMESTAMP"^^<...>
       const timestampMatch = cleanData.match(/hasTimestamp>\s*"(\d+)"/);
-      
+
       if (timestampMatch && timestampMatch[1]) {
         const timestamp = parseInt(timestampMatch[1], 10);
         this.logger.log(`Extracted data timestamp from chunk: ${timestamp}`);
         return timestamp;
       } else {
-        this.logger.log(`Could not extract timestamp from chunk, using current time as fallback`);
+        this.logger.log(
+          `Could not extract timestamp from chunk, using current time as fallback`,
+        );
         return Date.now();
       }
     } catch (error) {
-      this.logger.log(`Error extracting timestamp from chunk: ${error}, using current time`);
+      this.logger.log(
+        `Error extracting timestamp from chunk: ${error}, using current time`,
+      );
       return Date.now();
     }
   }
@@ -909,7 +934,7 @@ For example, the allResults object might look like this:
    * @param aggregationFunction
    * @param variable
    */
-    getAggregationSPARQLQuery(
+  getAggregationSPARQLQuery(
     aggregationFunction: string,
     variable: string,
   ): string {
@@ -932,7 +957,7 @@ For example, the allResults object might look like this:
 
     // Weighted Average Logic for AVG
     if (aggregationFunction === "AVG") {
-       return `
+      return `
         PREFIX saref: <https://saref.etsi.org/core/>
         SELECT ((SUM(?val * ?cnt) / SUM(?cnt)) AS ?result)
         WHERE {

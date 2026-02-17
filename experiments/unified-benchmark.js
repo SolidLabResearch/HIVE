@@ -247,7 +247,7 @@ class UnifiedBenchmark {
       });
 
       let messagesCleared = 0;
-      const drainTimeout = 3000;
+      const chunkedTopicsSeen = new Set();
 
       cleanupClient.on("connect", () => {
         const allTopics = [
@@ -264,18 +264,58 @@ class UnifiedBenchmark {
 
         cleanupClient.on("message", (topic, message) => {
           messagesCleared++;
+          // Track individual chunked/* topics so we can clear their retained messages
+          if (topic.startsWith("chunked/")) {
+            chunkedTopicsSeen.add(topic);
+          }
         });
 
-        setTimeout(() => {
+        // Drain phase: wait until no new messages arrive for 1 second,
+        // or up to 5 seconds max. This handles the case where chunked
+        // sub-query processes were killed but had already published messages.
+        let lastMessageCount = -1;
+        let stableChecks = 0;
+        const stabilityInterval = setInterval(() => {
+          if (messagesCleared === lastMessageCount) {
+            stableChecks++;
+          } else {
+            stableChecks = 0;
+            lastMessageCount = messagesCleared;
+          }
+          // Consider drained when no new messages for 2 checks (1 second)
+          if (stableChecks >= 2) {
+            clearInterval(stabilityInterval);
+            clearTimeout(maxTimeout);
+            finishCleanup();
+          }
+        }, 500);
+
+        const maxTimeout = setTimeout(() => {
+          clearInterval(stabilityInterval);
+          finishCleanup();
+        }, 5000);
+
+        const finishCleanup = () => {
+          // Clear retained messages on output topics
           for (const topic of topics) {
             cleanupClient.publish(topic, "", { retain: true });
           }
+          // Also clear retained messages on all discovered chunked/* topics
+          for (const topic of chunkedTopicsSeen) {
+            cleanupClient.publish(topic, "", { retain: true });
+          }
+          // Clear the generic output topic too
+          cleanupClient.publish("output", "", { retain: true });
+
+          this.log(
+            `MQTT cleanup: drained ${messagesCleared} messages, cleared ${chunkedTopicsSeen.size} chunked topics`,
+          );
 
           setTimeout(() => {
             cleanupClient.end(true);
             resolve();
           }, 500);
-        }, drainTimeout);
+        };
       });
 
       cleanupClient.on("error", (err) => {
