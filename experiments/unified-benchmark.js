@@ -375,42 +375,105 @@ class UnifiedBenchmark {
     this.log(`${"=".repeat(60)}`);
 
     const topics = OUTPUT_TOPICS[approachName];
-    await this.clearMqttState(topics);
 
+    // Phase 1: Subscribe early and drain any stale messages from previous runs.
+    // By subscribing BEFORE cleanup, we guarantee that any in-flight messages
+    // from a dying orchestrator are captured and discarded here, leaving
+    // no window for stale messages to sneak through.
+    let staleMessagesDrained = 0;
+    let acceptingResults = false;
+
+    this.mqttClient = mqtt.connect(CONFIG.mqttBroker, {
+      clientId: `benchmark-${approachName}-${Date.now()}`,
+      clean: true,
+    });
+
+    await new Promise((res, rej) => {
+      this.mqttClient.on("connect", () => {
+        this.log(`MQTT subscriber connected (drain phase)`);
+        for (const topic of topics) {
+          this.mqttClient.subscribe(topic, { qos: 1 });
+        }
+        // Also subscribe to chunked/# to drain any stale chunk topics
+        this.mqttClient.subscribe("chunked/#", { qos: 0 });
+        res();
+      });
+
+      this.mqttClient.on("error", (err) => {
+        this.log(`MQTT error: ${err}`);
+        rej(err);
+      });
+    });
+
+    // Drain phase: wait until no new stale messages arrive for 1 second, up to 3s max
+    await new Promise((res) => {
+      let lastCount = -1;
+      let stableChecks = 0;
+
+      const drainHandler = (topic, message) => {
+        staleMessagesDrained++;
+      };
+      this.mqttClient.on("message", drainHandler);
+
+      const checkInterval = setInterval(() => {
+        if (staleMessagesDrained === lastCount) {
+          stableChecks++;
+        } else {
+          stableChecks = 0;
+          lastCount = staleMessagesDrained;
+        }
+        if (stableChecks >= 2) {
+          clearInterval(checkInterval);
+          clearTimeout(maxTimeout);
+          finish();
+        }
+      }, 500);
+
+      const maxTimeout = setTimeout(() => {
+        clearInterval(checkInterval);
+        finish();
+      }, 3000);
+
+      const finish = () => {
+        this.mqttClient.removeListener("message", drainHandler);
+        // Clear retained messages on output topics
+        for (const topic of topics) {
+          this.mqttClient.publish(topic, "", { retain: true });
+        }
+        this.mqttClient.publish("output", "", { retain: true });
+        // Unsubscribe from chunked/# wildcard so internal chunk messages
+        // don't interfere with result collection during the actual run
+        this.mqttClient.unsubscribe("chunked/#");
+        this.log(
+          `MQTT drain phase complete: discarded ${staleMessagesDrained} stale messages`,
+        );
+        res();
+      };
+    });
+
+    // Phase 2: Now accept real results
     return new Promise(async (resolve, reject) => {
       let queryRegistrationTime = null;
       let firstResultTime = null;
       let firstResultValue = null;
       let resolved = false;
-
-      // Set up MQTT subscriber
-      this.mqttClient = mqtt.connect(CONFIG.mqttBroker, {
-        clientId: `benchmark-${approachName}-${Date.now()}`,
-        clean: true,
-      });
-
-      await new Promise((res, rej) => {
-        this.mqttClient.on("connect", () => {
-          this.log(`MQTT subscriber connected`);
-          for (const topic of topics) {
-            this.mqttClient.subscribe(topic, { qos: 1 });
-          }
-          res();
-        });
-
-        this.mqttClient.on("error", (err) => {
-          this.log(`MQTT error: ${err}`);
-          rej(err);
-        });
-      });
+      acceptingResults = true;
 
       this.mqttClient.on("message", (topic, message) => {
-        if (resolved) return;
+        if (resolved || !acceptingResults) return;
 
         const receiveTime = Date.now();
         const value = this.extractValueFromMessage(message);
 
         if (value === null || isNaN(value)) {
+          return;
+        }
+
+        // Ignore results arriving before the publisher has started
+        if (queryRegistrationTime === null) {
+          this.log(
+            `⚠️ Ignoring pre-registration message: value=${value.toFixed(4)} on topic=${topic}`,
+          );
           return;
         }
 
