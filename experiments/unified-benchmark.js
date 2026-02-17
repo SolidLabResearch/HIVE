@@ -391,11 +391,17 @@ class UnifiedBenchmark {
     await new Promise((res, rej) => {
       this.mqttClient.on("connect", () => {
         this.log(`MQTT subscriber connected (drain phase)`);
-        for (const topic of topics) {
-          this.mqttClient.subscribe(topic, { qos: 1 });
+        // Subscribe to output topics, raw data topics, and chunked wildcard
+        // to drain any stale messages from previous iterations
+        const drainTopics = [
+          ...topics,
+          "chunked/#",
+          "wearableX",
+          "smartphoneX",
+        ];
+        for (const topic of drainTopics) {
+          this.mqttClient.subscribe(topic, { qos: 0 });
         }
-        // Also subscribe to chunked/# to drain any stale chunk topics
-        this.mqttClient.subscribe("chunked/#", { qos: 0 });
         res();
       });
 
@@ -405,7 +411,7 @@ class UnifiedBenchmark {
       });
     });
 
-    // Drain phase: wait until no new stale messages arrive for 1 second, up to 3s max
+    // Drain phase: wait until no new stale messages arrive for 1 second, up to 5s max
     await new Promise((res) => {
       let lastCount = -1;
       let stableChecks = 0;
@@ -432,18 +438,26 @@ class UnifiedBenchmark {
       const maxTimeout = setTimeout(() => {
         clearInterval(checkInterval);
         finish();
-      }, 3000);
+      }, 5000);
 
       const finish = () => {
         this.mqttClient.removeListener("message", drainHandler);
-        // Clear retained messages on output topics
+        // Clear retained messages on all relevant topics
         for (const topic of topics) {
           this.mqttClient.publish(topic, "", { retain: true });
         }
         this.mqttClient.publish("output", "", { retain: true });
-        // Unsubscribe from chunked/# wildcard so internal chunk messages
-        // don't interfere with result collection during the actual run
+        this.mqttClient.publish("wearableX", "", { retain: true });
+        this.mqttClient.publish("smartphoneX", "", { retain: true });
+        // Unsubscribe from drain-only topics so they don't interfere
+        // with result collection during the actual run
         this.mqttClient.unsubscribe("chunked/#");
+        this.mqttClient.unsubscribe("wearableX");
+        this.mqttClient.unsubscribe("smartphoneX");
+        // Re-subscribe to output topics with proper QoS for result collection
+        for (const topic of topics) {
+          this.mqttClient.subscribe(topic, { qos: 1 });
+        }
         this.log(
           `MQTT drain phase complete: discarded ${staleMessagesDrained} stale messages`,
         );
@@ -483,7 +497,10 @@ class UnifiedBenchmark {
           const latency = firstResultTime - queryRegistrationTime;
 
           this.log(
-            `✅ First result received: ${latency}ms, value: ${value.toFixed(4)}`,
+            `✅ First result received: ${latency}ms, value: ${value.toFixed(4)}, topic: ${topic}`,
+          );
+          this.log(
+            `   Raw message (first 300 chars): ${message.toString().substring(0, 300)}`,
           );
 
           resolved = true;
