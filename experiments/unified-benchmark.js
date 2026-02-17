@@ -492,11 +492,10 @@ class UnifiedBenchmark {
         }
 
         // Minimum latency threshold: a valid result cannot arrive before
-        // at least one sub-window step has elapsed. This adapts to any
-        // window configuration (--sub-window-step) and rejects stale
+        // the super query's window slide has elapsed. This rejects stale
         // results from a previous iteration's dying orchestrator.
         const elapsed = receiveTime - queryRegistrationTime;
-        const minValidLatency = parseInt(CONFIG.subWindowStep, 10);
+        const minValidLatency = CONFIG.windowSlide;
         if (elapsed < minValidLatency) {
           this.log(
             `⚠️ Ignoring stale result (${elapsed}ms < ${minValidLatency}ms threshold): value=${value.toFixed(4)} on topic=${topic}`,
