@@ -889,6 +889,7 @@ class UnifiedBenchmark {
         this.mqttClient = null;
       }
     }
+    process.exit(0);
   }
 }
 
