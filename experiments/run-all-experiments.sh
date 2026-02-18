@@ -13,7 +13,7 @@
 # Estimated time per experiment (35 iterations): ~2 hours
 # Total for all 12 experiments (35 iterations):  ~24 hours
 
-set -e
+# Do NOT use set -e: individual experiment failures should not abort the suite
 
 ITERATIONS=${1:-5}
 SKIP_TO=0
@@ -56,10 +56,14 @@ run_experiment() {
   echo ""
 
   $BENCHMARK --iterations $ITERATIONS $args
+  local exit_code=$?
 
   local elapsed=$(( $(date +%s) - START_TIME ))
   local elapsed_min=$((elapsed / 60))
   echo ""
+  if [ $exit_code -ne 0 ]; then
+    echo "  WARNING: Experiment exited with code $exit_code"
+  fi
   echo "  Completed: $(date '+%Y-%m-%d %H:%M:%S') (${elapsed_min}m elapsed total)"
   echo ""
 
