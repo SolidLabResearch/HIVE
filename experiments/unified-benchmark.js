@@ -216,16 +216,7 @@ class UnifiedBenchmark {
     }
     this.processes = [];
 
-    if (this.mqttClient) {
-      try {
-        this.mqttClient.end(true);
-      } catch (e) {
-        // Ignore
-      }
-      this.mqttClient = null;
-    }
-
-    // Kill stale processes
+    // Kill stale processes (do NOT close mqttClient — it's reused across iterations)
     try {
       execSync('pkill -f "StreamingQuery.*Orchestrator" 2>/dev/null || true', {
         stdio: "ignore",
@@ -239,89 +230,46 @@ class UnifiedBenchmark {
     }
   }
 
-  async clearMqttState(topics) {
-    return new Promise((resolve) => {
-      const cleanupClient = mqtt.connect(CONFIG.mqttBroker, {
-        clientId: `cleanup-${Date.now()}`,
-        clean: true,
-      });
+  async ensureMqttClient() {
+    if (this.mqttClient && this.mqttClient.connected) return;
 
-      let messagesCleared = 0;
-      const chunkedTopicsSeen = new Set();
+    // Close any broken client
+    if (this.mqttClient) {
+      try {
+        this.mqttClient.end(true);
+      } catch (e) {
+        /* ignore */
+      }
+      this.mqttClient = null;
+    }
 
-      cleanupClient.on("connect", () => {
-        const allTopics = [
-          ...topics,
-          "chunked/#",
-          "output",
-          "wearableX",
-          "smartphoneX",
-        ];
+    this.mqttClient = mqtt.connect(CONFIG.mqttBroker, {
+      clientId: `benchmark-${Date.now()}`,
+      clean: true,
+      reconnectPeriod: 1000,
+    });
 
-        for (const topic of allTopics) {
-          cleanupClient.subscribe(topic, { qos: 0 });
-        }
+    await new Promise((res, rej) => {
+      const onConnect = () => {
+        this.mqttClient.removeListener("error", onError);
+        clearTimeout(timer);
+        this.log("Persistent MQTT client connected");
+        res();
+      };
+      const onError = (err) => {
+        this.mqttClient.removeListener("connect", onConnect);
+        clearTimeout(timer);
+        this.log(`MQTT connection error: ${err.message}`);
+        rej(err);
+      };
+      const timer = setTimeout(() => {
+        this.mqttClient.removeListener("connect", onConnect);
+        this.mqttClient.removeListener("error", onError);
+        rej(new Error("MQTT connection timeout"));
+      }, 10000);
 
-        cleanupClient.on("message", (topic, message) => {
-          messagesCleared++;
-          // Track individual chunked/* topics so we can clear their retained messages
-          if (topic.startsWith("chunked/")) {
-            chunkedTopicsSeen.add(topic);
-          }
-        });
-
-        // Drain phase: wait until no new messages arrive for 1 second,
-        // or up to 5 seconds max. This handles the case where chunked
-        // sub-query processes were killed but had already published messages.
-        let lastMessageCount = -1;
-        let stableChecks = 0;
-        const stabilityInterval = setInterval(() => {
-          if (messagesCleared === lastMessageCount) {
-            stableChecks++;
-          } else {
-            stableChecks = 0;
-            lastMessageCount = messagesCleared;
-          }
-          // Consider drained when no new messages for 2 checks (1 second)
-          if (stableChecks >= 2) {
-            clearInterval(stabilityInterval);
-            clearTimeout(maxTimeout);
-            finishCleanup();
-          }
-        }, 500);
-
-        const maxTimeout = setTimeout(() => {
-          clearInterval(stabilityInterval);
-          finishCleanup();
-        }, 5000);
-
-        const finishCleanup = () => {
-          // Clear retained messages on output topics
-          for (const topic of topics) {
-            cleanupClient.publish(topic, "", { retain: true });
-          }
-          // Also clear retained messages on all discovered chunked/* topics
-          for (const topic of chunkedTopicsSeen) {
-            cleanupClient.publish(topic, "", { retain: true });
-          }
-          // Clear the generic output topic too
-          cleanupClient.publish("output", "", { retain: true });
-
-          this.log(
-            `MQTT cleanup: drained ${messagesCleared} messages, cleared ${chunkedTopicsSeen.size} chunked topics`,
-          );
-
-          setTimeout(() => {
-            cleanupClient.end(true);
-            resolve();
-          }, 500);
-        };
-      });
-
-      cleanupClient.on("error", (err) => {
-        cleanupClient.end(true);
-        resolve();
-      });
+      this.mqttClient.once("connect", onConnect);
+      this.mqttClient.once("error", onError);
     });
   }
 
@@ -376,40 +324,21 @@ class UnifiedBenchmark {
 
     const topics = OUTPUT_TOPICS[approachName];
 
-    // Phase 1: Subscribe early and drain any stale messages from previous runs.
-    // By subscribing BEFORE cleanup, we guarantee that any in-flight messages
-    // from a dying orchestrator are captured and discarded here, leaving
-    // no window for stale messages to sneak through.
+    // Ensure persistent MQTT client is connected (reused across all iterations)
     let staleMessagesDrained = 0;
     let acceptingResults = false;
 
-    this.mqttClient = mqtt.connect(CONFIG.mqttBroker, {
-      clientId: `benchmark-${approachName}-${Date.now()}`,
-      clean: true,
-    });
+    await this.ensureMqttClient();
 
-    await new Promise((res, rej) => {
-      this.mqttClient.on("connect", () => {
-        this.log(`MQTT subscriber connected (drain phase)`);
-        // Subscribe to output topics, raw data topics, and chunked wildcard
-        // to drain any stale messages from previous iterations
-        const drainTopics = [
-          ...topics,
-          "chunked/#",
-          "wearableX",
-          "smartphoneX",
-        ];
-        for (const topic of drainTopics) {
-          this.mqttClient.subscribe(topic, { qos: 0 });
-        }
-        res();
-      });
+    // Remove any leftover listeners from previous runs
+    this.mqttClient.removeAllListeners("message");
 
-      this.mqttClient.on("error", (err) => {
-        this.log(`MQTT error: ${err}`);
-        rej(err);
-      });
-    });
+    // Subscribe to drain topics
+    this.log(`MQTT drain phase starting...`);
+    const drainTopics = [...topics, "chunked/#", "wearableX", "smartphoneX"];
+    for (const topic of drainTopics) {
+      this.mqttClient.subscribe(topic, { qos: 0 });
+    }
 
     // Drain phase: wait until no new stale messages arrive for 1 second, up to 5s max
     await new Promise((res) => {
@@ -517,6 +446,10 @@ class UnifiedBenchmark {
 
           resolved = true;
           clearInterval(monitorInterval);
+          // Unsubscribe from output topics before cleanup
+          for (const t of topics) {
+            this.mqttClient.unsubscribe(t);
+          }
           this.cleanup();
 
           const avgCpu =
@@ -609,6 +542,9 @@ class UnifiedBenchmark {
           resolved = true;
           clearInterval(monitorInterval);
           clearTimeout(timeoutId);
+          for (const t of topics) {
+            this.mqttClient.unsubscribe(t);
+          }
           this.cleanup();
           resolve({
             approach: approachName,
@@ -700,6 +636,9 @@ class UnifiedBenchmark {
           );
           resolved = true;
           clearInterval(monitorInterval);
+          for (const t of topics) {
+            this.mqttClient.unsubscribe(t);
+          }
           this.cleanup();
           resolve({
             approach: approachName,
@@ -932,12 +871,23 @@ class UnifiedBenchmark {
 
   async run() {
     try {
+      await this.ensureMqttClient();
       await this.runAllIterations();
       this.generateReport();
       this.log(`\n🎉 Benchmark complete!\n`);
     } catch (error) {
       this.log(`💥 Benchmark failed: ${error.message}`);
       process.exit(1);
+    } finally {
+      // Close the persistent MQTT client at the very end
+      if (this.mqttClient) {
+        try {
+          this.mqttClient.end(true);
+        } catch (e) {
+          /* ignore */
+        }
+        this.mqttClient = null;
+      }
     }
   }
 }
