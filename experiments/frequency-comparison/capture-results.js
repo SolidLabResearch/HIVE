@@ -34,6 +34,8 @@ class ResultsCapture {
       this.resultTopic = "approximation/output"; // Approximation publishes here
     } else if (approach === "chunked") {
       this.resultTopic = "chunked/output"; // Chunked publishes here
+    } else if (approach === "naive-distributed") {
+      this.resultTopic = "naive_distributed/output"; // Naive Distributed publishes here
     } else {
       throw new Error(`Unknown approach: ${approach}`);
     }

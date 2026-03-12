@@ -3,10 +3,11 @@
 /**
  * Master Runner for All Three Approaches - Frequency Comparison
  *
- * This script runs the frequency comparison experiment for all three approaches:
- * 1. Fetching (client-side)
+ * This script runs the frequency comparison experiment for all four approaches:
+ * 1. Fetching (client-side, Local-Only baseline)
  * 2. Approximation (rate-based)
  * 3. Chunked (aggregation)
+ * 4. Naive Distributed (subqueries + super-query simultaneously, no result reuse)
  *
  * It then extracts results from logs and performs accuracy + latency comparison.
  *
@@ -39,6 +40,11 @@ class AllApproachesComparisonRunner {
                 name: 'chunked',
                 script: 'experiments/frequency-comparison/experiment-frequency-chunked-with-capture.js',
                 logDir: './logs/frequency-comparison-chunked'
+            },
+            {
+                name: 'naive-distributed',
+                script: 'experiments/frequency-comparison/experiment-frequency-naive-distributed-with-capture.js',
+                logDir: './logs/frequency-comparison-naive-distributed'
             }
         ];
 

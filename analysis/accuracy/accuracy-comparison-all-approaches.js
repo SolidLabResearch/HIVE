@@ -26,7 +26,7 @@ const path = require("path");
 class AllApproachesComparison {
   constructor() {
     this.baseLogDir = "./logs";
-    this.approaches = ["fetching", "approximation", "chunked"];
+    this.approaches = ["fetching", "approximation", "chunked", "naive-distributed"];
     this.frequencies = [0.1, 0.5, 1.0, 1.5, 2.0];
     this.oscillationType = "complex_oscillation";
   }
@@ -40,7 +40,9 @@ class AllApproachesComparison {
         ? parseFloat(frequency).toFixed(1)
         : frequency.toString();
 
-    const logDirName = `frequency-comparison-${approach}`;
+    const logDirName = approach === "naive-distributed"
+      ? "frequency-comparison-naive-distributed"
+      : `frequency-comparison-${approach}`;
     const metadataPath = path.join(
       this.baseLogDir,
       logDirName,
@@ -72,7 +74,9 @@ class AllApproachesComparison {
         ? parseFloat(frequency).toFixed(1)
         : frequency.toString();
 
-    const logDirName = `frequency-comparison-${approach}`;
+    const logDirName = approach === "naive-distributed"
+      ? "frequency-comparison-naive-distributed"
+      : `frequency-comparison-${approach}`;
     const resultsPath = path.join(
       this.baseLogDir,
       logDirName,
@@ -198,6 +202,7 @@ class AllApproachesComparison {
       },
       approximation: null,
       chunked: null,
+      naive_distributed: null,
     };
 
     // Compare approximation
@@ -258,6 +263,35 @@ class AllApproachesComparison {
       console.log(`  Chunked: ✗ Data not available`);
     }
 
+    // Compare naive-distributed
+    const naiveMetadata = this.readMetadata("naive-distributed", frequency);
+    const naiveResults = this.readResults("naive-distributed", frequency);
+
+    if (naiveMetadata && naiveResults) {
+      const accuracyMetrics = this.calculateAccuracyMetrics(fetchingResults, naiveResults);
+
+      comparison.naive_distributed = {
+        firstEventLatency: naiveMetadata.firstEventLatency,
+        firstEventLatencySeconds: naiveMetadata.firstEventLatencySeconds,
+        latencyDifference: naiveMetadata.firstEventLatency - fetchingMetadata.firstEventLatency,
+        resultCount: naiveResults.length,
+        avgValue: naiveResults.length > 0
+          ? naiveResults.reduce((sum, r) => sum + r.resultValue, 0) / naiveResults.length
+          : null,
+        accuracy: accuracyMetrics,
+      };
+
+      console.log(`  Naive Distributed:`);
+      console.log(`    First-event latency: ${naiveMetadata.firstEventLatencySeconds}s (Δ ${(comparison.naive_distributed.latencyDifference / 1000).toFixed(2)}s)`);
+      if (accuracyMetrics) {
+        console.log(`    MAPE: ${accuracyMetrics.mape.toFixed(4)}%`);
+        console.log(`    MAE: ${accuracyMetrics.mae.toFixed(6)}`);
+        console.log(`    RMSE: ${accuracyMetrics.rmse.toFixed(6)}`);
+      }
+    } else {
+      console.log(`  Naive Distributed: ✗ Data not available`);
+    }
+
     return comparison;
   }
 
@@ -301,6 +335,17 @@ class AllApproachesComparison {
         console.log(`${" ".repeat(9)} | Chunked       | N/A        | N/A        | N/A        | N/A`);
       }
 
+      // Naive Distributed
+      if (comp.naive_distributed && comp.naive_distributed.accuracy) {
+        const acc = comp.naive_distributed.accuracy;
+        console.log(
+          `${" ".repeat(9)} | NaiveDistr.   | ${acc.mape.toFixed(4).padEnd(10)} | ` +
+          `${acc.mae.toFixed(6).padEnd(10)} | ${acc.rmse.toFixed(6).padEnd(10)} | ${comp.naive_distributed.resultCount}`,
+        );
+      } else {
+        console.log(`${" ".repeat(9)} | NaiveDistr.   | N/A        | N/A        | N/A        | N/A`);
+      }
+
       console.log("─".repeat(80));
     });
 
@@ -340,6 +385,17 @@ class AllApproachesComparison {
         console.log(`${" ".repeat(9)} | Chunked       | N/A                 | N/A`);
       }
 
+      // Naive Distributed
+      if (comp.naive_distributed) {
+        const diff = (comp.naive_distributed.latencyDifference / 1000).toFixed(2);
+        const sign = comp.naive_distributed.latencyDifference >= 0 ? "+" : "";
+        console.log(
+          `${" ".repeat(9)} | NaiveDistr.   | ${comp.naive_distributed.firstEventLatencySeconds.padEnd(19)}s | ${sign}${diff}s`,
+        );
+      } else {
+        console.log(`${" ".repeat(9)} | NaiveDistr.   | N/A                 | N/A`);
+      }
+
       console.log("─".repeat(80));
     });
   }
@@ -369,6 +425,12 @@ class AllApproachesComparison {
         const acc = comp.chunked.accuracy;
         accuracyCsv += `${comp.frequency},chunked,${acc.mape},${acc.mae},${acc.rmse},${comp.chunked.resultCount},${comp.chunked.avgValue}\n`;
       }
+
+      // Naive Distributed
+      if (comp.naive_distributed && comp.naive_distributed.accuracy) {
+        const acc = comp.naive_distributed.accuracy;
+        accuracyCsv += `${comp.frequency},naive-distributed,${acc.mape},${acc.mae},${acc.rmse},${comp.naive_distributed.resultCount},${comp.naive_distributed.avgValue}\n`;
+      }
     });
 
     fs.writeFileSync(accuracyPath, accuracyCsv);
@@ -392,6 +454,11 @@ class AllApproachesComparison {
       // Chunked
       if (comp.chunked) {
         latencyCsv += `${comp.frequency},chunked,${comp.chunked.firstEventLatency},${comp.chunked.firstEventLatencySeconds},${comp.chunked.latencyDifference}\n`;
+      }
+
+      // Naive Distributed
+      if (comp.naive_distributed) {
+        latencyCsv += `${comp.frequency},naive-distributed,${comp.naive_distributed.firstEventLatency},${comp.naive_distributed.firstEventLatencySeconds},${comp.naive_distributed.latencyDifference}\n`;
       }
     });
 
@@ -419,7 +486,7 @@ class AllApproachesComparison {
     console.log("═".repeat(80));
     console.log("COMPREHENSIVE ACCURACY & LATENCY COMPARISON - ALL APPROACHES");
     console.log("═".repeat(80));
-    console.log("Approaches: Fetching (baseline), Approximation, Chunked");
+    console.log("Approaches: Fetching (Local-Only baseline), Approximation, Chunked, Naive Distributed");
     console.log(`Frequencies: ${this.frequencies.join(", ")} Hz`);
     console.log("═".repeat(80));
 

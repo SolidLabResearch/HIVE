@@ -30,7 +30,9 @@ class LogResultExtractor {
         ? "frequency-comparison-fetching"
         : approach === "approximation"
           ? "frequency-comparison-approximation"
-          : "frequency-comparison-chunked";
+          : approach === "naive-distributed"
+            ? "frequency-comparison-naive-distributed"
+            : "frequency-comparison-chunked";
 
     const formattedFreq =
       parseFloat(frequency) % 1 === 0
@@ -50,7 +52,9 @@ class LogResultExtractor {
         ? path.join(this.logDir, "fetching_client_side_log.csv")
         : approach === "approximation"
           ? path.join(this.logDir, "approximation_approach_log.csv")
-          : path.join(this.logDir, "streaming_query_chunk_aggregator_log.csv");
+          : approach === "naive-distributed"
+            ? path.join(this.logDir, "naive_distributed_approach_log.csv")
+            : path.join(this.logDir, "streaming_query_chunk_aggregator_log.csv");
 
     this.outputFile = path.join(this.logDir, `${approach}_results.csv`);
     this.metadataFile = path.join(this.logDir, `${approach}_metadata.json`);
@@ -70,8 +74,7 @@ class LogResultExtractor {
     let queryRegisteredTime = null;
 
     // For fetching approach
-    if (this.approach === "fetching") {
-      // Extract query registration time from "fetching_query_registered" log
+    if (this.approach === "fetching") {      // Extract query registration time from "fetching_query_registered" log
       const registrationMatch = content.match(
         /LOG:\s*(\d+)\s*-\s*fetching_query_registered/,
       );
@@ -98,6 +101,64 @@ class LogResultExtractor {
             const data = JSON.parse(jsonStr);
 
             // Extract avgValue from nested structure
+            if (data.bindings && data.bindings.entries) {
+              const avgValue = data.bindings.entries.avgValue;
+
+              if (avgValue && avgValue.value) {
+                const resultValue = parseFloat(avgValue.value);
+                const timestamp = data.timestamp_to || Date.now();
+
+                if (!firstResultTime) {
+                  firstResultTime = timestamp;
+                }
+
+                results.push({
+                  timestamp,
+                  resultValue,
+                  windowNumber: results.length + 1,
+                });
+
+                console.log(
+                  `  Window ${results.length}: ${resultValue.toFixed(6)} at ${timestamp}`,
+                );
+              }
+            }
+          } catch (e) {
+            // Skip lines that can't be parsed
+            continue;
+          }
+        }
+      }
+    }
+    // For naive-distributed approach
+    // Log format is identical to the fetching approach: the super-query result is
+    // logged as "DEBUG: RStream event received: {JSON}" and the registration time
+    // is recorded with the "naive_distributed_query_registered" marker.
+    else if (this.approach === "naive-distributed") {
+      const registrationMatch = content.match(
+        /LOG:\s*(\d+)\s*-\s*naive_distributed_query_registered/,
+      );
+      if (registrationMatch) {
+        queryRegisteredTime = parseInt(registrationMatch[1]);
+        console.log(`Found query registration time: ${queryRegisteredTime}`);
+      } else {
+        console.warn(
+          "Could not find query registration timestamp in naive-distributed log",
+        );
+      }
+
+      // Parse super-query RStream events (same JSON structure as fetching)
+      const lines = content.split("\n");
+
+      for (const line of lines) {
+        if (line.includes("DEBUG: RStream event received:")) {
+          try {
+            const jsonStart = line.indexOf("{");
+            if (jsonStart === -1) continue;
+
+            const jsonStr = line.substring(jsonStart);
+            const data = JSON.parse(jsonStr);
+
             if (data.bindings && data.bindings.entries) {
               const avgValue = data.bindings.entries.avgValue;
 
@@ -450,10 +511,11 @@ const [approach, frequency] = args;
 if (
   approach !== "fetching" &&
   approach !== "approximation" &&
-  approach !== "chunked"
+  approach !== "chunked" &&
+  approach !== "naive-distributed"
 ) {
   console.error(
-    'Error: Approach must be "fetching", "approximation", or "chunked"',
+    'Error: Approach must be "fetching", "approximation", "chunked", or "naive-distributed"',
   );
   process.exit(1);
 }
