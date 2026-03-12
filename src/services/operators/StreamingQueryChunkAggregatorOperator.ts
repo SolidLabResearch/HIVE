@@ -309,13 +309,21 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         const now = Date.now();
 
         // TIME-BASED GATING (Option 3 - Part 1):
-        // Ensure sufficient time has passed based on window semantics
-        // For first result: wait until queryRegisteredTime + STEP (aligns with other approaches)
-        // For subsequent results: wait until lastProcessedTime + STEP
+        // Ensure sufficient time has passed based on window semantics.
+        //
+        // FIX: Use firstDataReceivedTime + STEP (not queryRegisteredTime + STEP)
+        // for the first window trigger. There is a ~1-3s startup gap between when
+        // the query is registered and when the first MQTT message arrives. Using
+        // queryRegisteredTime fires the aggregator ~2s before the final chunk of
+        // the first 60s window has been received, causing it to compute over only
+        // half the expected data (2/4 chunks). Using firstDataReceivedTime aligns
+        // the trigger with actual data arrival, ensuring all chunks are present.
+        const firstDataTime =
+          this.firstDataReceivedTime > 0
+            ? this.firstDataReceivedTime
+            : this.queryRegisteredTime;
         const minTimeForFirstResult =
-          this.queryRegisteredTime > 0
-            ? this.queryRegisteredTime + outputQuerySlide
-            : Infinity;
+          firstDataTime > 0 ? firstDataTime + outputQuerySlide : Infinity;
         const minTimeForSubsequent =
           this.lastProcessedTime > 0
             ? this.lastProcessedTime + outputQuerySlide
@@ -332,7 +340,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               : minTimeForSubsequent - now;
           this.logger.log(
             `Time condition not met for ${triggerSource}. Need to wait ${waitingFor}ms more. ` +
-              `queryRegisteredTime=${this.queryRegisteredTime}, lastProcessedTime=${this.lastProcessedTime}, now=${now}`,
+              `firstDataTime=${firstDataTime}, lastProcessedTime=${this.lastProcessedTime}, now=${now}`,
           );
           this.processingInProgress = false;
           return;
@@ -435,27 +443,32 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           .push({ data: message.toString(), timestamp: Date.now() });
 
         // IMMEDIATE TRIGGER OPTIMIZATION:
-        // Check if we should process immediately instead of waiting for interval
-        // Aligned with processChunks time gating which uses queryRegisteredTime
+        // Check if we should process immediately instead of waiting for interval.
+        // FIX: use time since firstDataReceivedTime (not queryRegisteredTime) so
+        // the trigger fires after all chunks for the first window have arrived.
         if (this.useImmediateTrigger) {
-          const timeSinceQueryReg = now - this.queryRegisteredTime;
+          const firstDataTime =
+            this.firstDataReceivedTime > 0
+              ? this.firstDataReceivedTime
+              : this.queryRegisteredTime;
+          const timeSinceFirstData = now - firstDataTime;
           const timeSinceLastProcess =
             this.lastProcessedTime > 0
               ? now - this.lastProcessedTime
-              : timeSinceQueryReg;
+              : timeSinceFirstData;
 
-          // Trigger if: enough time for STEP has passed since query registration
-          // For first result: wait for STEP time since query registration
+          // Trigger if: enough time for STEP has passed since first data arrived
+          // For first result: wait for STEP time since first data
           // For subsequent: wait for STEP time since last processed
           const shouldTrigger =
             (this.lastProcessedTime === 0 &&
-              timeSinceQueryReg >= outputQuerySlide) ||
+              timeSinceFirstData >= outputQuerySlide) ||
             (this.lastProcessedTime > 0 &&
               timeSinceLastProcess >= outputQuerySlide);
 
           if (shouldTrigger) {
             this.logger.log(
-              `Immediate trigger activated: timeSinceQueryReg=${timeSinceQueryReg}ms, timeSinceLastProcess=${timeSinceLastProcess}ms, outputQuerySlide=${outputQuerySlide}ms`,
+              `Immediate trigger activated: timeSinceFirstData=${timeSinceFirstData}ms, timeSinceLastProcess=${timeSinceLastProcess}ms, outputQuerySlide=${outputQuerySlide}ms`,
             );
             await processChunks("Immediate");
           }
