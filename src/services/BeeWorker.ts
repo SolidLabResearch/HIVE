@@ -1,5 +1,5 @@
 import { QueryCombiner } from "hive-thought-rewriter";
-import { ContainmentChecker } from "rspql-containment-checker";
+import { RSPQLParser, SPeCSWrapper } from "rspql-containment-checker";
 import { ExtractedQuery, QueryMap } from "../util/Types";
 import { StreamingQueryChunkAggregatorOperator } from "./operators/StreamingQueryChunkAggregatorOperator";
 import { ApproximationApproachOperator } from "./operators/RateBasedApproximationApproachOperator";
@@ -12,7 +12,8 @@ export class BeeWorker {
 
     private query: string;
     private r2s_topic: string;
-    private containmentChecker: ContainmentChecker;
+    private specsWrapper: SPeCSWrapper;
+    private rspqlParser: RSPQLParser;
     private operator: IStreamQueryOperator;
     private queryCombiner: QueryCombiner;
     private queryFetchLocation: string;
@@ -28,7 +29,8 @@ export class BeeWorker {
         } else {
             throw new Error(`Unsupported operator type: ${operatorType}`);
         }
-        this.containmentChecker = new ContainmentChecker();
+        this.specsWrapper = new SPeCSWrapper();
+        this.rspqlParser = new RSPQLParser();
         this.queryCombiner = new QueryCombiner();
         this.queryFetchLocation = "http://localhost:8080/fetchQueries";
         const query = process.env.QUERY;
@@ -82,12 +84,10 @@ export class BeeWorker {
             for (const containedQuery of containedQueries) {
                 this.queryCombiner.addQuery(containedQuery);
             }
-            this.queryCombiner.combine();
-            console.log(`Combined query: ${this.queryCombiner.ParsedToString(this.queryCombiner.combine())}`);
             const combinedQuery = this.queryCombiner.ParsedToString(this.queryCombiner.combine());
+            console.log(`Combined query: ${combinedQuery}`);
 
-            // const isValid = await this.validateQueryContainment(this.query, combinedQuery);
-            const isValid = true; // Assuming the containment check is valid for now
+            const isValid = await this.validateQueryContainment(this.query, combinedQuery);
             console.log(`Is the combined query valid? ${isValid}`);
             if (isValid) {
                 this.operator.addOutputQuery(this.query);
@@ -119,7 +119,7 @@ export class BeeWorker {
             let removedAggregationFunctionQuery = this.removeAggregationFunctions(this.query);
             let extractedQueryRspql = this.removeAggregationFunctions(extractedQuery.rspql_query);
 
-            const isContained = await this.containmentChecker.checkContainment(extractedQueryRspql, removedAggregationFunctionQuery);
+            const isContained = await this.checkContainmentWithFlags(extractedQueryRspql, removedAggregationFunctionQuery, true, true);
 
             if (isContained) {
                 console.log(`Query "${extractedQueryRspql}" is contained in the main query.`);
@@ -130,6 +130,47 @@ export class BeeWorker {
             }
         }
         return containedQueries;
+    }
+
+    /**
+     * Calls the SPeCS containment checker directly with the -qc and -rename flags.
+     * -qc  : explicitly enables query containment mode in SPeCS.
+     * -rename : normalises variable names before the check so that structurally
+     *           equivalent queries with different projection aliases (e.g. ?avgWearableX
+     *           vs ?value) are correctly identified as equivalent.
+     * @param subQuery   - The candidate sub-query (RSP-QL string, aggregations already stripped).
+     * @param superQuery - The candidate super-query (RSP-QL string, aggregations already stripped).
+     * @param rename     - Pass -rename to SPeCS (default true).
+     * @param qc         - Pass -qc to SPeCS (default true).
+     */
+    async checkContainmentWithFlags(
+        subQuery: string,
+        superQuery: string,
+        rename: boolean = true,
+        qc: boolean = true,
+    ): Promise<boolean> {
+        const parsedSub   = this.rspqlParser.parse(subQuery);
+        const parsedSuper = this.rspqlParser.parse(superQuery);
+
+        // R2S operator check: IStream/DStream can be contained in RStream, same operator always ok.
+        const r2sSub   = parsedSub.r2s.operator;
+        const r2sSuper = parsedSuper.r2s.operator;
+        const r2sOk = r2sSub === r2sSuper ||
+                      ((r2sSub === 'IStream' || r2sSub === 'DStream') && r2sSuper === 'RStream');
+        if (!r2sOk) return false;
+
+        if (!parsedSub.sparql || !parsedSuper.sparql) return false;
+
+        const specsOptions: { subquery: string; superquery: string; rename?: string; qc?: string } = {
+            subquery:   parsedSub.sparql,
+            superquery: parsedSuper.sparql,
+        };
+        if (rename) specsOptions.rename = 'true';
+        if (qc)     specsOptions.qc     = 'true';
+
+        const result = await this.specsWrapper.runSPeCS(specsOptions);
+        if (result.exitCode !== 0 || result.containment === null) return false;
+        return result.containment;
     }
 
     /**
@@ -184,9 +225,9 @@ export class BeeWorker {
         // Completeness Check for query containment
         queryOne = this.removeAggregationFunctions(queryOne);
         queryTwo = this.removeAggregationFunctions(queryTwo);
-        const isComplete = await this.containmentChecker.checkContainment(queryOne, queryTwo);
+        const isComplete = await this.checkContainmentWithFlags(queryOne, queryTwo);
         // Soundness Check for query containment
-        const isSound = await this.containmentChecker.checkContainment(queryTwo, queryOne);
+        const isSound = await this.checkContainmentWithFlags(queryTwo, queryOne);
 
         if (isComplete && isSound) {
             console.log(`Query "${queryOne}" is contained in "${queryTwo}" and vice versa.`);
@@ -202,7 +243,7 @@ export class BeeWorker {
         }
         else {
             console.log(`Query "${queryOne}" is not contained in "${queryTwo}" and vice versa.`);
-            return true;
+            return false;
         }
     }
 
@@ -222,17 +263,17 @@ export class BeeWorker {
     }
 }
 
-// You can choose either "StreamingQueryChunkAggregatorOperator" or "ApproximationApproachOperator" as the argument
-const operatorType = process.argv[2] || "StreamingQueryChunkAggregatorOperator";
-const beeWorker = new BeeWorker();
+if (require.main === module) {
+    const beeWorker = new BeeWorker();
 
-process.on("SIGINT", () => {
-    beeWorker.stop();
-    process.exit(0);
-});
+    process.on("SIGINT", () => {
+        beeWorker.stop();
+        process.exit(0);
+    });
 
-process.on("SIGTERM", () => {
-    beeWorker.stop();
-    process.exit(0);
-});
+    process.on("SIGTERM", () => {
+        beeWorker.stop();
+        process.exit(0);
+    });
+}
 

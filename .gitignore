@@ -113,3 +113,7 @@ approximation_approach_log.csv
 .gitignore
 streaming_query_approximation_approach_log.csv
 approximation_approach_resource_usage.csv
+chunked_latency_log.csv
+
+# SPeCS containment checker solver artefact
+formula.smt
