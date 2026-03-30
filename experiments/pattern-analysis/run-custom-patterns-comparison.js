@@ -22,14 +22,14 @@
  *   node run-custom-patterns-comparison.js low_variability    # Run specific pattern
  */
 
-const { spawn } = require("child_process");
+const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
 class CustomPatternComparisonRunner {
   constructor(iterations = 35) {
     this.iterations = iterations;
-    this.approaches = ["fetching", "approximation", "chunked"];
+    this.approaches = ["fetching", "naive_distributed", "approximation", "chunked"];
 
     // Custom patterns matching the table specification
     this.patterns = [
@@ -79,11 +79,20 @@ class CustomPatternComparisonRunner {
       approximation:
         "dist/approaches/StreamingQueryApproximationApproachOrchestrator.js",
       chunked: "dist/approaches/StreamingQueryChunkedApproachOrchestrator.js",
+      naive_distributed: "dist/approaches/StreamingQueryNaiveDistributedApproachOrchestrator.js",
     };
     return scripts[approach];
   }
 
+  cleanupStaleProcesses() {
+    try { execSync('pkill -f "dist/approaches" 2>/dev/null || true', { stdio: 'ignore' }); } catch (_) {}
+    try { execSync('pkill -f "dist/services/BeeWorker" 2>/dev/null || true', { stdio: 'ignore' }); } catch (_) {}
+    try { execSync('lsof -ti:8080 | xargs kill -9 2>/dev/null || true', { stdio: 'ignore' }); } catch (_) {}
+    return new Promise(resolve => setTimeout(resolve, 1500));
+  }
+
   async runSingleTest(approach, pattern, iterationNum = 1) {
+    await this.cleanupStaleProcesses();
     const patternName = this.getPatternName(pattern);
     const dataPath = this.getDataPath(pattern);
 
@@ -224,6 +233,12 @@ class CustomPatternComparisonRunner {
         "streaming_query_chunk_aggregator_log.csv",
         "chunked_latency_log.csv",
         "streaming_query_hive_resource_log.csv",
+        "replayer-log.csv",
+      ],
+      naive_distributed: [
+        "naive_distributed_approach_log.csv",
+        "naive_distributed_latency_log.csv",
+        "naive_distributed_approach_resource_usage.csv",
         "replayer-log.csv",
       ],
     };
@@ -509,9 +524,9 @@ async function main() {
   console.log(`Configuration: Running ${iterations} iteration(s) per test`);
   console.log(`Total patterns: 5 custom patterns`);
   console.log(
-    `Expected total tests: ${5 * 3 * iterations} (5 patterns × 3 approaches × ${iterations} iterations)`,
+    `Expected total tests: ${5 * 4 * iterations} (5 patterns × 4 approaches × ${iterations} iterations)`,
   );
-  console.log(`Expected runtime: ~${Math.ceil((5 * 3 * iterations * 3) / 60)} minutes`);
+  console.log(`Expected runtime: ~${Math.ceil((5 * 4 * iterations * 3) / 60)} minutes`);
   console.log("=".repeat(80));
 
   try {

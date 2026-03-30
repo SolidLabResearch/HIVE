@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
 /**
- * Real Data 3-Way Comparison Experiment
+ * Real Data 4-Way Comparison Experiment
  * Uses actual smartphone.acceleration.x and wearable.acceleration.x data
- * Compares: Fetching Client Side, Approximation, and Chunked approaches
+ * Compares: Fetching Client Side, Naive Distributed, Approximation, and Chunked approaches
  * Metrics: Window Close Latency, Accuracy (using Fetching as baseline)
  */
 
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
@@ -45,6 +45,17 @@ const APPROACHES = [
       latency: 'chunked_latency_log.csv',
       replayer: 'replayer-log.csv'
     }
+  },
+  {
+    name: 'naive_distributed',
+    label: 'Naive Distributed',
+    orchestrator: 'dist/approaches/StreamingQueryNaiveDistributedApproachOrchestrator.js',
+    logFiles: {
+      main: 'naive_distributed_approach_log.csv',
+      resource: 'naive_distributed_approach_resource_usage.csv',
+      latency: 'naive_distributed_latency_log.csv',
+      replayer: 'replayer-log.csv'
+    }
   }
 ];
 
@@ -68,7 +79,22 @@ class RealDataComparisonRunner {
     }
   }
 
+  cleanupStaleProcesses() {
+    try {
+      execSync('pkill -f "dist/approaches" 2>/dev/null || true', { stdio: 'ignore' });
+    } catch (_) {}
+    try {
+      execSync('pkill -f "dist/services/BeeWorker" 2>/dev/null || true', { stdio: 'ignore' });
+    } catch (_) {}
+    try {
+      execSync('lsof -ti:8080 | xargs kill -9 2>/dev/null || true', { stdio: 'ignore' });
+    } catch (_) {}
+    // Give OS time to release resources
+    return new Promise(resolve => setTimeout(resolve, 1500));
+  }
+
   async runSingleTest(approach, iteration) {
+    await this.cleanupStaleProcesses();
     return new Promise((resolve, reject) => {
       const runLabel = `${approach.label} - Iteration ${iteration}`;
       console.log(`\n${'='.repeat(80)}`);
@@ -179,7 +205,7 @@ class RealDataComparisonRunner {
   }
 
   async runAllTests() {
-    console.log('🚀 Starting Real Data 3-Way Comparison');
+    console.log('🚀 Starting Real Data 4-Way Comparison');
     console.log(`Approaches: ${APPROACHES.map(a => a.label).join(', ')}`);
     console.log(`Iterations per approach: ${ITERATIONS}`);
     console.log(`Data: smartphone.acceleration.x & wearable.acceleration.x\n`);
@@ -346,6 +372,14 @@ class RealDataComparisonRunner {
             }
           }
 
+          // Naive Distributed approach pattern: "Successfully published unified cross-sensor avgValue: -10.767..."
+          if (val === null && record.message.includes('unified cross-sensor avgValue')) {
+            const naiveMatch = record.message.match(/unified cross-sensor avgValue:\s*([-0-9.]+)/);
+            if (naiveMatch) {
+              val = parseFloat(naiveMatch[1]);
+            }
+          }
+
           // Legacy patterns
           if (val === null && (
             record.message.includes('avgWearableX') ||
@@ -457,7 +491,8 @@ class RealDataComparisonRunner {
 
     // Collect metrics for each approach
     for (const approach of APPROACHES) {
-      const approachResults = this.results.filter(r => r.approach === approach.name && r.success);
+      // Include timed-out runs too — log files are written even when the publisher is killed
+      const approachResults = this.results.filter(r => r.approach === approach.name && r.logDir);
 
       if (approachResults.length === 0) {
         console.log(`⚠️  No successful results for ${approach.label}`);
@@ -508,7 +543,7 @@ class RealDataComparisonRunner {
 
   generateReport(analysis) {
     console.log('\n' + '='.repeat(100));
-    console.log('REAL DATA 3-WAY COMPARISON REPORT');
+    console.log('REAL DATA 4-WAY COMPARISON REPORT');
     console.log('='.repeat(100));
     console.log('Data Source: smartphone.acceleration.x & wearable.acceleration.x');
     console.log('Baseline for Accuracy: Fetching Client Side Approach\n');
@@ -646,17 +681,6 @@ class RealDataComparisonRunner {
     console.log('  ✓ Ensure MQTT broker is running (mosquitto)');
     console.log('  ✓ Data files exist in src/streamer/data/');
     console.log('  ✓ Project is built (npm run build)\n');
-
-    await new Promise(resolve => {
-      const readline = require('readline').createInterface({
-        input: process.stdin,
-        output: process.stdout
-      });
-      readline.question('Press Enter to continue or Ctrl+C to abort...', () => {
-        readline.close();
-        resolve();
-      });
-    });
 
     await this.runAllTests();
     const analysis = this.analyzeResults();

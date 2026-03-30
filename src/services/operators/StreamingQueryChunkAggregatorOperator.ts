@@ -353,24 +353,57 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         // Record when processing is triggered (before any processing)
         this.intervalTriggerTime = now;
 
-        const windowStart = now - outputQueryWidth;
+        // Determine how many chunks per topic to include in this window.
+        //
+        // The problem with filtering by wall-clock timestamp is that the replayer
+        // can run slightly faster than 1×, causing a chunk from the NEXT data
+        // period to arrive a few ms before the trigger fires. This "early arrival"
+        // corrupts the window with data that belongs to the following step.
+        //
+        // Fix strategy:
+        //  • First window  – the window has no prior anchor, so we take the
+        //    OLDEST chunksPerStep chunks per topic (sorted by arrival time).
+        //    Data is replayed in chronological order, so the oldest chunks always
+        //    cover the earliest data period, regardless of replay speed.
+        //  • Subsequent windows – lastProcessedTime is a stable anchor. We use a
+        //    canonical window [lastProcessedTime, lastProcessedTime + outputQueryWidth)
+        //    and take at most chunksPerFullWindow chunks per topic (oldest first).
+        const chunksPerStep        = Math.ceil(outputQuerySlide / this.chunkGCD); // e.g. 2
+        const chunksPerFullWindow  = Math.ceil(outputQueryWidth  / this.chunkGCD); // e.g. 4
+
+        const canonicalWindowStart =
+          this.lastProcessedTime === 0
+            ? 0  // first window: no lower bound needed (we limit by count instead)
+            : this.lastProcessedTime - (outputQueryWidth - outputQuerySlide);
 
         // Collect all chunks from all topics within the window
         const allWindowChunks: string[] = [];
         let totalTopicsWithData = 0;
 
         for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
-          const windowChunks = chunks.filter(
-            (chunk) => chunk.timestamp >= windowStart,
-          );
+          // Sort by arrival time so slice(0, N) reliably picks the earliest chunks
+          const sorted = [...chunks].sort((a, b) => a.timestamp - b.timestamp);
+
+          let windowChunks: typeof sorted;
+          if (this.lastProcessedTime === 0) {
+            // First window: take the oldest chunksPerStep chunks — these are
+            // guaranteed to cover the first STEP period of data regardless of
+            // how slightly faster the replayer runs.
+            windowChunks = sorted.slice(0, chunksPerStep);
+          } else {
+            // Subsequent windows: sliding window anchored to lastProcessedTime.
+            // Take at most chunksPerFullWindow of the oldest chunks that arrived
+            // after canonicalWindowStart, covering the full RANGE period.
+            const inWindow = sorted.filter(
+              (c) => c.timestamp >= canonicalWindowStart,
+            );
+            windowChunks = inWindow.slice(0, chunksPerFullWindow);
+          }
 
           if (windowChunks.length > 0) {
             totalTopicsWithData++;
             this.logger.log(
               `${triggerSource} evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
-            );
-            this.logger.log(
-              `Window start timestamp: ${windowStart}, Current time: ${now}`,
             );
             this.logger.log(
               `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
@@ -380,10 +413,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
           }
 
-          // Clean up old chunks for this topic
+          // Retain only chunks that may still be needed for future windows
           chunksByTopic.set(
             topic,
-            chunks.filter((chunk) => chunk.timestamp >= windowStart),
+            chunks.filter((c) => c.timestamp >= canonicalWindowStart),
           );
         }
 
@@ -418,6 +451,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         this.processingInProgress = false;
       };
 
+      // Interval handle — will be started (and restarted) aligned to first data arrival
+      let intervalHandle: ReturnType<typeof setInterval> | null = null;
+
       rsp_client.on("message", async (topic, message) => {
         this.logger.log(
           `Received message on topic ${topic}: ${message.toString()}`,
@@ -430,6 +466,19 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           this.lastProcessedTime = 0; // Reset to allow first processing
           this.logger.log(
             `First data received at wall-clock time: ${this.firstDataReceivedTime}`,
+          );
+
+          // Restart the interval aligned to first data arrival so the first tick
+          // fires at exactly firstDataTime + outputQuerySlide, not at some
+          // arbitrary offset from process startup. Without this, the interval can
+          // fire up to outputQuerySlide ms late, causing the window to scoop up
+          // more chunks than intended and producing an incorrect first result.
+          if (intervalHandle) clearInterval(intervalHandle);
+          intervalHandle = setInterval(async () => {
+            await processChunks("Interval");
+          }, outputQuerySlide);
+          this.logger.log(
+            `Interval restarted aligned to first data arrival. Will fire every ${outputQuerySlide}ms.`,
           );
         }
         this.lastChunkReceivedTime = now;
@@ -477,9 +526,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
       });
 
-      // Sliding window fallback: evaluate every outputQuerySlide ms as safety net
-      // This ensures we still process even if immediate trigger conditions aren't met
-      setInterval(async () => {
+      // Initial interval — runs at startup as a safety net before first data arrives.
+      // Once the first chunk is received, this is cleared and restarted aligned to
+      // firstDataReceivedTime so that subsequent ticks fire at exact STEP boundaries.
+      intervalHandle = setInterval(async () => {
         await processChunks("Interval");
       }, outputQuerySlide);
     });
