@@ -601,56 +601,81 @@ For example, the allResults object might look like this:
       console.error("Failed to execute R2R Operator.");
       return;
     }
-    bindingStream.on("data", (data: any) => {
-      this.logger.log(`R2R Operator Data Received: ${data}`);
-      const resultValue = data.get("result").value;
-      const outputQueryEvent = this.generateOutputQueryEvent(resultValue);
-      this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
+    await new Promise<void>((resolve) => {
+      let completed = false;
+      const finalize = () => {
+        if (completed) return;
+        completed = true;
+        resolve();
+      };
 
-      // Calculate and log latency with multiple metrics
-      this.windowCount++;
-      const resultEmittedAt = Date.now();
-      const expectedWindowClose = this.getExpectedWindowCloseTime(
-        this.windowCount,
-      );
-      this.logLatency(
-        this.windowCount,
-        expectedWindowClose,
-        this.lastChunkReceivedTime,
-        this.intervalTriggerTime,
-        resultEmittedAt,
-        resultValue,
-      );
+      bindingStream.on("data", (data: any) => {
+        if (completed) return;
 
-      // Publish the output query event to the MQTT broker
-      const rsp_client = mqtt.connect(this.mqttBroker);
-      rsp_client.on("connect", () => {
-        const outputTopic = `output`;
-        this.logger.log(`calculated result ${outputQueryEvent}`);
+        this.logger.log(`R2R Operator Data Received: ${data}`);
+        const resultValue = data.get("result").value;
+        const outputQueryEvent = this.generateOutputQueryEvent(resultValue);
+        this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
 
-        rsp_client.publish(outputTopic, outputQueryEvent, (err: any) => {
-          if (err) {
-            console.error(
-              `Error publishing output query event to topic ${outputTopic}:`,
-              err,
-            );
-          } else {
-            this.logger.log(
-              `Output query event published to topic ${outputTopic}`,
-            );
-          }
-        });
-      });
-      rsp_client.on("error", (err) => {
-        console.error("MQTT connection error:", err);
-      });
-      rsp_client.on("offline", () => {
-        console.error(
-          "MQTT client is offline. Please check the broker connection.",
+        // Calculate and log latency with multiple metrics
+        this.windowCount++;
+        const resultEmittedAt = Date.now();
+        const expectedWindowClose = this.getExpectedWindowCloseTime(
+          this.windowCount,
         );
+        this.logLatency(
+          this.windowCount,
+          expectedWindowClose,
+          this.lastChunkReceivedTime,
+          this.intervalTriggerTime,
+          resultEmittedAt,
+          resultValue,
+        );
+
+        // Publish the output query event to the MQTT broker
+        const rsp_client = mqtt.connect(this.mqttBroker);
+        rsp_client.on("connect", () => {
+          const outputTopic = `output`;
+          this.logger.log(`calculated result ${outputQueryEvent}`);
+
+          rsp_client.publish(outputTopic, outputQueryEvent, (err: any) => {
+            if (err) {
+              console.error(
+                `Error publishing output query event to topic ${outputTopic}:`,
+                err,
+              );
+            } else {
+              this.logger.log(
+                `Output query event published to topic ${outputTopic}`,
+              );
+            }
+          });
+        });
+        rsp_client.on("error", (err) => {
+          console.error("MQTT connection error:", err);
+        });
+        rsp_client.on("offline", () => {
+          console.error(
+            "MQTT client is offline. Please check the broker connection.",
+          );
+        });
+        rsp_client.on("reconnect", () => {
+          this.logger.log("Reconnecting to MQTT broker...");
+        });
+
+        finalize();
       });
-      rsp_client.on("reconnect", () => {
-        this.logger.log("Reconnecting to MQTT broker...");
+
+      bindingStream.on("end", () => {
+        this.logger.log(
+          "R2R Operator binding stream ended without additional results.",
+        );
+        finalize();
+      });
+
+      bindingStream.on("error", (err: any) => {
+        console.error("R2R Operator binding stream error:", err);
+        finalize();
       });
     });
   }
@@ -1031,17 +1056,32 @@ For example, the allResults object might look like this:
             resolve(null);
             return;
           }
+
+          let completed = false;
+          const finalize = (value: number | null) => {
+            if (completed) return;
+            completed = true;
+            resolve(value);
+          };
+
           bindingStream.on("data", (data: any) => {
+            if (completed) return;
             const resultValue = data.get("result").value;
             this.logger.log(
               `R2R Operator Data Received for ${topic}: ${JSON.stringify(data)}`,
             );
             const numericResult = parseFloat(resultValue);
-            resolve(numericResult);
+            finalize(numericResult);
+          });
+          bindingStream.on("end", () => {
+            this.logger.log(
+              `R2R Operator stream ended for ${topic} without additional results.`,
+            );
+            finalize(null);
           });
           bindingStream.on("error", (error: any) => {
             console.error(`R2R Operator error for topic ${topic}:`, error);
-            resolve(null);
+            finalize(null);
           });
         })
         .catch((error) => {
