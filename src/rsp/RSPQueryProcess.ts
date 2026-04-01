@@ -199,7 +199,7 @@ export class RSPQueryProcess {
                 (isCountAggregation && key.startsWith("agg"));
              const datatype = isCountBinding
                 ? "http://www.w3.org/2001/XMLSchema#integer"
-                : "http://www.w3.org/2001/XMLSchema#float";
+                : "http://www.w3.org/2001/XMLSchema#double";
 
              triples += `<https://rsp.js/aggregation_event/${uuid_random}> ${predicate} "${value}"^^<${datatype}> .\n`;
         }
