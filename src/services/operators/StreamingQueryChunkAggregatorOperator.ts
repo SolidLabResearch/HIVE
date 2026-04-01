@@ -925,6 +925,18 @@ For example, the allResults object might look like this:
        `;
     }
 
+    // COUNT: each sub-query emits per-sub-window count as saref:hasValue.
+    // Summing those values yields the total count for the output window.
+    if (aggregationFunction === "COUNT") {
+      return `
+        PREFIX saref: <https://saref.etsi.org/core/>
+        SELECT (SUM(?val) AS ?result)
+        WHERE {
+          ?s saref:hasValue ?val .
+        }
+      `;
+    }
+
     // Default behavior for other functions (assuming simple hasValue for now, but really only AVG is critical here)
     // Note: This simplifies the dynamic variable name usage because the RDF data is now consistently using saref:hasValue
     return `

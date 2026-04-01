@@ -189,7 +189,8 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
 
         test('should generate a COUNT SPARQL query', () => {
             const query = operator.getAggregationSPARQLQuery('COUNT', 'val');
-            expect(query).toContain('COUNT(?val)');
+            expect(query).toContain('SUM(?val)');
+            expect(query).toContain('saref:hasValue');
         });
 
         test('should use saref:hasValue as the source predicate', () => {

@@ -10,6 +10,29 @@ async function StreamingQueryHiveApproachOrchestrator() {
   const orchestrator = new Orchestrator(
     "StreamingQueryChunkAggregatorOperator",
   );
+
+  const configuredAgg = (
+    process.env.AGGREGATION_FUNCTION || process.env.AGGREGATION_FUNC || "AVG"
+  ).toUpperCase();
+  const allowedAgg = ["AVG", "SUM", "COUNT", "MIN", "MAX"];
+  const aggFunc = allowedAgg.includes(configuredAgg) ? configuredAgg : "AVG";
+  const subWindowRange = process.env.SUB_WINDOW_RANGE || "60000";
+  const subWindowStep = process.env.SUB_WINDOW_STEP || "30000";
+
+  const aggSelectWearable =
+    aggFunc === "COUNT"
+      ? `(COUNT(?value) AS ?aggWearableX)`
+      : `(${aggFunc}(?value) AS ?aggWearableX) (COUNT(?value) AS ?countWearableX)`;
+
+  const aggSelectSmartphone =
+    aggFunc === "COUNT"
+      ? `(COUNT(?value) AS ?aggSmartphoneX)`
+      : `(${aggFunc}(?value) AS ?aggSmartphoneX) (COUNT(?value) AS ?countSmartphoneX)`;
+
+  logger.log(
+    `Chunked orchestrator config: aggregation=${aggFunc}, subWindowRange=${subWindowRange}, subWindowStep=${subWindowStep}`,
+  );
+
   // Add sub-queries
   const query1 = `
             PREFIX mqtt_broker: <mqtt://localhost:1883/>
@@ -17,8 +40,8 @@ async function StreamingQueryHiveApproachOrchestrator() {
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
-SELECT (AVG(?value) AS ?avgWearableX) (COUNT(?value) AS ?countWearableX)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 60000 STEP 30000]
+SELECT ${aggSelectWearable}
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/wearableX> {
         ?s1 saref:hasValue ?value .
@@ -32,8 +55,8 @@ WHERE {
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
-SELECT (AVG(?value) AS ?avgSmartphoneX) (COUNT(?value) AS ?countSmartphoneX)
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 60000 STEP 30000]
+    SELECT ${aggSelectSmartphone}
+    FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/smartphoneX> {
         ?s2 saref:hasValue ?value .
@@ -55,7 +78,7 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
-SELECT (AVG(?value) AS ?avgValue)
+SELECT (${aggFunc}(?value) AS ?resultValue)
 FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
 FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
 WHERE {

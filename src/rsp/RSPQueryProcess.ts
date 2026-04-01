@@ -177,6 +177,7 @@ export class RSPQueryProcess {
     public generate_aggregation_event(bindings: any, timestamp: number) {
         const uuid_random = uuidv4();
         let triples = "";
+        const isCountAggregation = /\bCOUNT\s*\(/i.test(this.query);
 
         // Iterate over keys in the binding object (e.g. avgWearableX, countWearableX)
         // Note: rsp-js bindings might be a Map or an Object. Adjusting for Object behavior based on JSON.stringify output.
@@ -185,15 +186,22 @@ export class RSPQueryProcess {
         for (const [key, value] of Object.entries(bindings)) {
              console.log(`DEBUG: Generating triple for key: ${key}, value: ${value}`);
              let predicate = "";
-             if (key.startsWith("avg")) {
+             if (key.startsWith("avg") || key.startsWith("agg")) {
                  predicate = "<https://saref.etsi.org/core/hasValue>";
              } else if (key.startsWith("count")) {
                  predicate = "<https://saref.etsi.org/core/hasCount>";
              } else {
                  continue; // specific interest only
              }
-             
-             triples += `<https://rsp.js/aggregation_event/${uuid_random}> ${predicate} "${value}"^^<http://www.w3.org/2001/XMLSchema#float> .\n`;
+
+             const isCountBinding =
+                key.startsWith("count") ||
+                (isCountAggregation && key.startsWith("agg"));
+             const datatype = isCountBinding
+                ? "http://www.w3.org/2001/XMLSchema#integer"
+                : "http://www.w3.org/2001/XMLSchema#float";
+
+             triples += `<https://rsp.js/aggregation_event/${uuid_random}> ${predicate} "${value}"^^<${datatype}> .\n`;
         }
         
         return triples.trim();
