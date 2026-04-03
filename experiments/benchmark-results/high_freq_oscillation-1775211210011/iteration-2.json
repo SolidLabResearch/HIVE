@@ -1,0 +1,50 @@
+{
+  "timestamp": "2026-04-03T10:17:02.572Z",
+  "results": {
+    "fetching": {
+      "approach": "fetching",
+      "iteration": 2,
+      "queryRegistrationTime": 1775211429082,
+      "firstResultTime": 1775211489639,
+      "latency": 60557,
+      "value": -22.996064269874477,
+      "resources": {
+        "avgCpu": 4.179230769230768,
+        "maxCpu": 41.8,
+        "avgMemory": 103180256.4923077,
+        "maxMemory": 114343936,
+        "samples": 130
+      }
+    },
+    "approximation": {
+      "approach": "approximation",
+      "iteration": 2,
+      "queryRegistrationTime": 1775211498195,
+      "firstResultTime": 1775211558613,
+      "latency": 60418,
+      "value": -22.989269714285715,
+      "resources": {
+        "avgCpu": 4.62,
+        "maxCpu": 42.6,
+        "avgMemory": 127621529.6,
+        "maxMemory": 163971072,
+        "samples": 130
+      }
+    },
+    "chunked": {
+      "approach": "chunked",
+      "iteration": 2,
+      "queryRegistrationTime": 1775211567166,
+      "firstResultTime": 1775211627950,
+      "latency": 60784,
+      "value": -22.983193277310924,
+      "resources": {
+        "avgCpu": 4.538167938931297,
+        "maxCpu": 48.8,
+        "avgMemory": 152170339.66412213,
+        "maxMemory": 189988864,
+        "samples": 131
+      }
+    }
+  }
+}

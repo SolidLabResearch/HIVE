@@ -1,0 +1,17 @@
+INTELLIGENT ROUTING BENCHMARK REPORT
+Timestamp        : 2026-04-03T11:34:12.792Z
+Observation secs : 35
+Runs             : 2
+Routing accuracy : 2/18 = 11.1%
+
+Stream Condition         | Stream Type  | Recommended  | Oracle Best  | Match | Confidence
+------------------------------------------------------------------------------------------
+Real data AVG  (16Hz)    | volatile     | fetching     | approximation| ✗     | 100.0%
+Real data SUM  (16Hz)    | volatile     | fetching     | approximation| ✗     | 100.0%
+Real data COUNT(16Hz)    | volatile     | fetching     | approximation| ✗     | 100.0%
+Real data MIN  (16Hz)    | volatile     | fetching     | approximation| ✗     | 100.0%
+Real data MAX  (16Hz)    | volatile     | fetching     | approximation| ✗     | 100.0%
+Pattern: spike           | stable       | chunked      | approximation| ✗     | 100.0%
+Pattern: oscillation     | stable       | chunked      | approximation| ✗     | 100.0%
+Pattern: noise_2.0       | volatile     | fetching     | fetching     | ✓     | 100.0%
+Pattern: low_var         | stable       | chunked      | approximation| ✗     | 100.0%
