@@ -1,5 +1,5 @@
 {
-    "log_level": "INFO",
+    "log_level": "WARN",
     "classes_to_log": [
         "RDFStream",
         "RSPEngine",
