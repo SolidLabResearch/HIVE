@@ -226,4 +226,197 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(uuid1).not.toBe(uuid2);
         });
     });
+
+    describe('logical windowing exactness', () => {
+        type Aggregation = 'AVG' | 'SUM' | 'COUNT' | 'MIN' | 'MAX';
+        type TopicChunk = {
+            logicalChunkIndex: number;
+            data: string;
+            aggregateValue: number;
+            count: number;
+        };
+
+        const windowRange = 120000;
+        const windowSlide = 60000;
+        const chunkSize = 30000;
+        const samplesPerChunkByRate: Record<number, number> = {
+            1: 30,
+            4: 120,
+            16: 480,
+        };
+
+        const buildRawSeries = (channelIndex: number, rateHz: number, totalChunks: number): number[] => {
+            const samplesPerChunk = samplesPerChunkByRate[rateHz];
+            const values: number[] = [];
+            const totalSamples = totalChunks * samplesPerChunk;
+
+            for (let i = 0; i < totalSamples; i++) {
+                const base = (channelIndex + 1) * 10;
+                const slope = (channelIndex + 2) * 0.37;
+                const wave = ((i % 17) - 8) * 0.11;
+                values.push(base + (i * slope) / 10 + wave);
+            }
+
+            return values;
+        };
+
+        const aggregate = (values: number[], aggregation: Aggregation): number => {
+            switch (aggregation) {
+                case 'AVG':
+                    return values.reduce((sum, value) => sum + value, 0) / values.length;
+                case 'SUM':
+                    return values.reduce((sum, value) => sum + value, 0);
+                case 'COUNT':
+                    return values.length;
+                case 'MIN':
+                    return Math.min(...values);
+                case 'MAX':
+                    return Math.max(...values);
+            }
+        };
+
+        const buildTopicChunks = (
+            values: number[],
+            aggregation: Aggregation,
+            rateHz: number,
+            topicName: string,
+            replayMultiplier: number,
+            channelSkewMs: number,
+        ): TopicChunk[] => {
+            const samplesPerChunk = samplesPerChunkByRate[rateHz];
+            const chunks: TopicChunk[] = [];
+
+            for (let logicalChunkIndex = 0; logicalChunkIndex < values.length / samplesPerChunk; logicalChunkIndex++) {
+                const chunkValues = values.slice(
+                    logicalChunkIndex * samplesPerChunk,
+                    (logicalChunkIndex + 1) * samplesPerChunk,
+                );
+                const chunkResult = aggregate(chunkValues, aggregation);
+                const countTriple = aggregation === 'AVG'
+                    ? `\n<https://rsp.js/aggregation_event/${topicName}-${logicalChunkIndex}> <https://saref.etsi.org/core/hasCount> "${chunkValues.length}"^^<http://www.w3.org/2001/XMLSchema#integer> .`
+                    : '';
+                const payload = JSON.stringify(
+                    `<https://rsp.js/aggregation_event/${topicName}-${logicalChunkIndex}> <https://saref.etsi.org/core/hasValue> "${chunkResult}"^^<http://www.w3.org/2001/XMLSchema#double> .${countTriple}`,
+                );
+
+                chunks.push({
+                    logicalChunkIndex,
+                    data: payload,
+                    aggregateValue: chunkResult,
+                    count: chunkValues.length,
+                });
+            }
+
+            // The operator must be independent from wall-clock replay speed and minor skew.
+            // We still compute representative arrival times so the scenario matches the benchmark conditions.
+            expect(replayMultiplier).toBeGreaterThan(0);
+            expect(channelSkewMs).toBeGreaterThanOrEqual(0);
+
+            return chunks;
+        };
+
+        const computeFetchingBaseline = (
+            topicSeries: number[][],
+            aggregation: Aggregation,
+            windowNumber: number,
+            rateHz: number,
+        ): number => {
+            const samplesPerChunk = samplesPerChunkByRate[rateHz];
+            const chunksPerStep = windowSlide / chunkSize;
+            const chunksPerFullWindow = windowRange / chunkSize;
+            const chunkEndExclusive = windowNumber * chunksPerStep;
+            const chunkStartIndex = Math.max(0, chunkEndExclusive - Math.min(chunksPerFullWindow, chunkEndExclusive));
+
+            const windowValues = topicSeries.flatMap((series) =>
+                series.slice(
+                    chunkStartIndex * samplesPerChunk,
+                    chunkEndExclusive * samplesPerChunk,
+                ),
+            );
+
+            return aggregate(windowValues, aggregation);
+        };
+
+        const computeChunkedValue = (
+            topicChunks: Map<string, TopicChunk[]>,
+            aggregation: Aggregation,
+            windowNumber: number,
+        ): number => {
+            const anyOperator = operator as any;
+            anyOperator.chunkGCD = chunkSize;
+            const plan = anyOperator.buildLogicalWindowPlan(windowNumber, windowSlide, windowRange, topicChunks.size);
+            const selectedChunks = Array.from(topicChunks.values()).flatMap((chunks) =>
+                anyOperator.selectChunksForLogicalWindow(chunks, plan),
+            );
+
+            if (aggregation === 'AVG') {
+                let weightedSum = 0;
+                let totalCount = 0;
+
+                for (const chunk of selectedChunks) {
+                    weightedSum += chunk.aggregateValue * chunk.count;
+                    totalCount += chunk.count;
+                }
+
+                return weightedSum / totalCount;
+            }
+
+            const values = selectedChunks.map((chunk) => chunk.aggregateValue);
+
+            return aggregate(values, aggregation === 'COUNT' ? 'SUM' : aggregation);
+        };
+
+        const assertExactnessScenario = (
+            aggregation: Aggregation,
+            rateHz: number,
+            replayMultiplier: number,
+            channelSkewMs: number,
+        ) => {
+            const totalWindows = 35;
+            const totalChunks = totalWindows * (windowSlide / chunkSize);
+            const topicSeries = [
+                buildRawSeries(0, rateHz, totalChunks),
+                buildRawSeries(1, rateHz, totalChunks),
+            ];
+
+            const topicChunks = new Map<string, TopicChunk[]>([
+                ['wearableX', buildTopicChunks(topicSeries[0], aggregation, rateHz, 'wearableX', replayMultiplier, channelSkewMs)],
+                ['smartphoneX', buildTopicChunks(topicSeries[1], aggregation, rateHz, 'smartphoneX', replayMultiplier, channelSkewMs)],
+            ]);
+
+            const errors: number[] = [];
+            for (let windowNumber = 1; windowNumber <= totalWindows; windowNumber++) {
+                const fetchingValue = computeFetchingBaseline(topicSeries, aggregation, windowNumber, rateHz);
+                const chunkedValue = computeChunkedValue(topicChunks, aggregation, windowNumber);
+                errors.push(Math.abs(fetchingValue - chunkedValue));
+            }
+
+            const trimmedErrors = errors.slice(3, errors.length - 2);
+            expect(trimmedErrors).toHaveLength(30);
+            trimmedErrors.forEach((error) => {
+                expect(error).toBeCloseTo(0, 8);
+            });
+        };
+
+        const rates: Array<[number, number, number]> = [
+            [1, 0.9, 120],
+            [4, 1.0, 80],
+            [16, 1.1, 160],
+        ];
+        const aggregations: Aggregation[] = ['AVG', 'SUM', 'COUNT', 'MIN', 'MAX'];
+
+        test.each(aggregations.flatMap((aggregation) =>
+            rates.map(([rateHz, replayMultiplier, channelSkewMs]) => [aggregation, rateHz, replayMultiplier, channelSkewMs]),
+        ))(
+            'matches fetching for %s at %iHz with replay x%f and %ims skew over 35 windows',
+            (aggregation, rateHz, replayMultiplier, channelSkewMs) => {
+                assertExactnessScenario(
+                    aggregation as Aggregation,
+                    rateHz as number,
+                    replayMultiplier as number,
+                    channelSkewMs as number,
+                );
+            },
+        );
+    });
 });

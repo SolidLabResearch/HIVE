@@ -9,6 +9,21 @@ import { hash_string_md5, storeToString } from "../../util/Util";
 import { R2ROperator } from "./r2r";
 const N3 = require("n3");
 
+type TopicChunk = {
+  data: string;
+  timestamp: number;
+  logicalChunkIndex: number;
+};
+
+type LogicalWindowPlan = {
+  windowNumber: number;
+  expectedProcessingTime: number;
+  chunkStartIndex: number;
+  chunkEndExclusive: number;
+  requiredChunksPerTopic: number;
+  requiredTotalChunks: number;
+};
+
 /**
  *
  */
@@ -33,6 +48,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private lastProcessedTime: number = 0; // Track last time we processed (for immediate trigger)
   private processingInProgress: boolean = false; // Prevent concurrent processing
   private useImmediateTrigger: boolean = true; // Enable immediate trigger optimization
+  private nextWindowNumber: number = 1; // Logical window index, anchored to queryRegisteredTime
   /**
    *
    */
@@ -123,6 +139,60 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       this.windowRange +
       (windowNumber - 1) * this.windowSlide
     );
+  }
+
+  private buildLogicalWindowPlan(
+    windowNumber: number,
+    outputQuerySlide: number,
+    outputQueryWidth: number,
+    topicCount: number,
+  ): LogicalWindowPlan {
+    const chunksPerStep = Math.ceil(outputQuerySlide / this.chunkGCD);
+    const chunksPerFullWindow = Math.ceil(outputQueryWidth / this.chunkGCD);
+    const chunkEndExclusive = windowNumber * chunksPerStep;
+    const requiredChunksPerTopic =
+      windowNumber === 1
+        ? chunksPerStep
+        : Math.min(chunksPerFullWindow, chunkEndExclusive);
+    const chunkStartIndex = Math.max(
+      0,
+      chunkEndExclusive - requiredChunksPerTopic,
+    );
+
+    return {
+      windowNumber,
+      expectedProcessingTime:
+        this.queryRegisteredTime + windowNumber * outputQuerySlide,
+      chunkStartIndex,
+      chunkEndExclusive,
+      requiredChunksPerTopic,
+      requiredTotalChunks: requiredChunksPerTopic * topicCount,
+    };
+  }
+
+  private selectChunksForLogicalWindow(
+    chunks: TopicChunk[],
+    plan: LogicalWindowPlan,
+  ): TopicChunk[] {
+    return chunks.filter(
+      (chunk) =>
+        chunk.logicalChunkIndex >= plan.chunkStartIndex &&
+        chunk.logicalChunkIndex < plan.chunkEndExclusive,
+    );
+  }
+
+  private pruneChunksBeforeIndex(
+    chunksByTopic: Map<string, TopicChunk[]>,
+    minimumLogicalChunkIndex: number,
+  ) {
+    for (const [topic, chunks] of chunksByTopic.entries()) {
+      chunksByTopic.set(
+        topic,
+        chunks.filter(
+          (chunk) => chunk.logicalChunkIndex >= minimumLogicalChunkIndex,
+        ),
+      );
+    }
   }
 
   /**
@@ -279,11 +349,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       }
 
       // Data structure to collect chunks by topic with timestamps
-      const chunksByTopic: Map<string, { data: string; timestamp: number }[]> =
-        new Map();
-      const chunksRequired =
-        Math.ceil(outputQueryWidth / this.chunkGCD) * this.subQueries.length;
-      this.logger.log(`Chunks required for aggregation: ${chunksRequired}`);
+      const chunksByTopic: Map<string, TopicChunk[]> = new Map();
+      const nextChunkIndexByTopic: Map<string, number> = new Map();
       this.logger.log(
         `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
       );
@@ -292,10 +359,15 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       const expectedTopicCount = topicsOfProcesses.length;
       // Expected chunks for first window: STEP / chunkGCD * numTopics
       // This ensures we have enough data coverage before producing a result
+      const chunksPerStep = Math.ceil(outputQuerySlide / this.chunkGCD);
+      const chunksPerFullWindow = Math.ceil(outputQueryWidth / this.chunkGCD);
       const expectedChunksForFirstWindow =
-        Math.ceil(outputQuerySlide / this.chunkGCD) * expectedTopicCount;
+        chunksPerStep * expectedTopicCount;
       this.logger.log(
         `Expected topic count: ${expectedTopicCount}, Expected chunks for first window: ${expectedChunksForFirstWindow} (STEP=${outputQuerySlide} / chunkGCD=${this.chunkGCD} * topics=${expectedTopicCount})`,
+      );
+      this.logger.log(
+        `Subsequent windows require ${chunksPerFullWindow * expectedTopicCount} chunks in total (${chunksPerFullWindow} per topic).`,
       );
 
       // Helper function to process chunks - used by both immediate trigger and interval fallback
@@ -309,39 +381,21 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
 
         const now = Date.now();
+        const windowPlan = this.buildLogicalWindowPlan(
+          this.nextWindowNumber,
+          outputQuerySlide,
+          outputQueryWidth,
+          expectedTopicCount,
+        );
 
-        // TIME-BASED GATING (Option 3 - Part 1):
-        // Ensure sufficient time has passed based on window semantics.
-        //
-        // Anchor to queryRegisteredTime so the first result fires at
-        // t0 + outputQuerySlide, matching the window semantics. Using
-        // firstDataReceivedTime inflated latency by one sub-window step because
-        // the first sub-query result cannot arrive until subWindowStep ms after
-        // t0 (BUG-001). The chunk-count gate still prevents emitting incomplete
-        // results, so no premature output occurs.
-        const minTimeForFirstResult =
-          this.queryRegisteredTime > 0
-            ? this.queryRegisteredTime + outputQuerySlide
-            : Infinity;
-        const minTimeForSubsequent =
-          this.lastProcessedTime > 0
-            ? this.lastProcessedTime + outputQuerySlide
-            : Infinity;
-
-        const timeConditionMet =
-          (this.lastProcessedTime === 0 && now >= minTimeForFirstResult) ||
-          (this.lastProcessedTime > 0 && now >= minTimeForSubsequent);
+        const timeConditionMet = now >= windowPlan.expectedProcessingTime;
 
         if (!timeConditionMet) {
-          const waitingFor =
-            this.lastProcessedTime === 0
-              ? minTimeForFirstResult - now
-              : minTimeForSubsequent - now;
+          const waitingFor = windowPlan.expectedProcessingTime - now;
           this.logger.log(
             `Time condition not met for ${triggerSource}. Need to wait ${waitingFor}ms more. ` +
-              `queryRegisteredTime=${this.queryRegisteredTime}, lastProcessedTime=${this.lastProcessedTime}, now=${now}`,
+              `queryRegisteredTime=${this.queryRegisteredTime}, nextWindowNumber=${this.nextWindowNumber}, expectedProcessingTime=${windowPlan.expectedProcessingTime}, now=${now}`,
           );
-          this.processingInProgress = false;
           return;
         }
 
@@ -350,81 +404,42 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         // Record when processing is triggered (before any processing)
         this.intervalTriggerTime = now;
 
-        // Determine how many chunks per topic to include in this window.
-        //
-        // The problem with filtering by wall-clock timestamp is that the replayer
-        // can run slightly faster than 1×, causing a chunk from the NEXT data
-        // period to arrive a few ms before the trigger fires. This "early arrival"
-        // corrupts the window with data that belongs to the following step.
-        //
-        // Fix strategy:
-        //  • First window  – the window has no prior anchor, so we take the
-        //    OLDEST chunksPerStep chunks per topic (sorted by arrival time).
-        //    Data is replayed in chronological order, so the oldest chunks always
-        //    cover the earliest data period, regardless of replay speed.
-        //  • Subsequent windows – lastProcessedTime is a stable anchor. We use a
-        //    canonical window [lastProcessedTime, lastProcessedTime + outputQueryWidth)
-        //    and take at most chunksPerFullWindow chunks per topic (oldest first).
-        const chunksPerStep        = Math.ceil(outputQuerySlide / this.chunkGCD); // e.g. 2
-        const chunksPerFullWindow  = Math.ceil(outputQueryWidth  / this.chunkGCD); // e.g. 4
-
-        const canonicalWindowStart =
-          this.lastProcessedTime === 0
-            ? 0  // first window: no lower bound needed (we limit by count instead)
-            : this.lastProcessedTime - (outputQueryWidth - outputQuerySlide);
-
         // Collect all chunks from all topics within the window
         const allWindowChunks: string[] = [];
-        let totalTopicsWithData = 0;
+        let totalTopicsReady = 0;
+        let missingTopics: string[] = [];
 
-        for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
-          // Sort by arrival time so slice(0, N) reliably picks the earliest chunks
-          const sorted = [...chunks].sort((a, b) => a.timestamp - b.timestamp);
-
-          let windowChunks: typeof sorted;
-          if (this.lastProcessedTime === 0) {
-            // First window: take the oldest chunksPerStep chunks — these are
-            // guaranteed to cover the first STEP period of data regardless of
-            // how slightly faster the replayer runs.
-            windowChunks = sorted.slice(0, chunksPerStep);
-          } else {
-            // Subsequent windows: sliding window anchored to lastProcessedTime.
-            // Take at most chunksPerFullWindow of the oldest chunks that arrived
-            // after canonicalWindowStart, covering the full RANGE period.
-            const inWindow = sorted.filter(
-              (c) => c.timestamp >= canonicalWindowStart,
-            );
-            windowChunks = inWindow.slice(0, chunksPerFullWindow);
-          }
-
-          if (windowChunks.length > 0) {
-            totalTopicsWithData++;
-            this.logger.log(
-              `${triggerSource} evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
-            );
-            this.logger.log(
-              `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
-            );
-
-            // Add this topic's chunks to the combined collection
-            allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
-          }
-
-          // Retain only chunks that may still be needed for future windows
-          chunksByTopic.set(
-            topic,
-            chunks.filter((c) => c.timestamp >= canonicalWindowStart),
+        for (const topic of topicsOfProcesses) {
+          const topicChunks = chunksByTopic.get(topic) ?? [];
+          const windowChunks = this.selectChunksForLogicalWindow(
+            topicChunks,
+            windowPlan,
           );
+
+          if (windowChunks.length < windowPlan.requiredChunksPerTopic) {
+            missingTopics.push(
+              `${topic} (${windowChunks.length}/${windowPlan.requiredChunksPerTopic})`,
+            );
+            continue;
+          }
+
+          totalTopicsReady++;
+          this.logger.log(
+            `${triggerSource} evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
+          );
+          this.logger.log(
+            `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
+          );
+          allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
         }
 
-        // CHUNK COUNT CHECK (Option 3 - Part 2):
-        // Ensure we have enough chunks based on STEP / chunkGCD * numTopics
         const hasEnoughChunks =
-          allWindowChunks.length >= expectedChunksForFirstWindow;
+          totalTopicsReady === expectedTopicCount &&
+          allWindowChunks.length === windowPlan.requiredTotalChunks;
 
         if (!hasEnoughChunks) {
           this.logger.log(
-            `${triggerSource}: Chunk count not met. Have ${allWindowChunks.length}/${expectedChunksForFirstWindow} chunks. Waiting for more chunks.`,
+            `${triggerSource}: Chunk readiness not met for logical window ${windowPlan.windowNumber}. Have ${allWindowChunks.length}/${windowPlan.requiredTotalChunks} chunks. Missing coverage: ${missingTopics.join(", ") || "none"}. Waiting for more chunks.`,
           );
           this.processingInProgress = false;
           return;
@@ -432,7 +447,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
         if (allWindowChunks.length > 0) {
           this.logger.log(
-            `${triggerSource} evaluation completed. Combined chunks from ${totalTopicsWithData}/${expectedTopicCount} topics, total chunks: ${allWindowChunks.length}`,
+            `${triggerSource} evaluation completed for logical window ${windowPlan.windowNumber}. Combined chunks from ${totalTopicsReady}/${expectedTopicCount} topics, total chunks: ${allWindowChunks.length}`,
           );
           this.logger.log(
             `${triggerSource} evaluation. Aggregating and triggering R2R...`,
@@ -440,7 +455,18 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
           // Process all chunks together like the client-side approach
           await this.executeR2ROperator(allWindowChunks);
-          this.lastProcessedTime = Date.now();
+          this.lastProcessedTime = windowPlan.expectedProcessingTime;
+          this.nextWindowNumber += 1;
+          const nextWindowPlan = this.buildLogicalWindowPlan(
+            this.nextWindowNumber,
+            outputQuerySlide,
+            outputQueryWidth,
+            expectedTopicCount,
+          );
+          this.pruneChunksBeforeIndex(
+            chunksByTopic,
+            nextWindowPlan.chunkStartIndex,
+          );
         } else {
           this.logger.log(`${triggerSource}: no chunks to aggregate.`);
         }
@@ -491,33 +517,28 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
 
         // Add chunk to the appropriate topic
-        chunksByTopic
-          .get(topic)!
-          .push({ data: message.toString(), timestamp: Date.now() });
+        const logicalChunkIndex = nextChunkIndexByTopic.get(topic) ?? 0;
+        chunksByTopic.get(topic)!.push({
+          data: message.toString(),
+          timestamp: now,
+          logicalChunkIndex,
+        });
+        nextChunkIndexByTopic.set(topic, logicalChunkIndex + 1);
 
         // IMMEDIATE TRIGGER OPTIMIZATION:
         // Check if we should process immediately instead of waiting for interval.
-        // Anchor to queryRegisteredTime (t0) so the trigger fires at t0 + STEP,
-        // consistent with BUG-001 fix in the time-gate above.
         if (this.useImmediateTrigger) {
-          const timeSinceRegistered = now - this.queryRegisteredTime;
-          const timeSinceLastProcess =
-            this.lastProcessedTime > 0
-              ? now - this.lastProcessedTime
-              : timeSinceRegistered;
-
-          // Trigger if: enough time for STEP has passed since query registration
-          // For first result: wait for STEP time since t0
-          // For subsequent: wait for STEP time since last processed
-          const shouldTrigger =
-            (this.lastProcessedTime === 0 &&
-              timeSinceRegistered >= outputQuerySlide) ||
-            (this.lastProcessedTime > 0 &&
-              timeSinceLastProcess >= outputQuerySlide);
+          const nextWindowPlan = this.buildLogicalWindowPlan(
+            this.nextWindowNumber,
+            outputQuerySlide,
+            outputQueryWidth,
+            expectedTopicCount,
+          );
+          const shouldTrigger = now >= nextWindowPlan.expectedProcessingTime;
 
           if (shouldTrigger) {
             this.logger.log(
-              `Immediate trigger activated: timeSinceRegistered=${timeSinceRegistered}ms, timeSinceLastProcess=${timeSinceLastProcess}ms, outputQuerySlide=${outputQuerySlide}ms`,
+              `Immediate trigger activated for logical window ${nextWindowPlan.windowNumber}: now=${now}, expectedProcessingTime=${nextWindowPlan.expectedProcessingTime}, outputQuerySlide=${outputQuerySlide}ms`,
             );
             await processChunks("Immediate");
           }

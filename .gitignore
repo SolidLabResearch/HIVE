@@ -117,3 +117,10 @@ chunked_latency_log.csv
 
 # SPeCS containment checker solver artefact
 formula.smt
+docs/evaluation-30iter.tex
+.gitignore
+docs/.DS_Store
+.gitignore
+docs/evaluation-35iter.tex
+docs/evaluation.tex
+.DS_Store
