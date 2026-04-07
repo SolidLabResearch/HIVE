@@ -113,6 +113,7 @@ const CONFIG = {
 
 const OUTPUT_TOPICS = {
   fetching: ["client_operation_output"],
+  naive_distributed: ["naive_distributed/output"],
   approximation: ["approximation/output"],
   chunked: ["chunked/output", "output"],
 };
@@ -121,6 +122,10 @@ const ORCHESTRATORS = {
   fetching: path.join(
     PROJECT_ROOT,
     "dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js",
+  ),
+  naive_distributed: path.join(
+    PROJECT_ROOT,
+    "dist/approaches/StreamingQueryNaiveDistributedApproachOrchestrator.js",
   ),
   approximation: path.join(
     PROJECT_ROOT,
@@ -131,6 +136,13 @@ const ORCHESTRATORS = {
     "dist/approaches/StreamingQueryChunkedApproachOrchestrator.js",
   ),
 };
+
+const APPROACHES = [
+  "fetching",
+  "naive_distributed",
+  "approximation",
+  "chunked",
+];
 
 class UnifiedBenchmark {
   constructor() {
@@ -662,8 +674,6 @@ class UnifiedBenchmark {
     this.log(`Iterations: ${CONFIG.iterations}`);
     this.log(`${"█".repeat(70)}\n`);
 
-    const approaches = ["fetching", "approximation", "chunked"];
-
     for (let iter = 1; iter <= CONFIG.iterations; iter++) {
       this.log(`\n${"─".repeat(70)}`);
       this.log(`ITERATION ${iter}/${CONFIG.iterations}`);
@@ -674,7 +684,7 @@ class UnifiedBenchmark {
         results: {},
       };
 
-      for (const approach of approaches) {
+      for (const approach of APPROACHES) {
         try {
           const result = await this.runSingleApproach(approach, iter);
           iterationResults.results[approach] = result;
@@ -706,10 +716,9 @@ class UnifiedBenchmark {
   }
 
   calculateSummary() {
-    const approaches = ["fetching", "approximation", "chunked"];
     const summary = {};
 
-    for (const approach of approaches) {
+    for (const approach of APPROACHES) {
       const latencies = [];
       const cpuValues = [];
       const memoryValues = [];
@@ -790,7 +799,7 @@ class UnifiedBenchmark {
     report += `Approach        | Avg (ms) | StdDev (ms) | Min (ms) | Max (ms) | Median (ms) | Success\n`;
     report += `${"-".repeat(80)}\n`;
 
-    for (const approach of ["fetching", "approximation", "chunked"]) {
+    for (const approach of APPROACHES) {
       const data = this.allResults.summary[approach];
 
       if (data.error) {
@@ -814,7 +823,7 @@ class UnifiedBenchmark {
     report += `Approach        | Avg CPU (%) | Max Memory (MB)\n`;
     report += `${"-".repeat(45)}\n`;
 
-    for (const approach of ["fetching", "approximation", "chunked"]) {
+    for (const approach of APPROACHES) {
       const data = this.allResults.summary[approach];
 
       if (data.error) {
@@ -833,8 +842,18 @@ class UnifiedBenchmark {
 
     const fetchingData = this.allResults.summary.fetching;
     if (fetchingData && !fetchingData.error) {
+      const naiveDistributedData = this.allResults.summary.naive_distributed;
       const approxData = this.allResults.summary.approximation;
       const chunkedData = this.allResults.summary.chunked;
+
+      if (naiveDistributedData && !naiveDistributedData.error) {
+        const naiveDiff = (
+          ((naiveDistributedData.latency.avg - fetchingData.latency.avg) /
+            fetchingData.latency.avg) *
+          100
+        ).toFixed(1);
+        report += `Naive Distributed vs Fetching: ${naiveDiff}% (${naiveDiff > 0 ? "+" : ""}${naiveDiff}%)\n`;
+      }
 
       if (approxData && !approxData.error) {
         const approxDiff = (

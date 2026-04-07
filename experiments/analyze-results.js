@@ -19,6 +19,17 @@ const fs = require("fs");
 const path = require("path");
 
 const RESULTS_DIR = path.join(__dirname, "benchmark-results");
+const APPROACHES = [
+  "fetching",
+  "naive_distributed",
+  "approximation",
+  "chunked",
+];
+const ACCURACY_APPROACHES = [
+  "naive_distributed",
+  "approximation",
+  "chunked",
+];
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -166,10 +177,9 @@ function buildLabel(config) {
 // ── Extract per-approach stats from iterations ───────────────────────
 
 function extractApproachStats(iterations) {
-  const approaches = ["fetching", "approximation", "chunked"];
   const stats = {};
 
-  for (const approach of approaches) {
+  for (const approach of APPROACHES) {
     const latencies = [];
     const cpuValues = [];
     const memValues = [];
@@ -214,13 +224,15 @@ function extractApproachStats(iterations) {
 // ── Accuracy analysis ────────────────────────────────────────────────
 
 function computeAccuracy(iterations) {
-  const results = { approximation: [], chunked: [] };
+  const results = Object.fromEntries(
+    ACCURACY_APPROACHES.map((approach) => [approach, []]),
+  );
 
   for (const iter of iterations) {
     const fetching = iter.results?.fetching;
     if (!fetching || fetching.error || fetching.value == null) continue;
 
-    for (const approach of ["approximation", "chunked"]) {
+    for (const approach of ACCURACY_APPROACHES) {
       const r = iter.results?.[approach];
       if (r && !r.error && r.value != null) {
         const absError = Math.abs(r.value - fetching.value);
@@ -240,7 +252,7 @@ function computeAccuracy(iterations) {
   }
 
   const summary = {};
-  for (const approach of ["approximation", "chunked"]) {
+  for (const approach of ACCURACY_APPROACHES) {
     const data = results[approach];
     if (data.length === 0) {
       summary[approach] = { n: 0, exactMatches: 0, meanRelError: 0, maxRelError: 0 };
@@ -285,8 +297,10 @@ function generateReport(experiments) {
     pad("Experiment", 40, "left"),
     pad("Iters", 6),
     pad("Fetch Lat", 10),
+    pad("Naive Lat", 10),
     pad("Approx Lat", 10),
     pad("Chunk Lat", 10),
+    pad("Naive Err%", 11),
     pad("Approx Err%", 11),
     pad("Chunk Err%", 10),
   ].join(" | ");
@@ -301,8 +315,10 @@ function generateReport(experiments) {
       pad(exp.label.substring(0, 40), 40, "left"),
       pad(stats.fetching.n.toString(), 6),
       pad(stats.fetching.latency.mean > 0 ? stats.fetching.latency.mean.toFixed(0) : "N/A", 10),
+      pad(stats.naive_distributed.latency.mean > 0 ? stats.naive_distributed.latency.mean.toFixed(0) : "N/A", 10),
       pad(stats.approximation.latency.mean > 0 ? stats.approximation.latency.mean.toFixed(0) : "N/A", 10),
       pad(stats.chunked.latency.mean > 0 ? stats.chunked.latency.mean.toFixed(0) : "N/A", 10),
+      pad(accuracy.naive_distributed.n > 0 ? accuracy.naive_distributed.meanRelError.toFixed(2) + "%" : "N/A", 11),
       pad(accuracy.approximation.n > 0 ? accuracy.approximation.meanRelError.toFixed(2) + "%" : "N/A", 11),
       pad(accuracy.chunked.n > 0 ? accuracy.chunked.meanRelError.toFixed(2) + "%" : "N/A", 10),
     ].join(" | ");
@@ -328,7 +344,7 @@ function generateReport(experiments) {
     lines.push("  Latency (ms):");
     lines.push(`  ${"Approach".padEnd(16)} | ${"Mean".padStart(8)} | ${"StdDev".padStart(8)} | ${"Median".padStart(8)} | ${"Min".padStart(8)} | ${"Max".padStart(8)} | ${"N".padStart(4)}`);
     lines.push(`  ${"-".repeat(75)}`);
-    for (const approach of ["fetching", "approximation", "chunked"]) {
+    for (const approach of APPROACHES) {
       const s = stats[approach];
       if (s.n === 0) {
         lines.push(`  ${approach.padEnd(16)} | ${"N/A".padStart(8)} | ${"".padStart(8)} | ${"".padStart(8)} | ${"".padStart(8)} | ${"".padStart(8)} | ${pad("0", 4)}`);
@@ -342,7 +358,7 @@ function generateReport(experiments) {
     lines.push("  Resources:");
     lines.push(`  ${"Approach".padEnd(16)} | ${"Avg CPU %".padStart(10)} | ${"Max Mem MB".padStart(10)}`);
     lines.push(`  ${"-".repeat(45)}`);
-    for (const approach of ["fetching", "approximation", "chunked"]) {
+    for (const approach of APPROACHES) {
       const s = stats[approach];
       if (s.n === 0) {
         lines.push(`  ${approach.padEnd(16)} | ${"N/A".padStart(10)} | ${"N/A".padStart(10)}`);
@@ -356,7 +372,7 @@ function generateReport(experiments) {
     lines.push("  Accuracy (vs fetching baseline):");
     lines.push(`  ${"Approach".padEnd(16)} | ${"Exact".padStart(6)} | ${"Mean Err%".padStart(10)} | ${"Max Err%".padStart(10)} | ${"Median Err%".padStart(11)}`);
     lines.push(`  ${"-".repeat(65)}`);
-    for (const approach of ["approximation", "chunked"]) {
+    for (const approach of ACCURACY_APPROACHES) {
       const a = accuracy[approach];
       if (a.n === 0) {
         lines.push(`  ${approach.padEnd(16)} | ${"N/A".padStart(6)} | ${"N/A".padStart(10)} | ${"N/A".padStart(10)} | ${"N/A".padStart(11)}`);
@@ -368,20 +384,26 @@ function generateReport(experiments) {
     // Per-iteration values
     lines.push("");
     lines.push("  Per-iteration values:");
-    lines.push(`  ${"Iter".padEnd(5)} | ${"Fetching".padStart(14)} | ${"Approximation".padStart(14)} | ${"Chunked".padStart(14)} | ${"Approx Err%".padStart(11)} | ${"Chunk Err%".padStart(10)}`);
-    lines.push(`  ${"-".repeat(80)}`);
+    lines.push(`  ${"Iter".padEnd(5)} | ${"Fetching".padStart(14)} | ${"Naive Dist".padStart(14)} | ${"Approximation".padStart(14)} | ${"Chunked".padStart(14)} | ${"Naive Err%".padStart(11)} | ${"Approx Err%".padStart(11)} | ${"Chunk Err%".padStart(10)}`);
+    lines.push(`  ${"-".repeat(122)}`);
     for (let i = 0; i < exp.iterations.length; i++) {
       const iter = exp.iterations[i];
       const f = iter.results?.fetching;
+      const n = iter.results?.naive_distributed;
       const a = iter.results?.approximation;
       const c = iter.results?.chunked;
 
       const fVal = f && !f.error && f.value != null ? f.value.toFixed(6) : "ERR";
+      const nVal = n && !n.error && n.value != null ? n.value.toFixed(6) : "ERR";
       const aVal = a && !a.error && a.value != null ? a.value.toFixed(6) : "ERR";
       const cVal = c && !c.error && c.value != null ? c.value.toFixed(6) : "ERR";
 
+      let nErr = "N/A";
       let aErr = "N/A";
       let cErr = "N/A";
+      if (f && n && f.value != null && n.value != null && f.value !== 0) {
+        nErr = ((Math.abs(n.value - f.value) / Math.abs(f.value)) * 100).toFixed(4) + "%";
+      }
       if (f && a && f.value != null && a.value != null && f.value !== 0) {
         aErr = ((Math.abs(a.value - f.value) / Math.abs(f.value)) * 100).toFixed(4) + "%";
       }
@@ -389,7 +411,7 @@ function generateReport(experiments) {
         cErr = ((Math.abs(c.value - f.value) / Math.abs(f.value)) * 100).toFixed(4) + "%";
       }
 
-      lines.push(`  ${pad((i + 1).toString(), 5, "left")} | ${pad(fVal, 14)} | ${pad(aVal, 14)} | ${pad(cVal, 14)} | ${pad(aErr, 11)} | ${pad(cErr, 10)}`);
+      lines.push(`  ${pad((i + 1).toString(), 5, "left")} | ${pad(fVal, 14)} | ${pad(nVal, 14)} | ${pad(aVal, 14)} | ${pad(cVal, 14)} | ${pad(nErr, 11)} | ${pad(aErr, 11)} | ${pad(cErr, 10)}`);
     }
   }
 
@@ -399,12 +421,14 @@ function generateReport(experiments) {
   lines.push("3. ACCURACY COMPARISON ACROSS EXPERIMENTS");
   lines.push(hr);
   lines.push("");
-  lines.push("This section highlights where approximation diverges from the ground truth");
-  lines.push("(fetching) while chunked maintains accuracy.");
+  lines.push("This section highlights where the non-fetching approaches diverge from the");
+  lines.push("ground truth baseline (fetching), while preserving the chunked accuracy story.");
   lines.push("");
 
   const accHeader = [
     pad("Experiment", 40, "left"),
+    pad("Naive Mean Err%", 16),
+    pad("Naive Max Err%", 15),
     pad("Approx Mean Err%", 17),
     pad("Approx Max Err%", 15),
     pad("Chunk Mean Err%", 15),
@@ -416,11 +440,14 @@ function generateReport(experiments) {
 
   for (const exp of experiments) {
     const accuracy = computeAccuracy(exp.iterations);
+    const n = accuracy.naive_distributed;
     const a = accuracy.approximation;
     const c = accuracy.chunked;
 
     const row = [
       pad(exp.label.substring(0, 40), 40, "left"),
+      pad(n.n > 0 ? n.meanRelError.toFixed(4) + "%" : "N/A", 16),
+      pad(n.n > 0 ? n.maxRelError.toFixed(4) + "%" : "N/A", 15),
       pad(a.n > 0 ? a.meanRelError.toFixed(4) + "%" : "N/A", 17),
       pad(a.n > 0 ? a.maxRelError.toFixed(4) + "%" : "N/A", 15),
       pad(c.n > 0 ? c.meanRelError.toFixed(4) + "%" : "N/A", 15),
@@ -441,6 +468,8 @@ function generateReport(experiments) {
     pad("Experiment", 40, "left"),
     pad("Fetch CPU%", 10),
     pad("Fetch Mem", 10),
+    pad("Naive CPU%", 10),
+    pad("Naive Mem", 10),
     pad("Approx CPU%", 11),
     pad("Approx Mem", 10),
     pad("Chunk CPU%", 10),
@@ -456,6 +485,8 @@ function generateReport(experiments) {
       pad(exp.label.substring(0, 40), 40, "left"),
       pad(stats.fetching.n > 0 ? stats.fetching.cpu.mean.toFixed(1) : "N/A", 10),
       pad(stats.fetching.n > 0 ? stats.fetching.memory.maxMB.toFixed(0) + "MB" : "N/A", 10),
+      pad(stats.naive_distributed.n > 0 ? stats.naive_distributed.cpu.mean.toFixed(1) : "N/A", 10),
+      pad(stats.naive_distributed.n > 0 ? stats.naive_distributed.memory.maxMB.toFixed(0) + "MB" : "N/A", 10),
       pad(stats.approximation.n > 0 ? stats.approximation.cpu.mean.toFixed(1) : "N/A", 11),
       pad(stats.approximation.n > 0 ? stats.approximation.memory.maxMB.toFixed(0) + "MB" : "N/A", 10),
       pad(stats.chunked.n > 0 ? stats.chunked.cpu.mean.toFixed(1) : "N/A", 10),
@@ -472,19 +503,25 @@ function generateReport(experiments) {
   lines.push("");
 
   // Compute aggregate stats
+  let totalNaiveExact = 0;
+  let totalNaiveN = 0;
   let totalApproxExact = 0;
   let totalApproxN = 0;
   let totalChunkExact = 0;
   let totalChunkN = 0;
+  let naiveErrors = [];
   let approxErrors = [];
   let chunkErrors = [];
 
   for (const exp of experiments) {
     const accuracy = computeAccuracy(exp.iterations);
+    totalNaiveExact += accuracy.naive_distributed.exactMatches;
+    totalNaiveN += accuracy.naive_distributed.n;
     totalApproxExact += accuracy.approximation.exactMatches;
     totalApproxN += accuracy.approximation.n;
     totalChunkExact += accuracy.chunked.exactMatches;
     totalChunkN += accuracy.chunked.n;
+    if (accuracy.naive_distributed.n > 0) naiveErrors.push(accuracy.naive_distributed.meanRelError);
     if (accuracy.approximation.n > 0) approxErrors.push(accuracy.approximation.meanRelError);
     if (accuracy.chunked.n > 0) chunkErrors.push(accuracy.chunked.meanRelError);
   }
@@ -492,19 +529,25 @@ function generateReport(experiments) {
   lines.push(`Across ${experiments.length} experiments:`);
   lines.push("");
   lines.push(`  Accuracy:`);
+  lines.push(`    Naive Distributed: ${totalNaiveExact}/${totalNaiveN} exact matches (${totalNaiveN > 0 ? ((totalNaiveExact / totalNaiveN) * 100).toFixed(1) : 0}%), mean error ${mean(naiveErrors).toFixed(4)}%`);
   lines.push(`    Approximation: ${totalApproxExact}/${totalApproxN} exact matches (${totalApproxN > 0 ? ((totalApproxExact / totalApproxN) * 100).toFixed(1) : 0}%), mean error ${mean(approxErrors).toFixed(4)}%`);
   lines.push(`    Chunked:       ${totalChunkExact}/${totalChunkN} exact matches (${totalChunkN > 0 ? ((totalChunkExact / totalChunkN) * 100).toFixed(1) : 0}%), mean error ${mean(chunkErrors).toFixed(4)}%`);
   lines.push("");
 
+  let worstNaive = { label: "", error: 0 };
   // Find worst cases for approximation
   let worstApprox = { label: "", error: 0 };
   for (const exp of experiments) {
     const accuracy = computeAccuracy(exp.iterations);
+    if (accuracy.naive_distributed.meanRelError > worstNaive.error) {
+      worstNaive = { label: exp.label, error: accuracy.naive_distributed.meanRelError };
+    }
     if (accuracy.approximation.meanRelError > worstApprox.error) {
       worstApprox = { label: exp.label, error: accuracy.approximation.meanRelError };
     }
   }
-  lines.push(`  Worst approximation accuracy: ${worstApprox.label} (${worstApprox.error.toFixed(4)}% mean error)`);
+  lines.push(`  Worst naive distributed accuracy: ${worstNaive.label || "N/A"} (${worstNaive.error.toFixed(4)}% mean error)`);
+  lines.push(`  Worst approximation accuracy: ${worstApprox.label || "N/A"} (${worstApprox.error.toFixed(4)}% mean error)`);
 
   // Check if chunked is always exact
   const chunkedAlwaysExact = totalChunkExact === totalChunkN && totalChunkN > 0;
@@ -536,7 +579,7 @@ function generateCSV(experiments) {
       const iter = exp.iterations[i];
       const fetchVal = iter.results?.fetching?.value;
 
-      for (const approach of ["fetching", "approximation", "chunked"]) {
+      for (const approach of APPROACHES) {
         const r = iter.results?.[approach];
         if (!r || r.error) continue;
 
