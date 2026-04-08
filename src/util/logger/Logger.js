@@ -26,6 +26,22 @@ var Logger = /** @class */ (function () {
         var maxSizeMb = Number.isFinite(parsed) && parsed > 0 ? parsed : 256;
         return Math.floor(maxSizeMb * 1024 * 1024);
     };
+    Logger.prototype.shouldDisableFileOutput = function () {
+        var _a;
+        var envValue = process.env.LOG_DISABLE_FILE_OUTPUT;
+        return envValue === '1' || ((_a = envValue === null || envValue === void 0 ? void 0 : envValue.toLowerCase) === null || _a === void 0 ? void 0 : _a.call(envValue)) === 'true';
+    };
+    Logger.prototype.getEffectiveDestination = function () {
+        var _a;
+        var envDestination = (_a = process.env.LOG_DESTINATION) === null || _a === void 0 ? void 0 : _a.trim().toUpperCase();
+        if (envDestination === 'CONSOLE' || envDestination === 'FILE' || envDestination === 'NONE') {
+            return envDestination;
+        }
+        if (this.shouldDisableFileOutput() && this.log_destination === 'FILE') {
+            return 'NONE';
+        }
+        return String(this.log_destination).toUpperCase();
+    };
     Logger.prototype.appendToClassFile = function (className, logMessage) {
         var logsDir = './logs';
         var logPath = "".concat(logsDir, "/").concat(className, ".log");
@@ -75,7 +91,7 @@ var Logger = /** @class */ (function () {
     Logger.prototype.log = function (level, message, className) {
         if (level >= this.log_level && this.loggable_classes.includes(className)) {
             var logMessage = "".concat(Date.now(), ",").concat(message);
-            switch (this.log_destination) {
+            switch (this.getEffectiveDestination()) {
                 case 'CONSOLE':
                     console.log(logMessage);
                     break;
@@ -86,6 +102,8 @@ var Logger = /** @class */ (function () {
                     catch (error) {
                         console.error("Error writing to file: ".concat(error));
                     }
+                    break;
+                case 'NONE':
                     break;
                 default:
                     console.log("Invalid log destination: ".concat(this.log_destination));

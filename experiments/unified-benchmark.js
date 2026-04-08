@@ -519,6 +519,7 @@ class UnifiedBenchmark {
         SUB_WINDOW_RANGE: CONFIG.subWindowRange,
         SUB_WINDOW_STEP: CONFIG.subWindowStep,
         WEARABLE_FREQUENCY: CONFIG.wearableFrequency,
+        LOG_DISABLE_FILE_OUTPUT: process.env.LOG_DISABLE_FILE_OUTPUT ?? "1",
         SESSION_ID: `${approachName}-${iterationNum}-${Date.now()}`,
       };
 

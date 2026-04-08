@@ -61,11 +61,12 @@ run_experiment() {
   echo "=================================================================="
   echo "[$EXPERIMENT_NUM/$TOTAL_EXPERIMENTS] $description"
   echo "  Command: $BENCHMARK --iterations $ITERATIONS $args"
+  echo "  Class file logging: disabled (set LOG_DISABLE_FILE_OUTPUT=0 to re-enable)"
   echo "  Started: $(date '+%Y-%m-%d %H:%M:%S')"
   echo "=================================================================="
   echo ""
 
-  $BENCHMARK --iterations "$ITERATIONS" "$@"
+  LOG_DISABLE_FILE_OUTPUT="${LOG_DISABLE_FILE_OUTPUT:-1}" $BENCHMARK --iterations "$ITERATIONS" "$@"
   local exit_code=$?
 
   local elapsed=$(( $(date +%s) - START_TIME ))

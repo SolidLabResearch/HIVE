@@ -32,6 +32,24 @@ export class Logger {
         return Math.floor(maxSizeMb * 1024 * 1024);
     }
 
+    private shouldDisableFileOutput(): boolean {
+        const envValue = process.env.LOG_DISABLE_FILE_OUTPUT;
+        return envValue === '1' || envValue?.toLowerCase() === 'true';
+    }
+
+    private getEffectiveDestination(): string {
+        const envDestination = process.env.LOG_DESTINATION?.trim().toUpperCase();
+        if (envDestination === 'CONSOLE' || envDestination === 'FILE' || envDestination === 'NONE') {
+            return envDestination;
+        }
+
+        if (this.shouldDisableFileOutput() && this.log_destination === 'FILE') {
+            return 'NONE';
+        }
+
+        return String(this.log_destination).toUpperCase();
+    }
+
     private appendToClassFile(className: string, logMessage: string): void {
         const logsDir = './logs';
         const logPath = `${logsDir}/${className}.log`;
@@ -88,7 +106,7 @@ export class Logger {
     log(level: LogLevel, message: string, className: string) {
         if (level >= this.log_level && this.loggable_classes.includes(className)) {
             const logMessage = `${Date.now()},${message}`;
-            switch (this.log_destination) {
+            switch (this.getEffectiveDestination()) {
                 case 'CONSOLE':
                     console.log(logMessage);
                     break;
@@ -98,6 +116,8 @@ export class Logger {
                     } catch (error) {
                         console.error(`Error writing to file: ${error}`);
                     }
+                    break;
+                case 'NONE':
                     break;
                 default:
                     console.log(`Invalid log destination: ${this.log_destination}`);
