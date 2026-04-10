@@ -116,7 +116,8 @@ export class Orchestrator {
             return;
         }
 
-        this.beeKeeper.executeQuery(this.registeredQuery, "output", this.operatorType, this.subQueriesToRun)
+        const resultTopic = process.env.RESULT_TOPIC || "output";
+        this.beeKeeper.executeQuery(this.registeredQuery, resultTopic, this.operatorType, this.subQueriesToRun)
         console.log(`Running registered query: ${this.registeredQuery}`);
 
     }

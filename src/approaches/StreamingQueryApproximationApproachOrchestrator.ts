@@ -1,10 +1,24 @@
 import fs from "fs";
 import { Orchestrator } from "../orchestrator/Orchestrator";
 import { CSVLogger } from "../util/logger/CSVLogger";
+import {
+    buildOutputSelectClause,
+    buildSubQuerySelectClause,
+    getConfiguredAggregation,
+    getOutputWindowRange,
+    getOutputWindowStep,
+    getSubWindowRange,
+    getSubWindowStep,
+} from "../util/runtimeConfig";
 
 async function StreamingQueryApproximationApproachOrchestrator() {
     const logger = new CSVLogger('approximation_approach_log.csv');
     const orchestrator = new Orchestrator("ApproximationApproachOperator");
+    const aggregationFunction = getConfiguredAggregation();
+    const subWindowRange = getSubWindowRange();
+    const subWindowStep = getSubWindowStep();
+    const outputWindowRange = getOutputWindowRange();
+    const outputWindowStep = getOutputWindowStep();
     // Add sub-queries
     const query1 = `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
@@ -12,8 +26,8 @@ PREFIX saref: <https://saref.etsi.org/core/>
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js> 
 REGISTER RStream <output> AS
-SELECT (AVG(?value) AS ?avgWearableX)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 60000 STEP 30000]
+SELECT ${buildSubQuerySelectClause(aggregationFunction, "WearableX")}
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/wearableX> {
         ?s1 saref:hasValue ?value .
@@ -27,8 +41,8 @@ PREFIX saref: <https://saref.etsi.org/core/>
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js> 
 REGISTER RStream <output> AS
-SELECT (AVG(?value) AS ?avgSmartphoneX)
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 60000 STEP 30000]
+SELECT ${buildSubQuerySelectClause(aggregationFunction, "SmartphoneX")}
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/smartphoneX> {
         ?s2 saref:hasValue ?value .
@@ -48,9 +62,9 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js> 
 
 REGISTER RStream <sensor_averages> AS
-SELECT (AVG(?value) AS ?avgValue)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
+SELECT ${buildOutputSelectClause(aggregationFunction)}
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
 WHERE {
     {
         WINDOW <mqtt://localhost:1883/wearableX> {

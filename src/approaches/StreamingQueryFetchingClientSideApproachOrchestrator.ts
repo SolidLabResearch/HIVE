@@ -3,6 +3,16 @@ import fs from "fs";
 import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
 import { v4 as uuidv4 } from "uuid";
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
+import {
+  AggregationFunction,
+  buildBenchmarkResultPayload,
+  buildOutputSelectClause,
+  getConfiguredAggregation,
+  getOutputWindowRange,
+  getOutputWindowStep,
+  getResultTopic,
+  getSessionId,
+} from "../util/runtimeConfig";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -22,8 +32,8 @@ export class FetchingAllDataClientSide {
     "mqtt://localhost:1883/wearableX": "https://rsp.jsw1",
     "mqtt://localhost:1883/smartphoneX": "https://rsp.jsw1",
   };
-  private expectedWindowInterval: number = 60000; // 60 seconds based on STEP 60000
-  private windowRange: number = 120000; // 120 seconds based on RANGE 120000
+  private expectedWindowInterval: number = 60000;
+  private windowRange: number = 120000;
   private tolerance: number = 5000; // 5 second tolerance
   private startTime: number = 0; // Track when processing started
   private lastValidResultTime: number = 0; // Track last valid result timing
@@ -31,20 +41,30 @@ export class FetchingAllDataClientSide {
   private windowCount: number = 0; // Track window count for latency logging
   private firstDataReceivedTime: number = 0; // Track when first data arrives (wall-clock)
   private lastObservationReceivedTime: number = 0; // Track when last observation was received
+  private aggregationFunction: AggregationFunction;
+  private sessionId: string;
 
   /**
    *
    * @param query
    * @param r2s_topic
    */
-  constructor(query: string, r2s_topic: string) {
+  constructor(
+    query: string,
+    r2s_topic: string,
+    aggregationFunction: AggregationFunction,
+  ) {
     this.query = query;
     this.r2s_topic = r2s_topic;
+    this.aggregationFunction = aggregationFunction;
+    this.sessionId = getSessionId();
     this.rspql_parser = new RSPQLParser();
     this.rsp_engine = new RSPEngine(query);
     this.rstream_emitter = this.rsp_engine.register();
     this.startTime = 0; // Will be set when first result arrives
     this.queryRegisteredTime = Date.now(); // Track when query was registered
+    this.windowRange = getOutputWindowRange();
+    this.expectedWindowInterval = getOutputWindowStep();
 
     // Initialize CSV logging for this approach
     this.initializeLogging();
@@ -335,60 +355,67 @@ export class FetchingAllDataClientSide {
         : [object.bindings];
 
       for (const binding of bindings) {
-        // binding should be a Map-like object where keys are variable names
-        let avgValue = null;
-        let countValue = null;
+        let resultValue = null;
 
         if (binding instanceof Map) {
-          avgValue = binding.get("?avgValue")?.value;
-          countValue = binding.get("?countValue")?.value;
+          resultValue =
+            binding.get("?resultValue")?.value ??
+            binding.get("?avgValue")?.value ??
+            binding.get("?countValue")?.value;
         } else if (Array.isArray(binding)) {
-          // Sometimes it's [ [Var, Term], ... ]
           for (const [v, t] of binding) {
-            if (v.value === "avgValue") avgValue = t.value;
-            if (v.value === "countValue") countValue = t.value;
+            if (
+              v.value === "resultValue" ||
+              v.value === "avgValue" ||
+              v.value === "countValue"
+            ) {
+              resultValue = t.value;
+            }
           }
         } else if (binding.entries) {
-          // Has entries property - could be Immutable.js Map or plain object
           try {
-            // Check if it's an Immutable.js Map with .get() method
             if (typeof binding.entries.get === "function") {
-              const avgTerm = binding.entries.get("avgValue");
-              const countTerm = binding.entries.get("countValue");
-              if (avgTerm) avgValue = avgTerm.value;
-              if (countTerm) countValue = countTerm.value;
+              const resultTerm =
+                binding.entries.get("resultValue") ||
+                binding.entries.get("avgValue") ||
+                binding.entries.get("countValue");
+              if (resultTerm) resultValue = resultTerm.value;
             } else {
-              // Plain object
               for (const [key, value] of Object.entries(binding.entries)) {
-                if (key === "avgValue") avgValue = (value as any).value;
-                if (key === "countValue") countValue = (value as any).value;
+                if (
+                  key === "resultValue" ||
+                  key === "avgValue" ||
+                  key === "countValue"
+                ) {
+                  resultValue = (value as any).value;
+                }
               }
             }
           } catch (e) {
             console.log("Error parsing binding entries:", e);
           }
         } else {
-          // Try direct property access as fallback
           try {
-            if (binding.avgValue) avgValue = binding.avgValue.value;
-            if (binding.countValue) countValue = binding.countValue.value;
+            if (binding.resultValue) resultValue = binding.resultValue.value;
+            if (!resultValue && binding.avgValue) resultValue = binding.avgValue.value;
+            if (!resultValue && binding.countValue) {
+              resultValue = binding.countValue.value;
+            }
           } catch (e) {
             console.log("Error parsing binding:", e);
           }
         }
 
-        if (!avgValue) {
-          // Fallback if parsing failed or structure different
-          console.log("DEBUG: Could not parse avgValue from:", binding);
+        if (!resultValue) {
+          console.log("DEBUG: Could not parse resultValue from:", binding);
           continue;
         }
 
-        const data = avgValue;
-        const count = countValue || "N/A";
+        const data = resultValue;
         const currentTimestamp = Date.now();
 
         this.log(
-          `RStream result generated: ${data} (count: ${count}) at timestamp: ${currentTimestamp}`,
+          `RStream result generated: ${data} at timestamp: ${currentTimestamp}`,
         );
 
         // Apply timing filter to ignore extra dynamic windows
@@ -398,7 +425,7 @@ export class FetchingAllDataClientSide {
           continue;
         }
 
-        this.log(`Processing valid result: ${data} with count: ${count}`);
+        this.log(`Processing valid result: ${data}`);
 
         // Calculate and log latency with multiple metrics
         this.windowCount++;
@@ -417,9 +444,19 @@ export class FetchingAllDataClientSide {
         // Debug: print the full binding object
         // console.log("DEBUG: RStream binding:", binding);
 
-        // ... rest of publication logic using 'data' (avg)
-        const aggregation_event = this.generate_aggregation_event(data);
-        const aggregation_object_string = JSON.stringify(aggregation_event);
+        const numericValue = Number.parseFloat(data);
+        const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
+        const aggregation_object_string = useBenchmarkPayload
+          ? JSON.stringify(
+              buildBenchmarkResultPayload(
+                "fetching",
+                this.aggregationFunction,
+                this.sessionId,
+                numericValue,
+                this.windowCount,
+              ),
+            )
+          : JSON.stringify(this.generate_aggregation_event(data));
         console.log(
           `Aggregation event generated: ${aggregation_object_string}`,
         );
@@ -526,6 +563,9 @@ export class FetchingAllDataClientSide {
  *
  */
 async function clientSideProcessing() {
+  const aggregationFunction = getConfiguredAggregation();
+  const outputWindowRange = getOutputWindowRange();
+  const outputWindowStep = getOutputWindowStep();
   const query = `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
@@ -533,9 +573,9 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
-SELECT (AVG(?value) AS ?avgValue) (COUNT(?value) AS ?countValue)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
+SELECT ${buildOutputSelectClause(aggregationFunction)}
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
 WHERE {
     {
         WINDOW <mqtt://localhost:1883/wearableX> {
@@ -553,8 +593,12 @@ WHERE {
 
   console.log(new RSPQLParser().parse(query).sparql);
 
-  const r2s_topic = "client_operation_output";
-  const client = new FetchingAllDataClientSide(query, r2s_topic);
+  const r2s_topic = getResultTopic("client_operation_output");
+  const client = new FetchingAllDataClientSide(
+    query,
+    r2s_topic,
+    aggregationFunction,
+  );
 
   // Add cleanup handlers
   process.on("exit", () => client.cleanup());

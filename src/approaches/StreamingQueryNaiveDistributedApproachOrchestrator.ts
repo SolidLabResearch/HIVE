@@ -1,6 +1,19 @@
 import fs from "fs";
 import { RSPEngine, RSPQLParser } from "rsp-js";
 import { turtleStringToStore } from "../util/Util";
+import {
+    AggregationFunction,
+    buildBenchmarkResultPayload,
+    buildOutputSelectClause,
+    buildSubQuerySelectClause,
+    getConfiguredAggregation,
+    getOutputWindowRange,
+    getOutputWindowStep,
+    getResultTopic,
+    getSessionId,
+    getSubWindowRange,
+    getSubWindowStep,
+} from "../util/runtimeConfig";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -9,14 +22,19 @@ const { DataFactory } = N3;
 // These are the same queries used by Approximation and Chunked approaches so
 // that all four approaches are evaluated on identical workloads.
 
-const SUB_QUERY_1 = `
+function buildSubQuery1(
+    aggregationFunction: AggregationFunction,
+    subWindowRange: number,
+    subWindowStep: number,
+) {
+return `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <subquery1_output> AS
-SELECT (AVG(?value) AS ?avgWearableX)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 60000 STEP 30000]
+SELECT ${buildSubQuerySelectClause(aggregationFunction, "WearableX")}
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/wearableX> {
         ?s1 saref:hasValue ?value .
@@ -24,15 +42,21 @@ WHERE {
     }
 }
 `;
+}
 
-const SUB_QUERY_2 = `
+function buildSubQuery2(
+    aggregationFunction: AggregationFunction,
+    subWindowRange: number,
+    subWindowStep: number,
+) {
+return `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <subquery2_output> AS
-SELECT (AVG(?value) AS ?avgSmartphoneX)
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 60000 STEP 30000]
+SELECT ${buildSubQuerySelectClause(aggregationFunction, "SmartphoneX")}
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
     WINDOW <mqtt://localhost:1883/smartphoneX> {
         ?s2 saref:hasValue ?value .
@@ -40,16 +64,22 @@ WHERE {
     }
 }
 `;
+}
 
-const SUPER_QUERY = `
+function buildSuperQuery(
+    aggregationFunction: AggregationFunction,
+    outputWindowRange: number,
+    outputWindowStep: number,
+) {
+return `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
 PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <sensor_averages> AS
-SELECT (AVG(?value) AS ?avgValue) (COUNT(?value) AS ?countValue)
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
+SELECT ${buildOutputSelectClause(aggregationFunction)}
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
 WHERE {
     {
         WINDOW <mqtt://localhost:1883/wearableX> {
@@ -64,6 +94,7 @@ WHERE {
     }
 }
 `;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -220,6 +251,28 @@ async function subscribeEngineToMQTT(
 async function NaiveDistributedApproachOrchestrator(): Promise<void> {
     const log = initLog("naive_distributed_approach_log.csv");
     const logLatency = initLatencyLog("naive_distributed_latency_log.csv");
+    const aggregationFunction = getConfiguredAggregation();
+    const subWindowRange = getSubWindowRange();
+    const subWindowStep = getSubWindowStep();
+    const outputWindowRange = getOutputWindowRange();
+    const outputWindowStep = getOutputWindowStep();
+    const sessionId = getSessionId();
+    const resultTopic = getResultTopic("naive_distributed/output");
+    const subQuery1 = buildSubQuery1(
+        aggregationFunction,
+        subWindowRange,
+        subWindowStep,
+    );
+    const subQuery2 = buildSubQuery2(
+        aggregationFunction,
+        subWindowRange,
+        subWindowStep,
+    );
+    const superQuery = buildSuperQuery(
+        aggregationFunction,
+        outputWindowRange,
+        outputWindowStep,
+    );
 
     const queryRegisteredTime = Date.now();
     log("naive_distributed_query_registered");
@@ -235,9 +288,9 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
     };
 
     // ── Three independent RSP engines — no result reuse ──────────────────────
-    const subEngine1 = new RSPEngine(SUB_QUERY_1);
-    const subEngine2 = new RSPEngine(SUB_QUERY_2);
-    const superEngine = new RSPEngine(SUPER_QUERY);
+    const subEngine1 = new RSPEngine(subQuery1);
+    const subEngine2 = new RSPEngine(subQuery2);
+    const superEngine = new RSPEngine(superQuery);
 
     const subEmitter1 = subEngine1.register();
     const subEmitter2 = subEngine2.register();
@@ -254,8 +307,8 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
     });
 
     // ── Super-query result handler ────────────────────────────────────────────
-    const windowRange = 120000; // ms  (RANGE 120000)
-    const windowStep  =  60000; // ms  (STEP   60000)
+    const windowRange = outputWindowRange;
+    const windowStep  = outputWindowStep;
     let windowCount = 0;
 
     superEmitter.on("RStream", (object: any) => {
@@ -273,28 +326,41 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
             : [object.bindings];
 
         for (const binding of bindings) {
-            let avgValue: string | null = null;
+            let resultValue: string | null = null;
 
             if (binding instanceof Map) {
-                avgValue = (binding as Map<string, any>).get("?avgValue")?.value ?? null;
+                resultValue =
+                    (binding as Map<string, any>).get("?resultValue")?.value ??
+                    (binding as Map<string, any>).get("?avgValue")?.value ??
+                    null;
             } else if (binding.entries) {
                 try {
                     if (typeof binding.entries.get === "function") {
-                        avgValue = binding.entries.get("avgValue")?.value ?? null;
+                        resultValue =
+                            binding.entries.get("resultValue")?.value ??
+                            binding.entries.get("avgValue")?.value ??
+                            null;
                     } else {
-                        avgValue = (binding.entries as any).avgValue?.value ?? null;
+                        resultValue =
+                            (binding.entries as any).resultValue?.value ??
+                            (binding.entries as any).avgValue?.value ??
+                            null;
                     }
                 } catch (_) { /* ignore */ }
             } else {
                 try {
-                    avgValue = (binding as any).avgValue?.value ?? null;
+                    resultValue =
+                        (binding as any).resultValue?.value ??
+                        (binding as any).avgValue?.value ??
+                        null;
                 } catch (_) { /* ignore */ }
             }
 
-            if (!avgValue) {
-                console.log("DEBUG: Could not parse avgValue from binding:", binding);
+            if (!resultValue) {
+                console.log("DEBUG: Could not parse resultValue from binding:", binding);
                 continue;
             }
+            const resolvedResultValue = resultValue;
 
             windowCount++;
             const resultTime = Date.now();
@@ -304,9 +370,9 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
 
             log(`LATENCY: Window ${windowCount}:`);
             log(`  - From query registration: ${latency}ms (expected close: ${expectedClose}, result: ${resultTime})`);
-            log(`Successfully published unified cross-sensor avgValue: ${avgValue}`);
+            log(`Successfully published unified cross-sensor resultValue: ${resolvedResultValue}`);
             console.log(
-                `Window ${windowCount}: avgValue = ${avgValue}, latency from registration = ${latency}ms`,
+                `Window ${windowCount}: resultValue = ${resolvedResultValue}, latency from registration = ${latency}ms`,
             );
 
             // Write to per-window latency CSV (same format as other approaches)
@@ -317,7 +383,7 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
                 expectedClose,
                 lastObsReceivedTime  || resultTime,
                 resultTime,
-                avgValue,
+                resolvedResultValue,
             );
 
             // Publish result to the naive_distributed/output MQTT topic so that
@@ -329,16 +395,21 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
             });
             pubClient.on("connect", () => {
                 pubClient.publish(
-                    "naive_distributed/output",
+                    resultTopic,
                     JSON.stringify({
-                        avgValue,
+                        ...buildBenchmarkResultPayload(
+                            "naive_distributed",
+                            aggregationFunction,
+                            sessionId,
+                            Number.parseFloat(resolvedResultValue),
+                            windowCount,
+                        ),
                         windowNumber: windowCount,
-                        timestamp: resultTime,
                     }),
                     { qos: 1 },
                     (err: any) => {
                         if (err) {
-                            log(`Error publishing to naive_distributed/output: ${err}`);
+                            log(`Error publishing to ${resultTopic}: ${err}`);
                         }
                         pubClient.end();
                     },
@@ -349,13 +420,13 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
 
     // ── Subscribe all three engines directly to raw MQTT streams ─────────────
     log("Starting SubQuery 1 engine (wearableX, direct MQTT)...");
-    await subscribeEngineToMQTT(subEngine1, SUB_QUERY_1, log, onData);
+    await subscribeEngineToMQTT(subEngine1, subQuery1, log, onData);
 
     log("Starting SubQuery 2 engine (smartphoneX, direct MQTT)...");
-    await subscribeEngineToMQTT(subEngine2, SUB_QUERY_2, log, onData);
+    await subscribeEngineToMQTT(subEngine2, subQuery2, log, onData);
 
     log("Starting super-query engine (wearableX + smartphoneX, direct MQTT, no result reuse)...");
-    await subscribeEngineToMQTT(superEngine, SUPER_QUERY, log, onData);
+    await subscribeEngineToMQTT(superEngine, superQuery, log, onData);
 
     log("All three RSP engines started. Naive Distributed Execution running.");
     console.log(

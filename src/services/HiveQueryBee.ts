@@ -21,6 +21,7 @@ export class HiveQueryBee {
         this.query = query;
         this.process = fork(beeWorkerPath, [], {
             env: {
+                ...process.env,
                 QUERY: query,
                 TOPIC: topic,
                 OPERATOR_TYPE: operator,

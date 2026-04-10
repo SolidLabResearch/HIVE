@@ -7,6 +7,12 @@ import { IStreamQueryOperator } from "../../util/Interfaces";
 import { CSVLogger } from "../../util/logger/CSVLogger";
 import { hash_string_md5, storeToString } from "../../util/Util";
 import { R2ROperator } from "./r2r";
+import {
+  AggregationFunction,
+  buildBenchmarkResultPayload,
+  getResultTopic,
+  getSessionId,
+} from "../../util/runtimeConfig";
 const N3 = require("n3");
 
 type TopicChunk = {
@@ -57,7 +63,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.parser = new RSPQLParser();
     this.chunkGCD = 0;
     this.logger = new CSVLogger("streaming_query_chunk_aggregator_log.csv");
-    this.sessionId = process.env.SESSION_ID || Date.now().toString(36);
+    this.sessionId = getSessionId();
     this.initializeLatencyLogging();
     this.queryRegisteredTime = Date.now(); // Record when query is registered
   }
@@ -289,6 +295,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
     const outputQueryWidth = outputQueryParsed.s2r[0].width;
     const outputQuerySlide = outputQueryParsed.s2r[0].slide;
+    const resultTopic = getResultTopic("output");
+    this.windowRange = outputQueryWidth;
+    this.windowSlide = outputQuerySlide;
     if (outputQueryWidth <= 0 || outputQuerySlide <= 0) {
       console.error(
         `Invalid width or slide in output query: ${this.outputQuery}`,
@@ -654,18 +663,30 @@ For example, the allResults object might look like this:
         // Publish the output query event to the MQTT broker
         const rsp_client = mqtt.connect(this.mqttBroker);
         rsp_client.on("connect", () => {
-          const outputTopic = `output`;
-          this.logger.log(`calculated result ${outputQueryEvent}`);
+          const resultTopic = getResultTopic("output");
+          const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
+          const payload = useBenchmarkPayload
+            ? JSON.stringify(
+                buildBenchmarkResultPayload(
+                  "chunked",
+                  detectAggregationFunction as AggregationFunction,
+                  this.sessionId,
+                  Number.parseFloat(resultValue),
+                  this.windowCount,
+                ),
+              )
+            : outputQueryEvent;
+          this.logger.log(`calculated result ${payload}`);
 
-          rsp_client.publish(outputTopic, outputQueryEvent, (err: any) => {
+          rsp_client.publish(resultTopic, payload, (err: any) => {
             if (err) {
               console.error(
-                `Error publishing output query event to topic ${outputTopic}:`,
+                `Error publishing output query event to topic ${resultTopic}:`,
                 err,
               );
             } else {
               this.logger.log(
-                `Output query event published to topic ${outputTopic}`,
+                `Output query event published to topic ${resultTopic}`,
               );
             }
           });
@@ -1132,9 +1153,9 @@ For example, the allResults object might look like this:
   publishCombinedResults(finalResult: any): void {
     const rsp_client = mqtt.connect(this.mqttBroker);
     rsp_client.on("connect", () => {
-      // Publish to chunked/output topic to differentiate from other approaches
+      const resultTopic = getResultTopic("chunked/output");
       rsp_client.publish(
-        "chunked/output",
+        resultTopic,
         JSON.stringify(finalResult),
         { qos: 1 },
         (error) => {

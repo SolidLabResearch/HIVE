@@ -111,13 +111,6 @@ const CONFIG = {
   dataPath: resolveDataPath(pattern),
 };
 
-const OUTPUT_TOPICS = {
-  fetching: ["client_operation_output"],
-  naive_distributed: ["naive_distributed/output"],
-  approximation: ["approximation/output"],
-  chunked: ["chunked/output", "output"],
-};
-
 const ORCHESTRATORS = {
   fetching: path.join(
     PROJECT_ROOT,
@@ -143,6 +136,10 @@ const APPROACHES = [
   "approximation",
   "chunked",
 ];
+
+function buildResultTopic(approachName, sessionId) {
+  return `benchmark/results/${approachName}/${sessionId}`;
+}
 
 class UnifiedBenchmark {
   constructor() {
@@ -334,7 +331,8 @@ class UnifiedBenchmark {
     );
     this.log(`${"=".repeat(60)}`);
 
-    const topics = OUTPUT_TOPICS[approachName];
+    const sessionId = `${approachName}-${iterationNum}-${Date.now()}`;
+    const topics = [buildResultTopic(approachName, sessionId)];
 
     // Ensure persistent MQTT client is connected (reused across all iterations)
     let staleMessagesDrained = 0;
@@ -347,7 +345,7 @@ class UnifiedBenchmark {
 
     // Subscribe to drain topics
     this.log(`MQTT drain phase starting...`);
-    const drainTopics = [...topics, "chunked/#", "wearableX", "smartphoneX"];
+    const drainTopics = [...topics];
     for (const topic of drainTopics) {
       this.mqttClient.subscribe(topic, { qos: 0 });
     }
@@ -383,19 +381,7 @@ class UnifiedBenchmark {
 
       const finish = () => {
         this.mqttClient.removeListener("message", drainHandler);
-        // Clear retained messages on all relevant topics
-        for (const topic of topics) {
-          this.mqttClient.publish(topic, "", { retain: true });
-        }
-        this.mqttClient.publish("output", "", { retain: true });
-        this.mqttClient.publish("wearableX", "", { retain: true });
-        this.mqttClient.publish("smartphoneX", "", { retain: true });
-        // Unsubscribe from drain-only topics so they don't interfere
-        // with result collection during the actual run
-        this.mqttClient.unsubscribe("chunked/#");
-        this.mqttClient.unsubscribe("wearableX");
-        this.mqttClient.unsubscribe("smartphoneX");
-        // Re-subscribe to output topics with proper QoS for result collection
+        // Re-subscribe to the dedicated result topic with proper QoS
         for (const topic of topics) {
           this.mqttClient.subscribe(topic, { qos: 1 });
         }
@@ -520,7 +506,8 @@ class UnifiedBenchmark {
         SUB_WINDOW_STEP: CONFIG.subWindowStep,
         WEARABLE_FREQUENCY: CONFIG.wearableFrequency,
         LOG_DISABLE_FILE_OUTPUT: process.env.LOG_DISABLE_FILE_OUTPUT ?? "1",
-        SESSION_ID: `${approachName}-${iterationNum}-${Date.now()}`,
+        RESULT_TOPIC: topics[0],
+        SESSION_ID: sessionId,
       };
 
       const orchestratorProc = spawn("node", [orchestratorPath], {

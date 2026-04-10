@@ -5,6 +5,12 @@ import { ExtractedQuery, QueryMap } from "../../util/Types";
 import { CSVLogger } from "../../util/logger/CSVLogger";
 import mqtt from "mqtt";
 import fs from "fs";
+import {
+  AggregationFunction,
+  buildBenchmarkResultPayload,
+  getResultTopic,
+  getSessionId,
+} from "../../util/runtimeConfig";
 
 /**
  * Configuration interface for inactivity detection
@@ -39,6 +45,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private windowSlide: number = 60000; // 60 seconds based on STEP 60000
   private firstDataReceivedTime: number = 0; // Track when first data arrives (wall-clock)
   private lastDataReceivedTime: number = 0; // Track when last data was received
+  private sessionId: string = getSessionId();
 
   /**
    * The constructor class with optional inactivity configuration.
@@ -285,6 +292,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     const outputQueryParsed = this.parser.parse(this.outputQuery);
     const outputQueryWidth = outputQueryParsed.s2r[0].width;
     const outputQuerySlide = outputQueryParsed.s2r[0].slide;
+    const resultTopic = getResultTopic("approximation/output");
+    this.windowRange = outputQueryWidth;
+    this.windowSlide = outputQuerySlide;
 
     // Extract aggregation type from output query
     const outputAggregationMatch =
@@ -775,12 +785,15 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
               // Publish unified result similar to other approaches
               const finalResult = {
+                approach: "approximation",
+                aggregationType: outputAggregationType,
+                sessionId: this.sessionId,
                 timestamp: now,
                 window: { start: windowStartGlobal, end: now },
                 unifiedResult: unifiedResult,
+                value: unifiedResult,
                 unifiedAverage:
                   outputAggregationType === "AVG" ? unifiedResult : undefined, // Keep for backward compatibility
-                aggregationType: outputAggregationType,
                 individualTopics: individualTopicsResults,
                 metadata: {
                   validBuffers: totalValidBuffers,
@@ -817,8 +830,17 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                 // Publish with QoS 1 and error handling
 
                 rsp_client.publish(
-                  "approximation/output",
-                  JSON.stringify(finalResult),
+                  resultTopic,
+                  JSON.stringify({
+                    ...finalResult,
+                    ...buildBenchmarkResultPayload(
+                      "approximation",
+                      outputAggregationType as AggregationFunction,
+                      this.sessionId,
+                      unifiedResult,
+                      this.windowCount,
+                    ),
+                  }),
                   { qos: 1 },
                   (error) => {
                     if (error) {
