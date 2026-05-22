@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 const LOGS_DIR = 'logs/approximation-patterns';
 const APPROACH_CMD = ['node', ['dist/approaches/StreamingQueryApproximationApproachOrchestrator.js']];
@@ -17,7 +18,11 @@ if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
 async function testSinglePattern() {
   console.log('Testing single pattern with timeout...');
   
-  const env = { ...process.env, DATA_PATH: 'approximation_test/challenging/exponential_growth' };
+  const replayEnv = createBenchmarkReplayRunEnv(process.env);
+  const env = replayEnv.withBenchmarkReplayEnv({
+    ...process.env,
+    DATA_PATH: 'approximation_test/challenging/exponential_growth',
+  });
 
   const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { 
     stdio: 'inherit',

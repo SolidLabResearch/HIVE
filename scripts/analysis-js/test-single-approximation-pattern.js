@@ -1,5 +1,6 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 console.log('Testing single approximation pattern...');
 
@@ -10,10 +11,11 @@ const TIMEOUT_MS = 90 * 1000; // 90 seconds to allow windows to close
 async function testSinglePattern() {
   console.log('Starting single pattern test...');
   
-  const env = { 
+  const replayEnv = createBenchmarkReplayRunEnv(process.env);
+  const env = replayEnv.withBenchmarkReplayEnv({
     ...process.env, 
     DATA_PATH: 'approximation_test/challenging/exponential_growth' 
-  };
+  });
   
   console.log('Starting approach...');
   const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { 

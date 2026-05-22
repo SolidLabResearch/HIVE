@@ -1,0 +1,2 @@
+iteration,registered_query_ts,first_result_ts,latency_ms,result_value,avg_cpu_percent,avg_heapUsedMB
+1,1779449068220,,,,0.23,46.71

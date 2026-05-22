@@ -11,6 +11,7 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
+const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
 
 const APPROACHES = [
   {
@@ -73,6 +74,7 @@ const LOGS_DIR = 'experiments/real-data-comparison/logs';
 class RealDataComparisonRunner {
   constructor() {
     this.results = [];
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
     if (!fs.existsSync(LOGS_DIR)) {
       fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -108,11 +110,11 @@ class RealDataComparisonRunner {
 
       // Set environment to use the base smartphone/wearable data
       // The DATA_PATH should be empty or just the base directory name
-      const env = {
+      const env = this.replayEnv.withBenchmarkReplayEnv({
         ...process.env,
         DATA_PATH: '', // Uses default which points to the base data directories
         LOG_PATH: logDir
-      };
+      });
 
       const startTime = Date.now();
 

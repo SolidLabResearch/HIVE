@@ -22,6 +22,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { attachReplayMetadata } = require('../utils/benchmarkResultMetadata');
 
 class AllApproachesComparisonRunner {
     constructor() {
@@ -273,7 +274,7 @@ class AllApproachesComparisonRunner {
 
         // Save summary
         const summaryPath = './logs/frequency-comparison-all-approaches-summary.json';
-        const summary = {
+        const summary = attachReplayMetadata({
             timestamp: new Date().toISOString(),
             frequencies: this.frequencies,
             approaches: this.approaches.map(a => a.name),
@@ -283,7 +284,7 @@ class AllApproachesComparisonRunner {
                 successful: successful.length,
                 failed: failed.length
             }
-        };
+        });
 
         fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
         console.log(`\n📄 Summary saved to: ${summaryPath}`);

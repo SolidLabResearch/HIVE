@@ -21,11 +21,13 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 
 class PatternComparisonRunner {
   constructor(iterations = 35) {
     this.iterations = iterations;
     this.approaches = ["fetching", "approximation", "chunked"];
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
     // Exponential patterns
     this.exponentialPatterns = [
@@ -116,11 +118,11 @@ class PatternComparisonRunner {
       return { success: false, error: "Data not found" };
     }
 
-    const env = {
+    const env = this.replayEnv.withBenchmarkReplayEnv({
       ...process.env,
       DATA_PATH: dataPath,
       LOG_PATH: logDir,
-    };
+    });
 
     return new Promise((resolve) => {
       const startTime = Date.now();

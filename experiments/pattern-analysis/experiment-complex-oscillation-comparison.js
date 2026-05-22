@@ -9,6 +9,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
 
 const FREQUENCIES = [0.1, 0.5, 1.0]; // Only frequencies that support complex oscillation
 const OSCILLATION_TYPE = 'complex_oscillation';
@@ -19,6 +20,7 @@ class ComplexOscillationComparisonExperiment {
         this.oscillationType = OSCILLATION_TYPE;
         this.logDir = './logs/complex-oscillation-comparison';
         this.dataDir = './src/streamer/data/frequency_comparison';
+        this.replayEnv = createBenchmarkReplayRunEnv(process.env);
         
         // Ensure log directory exists
         if (!fs.existsSync(this.logDir)) {
@@ -35,10 +37,10 @@ class ComplexOscillationComparisonExperiment {
         console.log(`   Nyquist ratio: ${(frequency / 2.0).toFixed(2)}x`);
         
         // Set DATA_PATH environment variable
-        const env = { 
+        const env = this.replayEnv.withBenchmarkReplayEnv({ 
             ...process.env, 
             DATA_PATH: `frequency_comparison/${datasetName}`
-        };
+        });
         
         return new Promise((resolve, reject) => {
             // Create individual log directory

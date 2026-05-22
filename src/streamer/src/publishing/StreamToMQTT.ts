@@ -25,6 +25,10 @@ export class StreamToMQTT {
     private frequency: number;
     private successfulPublishes: number = 0;
     private failedPublishes: number = 0;
+    private deterministicEventTime: boolean = process.env.STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME === "1";
+    private benchmarkStartTime: number = Number(process.env.STREAMING_QUERY_HIVE_BENCHMARK_START_TIME || Date.now());
+    private datasetStartTime: number | null = null;
+    private debugChunksEnabled: boolean = process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
 
     /**
      *
@@ -205,11 +209,12 @@ export class StreamToMQTT {
 
             // Remove old timestamp
             const old = this.store.getQuads(node, namedNode('https://saref.etsi.org/core/hasTimestamp'), null, null);
+            const originalTimestamp = old[0]?.object?.value;
             this.store.removeQuads(old);
 
             // Add new timestamp
-            const now = new Date().toISOString();
-            this.store.addQuad(node, namedNode('https://saref.etsi.org/core/hasTimestamp'), literal(now));
+            const emittedTimestamp = this.computeEmittedTimestamp(originalTimestamp);
+            this.store.addQuad(node, namedNode('https://saref.etsi.org/core/hasTimestamp'), literal(emittedTimestamp));
 
             // Extract quads for this observation
             const quads = this.store.getQuads(node, null, null, null);
@@ -223,6 +228,9 @@ export class StreamToMQTT {
                         console.error('Error publishing observation with QoS 2:', err);
                     } else {
                         this.successfulPublishes++;
+                        if (this.debugChunksEnabled) {
+                            console.log(`[DEBUG_CHUNKS] publisher topic=${this.topic_to_publish} subject=${id} originalTs=${originalTimestamp || "none"} emittedTs=${emittedTimestamp}`);
+                        }
                         console.log(`Published observation: ${id} at ${this.file_location} with QoS 2`);
                     }
                 });
@@ -246,5 +254,20 @@ export class StreamToMQTT {
         return new Promise((resolve, reject) => {
             writer.end((err: any, result: string) => err ? reject(err) : resolve(result));
         });
+    }
+
+    private computeEmittedTimestamp(originalTimestamp: string | undefined): string {
+        if (!this.deterministicEventTime || !originalTimestamp) {
+            return new Date().toISOString();
+        }
+        const originalEpoch = Date.parse(originalTimestamp);
+        if (!Number.isFinite(originalEpoch)) {
+            return new Date().toISOString();
+        }
+        if (this.datasetStartTime === null) {
+            this.datasetStartTime = originalEpoch;
+        }
+        const offset = originalEpoch - this.datasetStartTime;
+        return new Date(this.benchmarkStartTime + offset).toISOString();
     }
 }

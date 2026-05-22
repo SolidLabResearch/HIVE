@@ -342,11 +342,20 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             aggregation: Aggregation,
             windowNumber: number,
         ): number => {
-            const anyOperator = operator as any;
-            anyOperator.chunkGCD = chunkSize;
-            const plan = anyOperator.buildLogicalWindowPlan(windowNumber, windowSlide, windowRange, topicChunks.size);
+            const chunksPerStep = windowSlide / chunkSize;
+            const chunksPerFullWindow = windowRange / chunkSize;
+            const chunkEndExclusive = windowNumber * chunksPerStep;
+            const requiredChunksPerTopic = windowNumber === 1
+                ? chunksPerStep
+                : Math.min(chunksPerFullWindow, chunkEndExclusive);
+            const chunkStartIndex = Math.max(0, chunkEndExclusive - requiredChunksPerTopic);
+
             const selectedChunks = Array.from(topicChunks.values()).flatMap((chunks) =>
-                anyOperator.selectChunksForLogicalWindow(chunks, plan),
+                chunks.filter(
+                    (chunk) =>
+                        chunk.logicalChunkIndex >= chunkStartIndex &&
+                        chunk.logicalChunkIndex < chunkEndExclusive,
+                ),
             );
 
             if (aggregation === 'AVG') {
@@ -383,7 +392,6 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                 ['wearableX', buildTopicChunks(topicSeries[0], aggregation, rateHz, 'wearableX', replayMultiplier, channelSkewMs)],
                 ['smartphoneX', buildTopicChunks(topicSeries[1], aggregation, rateHz, 'smartphoneX', replayMultiplier, channelSkewMs)],
             ]);
-
             const errors: number[] = [];
             for (let windowNumber = 1; windowNumber <= totalWindows; windowNumber++) {
                 const fetchingValue = computeFetchingBaseline(topicSeries, aggregation, windowNumber, rateHz);
@@ -418,5 +426,105 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                 );
             },
         );
+    });
+
+    describe('logical window identity buffering', () => {
+        test('should only mark complete when all expected subqueries for same window are present', () => {
+            const chunksByWindow = new Map();
+            const expectedSubqueryIds = ['subA', 'subB'];
+            const window = {
+                windowName: 'https://rsp.js/w1',
+                start: 1000,
+                end: 2000,
+                range: 1000,
+                step: 1000,
+                semantics: '[start,end)' as const,
+            };
+
+            const firstOutOfOrder = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'q1',
+                subqueryId: 'subB',
+                window,
+                chunkId: 'q1:w1:1000:2000:subB',
+                value: 8,
+                count: 4,
+                rdfPayload: '<x> <https://saref.etsi.org/core/hasValue> "8"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+            expect(firstOutOfOrder.isComplete).toBe(false);
+            expect(firstOutOfOrder.missingSubqueryIds).toEqual(['subA']);
+
+            const duplicate = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'q1',
+                subqueryId: 'subB',
+                window,
+                chunkId: 'q1:w1:1000:2000:subB',
+                value: 8,
+                count: 4,
+                rdfPayload: '<x> <https://saref.etsi.org/core/hasValue> "8"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+            expect(duplicate.isComplete).toBe(false);
+            expect(duplicate.missingSubqueryIds).toEqual(['subA']);
+
+            const complete = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'q1',
+                subqueryId: 'subA',
+                window,
+                chunkId: 'q1:w1:1000:2000:subA',
+                value: 10,
+                count: 5,
+                rdfPayload: '<y> <https://saref.etsi.org/core/hasValue> "10"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+            expect(complete.isComplete).toBe(true);
+            expect(complete.missingSubqueryIds).toEqual([]);
+
+            const missingWindow = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'q1',
+                subqueryId: 'subA',
+                window: { ...window, start: 2000, end: 3000 },
+                chunkId: 'q1:w1:2000:3000:subA',
+                value: 11,
+                count: 6,
+                rdfPayload: '<z> <https://saref.etsi.org/core/hasValue> "11"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+            expect(missingWindow.isComplete).toBe(false);
+            expect(missingWindow.missingSubqueryIds).toEqual(['subB']);
+        });
+
+        test('prints first 5 chunkGroupIds for 1Hz and 16Hz with deterministic event-time windows', () => {
+            const queryId = 'bench-q';
+            const windowName = 'https://rsp.js/w1';
+            const range = 60000;
+            const step = 30000;
+            const benchmarkStart = Date.parse('2026-01-01T00:00:00.000Z');
+
+            const buildChunkGroupIds = (rateHz: number): string[] => {
+                const intervalMs = Math.floor(1000 / rateHz);
+                const ids: string[] = [];
+                let emitted = 0;
+                let t = benchmarkStart;
+
+                while (ids.length < 5) {
+                    const end = Math.floor(t / step) * step;
+                    const start = end - range;
+                    if (end > benchmarkStart && (ids.length === 0 || ids[ids.length - 1] !== `${queryId}:${windowName}:${start}:${end}`)) {
+                        ids.push(`${queryId}:${windowName}:${start}:${end}`);
+                    }
+                    emitted++;
+                    t = benchmarkStart + emitted * intervalMs;
+                }
+                return ids;
+            };
+
+            const ids1Hz = buildChunkGroupIds(1);
+            const ids16Hz = buildChunkGroupIds(16);
+
+            // Integration-style diagnostic output for manual inspection.
+            console.log(`[chunkGroupIds][1Hz] ${ids1Hz.join(',')}`);
+            console.log(`[chunkGroupIds][16Hz] ${ids16Hz.join(',')}`);
+
+            expect(ids1Hz).toHaveLength(5);
+            expect(ids16Hz).toHaveLength(5);
+            expect(ids1Hz).toEqual(ids16Hz);
+        });
     });
 });

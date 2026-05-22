@@ -27,8 +27,14 @@ const fs = require("fs");
 const path = require("path");
 const mqtt = require("mqtt");
 const { parse } = require("csv-parse/sync");
+const { createBenchmarkReplayRunEnv } = require("./utils/benchmarkReplayEnv");
+const {
+  getReplayMetadata,
+  attachReplayMetadata,
+} = require("./utils/benchmarkResultMetadata");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
+const replayEnv = createBenchmarkReplayRunEnv(process.env);
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -171,6 +177,7 @@ class UnifiedBenchmark {
       config: CONFIG,
       byIteration: {},
       summary: {},
+      replayMetadata: getReplayMetadata(process.env),
     };
     this.processes = [];
     this.mqttClient = null;
@@ -497,7 +504,7 @@ class UnifiedBenchmark {
         return;
       }
 
-      const env = {
+      const env = replayEnv.withBenchmarkReplayEnv({
         ...process.env,
         DATA_PATH: CONFIG.dataPath,
         AGGREGATION_FUNC: CONFIG.aggregationFunc,
@@ -508,7 +515,7 @@ class UnifiedBenchmark {
         LOG_DISABLE_FILE_OUTPUT: process.env.LOG_DISABLE_FILE_OUTPUT ?? "1",
         RESULT_TOPIC: topics[0],
         SESSION_ID: sessionId,
-      };
+      });
 
       const orchestratorProc = spawn("node", [orchestratorPath], {
         stdio: ["inherit", "pipe", "pipe"],
@@ -667,10 +674,10 @@ class UnifiedBenchmark {
       this.log(`ITERATION ${iter}/${CONFIG.iterations}`);
       this.log(`${"─".repeat(70)}`);
 
-      const iterationResults = {
+      const iterationResults = attachReplayMetadata({
         timestamp: new Date().toISOString(),
         results: {},
-      };
+      });
 
       for (const approach of APPROACHES) {
         try {

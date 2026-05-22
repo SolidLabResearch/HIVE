@@ -8,6 +8,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
 
 const FREQUENCIES = [0.1, 0.5, 1.0, 1.5, 2.0];
 const OSCILLATION_TYPES = ['simple_oscillation', 'variable_amplitude', 'complex_oscillation'];
@@ -17,6 +18,7 @@ class FrequencyComparisonApproximationExperiment {
         this.frequencies = [0.1, 0.5, 1.0, 1.5, 2.0];
         this.logDir = './logs/frequency-comparison-approximation';
         this.dataDir = './src/streamer/data/frequency_comparison';
+        this.replayEnv = createBenchmarkReplayRunEnv(process.env);
         
         // Ensure log directory exists
         if (!fs.existsSync(this.logDir)) {
@@ -34,10 +36,10 @@ class FrequencyComparisonApproximationExperiment {
         console.log(`   Nyquist ratio: ${(frequency / 2.0).toFixed(2)}x`);
         
         // Set DATA_PATH environment variable
-        const env = { 
+        const env = this.replayEnv.withBenchmarkReplayEnv({ 
             ...process.env, 
             DATA_PATH: `frequency_comparison/${datasetName}`
-        };
+        });
         
         return new Promise((resolve, reject) => {
             const logFile = path.join(this.logDir, `${datasetName}.log`);

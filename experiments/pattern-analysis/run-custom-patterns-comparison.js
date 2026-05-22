@@ -25,11 +25,13 @@
 const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 
 class CustomPatternComparisonRunner {
   constructor(iterations = 35) {
     this.iterations = iterations;
     this.approaches = ["fetching", "naive_distributed", "approximation", "chunked"];
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
     // Custom patterns matching the table specification
     this.patterns = [
@@ -129,11 +131,11 @@ class CustomPatternComparisonRunner {
       return { success: false, error: "Data not found" };
     }
 
-    const env = {
+    const env = this.replayEnv.withBenchmarkReplayEnv({
       ...process.env,
       DATA_PATH: dataPath,
       LOG_PATH: logDir,
-    };
+    });
 
     return new Promise((resolve) => {
       const startTime = Date.now();

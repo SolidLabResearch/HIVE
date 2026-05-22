@@ -30,8 +30,10 @@ const { spawn, execSync } = require("child_process");
 const fs   = require("fs");
 const path = require("path");
 const mqtt = require("mqtt");
+const { createBenchmarkReplayRunEnv } = require("./utils/benchmarkReplayEnv");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
+const replayEnv = createBenchmarkReplayRunEnv(process.env);
 const RESULTS_DIR  = path.join(__dirname, "benchmark-results");
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -207,9 +209,9 @@ async function observeCondition(condition) {
       if (v !== null && !isNaN(v)) { scoutBee.addDataPoint(Date.now(), v, _t); pts++; }
     });
 
-    const env = { ...process.env, DATA_PATH: dataPath || ".", AGGREGATION_FUNC: condition.agg,
+    const env = replayEnv.withBenchmarkReplayEnv({ ...process.env, DATA_PATH: dataPath || ".", AGGREGATION_FUNC: condition.agg,
                   PUBLISH_MODE: "uniform", SUB_WINDOW_RANGE: "60000", SUB_WINDOW_STEP: "30000",
-                  WEARABLE_FREQUENCY: condition.wearableFreq, SESSION_ID: `routing-${Date.now()}` };
+                  WEARABLE_FREQUENCY: condition.wearableFreq, SESSION_ID: `routing-${Date.now()}` });
     publisherProc = spawn("node", [path.join(PROJECT_ROOT, "dist/streamer/src/publish.js")],
                           { stdio: ["inherit", "pipe", "pipe"], cwd: PROJECT_ROOT, env });
 

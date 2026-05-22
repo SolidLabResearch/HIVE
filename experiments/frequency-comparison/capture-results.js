@@ -16,6 +16,9 @@
 const mqtt = require("mqtt");
 const fs = require("fs");
 const path = require("path");
+const {
+  getReplayMetadata,
+} = require("../utils/benchmarkResultMetadata");
 
 class ResultsCapture {
   constructor(approach, frequency, outputDir) {
@@ -172,6 +175,7 @@ class ResultsCapture {
   }
 
   saveMetadata() {
+    const replayMetadata = getReplayMetadata(process.env);
     const metadata = {
       approach: this.approach,
       frequency: this.frequency,
@@ -183,6 +187,7 @@ class ResultsCapture {
         : null,
       resultTopic: this.resultTopic,
       captureDate: new Date().toISOString(),
+      replayMetadata,
     };
 
     fs.writeFileSync(this.metadataFile, JSON.stringify(metadata, null, 2));

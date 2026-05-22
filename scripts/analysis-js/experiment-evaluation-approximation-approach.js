@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 const RUNS = 1;
 const LOGS_DIR = 'logs/approximation-approach';
@@ -25,7 +26,10 @@ async function runOnce(iter, patternName = null, dataPath = null) {
   console.log(`--- ${runLabel} ---`);
 
   // Set environment variable if using custom data path
-  const env = dataPath ? { ...process.env, DATA_PATH: dataPath } : process.env;
+  const replayEnv = createBenchmarkReplayRunEnv(process.env);
+  const env = replayEnv.withBenchmarkReplayEnv(
+    dataPath ? { ...process.env, DATA_PATH: dataPath } : process.env,
+  );
 
   // Start the approach process
   const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { 

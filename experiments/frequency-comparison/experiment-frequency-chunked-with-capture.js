@@ -11,11 +11,13 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
 
 class FrequencyComparisonChunkedWithCapture {
     constructor() {
         this.logDir = './logs/frequency-comparison-chunked';
         this.dataDir = './src/streamer/data/frequency_comparison';
+        this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
         if (!fs.existsSync(this.logDir)) {
             fs.mkdirSync(this.logDir, { recursive: true });
@@ -31,10 +33,10 @@ class FrequencyComparisonChunkedWithCapture {
         console.log(`   Dataset: ${datasetName}`);
         console.log(`   Nyquist ratio: ${(frequency / 2.0).toFixed(2)}x`);
 
-        const env = {
+        const env = this.replayEnv.withBenchmarkReplayEnv({
             ...process.env,
             DATA_PATH: `frequency_comparison/${datasetName}`
-        };
+        });
 
         return new Promise((resolve, reject) => {
             const testLogDir = path.join(this.logDir, datasetName, 'iteration1');

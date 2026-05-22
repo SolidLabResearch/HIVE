@@ -1,6 +1,7 @@
 const { spawn, execSync, } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 const RUNS = 1;
 const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
@@ -45,18 +46,20 @@ async function runOnce(iteration) {
     console.log(`--- Multi-Approach Run ${iteration} ---`);
     killLingeringProcesses(); // Ensure no lingering processes before starting
 
+    const replayEnv = createBenchmarkReplayRunEnv(process.env);
+    const runEnv = replayEnv.withBenchmarkReplayEnv(process.env);
     const processes = [];
 
     for (const approach of APPROACHES) {
         console.log(`Starting approach: ${approach.name}`);
-        const process = spawn(approach.cmd[0], approach.cmd[1], { stdio: 'inherit' });
+        const process = spawn(approach.cmd[0], approach.cmd[1], { stdio: 'inherit', env: runEnv });
         processes.push({ name: approach.name, process });
     }
 
     await new Promise(res => setTimeout(res, 5000)); // To ensure the subscriber is ready
 
     console.log('Starting the publisher...');
-    const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD[1], { stdio: 'inherit' });
+    const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD[1], { stdio: 'inherit', env: runEnv });
 
     const timeout = setTimeout(() => {
         console.log('Timeout reached, killing processes...');
@@ -107,4 +110,3 @@ async function runOnce(iteration) {
     }
     console.log('All Multi-Approach runs complete.');
 })();
-

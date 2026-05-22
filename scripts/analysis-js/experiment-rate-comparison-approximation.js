@@ -8,6 +8,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 const LOGS_DIR = 'logs/rate-comparison-approximation';
 const DATA_BASE_PATH = 'src/streamer/data/rate_comparison';
@@ -51,11 +52,12 @@ async function runSingleTest(rate, pattern, iteration = 1) {
   }
 
   // Set environment variables - use relative path from src/streamer/data/
-  const env = { 
+  const replayEnv = createBenchmarkReplayRunEnv(process.env);
+  const env = replayEnv.withBenchmarkReplayEnv({
     ...process.env, 
     DATA_PATH: `rate_comparison/${datasetName}`,
     LOG_PATH: logDir
-  };
+  });
 
   const startTime = Date.now();
 

@@ -14,6 +14,7 @@ const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const mqtt = require("mqtt");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
 
@@ -60,6 +61,7 @@ class FirstResultLatencyExperiment {
       path.join(this.logsDir, "experiment.log"),
     );
     this.processes = [];
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
     this.mqttClient = null;
     this.results = {};
   }
@@ -356,10 +358,11 @@ class FirstResultLatencyExperiment {
         return;
       }
 
+      const runEnv = this.replayEnv.withBenchmarkReplayEnv(process.env);
       const orchestratorProc = spawn("node", [orchestratorPath], {
         stdio: ["inherit", "pipe", "pipe"],
         cwd: PROJECT_ROOT,
-        env: process.env,
+        env: runEnv,
       });
 
       this.processes.push(orchestratorProc);
@@ -417,7 +420,7 @@ class FirstResultLatencyExperiment {
       const publisherProc = spawn("node", [publisherPath], {
         stdio: ["inherit", "pipe", "pipe"],
         cwd: PROJECT_ROOT,
-        env: process.env,
+        env: runEnv,
       });
 
       this.processes.push(publisherProc);

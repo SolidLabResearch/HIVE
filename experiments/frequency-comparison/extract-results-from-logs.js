@@ -18,6 +18,9 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  getReplayMetadata,
+} = require("../utils/benchmarkResultMetadata");
 
 class LogResultExtractor {
   constructor(approach, frequency) {
@@ -452,6 +455,7 @@ class LogResultExtractor {
         this.approach === "approximation" && !queryRegisteredTime
           ? "Query registration time estimated based on first result time"
           : "Query registration time extracted from logs",
+      replayMetadata: getReplayMetadata(process.env),
     };
 
     fs.writeFileSync(this.metadataFile, JSON.stringify(metadata, null, 2));

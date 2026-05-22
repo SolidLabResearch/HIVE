@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { RDFStream, RSPEngine, RSPQLParser } from 'rsp-js';
 import { v4 as uuidv4 } from 'uuid';
 import { turtleStringToStore } from '../util/Util';
+import { PartialChunkResult } from '../util/chunkTypes';
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
 
@@ -14,18 +15,24 @@ export class RSPQueryProcess {
     public rstream_emitter: EventEmitter;
     public rsp_engine: RSPEngine;
     public rspql_parser: RSPQLParser;
+    private queryId: string;
+    private subqueryId: string;
+    private debugChunksEnabled: boolean;
 
     /**
      *
      * @param query
      * @param rstream_topic
      */
-    constructor(query: string, rstream_topic: string) {
+    constructor(query: string, rstream_topic: string, queryId: string = "default-query", subqueryId: string = "default-subquery") {
         this.query = query;
         this.rstream_topic = rstream_topic;
         this.rsp_engine = new RSPEngine(query);
         this.rstream_emitter = this.rsp_engine.register();
         this.rspql_parser = new RSPQLParser();
+        this.queryId = queryId;
+        this.subqueryId = subqueryId;
+        this.debugChunksEnabled = process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
         this.subscribeToResultStream();
     }
 
@@ -151,11 +158,15 @@ export class RSPQueryProcess {
             
             console.log(`DEBUG: Final Merged Binding: ${JSON.stringify(mergedBinding)}`);
 
-            const event_timestamp = new Date().getTime();
-            const aggregation_event = this.generate_aggregation_event(mergedBinding, event_timestamp);
-            
-            if (aggregation_event) {
-                const aggregation_object_string = JSON.stringify(aggregation_event);
+            const partialChunkResult = this.generate_partial_chunk_result(mergedBinding, object);
+
+            if (partialChunkResult) {
+                if (this.debugChunksEnabled) {
+                    console.log(
+                        `[DEBUG_CHUNKS] subquery subqueryId=${partialChunkResult.subqueryId} windowName=${partialChunkResult.window.windowName} windowStart=${partialChunkResult.window.start} windowEnd=${partialChunkResult.window.end} chunkId=${partialChunkResult.chunkId} value=${partialChunkResult.value} count=${partialChunkResult.count}`,
+                    );
+                }
+                const aggregation_object_string = JSON.stringify(partialChunkResult);
                 rstream_publisher.publish(this.rstream_topic, aggregation_object_string, (err: any) => {
                     if (err) {
                         console.error(`Error publishing aggregation event: ${err}`);
@@ -174,6 +185,82 @@ export class RSPQueryProcess {
      * @param bindings Map of variable names to values
      * @param timestamp
      */
+    private generate_partial_chunk_result(bindings: any, rstreamObject: any): PartialChunkResult | null {
+        const parsedQuery = this.rspql_parser.parse(this.query);
+        if (!parsedQuery || !parsedQuery.s2r || parsedQuery.s2r.length === 0) {
+            return null;
+        }
+        const s2rWindow = parsedQuery.s2r[0];
+        const windowName = s2rWindow.window_name || s2rWindow.stream_name || "window";
+        const range = s2rWindow.width;
+        const step = s2rWindow.slide;
+        const windowBounds = this.extractWindowBounds(rstreamObject, range, step);
+        if (!windowBounds) {
+            return null;
+        }
+
+        const aggregateFunctionMatch = this.query.match(/\b(AVG|SUM|COUNT|MIN|MAX)\s*\(/i);
+        const aggregateFunction = aggregateFunctionMatch?.[1]?.toUpperCase();
+        const value = this.extractNumericBinding(bindings, ["avg", "agg", "sum", "min", "max", "count"]);
+        const count = this.extractNumericBinding(bindings, ["count"]);
+        const event_timestamp = new Date().getTime();
+        const rdfPayload = this.generate_aggregation_event(bindings, event_timestamp);
+        const chunkGroupId = `${this.queryId}:${windowName}:${windowBounds.start}:${windowBounds.end}`;
+        const chunkId = `${chunkGroupId}:${this.subqueryId}`;
+
+        return {
+            queryId: this.queryId,
+            subqueryId: this.subqueryId,
+            window: {
+                windowName,
+                start: windowBounds.start,
+                end: windowBounds.end,
+                range,
+                step,
+                semantics: "[start,end)",
+            },
+            chunkId,
+            aggregateFunction,
+            value,
+            count,
+            rdfPayload,
+        };
+    }
+
+    private extractNumericBinding(bindings: any, prefixes: string[]): number | undefined {
+        for (const [key, value] of Object.entries(bindings)) {
+            const keyLc = key.toLowerCase();
+            if (!prefixes.some((prefix) => keyLc.startsWith(prefix))) continue;
+            const numeric = Number(value);
+            if (Number.isFinite(numeric)) {
+                return numeric;
+            }
+        }
+        return undefined;
+    }
+
+    private extractWindowBounds(rstreamObject: any, range: number, step: number): { start: number; end: number } | null {
+        const candidates: Array<{ start?: number; end?: number }> = [
+            { start: rstreamObject?.window?.open, end: rstreamObject?.window?.close },
+            { start: rstreamObject?.windowOpen, end: rstreamObject?.windowClose },
+            { start: rstreamObject?.open, end: rstreamObject?.close },
+            { start: rstreamObject?.start, end: rstreamObject?.end },
+        ];
+        for (const candidate of candidates) {
+            if (Number.isFinite(candidate.start) && Number.isFinite(candidate.end)) {
+                return { start: candidate.start as number, end: candidate.end as number };
+            }
+        }
+
+        const anchorCandidate = rstreamObject?.timestamp ?? rstreamObject?.tick;
+        const anchor = Number(anchorCandidate);
+        if (!Number.isFinite(anchor) || !Number.isFinite(step) || step <= 0 || !Number.isFinite(range) || range <= 0) {
+            return null;
+        }
+        const end = Math.floor(anchor / step) * step;
+        return { start: end - range, end };
+    }
+
     public generate_aggregation_event(bindings: any, timestamp: number) {
         const uuid_random = uuidv4();
         let triples = "";

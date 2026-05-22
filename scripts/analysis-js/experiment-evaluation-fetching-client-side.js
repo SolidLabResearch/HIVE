@@ -1,6 +1,7 @@
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 const RUNS = 1;
 const LOGS_DIR = 'logs/fetching-client-side';
@@ -33,10 +34,12 @@ async function runOnce(iter) {
 
   killLingeringProcesses(); // Ensure no lingering processes before starting
 
-  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { stdio: 'inherit' });
+  const replayEnv = createBenchmarkReplayRunEnv(process.env);
+  const runEnv = replayEnv.withBenchmarkReplayEnv(process.env);
+  const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { stdio: 'inherit', env: runEnv });
 
   await new Promise(res => setTimeout(res, 2000));
-  const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD[1], { stdio: 'inherit' });
+  const publisher = spawn(PUBLISH_CMD[0], PUBLISH_CMD[1], { stdio: 'inherit', env: runEnv });
 
   const timeout = setTimeout(() => {
     console.log('Timeout reached, killing processes...');

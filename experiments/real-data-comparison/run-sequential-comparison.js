@@ -15,6 +15,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const mqtt = require("mqtt");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 
 // Project root directory
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -92,6 +93,8 @@ class SequentialComparisonRunner {
 
     this.processes = [];
     this.mqttClient = null;
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
+    this.runEnv = this.replayEnv.withBenchmarkReplayEnv(process.env);
   }
 
   /**
@@ -369,7 +372,7 @@ class SequentialComparisonRunner {
       const orchestratorProc = spawn("node", [orchestratorPath], {
         stdio: ["inherit", "pipe", "pipe"],
         cwd: PROJECT_ROOT,
-        env: process.env,
+        env: this.runEnv,
       });
 
       this.processes.push(orchestratorProc);
@@ -404,7 +407,7 @@ class SequentialComparisonRunner {
       const publisherProc = spawn("node", [publisherPath], {
         stdio: ["inherit", "pipe", "pipe"],
         cwd: PROJECT_ROOT,
-        env: process.env,
+        env: this.runEnv,
       });
 
       this.processes.push(publisherProc);

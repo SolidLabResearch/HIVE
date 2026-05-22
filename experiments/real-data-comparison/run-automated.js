@@ -11,6 +11,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("csv-parse/sync");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 
 const APPROACHES = [
   {
@@ -55,6 +56,7 @@ const LOGS_DIR = "../../logs/real_data_comparison";
 class RealDataComparisonRunner {
   constructor() {
     this.results = [];
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
     if (!fs.existsSync(LOGS_DIR)) {
       fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -78,10 +80,10 @@ class RealDataComparisonRunner {
       }
 
       // Set environment - use default DATA_PATH which points to noisy_datasets/noise_0.5
-      const env = {
+      const env = this.replayEnv.withBenchmarkReplayEnv({
         ...process.env,
         LOG_PATH: logDir,
-      };
+      });
 
       const startTime = Date.now();
 

@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 console.log('Script starting...');
 
@@ -40,7 +41,8 @@ async function runOnceWithPattern(patternName, dataPath, iter) {
     }
   }
   
-  const env = { ...process.env, DATA_PATH: dataPath };
+  const replayEnv = createBenchmarkReplayRunEnv(process.env);
+  const env = replayEnv.withBenchmarkReplayEnv({ ...process.env, DATA_PATH: dataPath });
   
   const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { 
     stdio: 'inherit',

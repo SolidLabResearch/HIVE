@@ -9,6 +9,7 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 
 // Get project root directory
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -77,6 +78,7 @@ class SingleTestRunner {
     this.publisherProcess = null;
     this.checkTimer = null;
     this.timeoutTimer = null;
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
   }
 
   cleanup() {
@@ -161,10 +163,10 @@ class SingleTestRunner {
     console.log(`Timeout: ${TIMEOUT_MS / 1000}s\n`);
 
     return new Promise((resolve, reject) => {
-      const env = {
+      const env = this.replayEnv.withBenchmarkReplayEnv({
         ...process.env,
         LOG_PATH: this.logDir,
-      };
+      });
 
       // Start orchestrator
       console.log(`Starting ${this.approach.label} orchestrator...`);

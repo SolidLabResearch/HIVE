@@ -15,6 +15,9 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  getReplayMetadata,
+} = require("../utils/benchmarkResultMetadata");
 
 class PatternResultExtractor {
   constructor(approach, patternName, logDir) {
@@ -357,6 +360,7 @@ class PatternResultExtractor {
       },
       extractionMethod: "log_parsing",
       extractionDate: new Date().toISOString(),
+      replayMetadata: getReplayMetadata(process.env),
     };
 
     fs.writeFileSync(this.metadataFile, JSON.stringify(metadata, null, 2));

@@ -21,6 +21,9 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  attachReplayMetadata,
+} = require("../../experiments/utils/benchmarkResultMetadata");
 
 class PatternAccuracyComparison {
   constructor() {
@@ -30,6 +33,34 @@ class PatternAccuracyComparison {
     // Define all patterns
     this.exponentialRates = [0.001, 0.01, 0.1, 1, 10, 100];
     this.noiseLevels = [0.1, 0.2, 0.5, 1.0, 2.0];
+  }
+
+  getBenchmarkStartTime(metadata) {
+    if (!metadata || !metadata.replayMetadata) return null;
+    return metadata.replayMetadata.streamingQueryHiveBenchmarkStartTime || null;
+  }
+
+  validateComparableBenchmarkStartTime(patternName, metadataByApproach) {
+    const pairs = Object.entries(metadataByApproach)
+      .map(([approach, metadata]) => ({
+        approach,
+        benchmarkStartTime: this.getBenchmarkStartTime(metadata),
+      }))
+      .filter((item) => item.benchmarkStartTime !== null);
+
+    if (pairs.length <= 1) {
+      return;
+    }
+
+    const unique = [...new Set(pairs.map((p) => p.benchmarkStartTime))];
+    if (unique.length > 1) {
+      const detail = pairs
+        .map((p) => `${p.approach}=${p.benchmarkStartTime}`)
+        .join(", ");
+      throw new Error(
+        `Mismatched STREAMING_QUERY_HIVE_BENCHMARK_START_TIME for absolute-window comparison on pattern ${patternName}: ${detail}`,
+      );
+    }
   }
 
   getAllPatterns() {
@@ -257,6 +288,14 @@ class PatternAccuracyComparison {
       return null;
     }
 
+    const approxMetadata = this.readMetadata("approximation", pattern.name);
+    const chunkedMetadata = this.readMetadata("chunked", pattern.name);
+    this.validateComparableBenchmarkStartTime(pattern.name, {
+      fetching: fetchingMetadata,
+      approximation: approxMetadata,
+      chunked: chunkedMetadata,
+    });
+
     const comparison = {
       pattern: pattern.name,
       patternType: pattern.type,
@@ -277,7 +316,6 @@ class PatternAccuracyComparison {
     };
 
     // Compare approximation
-    const approxMetadata = this.readMetadata("approximation", pattern.name);
     const approxResults = this.readResults("approximation", pattern.name);
     const approxResources = this.readResourceUsage(
       "approximation",
@@ -323,7 +361,6 @@ class PatternAccuracyComparison {
     }
 
     // Compare chunked
-    const chunkedMetadata = this.readMetadata("chunked", pattern.name);
     const chunkedResults = this.readResults("chunked", pattern.name);
     const chunkedResources = this.readResourceUsage("chunked", pattern.name);
 
@@ -566,14 +603,28 @@ class PatternAccuracyComparison {
       this.baseLogDir,
       "pattern_analysis_summary.json",
     );
-    const summary = {
+    const summary = attachReplayMetadata({
       timestamp: new Date().toISOString(),
       totalPatterns: validComparisons.length,
       comparisons: validComparisons,
-    };
+    });
 
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
     console.log(`📄 Summary saved to: ${summaryPath}`);
+
+    const artifactsMetadataPath = path.join(
+      this.baseLogDir,
+      "pattern_analysis_summary.metadata.json",
+    );
+    const artifactsMetadata = {
+      artifacts: [accuracyPath, summaryPath],
+      replayMetadata: summary.replayMetadata,
+    };
+    fs.writeFileSync(
+      artifactsMetadataPath,
+      JSON.stringify(artifactsMetadata, null, 2),
+    );
+    console.log(`📄 Artifact metadata saved to: ${artifactsMetadataPath}`);
   }
 
   run() {

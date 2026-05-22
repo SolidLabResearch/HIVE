@@ -20,6 +20,7 @@ const { spawn, execSync } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
+const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -28,6 +29,7 @@ const OSCILLATION_TYPE = 'complex_oscillation';
 const DATA_PATH        = `frequency_comparison/${OSCILLATION_TYPE}_freq_${FREQUENCY % 1 === 0 ? FREQUENCY.toFixed(1) : FREQUENCY}`;
 const TIMEOUT_MS       = 3 * 60 * 1000; // 3 minutes per approach
 const NUM_CORES        = os.cpus().length;
+const replayEnv = createBenchmarkReplayRunEnv(process.env);
 
 const OUT_DIR = path.join('logs', 'comparison-table-run',
     `${OSCILLATION_TYPE}_freq_${FREQUENCY % 1 === 0 ? FREQUENCY.toFixed(1) : FREQUENCY}`);
@@ -135,7 +137,7 @@ async function runAllConcurrent() {
         if (!fs.existsSync(approachDir)) fs.mkdirSync(approachDir, { recursive: true });
     }
 
-    const env = { ...process.env, DATA_PATH };
+    const env = replayEnv.withBenchmarkReplayEnv({ ...process.env, DATA_PATH });
 
     // Start all orchestrators simultaneously
     const orchProcs = APPROACHES.map(approach => {

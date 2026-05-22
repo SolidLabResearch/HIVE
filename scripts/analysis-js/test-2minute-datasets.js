@@ -1,5 +1,6 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
+const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
 
 console.log('Testing 2-minute dataset behavior...');
 
@@ -13,7 +14,8 @@ console.log(`Data path: ${dataPath}`);
 const startTime = Date.now();
 
 // Set environment and start the test
-const env = { ...process.env, DATA_PATH: dataPath };
+const replayEnv = createBenchmarkReplayRunEnv(process.env);
+const env = replayEnv.withBenchmarkReplayEnv({ ...process.env, DATA_PATH: dataPath });
 
 const approach = spawn('node', ['dist/approaches/StreamingQueryApproximationApproachOrchestrator.js'], {
   env: env,

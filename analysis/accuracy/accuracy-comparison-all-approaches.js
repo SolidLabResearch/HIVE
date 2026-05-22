@@ -22,6 +22,10 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  getReplayMetadata,
+  attachReplayMetadata,
+} = require("../../experiments/utils/benchmarkResultMetadata");
 
 class AllApproachesComparison {
   constructor() {
@@ -29,6 +33,34 @@ class AllApproachesComparison {
     this.approaches = ["fetching", "approximation", "chunked", "naive-distributed"];
     this.frequencies = [0.1, 0.5, 1.0, 1.5, 2.0];
     this.oscillationType = "complex_oscillation";
+  }
+
+  getBenchmarkStartTime(metadata) {
+    if (!metadata || !metadata.replayMetadata) return null;
+    return metadata.replayMetadata.streamingQueryHiveBenchmarkStartTime || null;
+  }
+
+  validateComparableBenchmarkStartTime(frequency, metadataByApproach) {
+    const pairs = Object.entries(metadataByApproach)
+      .map(([approach, metadata]) => ({
+        approach,
+        benchmarkStartTime: this.getBenchmarkStartTime(metadata),
+      }))
+      .filter((item) => item.benchmarkStartTime !== null);
+
+    if (pairs.length <= 1) {
+      return;
+    }
+
+    const unique = [...new Set(pairs.map((p) => p.benchmarkStartTime))];
+    if (unique.length > 1) {
+      const detail = pairs
+        .map((p) => `${p.approach}=${p.benchmarkStartTime}`)
+        .join(", ");
+      throw new Error(
+        `Mismatched STREAMING_QUERY_HIVE_BENCHMARK_START_TIME for absolute-window comparison at ${frequency} Hz: ${detail}`,
+      );
+    }
   }
 
   /**
@@ -189,6 +221,13 @@ class AllApproachesComparison {
       console.log(`  ✗ Fetching data not available - skipping ${frequency} Hz`);
       return null;
     }
+
+    this.validateComparableBenchmarkStartTime(frequency, {
+      fetching: fetchingMetadata,
+      approximation: this.readMetadata("approximation", frequency),
+      chunked: this.readMetadata("chunked", frequency),
+      "naive-distributed": this.readMetadata("naive-distributed", frequency),
+    });
 
     const comparison = {
       frequency,
@@ -467,16 +506,30 @@ class AllApproachesComparison {
 
     // JSON summary
     const summaryPath = path.join(this.baseLogDir, "comparison_summary_all_approaches.json");
-    const summary = {
+    const summary = attachReplayMetadata({
       timestamp: new Date().toISOString(),
       oscillationType: this.oscillationType,
       frequencies: this.frequencies,
       approaches: this.approaches,
       comparisons: allComparisons,
-    };
+    });
 
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
     console.log(`📄 JSON summary saved to: ${summaryPath}`);
+
+    const artifactsMetadataPath = path.join(
+      this.baseLogDir,
+      "comparison_summary_all_approaches.metadata.json",
+    );
+    const artifactsMetadata = {
+      artifacts: [accuracyPath, latencyPath, summaryPath],
+      replayMetadata: summary.replayMetadata,
+    };
+    fs.writeFileSync(
+      artifactsMetadataPath,
+      JSON.stringify(artifactsMetadata, null, 2),
+    );
+    console.log(`📄 Artifact metadata saved to: ${artifactsMetadataPath}`);
   }
 
   /**

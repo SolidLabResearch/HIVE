@@ -13,21 +13,12 @@ import {
   getResultTopic,
   getSessionId,
 } from "../../util/runtimeConfig";
+import { PartialChunkResult } from "../../util/chunkTypes";
 const N3 = require("n3");
 
-type TopicChunk = {
-  data: string;
-  timestamp: number;
-  logicalChunkIndex: number;
-};
-
-type LogicalWindowPlan = {
-  windowNumber: number;
-  expectedProcessingTime: number;
-  chunkStartIndex: number;
-  chunkEndExclusive: number;
-  requiredChunksPerTopic: number;
-  requiredTotalChunks: number;
+type SubqueryIdentity = {
+  subqueryId: string;
+  topic: string;
 };
 
 /**
@@ -54,7 +45,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private lastProcessedTime: number = 0; // Track last time we processed (for immediate trigger)
   private processingInProgress: boolean = false; // Prevent concurrent processing
   private useImmediateTrigger: boolean = true; // Enable immediate trigger optimization
-  private nextWindowNumber: number = 1; // Logical window index, anchored to queryRegisteredTime
+  private debugChunksEnabled: boolean = process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
+  private ignoredLegacyChunkCount: number = 0;
   /**
    *
    */
@@ -147,58 +139,65 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     );
   }
 
-  private buildLogicalWindowPlan(
-    windowNumber: number,
-    outputQuerySlide: number,
-    outputQueryWidth: number,
-    topicCount: number,
-  ): LogicalWindowPlan {
-    const chunksPerStep = Math.ceil(outputQuerySlide / this.chunkGCD);
-    const chunksPerFullWindow = Math.ceil(outputQueryWidth / this.chunkGCD);
-    const chunkEndExclusive = windowNumber * chunksPerStep;
-    const requiredChunksPerTopic =
-      windowNumber === 1
-        ? chunksPerStep
-        : Math.min(chunksPerFullWindow, chunkEndExclusive);
-    const chunkStartIndex = Math.max(
-      0,
-      chunkEndExclusive - requiredChunksPerTopic,
-    );
 
-    return {
-      windowNumber,
-      expectedProcessingTime:
-        this.queryRegisteredTime + windowNumber * outputQuerySlide,
-      chunkStartIndex,
-      chunkEndExclusive,
-      requiredChunksPerTopic,
-      requiredTotalChunks: requiredChunksPerTopic * topicCount,
-    };
-  }
-
-  private selectChunksForLogicalWindow(
-    chunks: TopicChunk[],
-    plan: LogicalWindowPlan,
-  ): TopicChunk[] {
-    return chunks.filter(
-      (chunk) =>
-        chunk.logicalChunkIndex >= plan.chunkStartIndex &&
-        chunk.logicalChunkIndex < plan.chunkEndExclusive,
-    );
-  }
-
-  private pruneChunksBeforeIndex(
-    chunksByTopic: Map<string, TopicChunk[]>,
-    minimumLogicalChunkIndex: number,
-  ) {
-    for (const [topic, chunks] of chunksByTopic.entries()) {
-      chunksByTopic.set(
-        topic,
-        chunks.filter(
-          (chunk) => chunk.logicalChunkIndex >= minimumLogicalChunkIndex,
-        ),
-      );
+  private debugChunkLog(message: string): void {
+    if (this.debugChunksEnabled) {
+      this.logger.log(`[DEBUG_CHUNKS] ${message}`);
     }
+  }
+
+  private normalizeChunkPayload(message: string): PartialChunkResult | null {
+    try {
+      const parsed = JSON.parse(message);
+      if (
+        parsed &&
+        typeof parsed.queryId === "string" &&
+        typeof parsed.subqueryId === "string" &&
+        parsed.window &&
+        Number.isFinite(parsed.window.start) &&
+        Number.isFinite(parsed.window.end)
+      ) {
+        const chunkGroupId = `${parsed.queryId}:${parsed.window.windowName}:${parsed.window.start}:${parsed.window.end}`;
+        return {
+          queryId: parsed.queryId,
+          subqueryId: parsed.subqueryId,
+          window: parsed.window,
+          chunkId: parsed.chunkId || `${chunkGroupId}:${parsed.subqueryId}`,
+          aggregateFunction: parsed.aggregateFunction,
+          value: Number.isFinite(Number(parsed.value))
+            ? Number(parsed.value)
+            : undefined,
+          count: Number.isFinite(Number(parsed.count))
+            ? Number(parsed.count)
+            : undefined,
+          rdfPayload: typeof parsed.rdfPayload === "string" ? parsed.rdfPayload : undefined,
+        };
+      }
+    } catch {
+      // legacy payload, keep null to skip structured aggregation
+    }
+    return null;
+  }
+
+  public collectChunkByWindow(
+    chunksByWindow: Map<string, Map<string, PartialChunkResult>>,
+    partial: PartialChunkResult,
+    expectedSubqueryIds: string[],
+  ): { chunkGroupId: string; missingSubqueryIds: string[]; isComplete: boolean } {
+    const chunkGroupId = `${partial.queryId}:${partial.window.windowName}:${partial.window.start}:${partial.window.end}`;
+    if (!chunksByWindow.has(chunkGroupId)) {
+      chunksByWindow.set(chunkGroupId, new Map<string, PartialChunkResult>());
+    }
+    const bySubquery = chunksByWindow.get(chunkGroupId)!;
+    bySubquery.set(partial.subqueryId, partial);
+    const missingSubqueryIds = expectedSubqueryIds.filter(
+      (subqueryId) => !bySubquery.has(subqueryId),
+    );
+    return {
+      chunkGroupId,
+      missingSubqueryIds,
+      isComplete: missingSubqueryIds.length === 0,
+    };
   }
 
   /**
@@ -326,6 +325,13 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         `subQueryTopicMap : ${JSON.stringify(that.subQueryMQTTTopicMap)}`,
       );
       const topics = Array.from(that.subQueryMQTTTopicMap.values());
+      const subqueryIdentities: SubqueryIdentity[] = Array.from(
+        that.subQueryMQTTTopicMap.entries(),
+      ).map(([subqueryId, topic]) => ({ subqueryId, topic }));
+      const expectedSubqueryIds = subqueryIdentities.map((entry) => entry.subqueryId);
+      const topicToSubqueryId = new Map(
+        subqueryIdentities.map((entry) => [entry.topic, entry.subqueryId]),
+      );
       this.logger.log(`topics to subscribe: ${topics}`);
       // TODO : Remove hardcoded topics, use the topics from subQueryMQTTTopicMap but currently there is a bug in the subQueryMQTTTopicMap that prevents it from being used correctly.
       // TODO : Such that only one topic is subscribed to at a time.
@@ -357,26 +363,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         });
       }
 
-      // Data structure to collect chunks by topic with timestamps
-      const chunksByTopic: Map<string, TopicChunk[]> = new Map();
-      const nextChunkIndexByTopic: Map<string, number> = new Map();
+      const chunksByWindow: Map<string, Map<string, PartialChunkResult>> = new Map();
       this.logger.log(
         `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
-      );
-
-      // Expected number of topics (sub-queries)
-      const expectedTopicCount = topicsOfProcesses.length;
-      // Expected chunks for first window: STEP / chunkGCD * numTopics
-      // This ensures we have enough data coverage before producing a result
-      const chunksPerStep = Math.ceil(outputQuerySlide / this.chunkGCD);
-      const chunksPerFullWindow = Math.ceil(outputQueryWidth / this.chunkGCD);
-      const expectedChunksForFirstWindow =
-        chunksPerStep * expectedTopicCount;
-      this.logger.log(
-        `Expected topic count: ${expectedTopicCount}, Expected chunks for first window: ${expectedChunksForFirstWindow} (STEP=${outputQuerySlide} / chunkGCD=${this.chunkGCD} * topics=${expectedTopicCount})`,
-      );
-      this.logger.log(
-        `Subsequent windows require ${chunksPerFullWindow * expectedTopicCount} chunks in total (${chunksPerFullWindow} per topic).`,
       );
 
       // Helper function to process chunks - used by both immediate trigger and interval fallback
@@ -389,95 +378,53 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           return;
         }
 
-        const now = Date.now();
-        const windowPlan = this.buildLogicalWindowPlan(
-          this.nextWindowNumber,
-          outputQuerySlide,
-          outputQueryWidth,
-          expectedTopicCount,
-        );
-
-        const timeConditionMet = now >= windowPlan.expectedProcessingTime;
-
-        if (!timeConditionMet) {
-          const waitingFor = windowPlan.expectedProcessingTime - now;
-          this.logger.log(
-            `Time condition not met for ${triggerSource}. Need to wait ${waitingFor}ms more. ` +
-              `queryRegisteredTime=${this.queryRegisteredTime}, nextWindowNumber=${this.nextWindowNumber}, expectedProcessingTime=${windowPlan.expectedProcessingTime}, now=${now}`,
-          );
-          return;
-        }
-
         this.processingInProgress = true;
 
         // Record when processing is triggered (before any processing)
-        this.intervalTriggerTime = now;
+        this.intervalTriggerTime = Date.now();
 
-        // Collect all chunks from all topics within the window
-        const allWindowChunks: string[] = [];
-        let totalTopicsReady = 0;
-        let missingTopics: string[] = [];
+        const readyGroups = Array.from(chunksByWindow.entries()).filter(
+          ([, bySubquery]) => expectedSubqueryIds.every((subqueryId) => bySubquery.has(subqueryId)),
+        );
 
-        for (const topic of topicsOfProcesses) {
-          const topicChunks = chunksByTopic.get(topic) ?? [];
-          const windowChunks = this.selectChunksForLogicalWindow(
-            topicChunks,
-            windowPlan,
-          );
-
-          if (windowChunks.length < windowPlan.requiredChunksPerTopic) {
-            missingTopics.push(
-              `${topic} (${windowChunks.length}/${windowPlan.requiredChunksPerTopic})`,
+        if (readyGroups.length === 0) {
+          for (const [chunkGroupId, bySubquery] of chunksByWindow.entries()) {
+            const missing = expectedSubqueryIds.filter((subqueryId) => !bySubquery.has(subqueryId));
+            this.debugChunkLog(
+              `${triggerSource}: waiting chunkGroupId=${chunkGroupId}; received=${Array.from(bySubquery.keys()).join(",") || "none"}; missing=${missing.join(",") || "none"}`,
             );
-            continue;
           }
-
-          totalTopicsReady++;
-          this.logger.log(
-            `${triggerSource} evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`,
-          );
-          this.logger.log(
-            `Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`,
-          );
-          allWindowChunks.push(...windowChunks.map((chunk) => chunk.data));
-        }
-
-        const hasEnoughChunks =
-          totalTopicsReady === expectedTopicCount &&
-          allWindowChunks.length === windowPlan.requiredTotalChunks;
-
-        if (!hasEnoughChunks) {
-          this.logger.log(
-            `${triggerSource}: Chunk readiness not met for logical window ${windowPlan.windowNumber}. Have ${allWindowChunks.length}/${windowPlan.requiredTotalChunks} chunks. Missing coverage: ${missingTopics.join(", ") || "none"}. Waiting for more chunks.`,
-          );
           this.processingInProgress = false;
           return;
         }
 
-        if (allWindowChunks.length > 0) {
-          this.logger.log(
-            `${triggerSource} evaluation completed for logical window ${windowPlan.windowNumber}. Combined chunks from ${totalTopicsReady}/${expectedTopicCount} topics, total chunks: ${allWindowChunks.length}`,
-          );
-          this.logger.log(
-            `${triggerSource} evaluation. Aggregating and triggering R2R...`,
-          );
+        readyGroups.sort((a, b) => {
+          const aStart = a[1].values().next().value?.window?.start ?? 0;
+          const bStart = b[1].values().next().value?.window?.start ?? 0;
+          return aStart - bStart;
+        });
 
-          // Process all chunks together like the client-side approach
-          await this.executeR2ROperator(allWindowChunks);
-          this.lastProcessedTime = windowPlan.expectedProcessingTime;
-          this.nextWindowNumber += 1;
-          const nextWindowPlan = this.buildLogicalWindowPlan(
-            this.nextWindowNumber,
-            outputQuerySlide,
-            outputQueryWidth,
-            expectedTopicCount,
-          );
-          this.pruneChunksBeforeIndex(
-            chunksByTopic,
-            nextWindowPlan.chunkStartIndex,
-          );
-        } else {
-          this.logger.log(`${triggerSource}: no chunks to aggregate.`);
+        for (const [chunkGroupId, bySubquery] of readyGroups) {
+          const chunksForAggregation: string[] = [];
+          for (const subqueryId of expectedSubqueryIds) {
+            const partial = bySubquery.get(subqueryId);
+            if (!partial) continue;
+            if (partial.rdfPayload) {
+              chunksForAggregation.push(partial.rdfPayload);
+            }
+          }
+
+          if (chunksForAggregation.length === expectedSubqueryIds.length) {
+            this.debugChunkLog(
+              `final emission chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
+            );
+            await this.executeR2ROperator(chunksForAggregation, chunkGroupId);
+            chunksByWindow.delete(chunkGroupId);
+          } else {
+            this.logger.log(
+              `${triggerSource}: chunkGroupId=${chunkGroupId} skipped due to incomplete rdfPayload coverage (${chunksForAggregation.length}/${expectedSubqueryIds.length})`,
+            );
+          }
         }
 
         this.processingInProgress = false;
@@ -520,37 +467,41 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
         this.lastChunkReceivedTime = now;
 
-        // Initialize topic array if it doesn't exist
-        if (!chunksByTopic.has(topic)) {
-          chunksByTopic.set(topic, []);
+        const normalized = this.normalizeChunkPayload(message.toString());
+        if (normalized) {
+          const expectedSubqueryId = topicToSubqueryId.get(topic);
+          const effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
+          const chunkGroupId = `${normalized.queryId}:${normalized.window.windowName}:${normalized.window.start}:${normalized.window.end}`;
+          const bySubquery = chunksByWindow.get(chunkGroupId) ?? new Map<string, PartialChunkResult>();
+          const existing = bySubquery.get(effectiveSubqueryId);
+          if (!existing) {
+            const outcome = this.collectChunkByWindow(
+              chunksByWindow,
+              {
+              ...normalized,
+              subqueryId: effectiveSubqueryId,
+              },
+              expectedSubqueryIds,
+            );
+            this.debugChunkLog(
+              `received chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${outcome.chunkGroupId}; completeness=${expectedSubqueryIds.length - outcome.missingSubqueryIds.length}/${expectedSubqueryIds.length}; missing=${outcome.missingSubqueryIds.join(",") || "none"}`,
+            );
+          } else {
+            this.debugChunkLog(
+              `duplicate chunk ignored chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${chunkGroupId}; existingChunkId=${existing.chunkId}`,
+            );
+          }
+        } else {
+          this.ignoredLegacyChunkCount++;
+          this.debugChunkLog(
+            `ignored legacy/unstructured chunk on topic=${topic}; ignoredLegacyChunkCount=${this.ignoredLegacyChunkCount}`,
+          );
         }
 
-        // Add chunk to the appropriate topic
-        const logicalChunkIndex = nextChunkIndexByTopic.get(topic) ?? 0;
-        chunksByTopic.get(topic)!.push({
-          data: message.toString(),
-          timestamp: now,
-          logicalChunkIndex,
-        });
-        nextChunkIndexByTopic.set(topic, logicalChunkIndex + 1);
-
         // IMMEDIATE TRIGGER OPTIMIZATION:
-        // Check if we should process immediately instead of waiting for interval.
+        // Process immediately when message arrives; only complete chunk groups emit.
         if (this.useImmediateTrigger) {
-          const nextWindowPlan = this.buildLogicalWindowPlan(
-            this.nextWindowNumber,
-            outputQuerySlide,
-            outputQueryWidth,
-            expectedTopicCount,
-          );
-          const shouldTrigger = now >= nextWindowPlan.expectedProcessingTime;
-
-          if (shouldTrigger) {
-            this.logger.log(
-              `Immediate trigger activated for logical window ${nextWindowPlan.windowNumber}: now=${now}, expectedProcessingTime=${nextWindowPlan.expectedProcessingTime}, outputQuerySlide=${outputQuerySlide}ms`,
-            );
-            await processChunks("Immediate");
-          }
+          await processChunks("Immediate");
         }
       });
 
@@ -567,7 +518,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
    *
    * @param chunks
    */
-  async executeR2ROperator(chunks: string[]): Promise<void> {
+  async executeR2ROperator(
+    chunks: string[],
+    chunkGroupId?: string,
+  ): Promise<void> {
     this.logger.log(`Executing the R2R Operator with results: ${chunks}`);
 
     /*
@@ -644,6 +598,11 @@ For example, the allResults object might look like this:
         const resultValue = data.get("result").value;
         const outputQueryEvent = this.generateOutputQueryEvent(resultValue);
         this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
+        if (chunkGroupId) {
+          this.debugChunkLog(
+            `final emission chunkGroupId=${chunkGroupId}; recomposedResult=${resultValue}`,
+          );
+        }
 
         // Calculate and log latency with multiple metrics
         this.windowCount++;
@@ -767,6 +726,8 @@ For example, the allResults object might look like this:
         const rspQueryProcess = new RSPQueryProcess(
           rewrittenChunkQueries[i],
           topicName,
+          this.sessionId,
+          hash_subQuery,
         );
         this.logger.log(
           `${topicName} topic created for rewrittenChunkQueries: ${rewrittenChunkQueries[i]}: ${rewrittenChunkQueries[i]}`,
