@@ -27,14 +27,15 @@ const fs = require("fs");
 const path = require("path");
 const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 
-class CustomPatternComparisonRunner {
-  constructor(iterations = 35) {
-    this.iterations = iterations;
-    this.approaches = ["fetching", "naive_distributed", "approximation", "chunked"];
-    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
+const SMOKE_PATTERN_TYPE = "low_variability";
+const SMOKE_APPROACHES = ["fetching", "approximation"];
 
-    // Custom patterns matching the table specification
-    this.patterns = [
+class CustomPatternComparisonRunner {
+  constructor(iterations = 35, options = {}) {
+    this.iterations = iterations;
+    this.smokeMode = Boolean(options.smokeMode ?? process.env.PAPER_BENCHMARK_SMOKE === "1");
+    this.allApproaches = ["fetching", "naive_distributed", "approximation", "chunked"];
+    this.allPatterns = [
       {
         type: "low_variability",
         name: "Low Variability",
@@ -61,9 +62,15 @@ class CustomPatternComparisonRunner {
         params: "μ=-23.0, A=3.0, f=0.5Hz",
       },
     ];
+    this.approaches = this.smokeMode ? SMOKE_APPROACHES : this.allApproaches;
+    const smokePattern = this.allPatterns.find((pattern) => pattern.type === SMOKE_PATTERN_TYPE);
+    this.patterns = this.smokeMode
+      ? (smokePattern ? [smokePattern] : [])
+      : this.allPatterns;
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
     this.baseLogDir = "./logs/custom-pattern-comparison";
-    this.timeout = 240000; // 4 minutes per test
+    this.timeout = resolvePatternTestTimeoutMs(options.patternTestTimeoutMs, this.smokeMode);
   }
 
   getDataPath(pattern) {
@@ -467,6 +474,9 @@ class CustomPatternComparisonRunner {
       timestamp: new Date().toISOString(),
       totalTests: results.length,
       iterations: this.iterations,
+      smokeMode: this.smokeMode,
+      selectedPatterns: this.patterns.map((pattern) => pattern.type),
+      selectedApproaches: this.approaches,
       successful: successful.length,
       failed: failed.length,
       byApproach: byApproach,
@@ -502,12 +512,35 @@ class CustomPatternComparisonRunner {
   }
 }
 
+function resolvePatternTestTimeoutMs(explicitTimeoutMs, smokeMode = false) {
+  const defaultTimeoutMs = 240000;
+
+  if (smokeMode && !Number.isFinite(explicitTimeoutMs)) {
+    return 120000;
+  }
+
+  if (Number.isFinite(explicitTimeoutMs)) {
+    return explicitTimeoutMs;
+  }
+
+  const envTimeoutMs = process.env.CUSTOM_PATTERN_TEST_TIMEOUT_MS;
+  if (envTimeoutMs !== undefined) {
+    const parsedTimeoutMs = Number.parseInt(envTimeoutMs, 10);
+    if (Number.isFinite(parsedTimeoutMs)) {
+      return parsedTimeoutMs;
+    }
+  }
+
+  return defaultTimeoutMs;
+}
+
 // Main execution
 async function main() {
   const args = process.argv.slice(2);
 
   // Check for iterations flag
   let iterations = 35; // default
+  let patternTestTimeoutMs;
   let filteredArgs = args;
 
   const iterFlag = args.findIndex(
@@ -520,15 +553,31 @@ async function main() {
     );
   }
 
-  const runner = new CustomPatternComparisonRunner(iterations);
+  const timeoutFlag = filteredArgs.findIndex(
+    (arg) => arg === "--pattern-test-timeout" || arg === "--test-timeout",
+  );
+  if (timeoutFlag !== -1 && filteredArgs[timeoutFlag + 1]) {
+    patternTestTimeoutMs = Number.parseInt(filteredArgs[timeoutFlag + 1], 10);
+    filteredArgs = filteredArgs.filter(
+      (_, idx) => idx !== timeoutFlag && idx !== timeoutFlag + 1,
+    );
+  }
+
+  const runner = new CustomPatternComparisonRunner(iterations, {
+    patternTestTimeoutMs,
+    smokeMode: process.env.PAPER_BENCHMARK_SMOKE === "1",
+  });
 
   console.log(`\n${"=".repeat(80)}`);
   console.log(`Configuration: Running ${iterations} iteration(s) per test`);
-  console.log(`Total patterns: 5 custom patterns`);
+  console.log(`Pattern test timeout: ${runner.timeout} ms`);
+  console.log(`Smoke mode: ${runner.smokeMode ? "enabled" : "disabled"}`);
+  console.log(`Total patterns: ${runner.patterns.length} custom pattern(s)`);
+  console.log(`Approaches: ${runner.approaches.join(", ")}`);
   console.log(
-    `Expected total tests: ${5 * 4 * iterations} (5 patterns × 4 approaches × ${iterations} iterations)`,
+    `Expected total tests: ${runner.patterns.length * runner.approaches.length * iterations} (${runner.patterns.length} patterns × ${runner.approaches.length} approaches × ${iterations} iterations)`,
   );
-  console.log(`Expected runtime: ~${Math.ceil((5 * 4 * iterations * 3) / 60)} minutes`);
+  console.log(`Expected runtime: ~${Math.ceil((runner.patterns.length * runner.approaches.length * iterations * 3) / 60)} minutes`);
   console.log("=".repeat(80));
 
   try {
@@ -566,10 +615,14 @@ async function main() {
       console.log(
         "  --iterations, -i N    Number of iterations per test (default: 35)",
       );
+      console.log(
+        "  --pattern-test-timeout MS  Per-test timeout in milliseconds (default: 240000)",
+      );
       process.exit(1);
     }
 
     console.log("\n✓ All experiments completed!");
+    process.exit(0);
   } catch (error) {
     console.error("\n✗ Experiment failed:", error.message);
     console.error(error.stack);

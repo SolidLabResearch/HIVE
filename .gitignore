@@ -124,3 +124,5 @@ docs/.DS_Store
 docs/evaluation-35iter.tex
 docs/evaluation.tex
 .DS_Store
+*.csv
+/results/

@@ -154,7 +154,7 @@ export class StreamToMQTT {
         }
 
         const delay = 1000 / this.frequency;
-        const durationSeconds = 300; // Run for 5 minutes
+        const durationSeconds = process.env.PAPER_BENCHMARK_SMOKE === "1" ? 120 : 300; // Smoke mode uses a shorter replay window.
         const startTime = Date.now();
 
         while ((Date.now() - startTime) < durationSeconds * 1000) {
