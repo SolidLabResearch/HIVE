@@ -7,6 +7,11 @@ import { StreamToMQTT } from './publishing/StreamToMQTT';
  */
 const logger = new CSVLogger('replayer-log.csv');
 
+function getReplayFrequency(): number {
+    const configured = Number.parseFloat(process.env.WEARABLE_FREQUENCY || '');
+    return Number.isFinite(configured) && configured > 0 ? configured : 4;
+}
+
 /**
  *
  */
@@ -20,7 +25,7 @@ async function replaySmartphoneXStream() {
     const basePath = process.env.DATA_PATH || 'noisy_datasets/noise_0.5';
     const dataPath = `src/streamer/data/${basePath}/smartphone.acceleration.x/data.nt`;
     
-    const publisher = new StreamToMQTT('mqtt://localhost:1883', 4, dataPath, "smartphoneX", mqttOptions);
+    const publisher = new StreamToMQTT('mqtt://localhost:1883', getReplayFrequency(), dataPath, "smartphoneX", mqttOptions);
     logger.log("Starting replay for SmartphoneX stream");
     await publisher.replay_streams();
     logger.log("Replay completed for SmartphoneX stream");
@@ -39,7 +44,7 @@ async function replayWearableXStream() {
     const basePath = process.env.DATA_PATH || 'noisy_datasets/noise_0.5';
     const dataPath = `src/streamer/data/${basePath}/wearable.acceleration.x/data.nt`;
     
-    const publisher = new StreamToMQTT('mqtt://localhost:1883', 4, dataPath, "wearableX", mqttOptions);
+    const publisher = new StreamToMQTT('mqtt://localhost:1883', getReplayFrequency(), dataPath, "wearableX", mqttOptions);
     logger.log("Starting replay for WearableX stream");
     await publisher.replay_streams();
     logger.log("Replay completed for WearableX stream");

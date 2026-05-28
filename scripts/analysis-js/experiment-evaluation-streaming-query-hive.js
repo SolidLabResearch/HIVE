@@ -16,7 +16,11 @@ const LOG_FILES = [
   'streaming_query_hive_stdout.log',
   'streaming_query_hive_stderr.log',
 ];
-const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const DEFAULT_TIMEOUT_MS = 3 * 60 * 1000;
+const TIMEOUT_MS = Number.parseInt(
+  process.env.STREAMING_QUERY_HIVE_BENCHMARK_TIMEOUT_MS || String(DEFAULT_TIMEOUT_MS),
+  10,
+) || DEFAULT_TIMEOUT_MS;
 
 if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
 

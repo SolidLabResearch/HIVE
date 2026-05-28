@@ -253,6 +253,33 @@ function parseNumeric(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function extractRecomposedResultFromChunkLog(records) {
+  for (const row of records) {
+    const message = row && row.message ? String(row.message) : '';
+    const recomposedMatch = message.match(
+      /final emission chunkGroupId=([^;]+); recomposedResult=([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)/i,
+    );
+    if (!recomposedMatch) {
+      continue;
+    }
+
+    const resultValue = Number.parseFloat(recomposedMatch[2]);
+    if (!Number.isFinite(resultValue)) {
+      continue;
+    }
+
+    return {
+      resultTs: Number(row.timestamp),
+      resultValue: recomposedMatch[2],
+    };
+  }
+
+  return {
+    resultTs: null,
+    resultValue: '',
+  };
+}
+
 function parseChunkGroupId(chunkGroupId) {
   const match = String(chunkGroupId).match(/^(.*):(\d+):(\d+)$/);
   if (!match) {
@@ -708,6 +735,7 @@ function analyzeIteration(iteration) {
   let registeredTs = null;
   let resultTs = null;
   let resultValue = '';
+  const chunkLogFallback = extractRecomposedResultFromChunkLog(records);
 
   for (const row of records) {
     if (!registeredTs && row.message && row.message.includes('Registered Query')) {
@@ -724,6 +752,13 @@ function analyzeIteration(iteration) {
       }
       break;
     }
+  }
+
+  if (!resultTs && chunkLogFallback.resultTs) {
+    resultTs = chunkLogFallback.resultTs;
+  }
+  if (!resultValue && chunkLogFallback.resultValue) {
+    resultValue = chunkLogFallback.resultValue;
   }
 
   return {

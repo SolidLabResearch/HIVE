@@ -196,16 +196,21 @@ export class RSPQueryProcess {
         const step = s2rWindow.slide;
         const windowBounds = this.extractWindowBounds(rstreamObject, range, step);
         if (!windowBounds) {
+            if (this.debugChunksEnabled) {
+                console.log(
+                    `[DEBUG_CHUNKS] subquery partial result dropped: unable to extract window bounds from keys=${Object.keys(rstreamObject || {}).join(",") || "none"}`,
+                );
+            }
             return null;
         }
 
         const aggregateFunctionMatch = this.query.match(/\b(AVG|SUM|COUNT|MIN|MAX)\s*\(/i);
         const aggregateFunction = aggregateFunctionMatch?.[1]?.toUpperCase();
-        const value = this.extractNumericBinding(bindings, ["avg", "agg", "sum", "min", "max", "count"]);
+        const value = this.extractNumericBinding(bindings, ["avg", "agg", "sum", "min", "max"]);
         const count = this.extractNumericBinding(bindings, ["count"]);
         const event_timestamp = new Date().getTime();
         const rdfPayload = this.generate_aggregation_event(bindings, event_timestamp);
-        const chunkGroupId = `${this.queryId}:${windowName}:${windowBounds.start}:${windowBounds.end}`;
+        const chunkGroupId = `${this.queryId}:${windowBounds.start}:${windowBounds.end}`;
         const chunkId = `${chunkGroupId}:${this.subqueryId}`;
 
         return {
@@ -228,12 +233,14 @@ export class RSPQueryProcess {
     }
 
     private extractNumericBinding(bindings: any, prefixes: string[]): number | undefined {
-        for (const [key, value] of Object.entries(bindings)) {
-            const keyLc = key.toLowerCase();
-            if (!prefixes.some((prefix) => keyLc.startsWith(prefix))) continue;
-            const numeric = Number(value);
-            if (Number.isFinite(numeric)) {
-                return numeric;
+        for (const prefix of prefixes) {
+            for (const [key, value] of Object.entries(bindings)) {
+                const keyLc = key.toLowerCase();
+                if (!keyLc.startsWith(prefix)) continue;
+                const numeric = Number(value);
+                if (Number.isFinite(numeric)) {
+                    return numeric;
+                }
             }
         }
         return undefined;
@@ -245,6 +252,7 @@ export class RSPQueryProcess {
             { start: rstreamObject?.windowOpen, end: rstreamObject?.windowClose },
             { start: rstreamObject?.open, end: rstreamObject?.close },
             { start: rstreamObject?.start, end: rstreamObject?.end },
+            { start: rstreamObject?.timestamp_from, end: rstreamObject?.timestamp_to },
         ];
         for (const candidate of candidates) {
             if (Number.isFinite(candidate.start) && Number.isFinite(candidate.end)) {
@@ -264,7 +272,7 @@ export class RSPQueryProcess {
     public generate_aggregation_event(bindings: any, timestamp: number) {
         const uuid_random = uuidv4();
         let triples = "";
-        const isCountAggregation = /\bCOUNT\s*\(/i.test(this.query);
+        const queryAggregation = this.query.match(/\b(AVG|SUM|COUNT|MIN|MAX)\s*\(/i)?.[1]?.toUpperCase();
 
         // Iterate over keys in the binding object (e.g. avgWearableX, countWearableX)
         // Note: rsp-js bindings might be a Map or an Object. Adjusting for Object behavior based on JSON.stringify output.
@@ -283,7 +291,7 @@ export class RSPQueryProcess {
 
              const isCountBinding =
                 key.startsWith("count") ||
-                (isCountAggregation && key.startsWith("agg"));
+                (queryAggregation === "COUNT" && (key.startsWith("avg") || key.startsWith("agg")));
              const datatype = isCountBinding
                 ? "http://www.w3.org/2001/XMLSchema#integer"
                 : "http://www.w3.org/2001/XMLSchema#double";

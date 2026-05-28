@@ -490,6 +490,50 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(missingWindow.missingSubqueryIds).toEqual(['subB']);
         });
 
+        test('should group different stream window names into the same logical chunk group', () => {
+            const chunksByWindow = new Map();
+            const expectedSubqueryIds = ['wearable', 'smartphone'];
+
+            const wearable = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'q1',
+                subqueryId: 'wearable',
+                window: {
+                    windowName: 'mqtt://localhost:1883/wearableX',
+                    start: 1000,
+                    end: 31000,
+                    range: 30000,
+                    step: 30000,
+                    semantics: '[start,end)' as const,
+                },
+                chunkId: 'wearable-chunk',
+                value: -26.0,
+                count: 481,
+                rdfPayload: '<wearable> <https://saref.etsi.org/core/hasValue> "-26.0"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+
+            const smartphone = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'q1',
+                subqueryId: 'smartphone',
+                window: {
+                    windowName: 'mqtt://localhost:1883/smartphoneX',
+                    start: 1000,
+                    end: 31000,
+                    range: 30000,
+                    step: 30000,
+                    semantics: '[start,end)' as const,
+                },
+                chunkId: 'smartphone-chunk',
+                value: 1.03,
+                count: 481,
+                rdfPayload: '<smartphone> <https://saref.etsi.org/core/hasValue> "1.03"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+
+            expect(wearable.chunkGroupId).toBe('q1:1000:31000');
+            expect(smartphone.chunkGroupId).toBe('q1:1000:31000');
+            expect(smartphone.isComplete).toBe(true);
+            expect(chunksByWindow.size).toBe(1);
+        });
+
         test('prints first 5 chunkGroupIds for 1Hz and 16Hz with deterministic event-time windows', () => {
             const queryId = 'bench-q';
             const windowName = 'https://rsp.js/w1';

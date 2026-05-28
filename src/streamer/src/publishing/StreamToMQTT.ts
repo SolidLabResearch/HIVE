@@ -28,6 +28,10 @@ export class StreamToMQTT {
     private deterministicEventTime: boolean = process.env.STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME === "1";
     private benchmarkStartTime: number = Number(process.env.STREAMING_QUERY_HIVE_BENCHMARK_START_TIME || Date.now());
     private datasetStartTime: number | null = null;
+    private datasetDuration: number = 0;
+    private replayLoopIndex: number = 0;
+    private originalObservationTimestamps: Map<string, string> = new Map();
+    private originalObservationOffsets: Map<string, number> = new Map();
     private debugChunksEnabled: boolean = process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
 
     /**
@@ -59,6 +63,7 @@ export class StreamToMQTT {
         try {
             const store: typeof N3.Store = await this.load_dataset(this.file_location);
             this.sorted_observation_subjects = await this.sort_observations(store);
+            this.captureOriginalObservationTiming();
         } catch (error) {
             console.error('Error initializing StreamToMQTT:', error);
             throw error;
@@ -157,6 +162,7 @@ export class StreamToMQTT {
                 // Reset pointer to loop data
                 this.observation_pointer = 0;
                 this.number_of_publish = 0; // Reset publish count for next loop logic check if needed
+                this.replayLoopIndex++;
                 console.log('Looping data stream...');
             }
 
@@ -209,11 +215,12 @@ export class StreamToMQTT {
 
             // Remove old timestamp
             const old = this.store.getQuads(node, namedNode('https://saref.etsi.org/core/hasTimestamp'), null, null);
-            const originalTimestamp = old[0]?.object?.value;
+            const originalTimestamp = this.originalObservationTimestamps.get(id) ?? old[0]?.object?.value;
+            const originalOffset = this.originalObservationOffsets.get(id);
             this.store.removeQuads(old);
 
             // Add new timestamp
-            const emittedTimestamp = this.computeEmittedTimestamp(originalTimestamp);
+            const emittedTimestamp = this.computeEmittedTimestamp(originalTimestamp, originalOffset);
             this.store.addQuad(node, namedNode('https://saref.etsi.org/core/hasTimestamp'), literal(emittedTimestamp));
 
             // Extract quads for this observation
@@ -229,7 +236,9 @@ export class StreamToMQTT {
                     } else {
                         this.successfulPublishes++;
                         if (this.debugChunksEnabled) {
-                            console.log(`[DEBUG_CHUNKS] publisher topic=${this.topic_to_publish} subject=${id} originalTs=${originalTimestamp || "none"} emittedTs=${emittedTimestamp}`);
+                            console.log(
+                                `[DEBUG_CHUNKS] publisher topic=${this.topic_to_publish} subject=${id} loopIndex=${this.replayLoopIndex} originalTs=${originalTimestamp || "none"} originalOffset=${originalOffset ?? "none"} emittedTs=${emittedTimestamp} datasetDuration=${this.datasetDuration}`,
+                            );
                         }
                         console.log(`Published observation: ${id} at ${this.file_location} with QoS 2`);
                     }
@@ -256,18 +265,65 @@ export class StreamToMQTT {
         });
     }
 
-    private computeEmittedTimestamp(originalTimestamp: string | undefined): string {
+    private captureOriginalObservationTiming(): void {
+        const observationsWithEpochs: Array<{ id: string; timestamp: string; epoch: number }> = [];
+
+        for (const id of this.sorted_observation_subjects) {
+            const timestamp = this.store.getObjects(
+                namedNode(id).id,
+                namedNode('https://saref.etsi.org/core/hasTimestamp'),
+            )[0]?.value;
+
+            if (!timestamp) {
+                continue;
+            }
+
+            this.originalObservationTimestamps.set(id, timestamp);
+
+            const epoch = Date.parse(timestamp);
+            if (Number.isFinite(epoch)) {
+                observationsWithEpochs.push({ id, timestamp, epoch });
+            }
+        }
+
+        if (observationsWithEpochs.length === 0) {
+            this.datasetStartTime = null;
+            this.datasetDuration = 0;
+            this.originalObservationOffsets.clear();
+            return;
+        }
+
+        const epochs = observationsWithEpochs.map(({ epoch }) => epoch);
+        this.datasetStartTime = Math.min(...epochs);
+        this.datasetDuration = Math.max(...epochs) - this.datasetStartTime;
+        this.originalObservationOffsets.clear();
+
+        for (const { id, epoch } of observationsWithEpochs) {
+            this.originalObservationOffsets.set(id, epoch - this.datasetStartTime);
+        }
+    }
+
+    private computeEmittedTimestamp(originalTimestamp: string | undefined, originalOffset?: number): string {
         if (!this.deterministicEventTime || !originalTimestamp) {
             return new Date().toISOString();
         }
-        const originalEpoch = Date.parse(originalTimestamp);
-        if (!Number.isFinite(originalEpoch)) {
+
+        const resolvedOffset = originalOffset ?? (() => {
+            const originalEpoch = Date.parse(originalTimestamp);
+            if (!Number.isFinite(originalEpoch)) {
+                return undefined;
+            }
+            if (this.datasetStartTime === null) {
+                this.datasetStartTime = originalEpoch;
+            }
+            return originalEpoch - this.datasetStartTime;
+        })();
+
+        if (resolvedOffset === undefined) {
             return new Date().toISOString();
         }
-        if (this.datasetStartTime === null) {
-            this.datasetStartTime = originalEpoch;
-        }
-        const offset = originalEpoch - this.datasetStartTime;
-        return new Date(this.benchmarkStartTime + offset).toISOString();
+
+        const loopBaseTime = this.benchmarkStartTime + (this.replayLoopIndex * this.datasetDuration);
+        return new Date(loopBaseTime + resolvedOffset).toISOString();
     }
 }

@@ -36,6 +36,34 @@ function makeSingleIterationFixture(prefix, label) {
     };
 }
 
+function makeChunkFallbackFixture(prefix, label) {
+    const root = makeTempRoot(prefix);
+    const dataPath = path.join(root, 'data');
+    const chunkedCsvPath = path.join(root, `${label}-chunked.csv`);
+    const stdoutLogPath = path.join(root, `${label}-stdout.log`);
+    const metadataPath = path.join(root, `${label}-metadata.json`);
+
+    fs.mkdirSync(dataPath, { recursive: true });
+    fs.writeFileSync(
+        chunkedCsvPath,
+        [
+            'timestamp,message',
+            '1,Registered Query',
+            '2,final emission chunkGroupId=chunked/example:0:60000; recomposedResult=-1.2485270867983369E1',
+        ].join('\n'),
+    );
+    fs.writeFileSync(stdoutLogPath, '');
+    fs.writeFileSync(metadataPath, JSON.stringify({ replayMetadata: { label } }, null, 2));
+
+    return {
+        root,
+        dataPath,
+        chunkedCsvPath,
+        stdoutLogPath,
+        metadataPath,
+    };
+}
+
 function runAnalyzer(args, envOverrides, cwd) {
     return spawnSync('node', [SCRIPT_PATH, ...args], {
         cwd,
@@ -63,10 +91,16 @@ describe('analyzeResultsStreamingQueryHive CLI contract', () => {
     });
 
     test('single-iteration mode rejects missing required inputs', () => {
-        const result = runAnalyzer(['--iteration', '1'], {}, makeTempRoot('sqh-analyzer-missing-'));
+        const result = runAnalyzer(
+            ['--iteration', '1'],
+            {
+                WEARABLE_FREQUENCY: '16',
+            },
+            makeTempRoot('sqh-analyzer-missing-'),
+        );
 
         expect(result.status).toBe(1);
-        expect(result.stderr).toContain('Missing required analyzer inputs: --frequency, --chunked-csv, --stdout-log, --metadata');
+        expect(result.stderr).toContain('Missing required analyzer inputs: --chunked-csv, --stdout-log, --metadata');
         expect(result.stderr).toContain('Usage: node scripts/analysis-js/analyzeResultsStreamingQueryHive.js');
     });
 
@@ -177,5 +211,28 @@ describe('analyzeResultsStreamingQueryHive CLI contract', () => {
 
         expect(result.status).toBe(0);
         expect(result.stdout).not.toContain('[DEBUG_CHUNKS] resolved analyzer inputs');
+    });
+
+    test('falls back to the chunked CSV recomposed result when stdout is empty', () => {
+        const fixture = makeChunkFallbackFixture('sqh-analyzer-chunk-fallback-', 'chunk-fallback');
+
+        const result = runAnalyzer(
+            [
+                '--data-path', fixture.dataPath,
+                '--iteration', '1',
+                '--chunked-csv', fixture.chunkedCsvPath,
+                '--stdout-log', fixture.stdoutLogPath,
+                '--metadata', fixture.metadataPath,
+                '--frequency', '16',
+            ],
+            {},
+            fixture.root,
+        );
+
+        expect(result.status).toBe(0);
+
+        const summaryPath = path.join(fixture.root, 'streaming_query_hive_latency_summary.csv');
+        const summaryLines = fs.readFileSync(summaryPath, 'utf8').trim().split('\n');
+        expect(summaryLines[1]).toBe('1,1,2,1,-1.2485270867983369E1,,');
     });
 });

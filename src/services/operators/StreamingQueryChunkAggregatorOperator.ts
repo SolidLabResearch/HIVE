@@ -21,6 +21,10 @@ type SubqueryIdentity = {
   topic: string;
 };
 
+function getLogicalChunkGroupId(partial: Pick<PartialChunkResult, "queryId" | "window">): string {
+  return `${partial.queryId}:${partial.window.start}:${partial.window.end}`;
+}
+
 /**
  *
  */
@@ -157,7 +161,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         Number.isFinite(parsed.window.start) &&
         Number.isFinite(parsed.window.end)
       ) {
-        const chunkGroupId = `${parsed.queryId}:${parsed.window.windowName}:${parsed.window.start}:${parsed.window.end}`;
+        const chunkGroupId = getLogicalChunkGroupId(parsed);
         return {
           queryId: parsed.queryId,
           subqueryId: parsed.subqueryId,
@@ -184,7 +188,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     partial: PartialChunkResult,
     expectedSubqueryIds: string[],
   ): { chunkGroupId: string; missingSubqueryIds: string[]; isComplete: boolean } {
-    const chunkGroupId = `${partial.queryId}:${partial.window.windowName}:${partial.window.start}:${partial.window.end}`;
+    const chunkGroupId = getLogicalChunkGroupId(partial);
     if (!chunksByWindow.has(chunkGroupId)) {
       chunksByWindow.set(chunkGroupId, new Map<string, PartialChunkResult>());
     }

@@ -56,13 +56,13 @@ describe('RSPQueryProcess', () => {
         test('should generate a hasValue triple for avg-prefixed bindings', () => {
             const result = process.generate_aggregation_event({ avgTemp: '22.5' }, Date.now());
             expect(result).toContain('<https://saref.etsi.org/core/hasValue>');
-            expect(result).toContain('"22.5"^^<http://www.w3.org/2001/XMLSchema#float>');
+            expect(result).toContain('"22.5"^^<http://www.w3.org/2001/XMLSchema#double>');
         });
 
         test('should generate a hasCount triple for count-prefixed bindings', () => {
             const result = process.generate_aggregation_event({ countReadings: '10' }, Date.now());
             expect(result).toContain('<https://saref.etsi.org/core/hasCount>');
-            expect(result).toContain('"10"^^<http://www.w3.org/2001/XMLSchema#float>');
+            expect(result).toContain('"10"^^<http://www.w3.org/2001/XMLSchema#integer>');
         });
 
         test('should generate triples for multiple bindings', () => {
@@ -87,6 +87,47 @@ describe('RSPQueryProcess', () => {
         test('should include the aggregation event IRI in the triple', () => {
             const result = process.generate_aggregation_event({ avgX: '1.0' }, Date.now());
             expect(result).toMatch(/^<https:\/\/rsp\.js\/aggregation_event\//);
+        });
+
+        test('should keep AVG payload values typed as double when the subquery also emits a count', () => {
+            const result = process.generate_aggregation_event(
+                { countTemp: '481', aggTemp: '1.0329299812889814' },
+                Date.now(),
+            );
+            expect(result).toContain('<https://saref.etsi.org/core/hasCount> "481"^^<http://www.w3.org/2001/XMLSchema#integer>');
+            expect(result).toContain('<https://saref.etsi.org/core/hasValue> "1.0329299812889814"^^<http://www.w3.org/2001/XMLSchema#double>');
+        });
+    });
+
+    describe('generate_partial_chunk_result', () => {
+        test('should extract window bounds from rsp-js timestamp_from/timestamp_to fields', () => {
+            const parsedQuery = {
+                s2r: [
+                    {
+                        window_name: 'mqtt://localhost:1883/sensor1',
+                        stream_name: 'mqtt://localhost:1883/sensor1',
+                        width: 30000,
+                        slide: 30000,
+                    },
+                ],
+            };
+            process.rspql_parser.parse = jest.fn().mockReturnValue(parsedQuery);
+
+            const partial = process['generate_partial_chunk_result'](
+                { avgTemp: '22.5', countTemp: '4' },
+                {
+                    bindings: { entries: {} },
+                    timestamp_from: 1779449067922,
+                    timestamp_to: 1779449097922,
+                },
+            );
+
+            expect(partial).not.toBeNull();
+            expect(partial?.window.start).toBe(1779449067922);
+            expect(partial?.window.end).toBe(1779449097922);
+            expect(partial?.value).toBe(22.5);
+            expect(partial?.count).toBe(4);
+            expect(partial?.chunkId).toContain('1779449067922:1779449097922');
         });
     });
 });
