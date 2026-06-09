@@ -14,6 +14,7 @@ import {
     getSubWindowRange,
     getSubWindowStep,
 } from "../util/runtimeConfig";
+import { recordPublishedMqttMessage } from "../util/mqttTraffic";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -397,23 +398,31 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
                 clean: false,
                 clientId: pubClientId,
             });
+            const resultPayload = JSON.stringify({
+                ...buildBenchmarkResultPayload(
+                    "naive_distributed",
+                    aggregationFunction,
+                    sessionId,
+                    Number.parseFloat(resolvedResultValue),
+                    windowCount,
+                ),
+                windowNumber: windowCount,
+            });
             pubClient.on("connect", () => {
                 pubClient.publish(
                     resultTopic,
-                    JSON.stringify({
-                        ...buildBenchmarkResultPayload(
-                            "naive_distributed",
-                            aggregationFunction,
-                            sessionId,
-                            Number.parseFloat(resolvedResultValue),
-                            windowCount,
-                        ),
-                        windowNumber: windowCount,
-                    }),
+                    resultPayload,
                     { qos: 1 },
                     (err: any) => {
                         if (err) {
                             log(`Error publishing to ${resultTopic}: ${err}`);
+                        } else {
+                            recordPublishedMqttMessage({
+                                topic: resultTopic,
+                                payload: resultPayload,
+                                messageType: "superquery_result",
+                                warmup: windowCount === 1,
+                            });
                         }
                         pubClient.end();
                     },

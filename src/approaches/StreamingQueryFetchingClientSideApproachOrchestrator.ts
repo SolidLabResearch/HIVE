@@ -19,6 +19,7 @@ import {
   getTimestampDomainMin,
   useCleanMqttSessionsForBenchmark,
 } from "../util/runtimeConfig";
+import { recordPublishedMqttMessage } from "../util/mqttTraffic";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -1097,6 +1098,12 @@ export class FetchingAllDataClientSide {
                 this.log(`Error publishing result: ${err}`);
               } else {
                 const publishEndTime = Date.now();
+                recordPublishedMqttMessage({
+                  topic: this.r2s_topic,
+                  payload: aggregation_object_string,
+                  messageType: "superquery_result",
+                  warmup: this.windowCount === 1,
+                });
                 console.log("Aggregation event published with QoS 2");
                 this.log(
                   `Successfully published result: ${data}, publish latency: ${publishEndTime - publishStartTime}ms`,

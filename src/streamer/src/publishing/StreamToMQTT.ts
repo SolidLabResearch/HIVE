@@ -3,6 +3,7 @@ import * as mqtt from 'mqtt';
 import * as path from 'path';
 import { StreamConsumer } from "./StreamConsumer";
 import { getOutputWindowRange, getOutputWindowStep } from "../../../util/runtimeConfig";
+import { recordPublishedMqttMessage } from "../../../util/mqttTraffic";
 const N3 = require('n3');
 const { DataFactory } = N3;
 const { namedNode, literal } = DataFactory;
@@ -561,6 +562,11 @@ export class StreamToMQTT {
                 }
 
                 this.successfulPublishes++;
+                recordPublishedMqttMessage({
+                    topic: this.topic_to_publish,
+                    payload: data,
+                    messageType: "raw_input_stream",
+                });
                 this.lifecycleLog("mqtt.publish.acks_complete", {
                     topic: this.topic_to_publish,
                     publishAttempts: this.publishAttempts,

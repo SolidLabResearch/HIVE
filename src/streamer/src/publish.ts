@@ -3,6 +3,7 @@ import { CSVLogger } from '../../util/logger/CSVLogger';
 import * as mqtt from "mqtt";
 import { StreamToMQTT } from './publishing/StreamToMQTT';
 import { buildBenchmarkTopicName, useCleanMqttSessionsForBenchmark } from "../../util/runtimeConfig";
+import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 
 /**
  *
@@ -51,14 +52,15 @@ async function publishFiniteReplayCompleteSignal(): Promise<void> {
         }, 10000);
 
         client.on("connect", () => {
+            const payload = JSON.stringify({
+                type: "finite_replay_complete",
+                source: "benchmark_publisher",
+                topicPrefix: process.env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX || "",
+                timestamp: Date.now(),
+            });
             client.publish(
                 controlTopic,
-                JSON.stringify({
-                    type: "finite_replay_complete",
-                    source: "benchmark_publisher",
-                    topicPrefix: process.env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX || "",
-                    timestamp: Date.now(),
-                }),
+                payload,
                 { qos: 1, retain: false },
                 (err) => {
                     if (err) {
@@ -71,6 +73,11 @@ async function publishFiniteReplayCompleteSignal(): Promise<void> {
                     }
 
                     finish(() => {
+                        recordPublishedMqttMessage({
+                            topic: controlTopic,
+                            payload,
+                            messageType: "control",
+                        });
                         clearTimeout(timeoutHandle);
                         client.end(false, () => resolve());
                     });

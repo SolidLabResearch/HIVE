@@ -27,6 +27,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
+const { finalizeMqttTrafficArtifacts } = require("../../dist/util/mqttTraffic");
 const {
   cleanupStaleBenchmarkProcesses,
   delay,
@@ -461,6 +462,10 @@ class CustomPatternComparisonRunner {
       ...process.env,
       DATA_PATH: dataPath,
       LOG_PATH: logDir,
+      BENCHMARK_SCENARIO: "custom-pattern-comparison",
+      BENCHMARK_SCALE: patternName,
+      BENCHMARK_APPROACH: approach,
+      BENCHMARK_ITERATION: String(iterationNum),
       STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX: topicPrefix,
       STREAMING_QUERY_HIVE_BENCHMARK_START_TIME: String(
         benchmarkEventTimeAnchor,
@@ -545,6 +550,7 @@ class CustomPatternComparisonRunner {
         this.activeAttemptCleanup = null;
         await cleanupAttempt();
         this.moveLogFiles(approach, logDir);
+        const mqttTrafficSummary = finalizeMqttTrafficArtifacts({ logDir });
         lifecycleLog("runSingleTest.finalize.resolved", {
           attemptId,
           benchmarkStatus: result?.benchmarkStatus,
@@ -552,7 +558,10 @@ class CustomPatternComparisonRunner {
           finalStatus: result?.finalStatus,
           waitState: currentWaitState,
         });
-        resolve(result);
+        resolve({
+          ...result,
+          mqttTrafficSummary,
+        });
       };
 
       this.activeAttemptCleanup = cleanupAttempt;

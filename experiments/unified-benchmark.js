@@ -28,6 +28,7 @@ const path = require("path");
 const mqtt = require("mqtt");
 const { parse } = require("csv-parse/sync");
 const { createBenchmarkReplayRunEnv } = require("./utils/benchmarkReplayEnv");
+const { finalizeMqttTrafficArtifacts } = require("../dist/util/mqttTraffic");
 const {
   getReplayMetadata,
   attachReplayMetadata,
@@ -340,6 +341,12 @@ class UnifiedBenchmark {
 
     const sessionId = `${approachName}-${iterationNum}-${Date.now()}`;
     const topics = [buildResultTopic(approachName, sessionId)];
+    const logDir = path.join(
+      this.logsBaseDir,
+      approachName,
+      `iteration-${iterationNum}`,
+    );
+    fs.mkdirSync(logDir, { recursive: true });
 
     // Ensure persistent MQTT client is connected (reused across all iterations)
     let staleMessagesDrained = 0;
@@ -401,6 +408,11 @@ class UnifiedBenchmark {
 
     // Phase 2: Now accept real results
     return new Promise(async (resolve, reject) => {
+      const finalizeWithTrafficSummary = (result) => ({
+        ...result,
+        logDir,
+        mqttTrafficSummary: finalizeMqttTrafficArtifacts({ logDir }),
+      });
       let queryRegistrationTime = null;
       let firstResultTime = null;
       let firstResultValue = null;
@@ -477,7 +489,7 @@ class UnifiedBenchmark {
               ? Math.max(...stats.memorySamples)
               : 0;
 
-          resolve({
+          resolve(finalizeWithTrafficSummary({
             approach: approachName,
             iteration: iterationNum,
             queryRegistrationTime,
@@ -491,7 +503,7 @@ class UnifiedBenchmark {
               maxMemory,
               samples: stats.cpuSamples.length,
             },
-          });
+          }));
         }
       });
 
@@ -513,8 +525,13 @@ class UnifiedBenchmark {
         SUB_WINDOW_STEP: CONFIG.subWindowStep,
         WEARABLE_FREQUENCY: CONFIG.wearableFrequency,
         LOG_DISABLE_FILE_OUTPUT: process.env.LOG_DISABLE_FILE_OUTPUT ?? "1",
+        LOG_PATH: logDir,
         RESULT_TOPIC: topics[0],
         SESSION_ID: sessionId,
+        BENCHMARK_SCENARIO: "unified-benchmark",
+        BENCHMARK_SCALE: CONFIG.pattern || "real-data",
+        BENCHMARK_APPROACH: approachName,
+        BENCHMARK_ITERATION: String(iterationNum),
       });
 
       const orchestratorProc = spawn("node", [orchestratorPath], {
@@ -553,7 +570,7 @@ class UnifiedBenchmark {
             this.mqttClient.unsubscribe(t);
           }
           this.cleanup();
-          resolve({
+          resolve(finalizeWithTrafficSummary({
             approach: approachName,
             iteration: iterationNum,
             queryRegistrationTime,
@@ -561,7 +578,7 @@ class UnifiedBenchmark {
             latency: null,
             value: null,
             error: `Orchestrator exited (code: ${code}, signal: ${signal})`,
-          });
+          }));
         }
       });
 
@@ -647,7 +664,7 @@ class UnifiedBenchmark {
             this.mqttClient.unsubscribe(t);
           }
           this.cleanup();
-          resolve({
+          resolve(finalizeWithTrafficSummary({
             approach: approachName,
             iteration: iterationNum,
             queryRegistrationTime,
@@ -655,7 +672,7 @@ class UnifiedBenchmark {
             latency: null,
             value: null,
             error: "TIMEOUT",
-          });
+          }));
         }
       }, CONFIG.timeout);
     });

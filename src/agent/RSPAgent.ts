@@ -5,6 +5,7 @@ const { DataFactory } = require("n3");
 import { v4 as uuidv4 } from 'uuid';
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import { buildBenchmarkTopicName } from "../util/runtimeConfig";
+import { recordPublishedMqttMessage } from "../util/mqttTraffic";
 const mqtt = require('mqtt');
 
 
@@ -152,10 +153,20 @@ export class RSPAgent {
                 const iterables = object.bindings.values();
 
                 for (const item of iterables) {
-                    const aggregation_event_timestamp = new Date().getTime();
                     const data = item.value;
                     console.log("Binding data received:", data);
-                    rstream_publisher.publish(this.r2s_topic, data);
+                    rstream_publisher.publish(this.r2s_topic, data, (err: any) => {
+                        if (err) {
+                            console.error("MQTT publisher error:", err);
+                            return;
+                        }
+
+                        recordPublishedMqttMessage({
+                            topic: this.r2s_topic,
+                            payload: data,
+                            messageType: "reusable_result",
+                        });
+                    });
                 }
             });
         });

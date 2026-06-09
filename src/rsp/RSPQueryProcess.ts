@@ -3,6 +3,7 @@ import { RDFStream, RSPEngine, RSPQLParser } from 'rsp-js';
 import { v4 as uuidv4 } from 'uuid';
 import { turtleStringToStore } from '../util/Util';
 import { PartialChunkResult } from '../util/chunkTypes';
+import { recordPublishedMqttMessage } from '../util/mqttTraffic';
 import { getTimestampDomainMax, getTimestampDomainMin, useCleanMqttSessionsForBenchmark } from '../util/runtimeConfig';
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
@@ -213,6 +214,11 @@ export class RSPQueryProcess {
                     if (err) {
                         console.error(`Error publishing aggregation event: ${err}`);
                     } else {
+                        recordPublishedMqttMessage({
+                            topic: this.rstream_topic,
+                            payload: aggregation_object_string,
+                            messageType: "chunk_result",
+                        });
                         console.log(`Successfully published aggregation event: ${aggregation_object_string}`);
                     }
                 });

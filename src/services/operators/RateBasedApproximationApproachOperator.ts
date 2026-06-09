@@ -12,6 +12,7 @@ import {
   getSessionId,
 } from "../../util/runtimeConfig";
 import { hash_string_md5 } from "../../util/Util";
+import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 
 /**
  * Configuration interface for inactivity detection
@@ -850,21 +851,22 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   resultEmittedAt,
                   String(unifiedResult),
                 );
+                const publishedPayload = JSON.stringify({
+                  ...finalResult,
+                  ...buildBenchmarkResultPayload(
+                    "approximation",
+                    outputAggregationType as AggregationFunction,
+                    this.sessionId,
+                    unifiedResult,
+                    this.windowCount,
+                  ),
+                });
 
                 // Publish with QoS 1 and error handling
 
                 rsp_client.publish(
                   resultTopic,
-                  JSON.stringify({
-                    ...finalResult,
-                    ...buildBenchmarkResultPayload(
-                      "approximation",
-                      outputAggregationType as AggregationFunction,
-                      this.sessionId,
-                      unifiedResult,
-                      this.windowCount,
-                    ),
-                  }),
+                  publishedPayload,
                   { qos: 1 },
                   (error) => {
                     if (error) {
@@ -876,6 +878,12 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                         `Failed to publish aggregated results: ${error}`,
                       );
                     } else {
+                      recordPublishedMqttMessage({
+                        topic: resultTopic,
+                        payload: publishedPayload,
+                        messageType: "superquery_result",
+                        warmup: this.windowCount === 1,
+                      });
                       console.log(
                         `Successfully published unified cross-sensor ${outputAggregationType.toLowerCase()}: ${unifiedResult} (from ${allAvailableValues.length} topics)`,
                       );

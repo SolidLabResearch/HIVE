@@ -21,6 +21,7 @@ import {
   useChunkedComparableOutputCadence,
 } from "../../util/runtimeConfig";
 import { PartialChunkResult } from "../../util/chunkTypes";
+import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 const N3 = require("n3");
 
 type SubqueryIdentity = {
@@ -1779,6 +1780,12 @@ For example, the allResults object might look like this:
             console.error("Failed to publish chunked results:", error);
             this.logger.log(`Failed to publish chunked results: ${error}`);
           } else {
+            recordPublishedMqttMessage({
+              topic: resultTopic,
+              payload: JSON.stringify(finalResult),
+              messageType: "superquery_result",
+              warmup: this.windowCount === 1,
+            });
             console.log(
               "Successfully published chunked results to chunked/output",
             );

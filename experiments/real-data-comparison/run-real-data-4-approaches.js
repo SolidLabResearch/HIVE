@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
 const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
+const { finalizeMqttTrafficArtifacts } = require('../../dist/util/mqttTraffic');
 
 const APPROACHES = [
   {
@@ -113,7 +114,11 @@ class RealDataComparisonRunner {
       const env = this.replayEnv.withBenchmarkReplayEnv({
         ...process.env,
         DATA_PATH: '', // Uses default which points to the base data directories
-        LOG_PATH: logDir
+        LOG_PATH: logDir,
+        BENCHMARK_SCENARIO: 'real-data-comparison',
+        BENCHMARK_SCALE: 'real-data',
+        BENCHMARK_APPROACH: approach.name,
+        BENCHMARK_ITERATION: String(iteration),
       });
 
       const startTime = Date.now();
@@ -153,13 +158,15 @@ class RealDataComparisonRunner {
 
             // Copy log files
             this.copyLogFiles(approach, logDir);
+            const mqttTrafficSummary = finalizeMqttTrafficArtifacts({ logDir });
 
             resolve({
               approach: approach.name,
               iteration,
               duration,
               success: code === 0,
-              logDir
+              logDir,
+              mqttTrafficSummary,
             });
           });
 
@@ -305,6 +312,20 @@ class RealDataComparisonRunner {
       return results;
     } catch (error) {
       console.error(`Error parsing latency log ${logPath}:`, error.message);
+      return null;
+    }
+  }
+
+  parseMqttTrafficSummary(logDir) {
+    const summaryPath = path.join(logDir, 'mqtt_traffic_summary.json');
+    if (!fs.existsSync(summaryPath)) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+    } catch (error) {
+      console.error(`Error parsing MQTT traffic summary ${summaryPath}:`, error.message);
       return null;
     }
   }
@@ -503,10 +524,15 @@ class RealDataComparisonRunner {
 
       const latencies = [];
       const allResultValues = [];
+      const mqttTrafficSummaries = [];
 
       approachResults.forEach(result => {
         const mainLogPath = path.join(result.logDir, approach.logFiles.main);
         const latencyLogPath = path.join(result.logDir, approach.logFiles.latency);
+        const mqttTrafficSummary = this.parseMqttTrafficSummary(result.logDir);
+        if (mqttTrafficSummary) {
+          mqttTrafficSummaries.push(mqttTrafficSummary);
+        }
         
         // Prefer latency log for more accurate data
         const latencyData = this.parseLatencyLog(latencyLogPath);
@@ -536,7 +562,15 @@ class RealDataComparisonRunner {
         minLatency: latencies.length > 0 ? Math.min(...latencies) : null,
         maxLatency: latencies.length > 0 ? Math.max(...latencies) : null,
         windowCloseCount: latencies.length,
-        resultValues: allResultValues.length > 0 ? allResultValues[0] : [] // Use first iteration for comparison
+        resultValues: allResultValues.length > 0 ? allResultValues[0] : [], // Use first iteration for comparison
+        mqttTraffic: mqttTrafficSummaries.length > 0
+          ? Object.keys(mqttTrafficSummaries[0]).reduce((acc, key) => {
+              acc[key] =
+                mqttTrafficSummaries.reduce((sum, summary) => sum + Number(summary[key] || 0), 0) /
+                mqttTrafficSummaries.length;
+              return acc;
+            }, {})
+          : null,
       };
     }
 
@@ -556,7 +590,7 @@ class RealDataComparisonRunner {
     console.log('|----------------------|------------|-------------|-------------|-------------|---------|----------|----------|----------|');
 
     const csvRows = [];
-    csvRows.push('Approach,Iterations,Avg_Latency_ms,Min_Latency_ms,Max_Latency_ms,Window_Count,Accuracy_%,MAE,MAPE_%');
+    csvRows.push('Approach,Iterations,Avg_Latency_ms,Min_Latency_ms,Max_Latency_ms,Window_Count,Accuracy_%,MAE,MAPE_%,published_application_bytes,estimated_delivery_bytes,published_bandwidth_kb_s,estimated_delivery_bandwidth_kb_s,raw_input_published_bytes,raw_input_estimated_delivery_bytes,raw_input_subscriber_count,reuse_layer_estimated_delivery_bytes,reuse_layer_bandwidth_kb_s,chunk_result_estimated_delivery_bytes,chunk_result_count,chunk_bandwidth_kb_s');
 
     for (const approach of APPROACHES) {
       const data = analysis.byApproach[approach.name];
@@ -571,6 +605,7 @@ class RealDataComparisonRunner {
       const maxLat = data.maxLatency ? data.maxLatency.toFixed(2) : 'N/A';
       const winCount = data.windowCloseCount || 'N/A';
       const iterations = data.iterations || 0;
+      const traffic = data.mqttTraffic || {};
 
       let accuracy = 'N/A';
       let mae = 'N/A';
@@ -603,7 +638,8 @@ class RealDataComparisonRunner {
 
       csvRows.push(
         `${approach.label},${iterations},${avgLat},${minLat},${maxLat},${winCount},` +
-        `${accuracy.replace('%', '').replace(' (baseline)', '')},${mae},${mape.replace('%', '')}`
+        `${accuracy.replace('%', '').replace(' (baseline)', '')},${mae},${mape.replace('%', '')},` +
+        `${traffic.published_application_bytes ?? 0},${traffic.estimated_delivery_bytes ?? 0},${traffic.published_bandwidth_kb_s ?? 0},${traffic.estimated_delivery_bandwidth_kb_s ?? 0},${traffic.raw_input_published_bytes ?? 0},${traffic.raw_input_estimated_delivery_bytes ?? 0},${traffic.raw_input_subscriber_count ?? 0},${traffic.reuse_layer_estimated_delivery_bytes ?? 0},${traffic.reuse_layer_bandwidth_kb_s ?? 0},${traffic.chunk_result_estimated_delivery_bytes ?? 0},${traffic.chunk_result_count ?? 0},${traffic.chunk_bandwidth_kb_s ?? 0}`
       );
     }
 
