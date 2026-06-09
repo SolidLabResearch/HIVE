@@ -168,8 +168,9 @@ class PatternMultiIterationAnalysis {
           const resources = this.readResources(approach, pattern.name, iter);
 
           // Latency
-          if (meta && meta.firstEventLatency !== null) {
-            metrics[approach].latency.push(meta.firstEventLatency);
+          const comparableLatencyMs = meta?.firstFinalizedComparableElapsedMs ?? meta?.firstEventLatency ?? null;
+          if (Number.isFinite(comparableLatencyMs)) {
+            metrics[approach].latency.push(comparableLatencyMs);
           }
 
           // Resources
@@ -220,7 +221,7 @@ class PatternMultiIterationAnalysis {
     // 1. CSV Report
     const csvHeader = [
       "Pattern", "Type", "Value", "Approach", "Iterations",
-      "Latency_Mean_ms", "Latency_Std",
+      "Comparable_Latency_Mean_ms", "Comparable_Latency_Std",
       "Heap_Avg_Mean_MB", "Heap_Avg_Std",
       "Heap_Max_Mean_MB", "Heap_Max_Std",
       "MAPE_Mean_%", "MAPE_Std",

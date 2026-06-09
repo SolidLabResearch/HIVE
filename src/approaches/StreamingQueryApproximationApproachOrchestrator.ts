@@ -31,6 +31,7 @@ FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearab
 WHERE {
     WINDOW <mqtt://localhost:1883/wearableX> {
         ?s1 saref:hasValue ?value .
+        ?s1 saref:hasTimestamp ?ts .
         ?s1 saref:relatesToProperty dahccsensors:wearableX .
     }
 }
@@ -46,6 +47,7 @@ FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smar
 WHERE {
     WINDOW <mqtt://localhost:1883/smartphoneX> {
         ?s2 saref:hasValue ?value .
+        ?s2 saref:hasTimestamp ?ts .
         ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
     }
 } 
@@ -69,11 +71,13 @@ WHERE {
     {
         WINDOW <mqtt://localhost:1883/wearableX> {
             ?s1 saref:hasValue ?value .
+            ?s1 saref:hasTimestamp ?ts .
             ?s1 saref:relatesToProperty dahccsensors:wearableX .
         }
     } UNION {
         WINDOW <mqtt://localhost:1883/smartphoneX> {
             ?s2 saref:hasValue ?value .
+            ?s2 saref:hasTimestamp ?ts .
             ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
         }
     }

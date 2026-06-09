@@ -40,6 +40,24 @@ const FULL_OPTIONAL_APPROACHES = ["naive_distributed"];
 const SMOKE_REQUIRED_APPROACHES = ["fetching", "approximation"];
 const SMOKE_OPTIONAL_APPROACHES = ["chunked", "naive_distributed"];
 
+function parseSelectionList(value, allowedValues) {
+  if (!value) {
+    return null;
+  }
+
+  const entries = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const filtered = entries.filter((entry) => allowedValues.includes(entry));
+  return [...new Set(filtered)];
+}
+
 const FILE_MAP = {
   fetching: {
     result: "fetching_results.csv",
@@ -71,6 +89,10 @@ function parseArgs(argv) {
   const args = {
     inputRoot: DEFAULT_INPUT_ROOT,
     outputDir: DEFAULT_OUTPUT_DIR,
+    executionSummaryPath: null,
+    selectedPatterns: null,
+    selectedApproaches: null,
+    selectedIterations: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -92,6 +114,31 @@ function parseArgs(argv) {
         args.outputDir = resolveMaybeRelativePath(next);
         index += 1;
         break;
+      case "--execution-summary":
+        if (!next) {
+          throw new Error("--execution-summary requires a value");
+        }
+        args.executionSummaryPath = resolveMaybeRelativePath(next);
+        index += 1;
+        break;
+      case "--patterns":
+        args.selectedPatterns = parseSelectionList(
+          next,
+          ALL_PATTERNS.map((pattern) => pattern.type),
+        );
+        index += 1;
+        break;
+      case "--approaches":
+        args.selectedApproaches = parseSelectionList(
+          next,
+          [...FULL_REQUIRED_APPROACHES, ...FULL_OPTIONAL_APPROACHES],
+        );
+        index += 1;
+        break;
+      case "--iterations":
+        args.selectedIterations = parseIntegerSelectionList(next);
+        index += 1;
+        break;
       case "--help":
       case "-h":
         printHelp();
@@ -111,6 +158,11 @@ function printHelp() {
 Options:
   --input-root <path>   Pattern benchmark output root (default: ${DEFAULT_INPUT_ROOT})
   --output-dir <path>   Directory for summary.json and summary.csv (default: ${DEFAULT_OUTPUT_DIR})
+  --execution-summary <path>
+                        Explicit custom_pattern_comparison_summary.json to use
+  --patterns <list>     Comma-separated pattern types to analyze
+  --approaches <list>   Comma-separated approaches to analyze
+  --iterations <list>   Comma-separated iteration numbers to expect
   --help                Show this help
 `);
 }
@@ -129,6 +181,23 @@ function pathExists(filePath) {
   } catch {
     return false;
   }
+}
+
+function parseIntegerSelectionList(value) {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = value
+    .split(",")
+    .map((entry) => Number.parseInt(entry.trim(), 10))
+    .filter((entry) => Number.isFinite(entry) && entry > 0);
+
+  if (parsed.length === 0) {
+    return null;
+  }
+
+  return [...new Set(parsed)].sort((left, right) => left - right);
 }
 
 function listIterationNumbers(rootDir) {
@@ -167,14 +236,18 @@ function readResultsCsv(filePath) {
     }
 
     const parts = line.split(",");
-    if (parts.length < 3) {
+    if (parts.length < 4) {
       continue;
     }
 
     const timestamp = Number.parseInt(parts[0], 10);
     const windowNumber = Number.parseInt(parts[1], 10);
-    const resultValue = Number.parseFloat(parts[2]);
-    const latencyValue = parts[3] && parts[3] !== "N/A" ? Number.parseFloat(parts[3]) : null;
+    const windowStart = Number.parseInt(parts[2], 10);
+    const windowEnd = Number.parseInt(parts[3], 10);
+    const resultValue = Number.parseFloat(parts[4] ?? parts[2]);
+    const latencyValue = parts[5] && parts[5] !== "N/A"
+      ? Number.parseFloat(parts[5])
+      : (parts[3] && parts[3] !== "N/A" ? Number.parseFloat(parts[3]) : null);
 
     if (!Number.isFinite(windowNumber) || !Number.isFinite(resultValue)) {
       continue;
@@ -183,6 +256,8 @@ function readResultsCsv(filePath) {
     results.push({
       timestamp: Number.isFinite(timestamp) ? timestamp : null,
       windowNumber,
+      windowStart: Number.isFinite(windowStart) ? windowStart : null,
+      windowEnd: Number.isFinite(windowEnd) ? windowEnd : null,
       resultValue,
       latency: Number.isFinite(latencyValue) ? latencyValue : null,
     });
@@ -203,6 +278,307 @@ function readMetadataJson(filePath) {
       parseError: error.message,
     };
   }
+}
+
+function readIterationMetadata(inputRoot) {
+  const candidates = [path.join(inputRoot, "metadata.json")];
+
+  for (const candidate of candidates) {
+    const metadata = readMetadataJson(candidate);
+    if (metadata) {
+      return metadata;
+    }
+  }
+
+  return null;
+}
+
+function readFirstJson(candidates) {
+  for (const candidate of candidates) {
+    const value = readMetadataJson(candidate);
+    if (value) {
+      return {
+        path: candidate,
+        value,
+      };
+    }
+  }
+
+  return null;
+}
+
+function readExecutionSummary(inputRoot, explicitSummaryPath = null) {
+  const candidates = [];
+  if (explicitSummaryPath) {
+    candidates.push(explicitSummaryPath);
+  }
+  candidates.push(
+    path.join(inputRoot, "custom_pattern_comparison_summary.json"),
+  );
+
+  const resolved = readFirstJson([...new Set(candidates)]);
+
+  if (!resolved || !Array.isArray(resolved.value?.results)) {
+    return {
+      sourcePath: null,
+      summary: null,
+      cases: [],
+      caseMap: new Map(),
+    };
+  }
+
+  const cases = resolved.value.results.map((entry) => normalizeExecutionCase(entry));
+  const caseMap = new Map(
+    cases.map((entry) => [buildExecutionCaseKey(entry.approach, entry.pattern, entry.iteration), entry]),
+  );
+
+  return {
+    sourcePath: resolved.path,
+    summary: resolved.value,
+    cases,
+    caseMap,
+  };
+}
+
+function buildExecutionCaseKey(approach, patternType, iterationNumber) {
+  return `${approach}::${patternType}::${iterationNumber}`;
+}
+
+function normalizeLegacyExecutionSemantics(entry) {
+  const rawBenchmarkStatus = entry?.benchmarkStatus || null;
+  const rawExtractionStatus = entry?.finalExtractionStatus || entry?.extractionStatus || null;
+  const rawTimedOut = Boolean(entry?.timedOut);
+  const success = Boolean(entry?.success);
+  const reachedDurationLimit = Boolean(entry?.reachedDurationLimit)
+    || (rawTimedOut && success && ["success", "skipped"].includes(rawExtractionStatus));
+
+  if (entry?.terminationReason) {
+    return {
+      benchmarkStatus: rawBenchmarkStatus,
+      terminationReason: entry.terminationReason,
+      reachedDurationLimit,
+      legacyTimedOut: rawTimedOut,
+    };
+  }
+
+  if (rawBenchmarkStatus === "timedOut") {
+    if (success && ["success", "skipped"].includes(rawExtractionStatus)) {
+      return {
+        benchmarkStatus: "completed",
+        terminationReason: "duration_limit_reached",
+        reachedDurationLimit: true,
+        legacyTimedOut: true,
+      };
+    }
+
+    return {
+      benchmarkStatus: "failed",
+      terminationReason: rawTimedOut ? "startup_timeout" : "process_error",
+      reachedDurationLimit,
+      legacyTimedOut: rawTimedOut,
+    };
+  }
+
+  return {
+    benchmarkStatus: rawBenchmarkStatus,
+    terminationReason: rawBenchmarkStatus === "completed" ? "process_exit" : null,
+    reachedDurationLimit,
+    legacyTimedOut: rawTimedOut,
+  };
+}
+
+function determineFailureStage(entry) {
+  if (entry.success) {
+    return null;
+  }
+
+  if (entry.extractionStatus && !["success", "skipped"].includes(entry.extractionStatus)) {
+    return "extraction";
+  }
+
+  if (entry.benchmarkStatus && entry.benchmarkStatus !== "completed") {
+    return "benchmark";
+  }
+
+  if (entry.error) {
+    return "benchmark";
+  }
+
+  return "unknown";
+}
+
+function buildFailureReason(entry) {
+  if (entry.error) {
+    return entry.error;
+  }
+
+  if (entry.extractionStatus && !["success", "skipped"].includes(entry.extractionStatus)) {
+    return `Extraction ${entry.extractionStatus}`;
+  }
+
+  if (entry.benchmarkStatus && entry.benchmarkStatus !== "completed") {
+    return `Benchmark ${entry.benchmarkStatus}`;
+  }
+
+  if (entry.terminationReason && entry.terminationReason !== "duration_limit_reached") {
+    return `Termination ${entry.terminationReason}`;
+  }
+
+  return null;
+}
+
+function normalizeExecutionCase(entry) {
+  const iteration = Number.parseInt(entry?.iteration, 10);
+  const durationMs = Number.parseInt(entry?.durationMs ?? entry?.duration, 10);
+  const finalAttemptNumber = Number.parseInt(entry?.finalAttemptNumber ?? entry?.attemptCount, 10);
+  const attemptCount = Number.parseInt(entry?.attemptCount, 10);
+  const configuredTimeoutMs = Number.parseInt(entry?.configuredTimeoutMs, 10);
+  const normalizedSemantics = normalizeLegacyExecutionSemantics(entry);
+
+  return {
+    approach: entry?.approach || null,
+    pattern: entry?.pattern || null,
+    patternDisplayName: entry?.patternDisplayName || null,
+    iteration: Number.isFinite(iteration) ? iteration : null,
+    success: Boolean(entry?.success),
+    finalStatus: entry?.finalStatus || (entry?.success ? "success" : "failed"),
+    benchmarkStatus: normalizedSemantics.benchmarkStatus || null,
+    terminationReason: normalizedSemantics.terminationReason,
+    extractionStatus: entry?.finalExtractionStatus || entry?.extractionStatus || null,
+    timedOut: Boolean(entry?.timedOut),
+    legacyTimedOut: normalizedSemantics.legacyTimedOut,
+    reachedDurationLimit: normalizedSemantics.reachedDurationLimit,
+    exitCode: entry?.exitCode ?? null,
+    durationMs: Number.isFinite(durationMs) ? durationMs : null,
+    configuredTimeoutMs: Number.isFinite(configuredTimeoutMs) ? configuredTimeoutMs : null,
+    logDir: entry?.finalLogDir || entry?.logDir || null,
+    finalLogDir: entry?.finalLogDir || entry?.logDir || null,
+    finalAttemptNumber: Number.isFinite(finalAttemptNumber) ? finalAttemptNumber : 1,
+    attemptCount: Number.isFinite(attemptCount) ? attemptCount : 1,
+    retryUsed: Boolean(entry?.retryUsed) || (Number.isFinite(attemptCount) && attemptCount > 1),
+    retriesConfigured: Number.parseInt(entry?.retriesConfigured, 10) || 0,
+    attempts: Array.isArray(entry?.attempts) ? entry.attempts : [],
+    firstFailureReason: entry?.firstFailureReason || null,
+    error: entry?.error || null,
+    failureStage: determineFailureStage(entry),
+    failureReason: buildFailureReason(entry),
+  };
+}
+
+function getCaseAttemptDir(inputRoot, executionCase) {
+  if (!executionCase?.approach || !executionCase?.pattern || !executionCase?.iteration) {
+    return null;
+  }
+
+  const iterationDir = path.join(
+    inputRoot,
+    executionCase.approach,
+    executionCase.pattern,
+    `iteration${executionCase.iteration}`,
+  );
+
+  if (executionCase.finalAttemptNumber > 1 || executionCase.retryUsed) {
+    return path.join(iterationDir, `attempt${executionCase.finalAttemptNumber}`);
+  }
+
+  const attemptOneDir = path.join(iterationDir, "attempt1");
+  if (pathExists(attemptOneDir)) {
+    return attemptOneDir;
+  }
+
+  return iterationDir;
+}
+
+function readSelectedNamesFromMetadata(metadata, key) {
+  const value = metadata?.cliConfiguration?.[key] || metadata?.[key];
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  return value.map((entry) => String(entry)).filter(Boolean);
+}
+
+function getConfiguredIterationCount(metadata) {
+  const countCandidates = [
+    metadata?.cliConfiguration?.iterations,
+    metadata?.iterationCount,
+    metadata?.iterations,
+  ];
+
+  for (const candidate of countCandidates) {
+    const parsed = Number.parseInt(candidate, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function getConfiguredIterationCountFromExecutionSummary(summary) {
+  const countCandidates = [
+    summary?.iterations,
+    summary?.iterationCount,
+    summary?.configuredIterationCount,
+  ];
+
+  for (const candidate of countCandidates) {
+    const parsed = Number.parseInt(candidate, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function buildExpectedIterationNumbers(configuredIterationCount, observedIterations, explicitIterations = null) {
+  if (Array.isArray(explicitIterations) && explicitIterations.length > 0) {
+    return explicitIterations;
+  }
+
+  if (Number.isFinite(configuredIterationCount) && configuredIterationCount > 0) {
+    return Array.from({ length: configuredIterationCount }, (_, index) => index + 1);
+  }
+
+  return observedIterations;
+}
+
+function getIgnoredObservedIterations(observedIterations, expectedIterations) {
+  const expectedIterationSet = new Set(expectedIterations || []);
+  return observedIterations.filter((iterationNumber) => !expectedIterationSet.has(iterationNumber));
+}
+
+function buildExecutionSummaryForCases(expectedCaseCount, executionCases) {
+  const observedCases = executionCases.filter((entry) => !entry.missing);
+  const failedExecutionCases = observedCases.filter((entry) => !entry.success);
+  const missingExecutionCases = executionCases.filter((entry) => entry.missing);
+  const successfulCases = observedCases.filter((entry) => entry.success);
+
+  return {
+    expectedCaseCount,
+    observedCaseCount: observedCases.length,
+    successfulCaseCount: successfulCases.length,
+    failedCaseCount: failedExecutionCases.length,
+    missingCaseCount: missingExecutionCases.length,
+    timedOutCaseCount: observedCases.filter((entry) => entry.terminationReason === "startup_timeout").length,
+    reachedDurationLimitCaseCount: observedCases.filter((entry) => entry.reachedDurationLimit).length,
+    extractionFailureCount: observedCases.filter(
+      (entry) => entry.extractionStatus && !["success", "skipped"].includes(entry.extractionStatus),
+    ).length,
+    nonCompletedBenchmarkCaseCount: observedCases.filter(
+      (entry) => entry.benchmarkStatus && entry.benchmarkStatus !== "completed",
+    ).length,
+    totalObservedDurationMs: observedCases.reduce(
+      (sum, entry) => sum + (entry.durationMs || 0),
+      0,
+    ),
+    status:
+      missingExecutionCases.length > 0 || failedExecutionCases.length > 0
+        ? "partial"
+        : (expectedCaseCount > 0 ? "complete" : "missing"),
+    failedExecutionCases,
+    missingExecutionCases,
+  };
 }
 
 function calculateStats(values) {
@@ -231,27 +607,33 @@ function calculateStats(values) {
 function compareResults(baselineResults, approachResults) {
   const baselineByWindow = new Map();
   const approachByWindow = new Map();
+  const hasWindowBounds = (result) =>
+    Number.isFinite(result.windowStart) && Number.isFinite(result.windowEnd);
+  const getWindowKey = (result) =>
+    hasWindowBounds(result)
+      ? `${result.windowStart}:${result.windowEnd}`
+      : `window-number:${result.windowNumber}`;
 
   for (const result of baselineResults) {
-    baselineByWindow.set(result.windowNumber, result);
+    baselineByWindow.set(getWindowKey(result), result);
   }
 
   for (const result of approachResults) {
-    approachByWindow.set(result.windowNumber, result);
+    approachByWindow.set(getWindowKey(result), result);
   }
 
-  const matchedWindowNumbers = [...baselineByWindow.keys()]
-    .filter((windowNumber) => approachByWindow.has(windowNumber))
-    .sort((left, right) => left - right);
+  const matchedWindowKeys = [...baselineByWindow.keys()]
+    .filter((windowKey) => approachByWindow.has(windowKey))
+    .sort();
 
   let sumAbsoluteError = 0;
   let sumSquaredError = 0;
   let sumPercentageError = 0;
   let mapeApplicableWindowCount = 0;
 
-  for (const windowNumber of matchedWindowNumbers) {
-    const baseline = baselineByWindow.get(windowNumber).resultValue;
-    const approach = approachByWindow.get(windowNumber).resultValue;
+  for (const windowKey of matchedWindowKeys) {
+    const baseline = baselineByWindow.get(windowKey).resultValue;
+    const approach = approachByWindow.get(windowKey).resultValue;
     const absoluteError = Math.abs(approach - baseline);
 
     sumAbsoluteError += absoluteError;
@@ -263,7 +645,7 @@ function compareResults(baselineResults, approachResults) {
     }
   }
 
-  const matchedWindowCount = matchedWindowNumbers.length;
+  const matchedWindowCount = matchedWindowKeys.length;
   const baselineOnlyCount = baselineResults.length - matchedWindowCount;
   const approachOnlyCount = approachResults.length - matchedWindowCount;
 
@@ -298,21 +680,29 @@ function collectFileInventory(approachRoot, expectedFiles) {
   const observed = new Set();
   const missingExpected = new Set(expectedFiles);
 
+  function collectFilesRecursively(dirPath, relativePrefix = "") {
+    const entries = fs.readdirSync(dirPath);
+    for (const entry of entries) {
+      const absolutePath = path.join(dirPath, entry);
+      const relativePath = relativePrefix ? path.join(relativePrefix, entry) : entry;
+      const stat = fs.statSync(absolutePath);
+      if (stat.isDirectory()) {
+        collectFilesRecursively(absolutePath, relativePath);
+        continue;
+      }
+
+      observed.add(relativePath);
+      missingExpected.delete(entry);
+    }
+  }
+
   const iterationNumbers = listIterationNumbers(approachRoot);
   for (const iterationNumber of iterationNumbers) {
     const iterationDir = path.join(approachRoot, `iteration${iterationNumber}`);
     if (!pathExists(iterationDir)) {
       continue;
     }
-
-    const fileNames = fs
-      .readdirSync(iterationDir)
-      .filter((entry) => fs.statSync(path.join(iterationDir, entry)).isFile());
-
-    for (const fileName of fileNames) {
-      observed.add(fileName);
-      missingExpected.delete(fileName);
-    }
+    collectFilesRecursively(iterationDir, `iteration${iterationNumber}`);
   }
 
   inventory.observedFiles = [...observed].sort((left, right) => left.localeCompare(right));
@@ -320,26 +710,51 @@ function collectFileInventory(approachRoot, expectedFiles) {
   return inventory;
 }
 
-function buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApproaches) {
+function buildPatternSummary(
+  inputRoot,
+  pattern,
+  requiredApproaches,
+  optionalApproaches,
+  executionContext,
+  configuredIterationCountOverride,
+  explicitIterations,
+) {
   const fetchingRoot = getApproachRoot(inputRoot, "fetching", pattern.type);
+  const configuredIterationCount = configuredIterationCountOverride;
   const baselineIterations = listIterationNumbers(fetchingRoot);
+  const expectedIterations = buildExpectedIterationNumbers(
+    configuredIterationCount,
+    baselineIterations,
+    explicitIterations,
+  );
   const baselineIterationSet = new Set(baselineIterations);
   const baselineInventory = collectFileInventory(fetchingRoot, Object.values(FILE_MAP.fetching));
+  const baselineIgnoredObservedIterations = getIgnoredObservedIterations(baselineIterations, expectedIterations);
 
   const patternSummary = {
     patternType: pattern.type,
     patternDisplayName: pattern.name,
     status: "missing",
+    dataStatus: "missing",
+    analysisStatus: "missing",
+    executionStatus: "missing",
+    configuredIterationCount: configuredIterationCount,
     baseline: {
       approach: "fetching",
       rootDir: fetchingRoot,
       iterations: baselineIterations,
+      expectedIterations,
+      ignoredObservedIterations: baselineIgnoredObservedIterations,
       iterationCount: baselineIterations.length,
       files: baselineInventory,
     },
     comparisons: [],
     optionalApproaches: [],
     inputIssues: [],
+    ignoredObservedIterations: [],
+    executionSummary: null,
+    failedExecutionCases: [],
+    missingExecutionCases: [],
   };
 
   if (!pathExists(fetchingRoot) || baselineIterations.length === 0) {
@@ -361,19 +776,31 @@ function buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApp
     const expectedFiles = Object.values(FILE_MAP[approach]);
     const inventory = collectFileInventory(approachRoot, expectedFiles);
     const iterationNumbers = listIterationNumbers(approachRoot);
-    const commonIterations = iterationNumbers.filter((iterationNumber) => baselineIterationSet.has(iterationNumber));
-    const missingIterations = baselineIterations.filter((iterationNumber) => !commonIterations.includes(iterationNumber));
+    const ignoredObservedIterations = getIgnoredObservedIterations(iterationNumbers, expectedIterations);
+    const commonIterations = expectedIterations.filter((iterationNumber) =>
+      iterationNumbers.includes(iterationNumber) && baselineIterationSet.has(iterationNumber),
+    );
+    const missingIterations = expectedIterations.filter(
+      (iterationNumber) => !commonIterations.includes(iterationNumber),
+    );
 
     const approachSummary = {
+      patternType: pattern.type,
+      patternDisplayName: pattern.name,
       approach,
       rootDir: approachRoot,
       iterations: iterationNumbers,
+      expectedIterations,
+      ignoredObservedIterations,
       iterationCount: iterationNumbers.length,
       commonIterations,
       commonIterationCount: commonIterations.length,
       missingIterations,
       files: inventory,
       status: "missing",
+      dataStatus: "missing",
+      analysisStatus: "missing",
+      executionStatus: "missing",
     };
 
     if (!pathExists(approachRoot) || iterationNumbers.length === 0) {
@@ -399,6 +826,20 @@ function buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApp
       continue;
     }
 
+    if (ignoredObservedIterations.length > 0) {
+      patternSummary.ignoredObservedIterations.push({
+        patternType: pattern.type,
+        patternDisplayName: pattern.name,
+        approach,
+        rootDir: approachRoot,
+        expectedIterations,
+        ignoredObservedIterations,
+      });
+      if (approach === "fetching") {
+        patternSummary.baseline.ignoredObservedIterations = ignoredObservedIterations;
+      }
+    }
+
     const comparableIterationDetails = [];
     const matchedWindowsTotals = [];
     const baselineOnlyTotals = [];
@@ -409,8 +850,16 @@ function buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApp
     const missingArtifacts = [];
 
     for (const iterationNumber of commonIterations) {
-      const iterationDir = path.join(approachRoot, `iteration${iterationNumber}`);
-      const baselineIterationDir = path.join(fetchingRoot, `iteration${iterationNumber}`);
+      const baselineExecutionCase = executionContext.caseMap.get(
+        buildExecutionCaseKey("fetching", pattern.type, iterationNumber),
+      );
+      const approachExecutionCase = executionContext.caseMap.get(
+        buildExecutionCaseKey(approach, pattern.type, iterationNumber),
+      );
+      const iterationDir = getCaseAttemptDir(inputRoot, approachExecutionCase)
+        || path.join(approachRoot, `iteration${iterationNumber}`);
+      const baselineIterationDir = getCaseAttemptDir(inputRoot, baselineExecutionCase)
+        || path.join(fetchingRoot, `iteration${iterationNumber}`);
 
       const baselineResultsPath = path.join(baselineIterationDir, FILE_MAP.fetching.result);
       const approachResultsPath = path.join(iterationDir, FILE_MAP[approach].result);
@@ -467,6 +916,8 @@ function buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApp
     }
 
     approachSummary.status = approachStatus;
+    approachSummary.dataStatus = approachStatus;
+    approachSummary.analysisStatus = approachStatus;
     approachSummary.iterationsCompared = comparableIterationDetails.length;
     approachSummary.metrics = {
       mae: calculateStats(maeValues),
@@ -494,6 +945,8 @@ function buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApp
       patternSummary.baseline.missingArtifacts = missingArtifacts;
       patternSummary.baseline.counts = approachSummary.counts;
       patternSummary.baseline.iterationMetrics = comparableIterationDetails;
+      patternSummary.baseline.expectedIterations = expectedIterations;
+      patternSummary.baseline.ignoredObservedIterations = ignoredObservedIterations;
       continue;
     }
 
@@ -508,12 +961,98 @@ function buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApp
     patternHasCompleteRequiredComparison = false;
   }
 
-  patternSummary.status = patternHasCompleteRequiredComparison ? "complete" : "partial";
+  const expectedExecutionCases = [];
+  const executionApproaches = [...new Set(requiredApproaches)];
+  for (const approach of executionApproaches) {
+    for (const iterationNumber of expectedIterations) {
+      const executionCase = executionContext.caseMap.get(
+        buildExecutionCaseKey(approach, pattern.type, iterationNumber),
+      );
+      expectedExecutionCases.push(
+        executionCase || {
+          approach,
+          pattern: pattern.type,
+          patternDisplayName: pattern.name,
+          iteration: iterationNumber,
+          success: false,
+          benchmarkStatus: null,
+          terminationReason: null,
+          extractionStatus: null,
+          timedOut: false,
+          legacyTimedOut: false,
+          reachedDurationLimit: false,
+          exitCode: null,
+          durationMs: null,
+          configuredTimeoutMs: null,
+          logDir: null,
+          error: null,
+          failureStage: "missing",
+          failureReason: "No execution case recorded in benchmark summary",
+          missing: true,
+        },
+      );
+    }
+  }
+
+  const executionSummary = buildExecutionSummaryForCases(
+    executionApproaches.length * expectedIterations.length,
+    expectedExecutionCases,
+  );
+
+  for (const approachSummary of [patternSummary.baseline, ...patternSummary.comparisons, ...patternSummary.optionalApproaches]) {
+    if (!approachSummary?.approach) {
+      continue;
+    }
+
+    const casesForApproach = expectedExecutionCases.filter(
+      (entry) => entry.approach === approachSummary.approach,
+    );
+    const approachExecutionSummary = buildExecutionSummaryForCases(
+      expectedIterations.length,
+      casesForApproach,
+    );
+
+    approachSummary.executionSummary = approachExecutionSummary;
+    approachSummary.executionStatus = approachExecutionSummary.status;
+    approachSummary.failedExecutionCases = approachExecutionSummary.failedExecutionCases;
+    approachSummary.missingExecutionCases = approachExecutionSummary.missingExecutionCases;
+  }
+
+  patternSummary.executionSummary = executionSummary;
+  patternSummary.failedExecutionCases = executionSummary.failedExecutionCases;
+  patternSummary.missingExecutionCases = executionSummary.missingExecutionCases;
+  patternSummary.dataStatus = patternHasCompleteRequiredComparison ? "complete" : "partial";
+  patternSummary.analysisStatus = patternHasCompleteRequiredComparison ? "complete" : "partial";
+  patternSummary.executionStatus = executionSummary.status;
+  patternSummary.status =
+    patternSummary.dataStatus === "complete" &&
+    patternSummary.analysisStatus === "complete" &&
+    patternSummary.executionStatus === "complete"
+      ? "complete"
+      : "partial";
   return patternSummary;
 }
 
-function summarizePatterns(inputRoot, patterns, requiredApproaches, optionalApproaches) {
-  return patterns.map((pattern) => buildPatternSummary(inputRoot, pattern, requiredApproaches, optionalApproaches));
+function summarizePatterns(
+  inputRoot,
+  patterns,
+  requiredApproaches,
+  optionalApproaches,
+  executionContext,
+  configuredIterationCount,
+  explicitIterations,
+) {
+  return patterns.map((pattern) =>
+    buildPatternSummary(
+      inputRoot,
+      pattern,
+      requiredApproaches,
+      optionalApproaches,
+      executionContext,
+      configuredIterationCount,
+      explicitIterations,
+    ),
+  );
 }
 
 function buildCsvRows(patternSummaries) {
@@ -617,10 +1156,26 @@ function formatCsvNumber(value) {
   return Number.isFinite(value) ? value.toFixed(6) : "";
 }
 
-function buildSummary(patternSummaries, inputRoot, outputDir, csvPath, expectedPatterns, requiredApproaches, optionalApproaches, smokeMode) {
+function buildSummary(patternSummaries, inputRoot, outputDir, csvPath, expectedPatterns, requiredApproaches, optionalApproaches, smokeMode, executionContext) {
   const comparisonRows = patternSummaries.flatMap((patternSummary) => patternSummary.comparisons);
   const requiredRows = comparisonRows.filter((row) => requiredApproaches.includes(row.approach));
   const missingRequiredRows = requiredRows.filter((row) => row.status !== "complete");
+  const ignoredObservedIterations = patternSummaries.flatMap((patternSummary) => patternSummary.ignoredObservedIterations || []);
+  const failedExecutionCases = patternSummaries.flatMap(
+    (patternSummary) => patternSummary.failedExecutionCases || [],
+  );
+  const missingExecutionCases = patternSummaries.flatMap(
+    (patternSummary) => patternSummary.missingExecutionCases || [],
+  );
+  const dataCompletePatterns = patternSummaries.filter(
+    (pattern) => pattern.dataStatus === "complete",
+  ).length;
+  const executionCompletePatterns = patternSummaries.filter(
+    (pattern) => pattern.executionStatus === "complete",
+  ).length;
+  const analysisCompletePatterns = patternSummaries.filter(
+    (pattern) => pattern.analysisStatus === "complete",
+  ).length;
 
   return {
     generatedAt: new Date().toISOString(),
@@ -628,21 +1183,80 @@ function buildSummary(patternSummaries, inputRoot, outputDir, csvPath, expectedP
     outputDir,
     csvPath,
     smokeMode,
+    configuredIterationCount: patternSummaries[0]?.configuredIterationCount || null,
     expectedPatterns,
+    selectedPatterns: patternSummaries.map((pattern) => pattern.patternType),
+    selectedApproaches: [
+      ...new Set(
+        patternSummaries.flatMap((pattern) => [
+          pattern.baseline?.approach,
+          ...(pattern.comparisons || []).map((comparison) => comparison.approach),
+          ...(pattern.optionalApproaches || []).map((comparison) => comparison.approach),
+        ]).filter(Boolean),
+      ),
+    ],
     requiredApproaches,
     optionalApproaches,
+    executionSummarySourcePath: executionContext.sourcePath,
+    ignoredObservedIterations,
+    retryCountConfigured: executionContext.summary?.retryCountConfigured ?? 0,
+    retryUsed: Boolean(executionContext.summary?.retryUsed),
+    retriedCases: executionContext.summary?.retriedCases || [],
+    failedAfterRetries: executionContext.summary?.failedAfterRetries || [],
+    executionSummary: {
+      totalExpectedCases: patternSummaries.reduce(
+        (sum, pattern) => sum + (pattern.executionSummary?.expectedCaseCount || 0),
+        0,
+      ),
+      observedCases: executionContext.cases.length,
+      successfulCases: executionContext.cases.filter((entry) => entry.success).length,
+      failedCases: failedExecutionCases.length,
+      missingCases: missingExecutionCases.length,
+      timedOutCases: executionContext.cases.filter((entry) => entry.terminationReason === "startup_timeout").length,
+      reachedDurationLimitCases: executionContext.cases.filter((entry) => entry.reachedDurationLimit).length,
+      extractionFailures: executionContext.cases.filter(
+        (entry) => entry.extractionStatus && !["success", "skipped"].includes(entry.extractionStatus),
+      ).length,
+      nonCompletedBenchmarkCases: executionContext.cases.filter(
+        (entry) => entry.benchmarkStatus && entry.benchmarkStatus !== "completed",
+      ).length,
+      totalAttempts: executionContext.summary?.totalAttempts ?? executionContext.cases.reduce(
+        (sum, entry) => sum + (entry.attemptCount || 1),
+        0,
+      ),
+      totalObservedDurationMs: executionContext.cases.reduce(
+        (sum, entry) => sum + (entry.durationMs || 0),
+        0,
+      ),
+      status:
+        failedExecutionCases.length > 0 || missingExecutionCases.length > 0
+          ? "partial"
+          : "complete",
+    },
     summary: {
       patternCount: patternSummaries.length,
       completePatterns: patternSummaries.filter((pattern) => pattern.status === "complete").length,
       partialPatterns: patternSummaries.filter((pattern) => pattern.status === "partial").length,
+      dataCompletePatterns,
+      executionCompletePatterns,
+      analysisCompletePatterns,
+      executionFailedPatterns: patternSummaries.filter((pattern) => pattern.failedExecutionCases.length > 0).length,
+      cleanCompletePatterns: patternSummaries.filter((pattern) => pattern.status === "complete").length,
+      retriedCaseCount: (executionContext.summary?.retriedCases || []).length,
+      failedAfterRetriesCount: (executionContext.summary?.failedAfterRetries || []).length,
+      ignoredObservedIterationCount: ignoredObservedIterations.length,
       missingRequiredComparisons: missingRequiredRows.length,
       totalMatchedWindows: requiredRows.reduce((sum, row) => sum + (row.counts ? row.counts.matchedWindowsTotal : 0), 0),
       totalBaselineOnlyWindows: requiredRows.reduce((sum, row) => sum + (row.counts ? row.counts.baselineOnlyTotal : 0), 0),
       totalApproachOnlyWindows: requiredRows.reduce((sum, row) => sum + (row.counts ? row.counts.approachOnlyTotal : 0), 0),
+      validationClean: failedExecutionCases.length === 0 && missingExecutionCases.length === 0 && missingRequiredRows.length === 0,
     },
     patterns: patternSummaries,
     requiredComparisonRows: requiredRows,
     missingRequiredComparisons: missingRequiredRows,
+    failedExecutionCases,
+    executionFailures: failedExecutionCases,
+    missingExecutionCases,
   };
 }
 
@@ -676,9 +1290,67 @@ function main() {
   const expectedPatterns = smokeMode ? SMOKE_PATTERNS : ALL_PATTERNS;
   const requiredApproaches = smokeMode ? SMOKE_REQUIRED_APPROACHES : FULL_REQUIRED_APPROACHES;
   const optionalApproaches = smokeMode ? SMOKE_OPTIONAL_APPROACHES : FULL_OPTIONAL_APPROACHES;
+  const envSelectedPatternTypes = parseSelectionList(
+    process.env.CUSTOM_PATTERN_SELECTED_PATTERNS,
+    ALL_PATTERNS.map((pattern) => pattern.type),
+  );
+  const envSelectedApproachTypes = parseSelectionList(
+    process.env.CUSTOM_PATTERN_SELECTED_APPROACHES,
+    [...FULL_REQUIRED_APPROACHES, ...FULL_OPTIONAL_APPROACHES],
+  );
   const resolvedInputRoot = resolvePatternInputRoot(args.inputRoot, requiredApproaches, optionalApproaches);
+  const benchmarkMetadata = readIterationMetadata(resolvedInputRoot);
+  const executionContext = readExecutionSummary(resolvedInputRoot, args.executionSummaryPath);
+  const metadataSelectedPatterns = readSelectedNamesFromMetadata(benchmarkMetadata, "selectedPatterns");
+  const metadataSelectedApproaches = readSelectedNamesFromMetadata(benchmarkMetadata, "selectedApproaches");
+  const summarySelectedPatterns = Array.isArray(executionContext.summary?.selectedPatterns)
+    ? executionContext.summary.selectedPatterns
+    : null;
+  const summarySelectedApproaches = Array.isArray(executionContext.summary?.selectedApproaches)
+    ? executionContext.summary.selectedApproaches
+    : null;
+  const selectedPatternTypes = args.selectedPatterns
+    || envSelectedPatternTypes
+    || metadataSelectedPatterns
+    || summarySelectedPatterns;
+  const selectedApproachTypes = args.selectedApproaches
+    || envSelectedApproachTypes
+    || metadataSelectedApproaches
+    || summarySelectedApproaches;
+  const configuredIterationCount = getConfiguredIterationCount(benchmarkMetadata)
+    || getConfiguredIterationCountFromExecutionSummary(executionContext.summary);
+  if (!configuredIterationCount) {
+    console.warn(
+      "Could not determine configured iteration count from benchmark metadata; falling back to observed iteration directories.",
+    );
+  }
 
-  const patternSummaries = summarizePatterns(resolvedInputRoot, expectedPatterns, requiredApproaches, optionalApproaches);
+  let effectivePatterns = expectedPatterns;
+  if (selectedPatternTypes && selectedPatternTypes.length > 0) {
+    effectivePatterns = expectedPatterns.filter((pattern) => selectedPatternTypes.includes(pattern.type));
+  } else if (metadataSelectedPatterns && metadataSelectedPatterns.length > 0) {
+    effectivePatterns = expectedPatterns.filter((pattern) => metadataSelectedPatterns.includes(pattern.type));
+  }
+
+  let effectiveRequiredApproaches = requiredApproaches;
+  let effectiveOptionalApproaches = optionalApproaches;
+  if (selectedApproachTypes && selectedApproachTypes.length > 0) {
+    effectiveRequiredApproaches = requiredApproaches.filter((approach) => selectedApproachTypes.includes(approach));
+    effectiveOptionalApproaches = optionalApproaches.filter((approach) => selectedApproachTypes.includes(approach));
+  } else if (metadataSelectedApproaches && metadataSelectedApproaches.length > 0) {
+    effectiveRequiredApproaches = requiredApproaches.filter((approach) => metadataSelectedApproaches.includes(approach));
+    effectiveOptionalApproaches = optionalApproaches.filter((approach) => metadataSelectedApproaches.includes(approach));
+  }
+
+  const patternSummaries = summarizePatterns(
+    resolvedInputRoot,
+    effectivePatterns,
+    effectiveRequiredApproaches,
+    effectiveOptionalApproaches,
+    executionContext,
+    configuredIterationCount,
+    args.selectedIterations,
+  );
   const csvRows = buildCsvRows(patternSummaries);
 
   ensureDir(args.outputDir);
@@ -690,10 +1362,18 @@ function main() {
     resolvedInputRoot,
     args.outputDir,
     csvPath,
-    expectedPatterns,
-    requiredApproaches,
-    optionalApproaches,
+    effectivePatterns,
+    effectiveRequiredApproaches,
+    effectiveOptionalApproaches,
     smokeMode,
+    executionContext,
+  );
+  summary.selectedPatterns = effectivePatterns.map((pattern) => pattern.type);
+  summary.selectedApproaches = selectedApproachTypes || summary.selectedApproaches;
+  summary.selectedIterations = buildExpectedIterationNumbers(
+    configuredIterationCount,
+    [],
+    args.selectedIterations,
   );
 
   fs.writeFileSync(jsonPath, `${JSON.stringify(summary, null, 2)}\n`);
@@ -703,6 +1383,25 @@ function main() {
   console.log(`Input root: ${resolvedInputRoot}`);
   console.log(`JSON summary: ${jsonPath}`);
   console.log(`CSV summary: ${csvPath}`);
+
+  if (summary.ignoredObservedIterations.length > 0) {
+    const ignoredList = summary.ignoredObservedIterations
+      .map((entry) => `${entry.patternType}/${entry.approach}: [${entry.ignoredObservedIterations.join(", ")}]`)
+      .join("; ");
+    console.warn(`Ignoring stale iteration directories outside configured range: ${ignoredList}`);
+  }
+
+  if (summary.failedExecutionCases.length > 0) {
+    console.warn("Execution failures were recorded for benchmark cases:");
+    for (const entry of summary.failedExecutionCases) {
+      console.warn(
+        `- ${entry.approach} / ${entry.pattern} / iteration${entry.iteration}: ${entry.failureReason || entry.failureStage || "failed"}`,
+      );
+    }
+    console.warn(
+      `Data completeness and execution cleanliness are reported separately. validationClean=${summary.summary.validationClean}`,
+    );
+  }
 
   const missingRequired = summary.missingRequiredComparisons;
   if (missingRequired.length > 0) {

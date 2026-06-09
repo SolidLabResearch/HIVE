@@ -5,6 +5,10 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const {
+  cleanupStaleBenchmarkProcesses,
+  terminateChildProcessTree,
+} = require("../../experiments/utils/processCleanup");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const DEFAULT_TIMESTAMP = new Date()
@@ -39,6 +43,9 @@ const SUITE_TO_JOBS = {
   "naive-distributed": ["real-data-core", "custom-pattern-core"],
 };
 
+let activeBenchmarkJobCleanup = null;
+let benchmarkSignalHandlersInstalled = false;
+
 function parseArgs(argv) {
   const args = {
     suites: [],
@@ -54,12 +61,15 @@ function parseArgs(argv) {
     aggregation: "AVG",
     timeout: 300000,
     patternTestTimeout: 240000,
+    retries: 0,
     outputDir: `results/paper-benchmarks/${DEFAULT_TIMESTAMP}`,
     outputDirProvided: false,
     dryRun: false,
     failFast: false,
     skipAnalysis: false,
     smoke: false,
+    refreshSummaryOnly: null,
+    skipBrokerPreflight: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -122,6 +132,23 @@ function parseArgs(argv) {
         args.patternTestTimeout = parseIntegerFlag("--pattern-test-timeout", next);
         index += 1;
         break;
+      case "--retries":
+        args.retries = parseIntegerFlag("--retries", next);
+        index += 1;
+        break;
+      case "--patterns":
+        args.patterns = parseCsvListFlag("--patterns", next, Object.keys(PATTERN_DIR_MAP));
+        index += 1;
+        break;
+      case "--approaches":
+        args.approaches = parseCsvListFlag("--approaches", next, [
+          "fetching",
+          "naive_distributed",
+          "approximation",
+          "chunked",
+        ]);
+        index += 1;
+        break;
       case "--output-dir":
         args.outputDir = requireValue("--output-dir", next);
         args.outputDirProvided = true;
@@ -138,6 +165,13 @@ function parseArgs(argv) {
         break;
       case "--smoke":
         args.smoke = true;
+        break;
+      case "--refresh-summary-only":
+        args.refreshSummaryOnly = requireValue("--refresh-summary-only", next);
+        index += 1;
+        break;
+      case "--skip-broker-preflight":
+        args.skipBrokerPreflight = true;
         break;
       case "--help":
       case "-h":
@@ -175,12 +209,18 @@ Options:
   --aggregation <type>        Default: AVG
   --timeout <ms>              Default: 300000
   --pattern-test-timeout <ms> Default: 240000
+  --retries <n>               Retry failed custom-pattern cases N additional times
+  --patterns <list>           Comma-separated custom-pattern types
+  --approaches <list>         Comma-separated custom-pattern approaches
   --output-dir <path>         Default: results/paper-benchmarks/<timestamp>
                               or results/paper-benchmarks/smoke-<timestamp> with --smoke
   --dry-run                   Print commands without executing them
   --fail-fast                 Stop on the first failed benchmark command
   --skip-analysis             Skip custom-pattern post-analysis after benchmarks
+  --skip-broker-preflight     Skip only the MQTT broker preflight probe
   --smoke                     Run a reduced custom-pattern pipeline smoke test
+  --refresh-summary-only <path>
+                              Refresh top-level summary.json from existing outputs only
   --help                      Show this help
 `);
 }
@@ -206,6 +246,26 @@ function parseNumberFlag(flag, value) {
     throw new Error(`${flag} must be a number`);
   }
   return parsed;
+}
+
+function parseCsvListFlag(flag, value, allowedValues = null) {
+  const items = requireValue(flag, value)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (items.length === 0) {
+    throw new Error(`${flag} requires at least one comma-separated value`);
+  }
+
+  if (allowedValues) {
+    const invalid = items.filter((item) => !allowedValues.includes(item));
+    if (invalid.length > 0) {
+      throw new Error(`${flag} contains unsupported value(s): ${invalid.join(", ")}`);
+    }
+  }
+
+  return [...new Set(items)];
 }
 
 function expandSuites(inputSuites) {
@@ -248,6 +308,18 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function readJsonIfExists(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 function copyFileIfExists(sourcePath, destinationPath) {
   if (!fs.existsSync(sourcePath)) {
     return false;
@@ -266,21 +338,246 @@ function copyDirectory(sourceDir, destinationDir) {
   return true;
 }
 
+function readPatternRunSummary(sourceRoot) {
+  return readJsonIfExists(path.join(sourceRoot, "custom_pattern_comparison_summary.json"));
+}
+
+function getPatternCaseIterationSourceDir(sourceRoot, result) {
+  return path.join(sourceRoot, result.approach, result.pattern, `iteration${result.iteration}`);
+}
+
+function copyPatternIterationArtifactsForCase(sourceRoot, outputDir, result) {
+  if (result.finalStatus !== "success") {
+    return null;
+  }
+
+  const finalLogDir = result.finalLogDir || result.logDir;
+  if (!finalLogDir || !fs.existsSync(finalLogDir)) {
+    return null;
+  }
+
+  const finalLogDirRelative = path.relative(sourceRoot, finalLogDir);
+  if (finalLogDirRelative.startsWith("..")) {
+    return null;
+  }
+
+  const iterationDestination = path.join(
+    outputDir,
+    "patterns",
+    "raw",
+    result.approach,
+    result.pattern,
+    `iteration${result.iteration}`,
+    `attempt${Number.isFinite(Number.parseInt(result.finalAttemptNumber, 10)) ? Number.parseInt(result.finalAttemptNumber, 10) : 1}`,
+  );
+
+  fs.rmSync(iterationDestination, { recursive: true, force: true });
+  copyDirectory(finalLogDir, iterationDestination);
+
+  return {
+    iterationSource: finalLogDir,
+    iterationDestination,
+    sourceLogDirs: [path.relative(REPO_ROOT, finalLogDir)],
+    usedAttemptDirs: true,
+  };
+}
+
+function mirrorPatternCaseIntoViews(outputDir, result) {
+  const patternDir = PATTERN_DIR_MAP[result.pattern] || result.pattern.replaceAll("_", "-");
+  const rawIterationDir = path.join(
+    outputDir,
+    "patterns",
+    "raw",
+    result.approach,
+    result.pattern,
+    `iteration${result.iteration}`,
+  );
+
+  if (!fs.existsSync(rawIterationDir)) {
+    return;
+  }
+
+  const structuredDestination = path.join(
+    outputDir,
+    "patterns",
+    patternDir,
+    result.approach,
+    `iteration${result.iteration}`,
+  );
+  fs.rmSync(structuredDestination, { recursive: true, force: true });
+  copyDirectory(rawIterationDir, structuredDestination);
+
+  const accuracyDestination = path.join(
+    outputDir,
+    "accuracy",
+    "patterns",
+    patternDir,
+    result.approach,
+    `iteration${result.iteration}`,
+  );
+  fs.rmSync(accuracyDestination, { recursive: true, force: true });
+  copyDirectory(rawIterationDir, accuracyDestination);
+
+  if (result.approach === "naive_distributed") {
+    const naiveDestination = path.join(
+      outputDir,
+      "naive-distributed",
+      "patterns",
+      patternDir,
+      result.approach,
+      `iteration${result.iteration}`,
+    );
+    fs.rmSync(naiveDestination, { recursive: true, force: true });
+    copyDirectory(rawIterationDir, naiveDestination);
+  }
+}
+
+function buildPatternReportingOverview(outputDir) {
+  const accuracySummaryPath = path.join(
+    outputDir,
+    "accuracy",
+    "patterns",
+    "custom-pattern-accuracy",
+    "summary.json",
+  );
+  const executionSummaryPathCandidates = [
+    path.join(outputDir, "patterns", "raw", "custom_pattern_comparison_summary.json"),
+    path.join(outputDir, "patterns", "summary.json"),
+  ];
+  const executionSummaryPath = executionSummaryPathCandidates.find((candidate) => fs.existsSync(candidate));
+  const accuracySummary = readJsonIfExists(accuracySummaryPath);
+  const executionSummary = executionSummaryPath ? readJsonIfExists(executionSummaryPath) : null;
+
+  if (!accuracySummary && !executionSummary) {
+    return null;
+  }
+
+  const failedExecutionCases = accuracySummary?.failedExecutionCases
+    || executionSummary?.results?.filter((entry) => !entry.success)
+    || [];
+
+  return {
+    configuredIterationCount: accuracySummary?.configuredIterationCount
+      ?? executionSummary?.iterations
+      ?? null,
+    retryCountConfigured: accuracySummary?.retryCountConfigured
+      ?? executionSummary?.retryCountConfigured
+      ?? 0,
+    retryUsed: accuracySummary?.retryUsed
+      ?? executionSummary?.retryUsed
+      ?? false,
+    retriedCases: accuracySummary?.retriedCases
+      ?? executionSummary?.retriedCases
+      ?? [],
+    failedAfterRetries: accuracySummary?.failedAfterRetries
+      ?? executionSummary?.failedAfterRetries
+      ?? [],
+    dataCompletePatterns: accuracySummary?.summary?.dataCompletePatterns ?? null,
+    executionCompletePatterns: accuracySummary?.summary?.executionCompletePatterns ?? null,
+    analysisCompletePatterns: accuracySummary?.summary?.analysisCompletePatterns ?? null,
+    cleanCompletePatterns: accuracySummary?.summary?.cleanCompletePatterns
+      ?? accuracySummary?.summary?.completePatterns
+      ?? null,
+    validationClean: accuracySummary?.summary?.validationClean ?? null,
+    executionFailedCaseCount: failedExecutionCases.length,
+    failedExecutionCases,
+    executionSummary: accuracySummary?.executionSummary || null,
+    executionSummarySourcePath: executionSummaryPath
+      ? path.relative(outputDir, executionSummaryPath)
+      : null,
+    accuracySummaryPath: fs.existsSync(accuracySummaryPath)
+      ? path.relative(outputDir, accuracySummaryPath)
+      : null,
+  };
+}
+
+function attachPatternReporting(summary, outputDir) {
+  const patternReporting = buildPatternReportingOverview(outputDir);
+  if (!patternReporting) {
+    return summary;
+  }
+
+  return {
+    ...summary,
+    patternReporting,
+  };
+}
+
+function refreshExistingSummary(outputDir) {
+  const summaryPath = path.join(outputDir, "summary.json");
+  const existingSummary = readJsonIfExists(summaryPath);
+
+  if (!existingSummary) {
+    throw new Error(`Existing summary not found or invalid: ${summaryPath}`);
+  }
+
+  const refreshedSummary = attachPatternReporting(existingSummary, outputDir);
+  writeJson(summaryPath, refreshedSummary);
+  return summaryPath;
+}
+
 function buildPatternAnalysisJob(config) {
+  const analysisArgs = [
+    "analysis/accuracy/accuracy-comparison-custom-patterns.js",
+    "--input-root",
+    path.join(config.outputDir, "patterns", "raw"),
+    "--output-dir",
+    path.join(config.outputDir, "accuracy", "patterns", "custom-pattern-accuracy"),
+    "--execution-summary",
+    path.join(config.outputDir, "patterns", "raw", "custom_pattern_comparison_summary.json"),
+  ];
+
+  if (config.patterns && config.patterns.length > 0) {
+    analysisArgs.push("--patterns", config.patterns.join(","));
+  }
+
+  if (config.approaches && config.approaches.length > 0) {
+    analysisArgs.push("--approaches", config.approaches.join(","));
+  }
+
+  if (Number.isFinite(config.iterations) && config.iterations > 0) {
+    const explicitIterations = Array.from({ length: config.iterations }, (_, index) => String(index + 1));
+    analysisArgs.push("--iterations", explicitIterations.join(","));
+  }
+
   return {
     name: "custom-pattern-accuracy-analysis",
     description: "Aggregate custom-pattern accuracy against the fetching baseline",
     command: [
       "node",
-      [
-        "analysis/accuracy/accuracy-comparison-custom-patterns.js",
-        "--input-root",
-        path.join(config.outputDir, "patterns", "raw"),
-        "--output-dir",
-        path.join(config.outputDir, "accuracy", "patterns", "custom-pattern-accuracy"),
-      ],
+      analysisArgs,
     ],
     env: buildBenchmarkEnv(config),
+  };
+}
+
+function getSelectedCustomPatternCounts(config) {
+  const patterns = config.patterns && config.patterns.length > 0
+    ? config.patterns
+    : Object.keys(PATTERN_DIR_MAP);
+  const approaches = config.approaches && config.approaches.length > 0
+    ? config.approaches
+    : ["fetching", "naive_distributed", "approximation", "chunked"];
+
+  return {
+    patterns,
+    approaches,
+    testCount: patterns.length * approaches.length * config.iterations,
+  };
+}
+
+function formatEstimatedRuntime(config) {
+  const counts = getSelectedCustomPatternCounts(config);
+  const estimatedMs = counts.testCount * config.patternTestTimeout;
+  const estimatedMinutes = estimatedMs / 60000;
+
+  return {
+    counts,
+    estimatedMs,
+    estimatedMinutes,
+    display: estimatedMinutes >= 60
+      ? `${(estimatedMinutes / 60).toFixed(1)} hours`
+      : `${Math.ceil(estimatedMinutes)} minutes`,
   };
 }
 
@@ -318,29 +615,97 @@ function parseBrokerUrl(brokerUrl) {
   return {
     host: url.hostname,
     port: Number(url.port || defaultPort),
+    protocol,
   };
 }
 
 function checkBrokerReachable(brokerUrl, timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const { host, port } = parseBrokerUrl(brokerUrl);
-    const socket = net.createConnection({ host, port });
+  const { host, port, protocol } = parseBrokerUrl(brokerUrl);
+  const candidates = host === "localhost" ? ["127.0.0.1", "::1"] : [host];
+  const startTimestamp = Date.now();
+  console.log(
+    `[preflight:mqtt-broker] brokerUrl=${brokerUrl} parsedProtocol=${protocol} parsedHostname=${host} parsedPort=${port} candidates=${candidates.join(",")} timeoutMs=${timeoutMs} startTimestamp=${startTimestamp}`,
+  );
 
-    const finish = (result) => {
-      if (settled) {
-        return;
+  const probeCandidate = (candidateHost) =>
+    new Promise((resolve) => {
+      const candidateStartTimestamp = Date.now();
+      let settled = false;
+      const socket = net.createConnection({ host: candidateHost, port });
+
+      const settle = (result) => {
+        if (settled) {
+          console.log(
+            `[preflight:mqtt-broker] duplicate-settle-ignored candidate=${candidateHost}`,
+          );
+          return;
+        }
+        settled = true;
+        socket.destroy();
+        resolve(result);
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.on("connect", () => {
+        const connectTimestamp = Date.now();
+        console.log(
+          `[preflight:mqtt-broker] candidate=${candidateHost} connect timestamp=${connectTimestamp} elapsedMs=${connectTimestamp - candidateStartTimestamp}`,
+        );
+        settle({ ok: true, candidate: candidateHost });
+      });
+      socket.on("timeout", () => {
+        const timeoutTimestamp = Date.now();
+        const elapsedMs = timeoutTimestamp - candidateStartTimestamp;
+        console.log(
+          `[preflight:mqtt-broker] candidate=${candidateHost} timeout timestamp=${timeoutTimestamp} elapsedMs=${elapsedMs}`,
+        );
+        settle({
+          ok: false,
+          candidate: candidateHost,
+          message: `Timed out connecting to ${candidateHost}:${port} for ${brokerUrl}`,
+        });
+      });
+      socket.on("error", (error) => {
+        const errorTimestamp = Date.now();
+        const elapsedMs = errorTimestamp - candidateStartTimestamp;
+        console.log(
+          `[preflight:mqtt-broker] candidate=${candidateHost} error timestamp=${errorTimestamp} elapsedMs=${elapsedMs} name=${error.name || ""} code=${error.code || ""} message=${error.message || ""} stack=${error.stack || ""}`,
+        );
+        settle({
+          ok: false,
+          candidate: candidateHost,
+          message: error.message || `Failed connecting to ${candidateHost}:${port}`,
+          error,
+        });
+      });
+    });
+
+  return (async () => {
+    const failures = [];
+    for (const candidateHost of candidates) {
+      const result = await probeCandidate(candidateHost);
+      if (result.ok) {
+        const finishTimestamp = Date.now();
+        console.log(
+          `[preflight:mqtt-broker] success candidate=${result.candidate} finishTimestamp=${finishTimestamp} elapsedMs=${finishTimestamp - startTimestamp}`,
+        );
+        return {
+          ok: true,
+          message: `Connected to ${brokerUrl} via ${result.candidate}:${port}`,
+        };
       }
-      settled = true;
-      socket.destroy();
-      resolve(result);
-    };
+      failures.push(`${result.candidate}: ${result.message}`);
+    }
 
-    socket.setTimeout(timeoutMs);
-    socket.on("connect", () => finish({ ok: true }));
-    socket.on("timeout", () => finish({ ok: false, message: `Timed out connecting to ${brokerUrl}` }));
-    socket.on("error", (error) => finish({ ok: false, message: error.message }));
-  });
+    const finishTimestamp = Date.now();
+    console.log(
+      `[preflight:mqtt-broker] all-candidates-failed finishTimestamp=${finishTimestamp} elapsedMs=${finishTimestamp - startTimestamp} failures=${failures.join(" | ")}`,
+    );
+    return {
+      ok: false,
+      message: `Failed to connect to ${brokerUrl}; tried ${candidates.join(", ")}; ${failures.join(" | ")}`,
+    };
+  })();
 }
 
 function buildBenchmarkEnv(config) {
@@ -348,6 +713,11 @@ function buildBenchmarkEnv(config) {
   const smokeWindowSlide = 15000;
   const smokeSubWindowRange = 30000;
   const smokeSubWindowStep = 15000;
+  const benchmarkFiniteReplayDurationSeconds = Math.ceil(
+    ((config.smoke ? smokeWindowWidth : config.windowWidth) +
+      (3 * (config.smoke ? smokeWindowSlide : config.windowSlide))) / 1000,
+  );
+  const skipBrokerPreflight = config.skipBrokerPreflight || process.env.STREAMING_QUERY_HIVE_SKIP_BROKER_PREFLIGHT === "1";
 
   return {
     ...process.env,
@@ -360,7 +730,12 @@ function buildBenchmarkEnv(config) {
     WEARABLE_FREQUENCY: String(config.frequency),
     MQTT_BROKER_URL: config.broker,
     CUSTOM_PATTERN_TEST_TIMEOUT_MS: String(config.patternTestTimeout),
+    CUSTOM_PATTERN_RETRIES: String(config.retries),
     PAPER_BENCHMARK_SMOKE: config.smoke ? "1" : "0",
+    STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: String(benchmarkFiniteReplayDurationSeconds),
+    STREAMING_QUERY_HIVE_SKIP_BROKER_PREFLIGHT: skipBrokerPreflight ? "1" : "0",
+    CUSTOM_PATTERN_SELECTED_PATTERNS: config.patterns ? config.patterns.join(",") : "",
+    CUSTOM_PATTERN_SELECTED_APPROACHES: config.approaches ? config.approaches.join(",") : "",
   };
 }
 
@@ -378,7 +753,7 @@ function createJobDefinitions(config) {
       env: sharedEnv,
       sourceLogs: path.join(REPO_ROOT, "experiments/real-data-comparison/logs"),
       snapshot(outputDir) {
-        snapshotRealDataArtifacts(this.sourceLogs, outputDir);
+        return snapshotRealDataArtifacts(this.sourceLogs, outputDir);
       },
     },
     "custom-pattern-core": {
@@ -393,12 +768,17 @@ function createJobDefinitions(config) {
           String(config.iterations),
           "--pattern-test-timeout",
           String(config.patternTestTimeout),
+          "--retries",
+          String(config.retries),
         ],
       ],
-      env: sharedEnv,
+      env: {
+        ...sharedEnv,
+        STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: "1",
+      },
       sourceLogs: path.join(REPO_ROOT, "logs/custom-pattern-comparison"),
       snapshot(outputDir) {
-        snapshotPatternArtifacts(this.sourceLogs, outputDir);
+        return snapshotPatternArtifacts(this.sourceLogs, outputDir);
       },
     },
   };
@@ -441,61 +821,77 @@ function snapshotRealDataArtifacts(sourceRoot, outputDir) {
 }
 
 function snapshotPatternArtifacts(sourceRoot, outputDir) {
-  copyDirectory(sourceRoot, path.join(outputDir, "patterns", "raw"));
-
-  const approachDirs = fs.existsSync(sourceRoot)
-    ? fs.readdirSync(sourceRoot).filter((entry) => fs.statSync(path.join(sourceRoot, entry)).isDirectory())
-    : [];
-
-  const patternNames = new Set();
-  for (const approach of approachDirs) {
-    const approachRoot = path.join(sourceRoot, approach);
-    for (const patternName of fs.readdirSync(approachRoot)) {
-      const patternRoot = path.join(approachRoot, patternName);
-      if (fs.statSync(patternRoot).isDirectory()) {
-        patternNames.add(patternName);
-      }
-    }
+  const patternSummary = readPatternRunSummary(sourceRoot);
+  if (!patternSummary || !Array.isArray(patternSummary.results)) {
+    return {
+      copiedCaseCount: 0,
+      copiedSourceLogDirs: [],
+      copiedCases: [],
+      sourceSummaryPath: null,
+    };
   }
 
-  for (const patternName of patternNames) {
-    const patternDir = PATTERN_DIR_MAP[patternName] || patternName.replaceAll("_", "-");
-    for (const approach of approachDirs) {
-      const approachPatternRoot = path.join(sourceRoot, approach, patternName);
-      const iterationDirs = listIterationDirs(approachPatternRoot);
-      for (const iterationDir of iterationDirs) {
-        const iterationSource = path.join(approachPatternRoot, iterationDir);
-        const structuredDestination = path.join(outputDir, "patterns", patternDir, approach, iterationDir);
-        copyDirectory(iterationSource, structuredDestination);
+  const copiedSourceLogDirs = [];
+  const copiedCases = [];
 
-        const accuracyDestination = path.join(outputDir, "accuracy", "patterns", patternDir, approach, iterationDir);
-        const naiveDestination = path.join(outputDir, "naive-distributed", "patterns", patternDir, approach, iterationDir);
-        const files = fs.readdirSync(iterationSource);
-
-        for (const fileName of files) {
-          const sourceFile = path.join(iterationSource, fileName);
-          if (!fs.statSync(sourceFile).isFile()) {
-            continue;
-          }
-          if (
-            fileName.endsWith("_results.csv") ||
-            fileName.endsWith("_metadata.json") ||
-            fileName.includes("latency") ||
-            fileName.includes("resource")
-          ) {
-            copyFileIfExists(sourceFile, path.join(accuracyDestination, fileName));
-          }
-          if (approach === "naive_distributed") {
-            copyFileIfExists(sourceFile, path.join(naiveDestination, fileName));
-          }
-        }
-      }
+  for (const result of patternSummary.results) {
+    if (!result?.approach || !result?.pattern || !result?.iteration) {
+      continue;
     }
+
+    const snapshotRecord = copyPatternIterationArtifactsForCase(sourceRoot, outputDir, result);
+    if (!snapshotRecord) {
+      continue;
+    }
+
+    mirrorPatternCaseIntoViews(outputDir, result);
+
+    copiedSourceLogDirs.push(...snapshotRecord.sourceLogDirs);
+    copiedCases.push({
+      approach: result.approach,
+      pattern: result.pattern,
+      iteration: result.iteration,
+      finalStatus: result.finalStatus || (result.success ? "success" : "failed"),
+      finalLogDir: result.finalLogDir || result.logDir || null,
+      sourceIterationDir: path.relative(REPO_ROOT, snapshotRecord.iterationSource),
+      copiedAttemptDirectories: snapshotRecord.sourceLogDirs,
+    });
   }
 
-  const patternSummary = path.join(sourceRoot, "custom_pattern_comparison_summary.json");
-  copyFileIfExists(patternSummary, path.join(outputDir, "patterns", "summary.json"));
-  copyFileIfExists(patternSummary, path.join(outputDir, "accuracy", "patterns-summary.json"));
+  const summaryDestination = path.join(outputDir, "patterns", "raw", "custom_pattern_comparison_summary.json");
+  writeJson(summaryDestination, patternSummary);
+  copyFileIfExists(summaryDestination, path.join(outputDir, "patterns", "summary.json"));
+  copyFileIfExists(summaryDestination, path.join(outputDir, "accuracy", "patterns-summary.json"));
+
+  return {
+    copiedCaseCount: copiedCases.length,
+    copiedSourceLogDirs: [...new Set(copiedSourceLogDirs)].sort((left, right) => left.localeCompare(right)),
+    copiedCases,
+    sourceSummaryPath: path.relative(REPO_ROOT, path.join(sourceRoot, "custom_pattern_comparison_summary.json")),
+  };
+}
+
+function installBenchmarkSignalHandlers() {
+  if (benchmarkSignalHandlersInstalled) {
+    return;
+  }
+
+  benchmarkSignalHandlersInstalled = true;
+
+  const handleSignal = (signal, exitCode) => {
+    void (async () => {
+      if (activeBenchmarkJobCleanup) {
+        console.log(`Received ${signal}; cleaning up benchmark job...`);
+        const cleanup = activeBenchmarkJobCleanup;
+        activeBenchmarkJobCleanup = null;
+        await cleanup();
+      }
+      process.exit(exitCode);
+    })();
+  };
+
+  process.on("SIGINT", () => handleSignal("SIGINT", 130));
+  process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
 }
 
 async function runCommand(job, logDir, dryRun) {
@@ -524,10 +920,33 @@ async function runCommand(job, logDir, dryRun) {
 
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const child = spawn(job.command[0], job.command[1], {
+    let settled = false;
+    let child = null;
+    const finalize = async (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (activeBenchmarkJobCleanup === cleanupJob) {
+        activeBenchmarkJobCleanup = null;
+      }
+      stdoutStream.end();
+      stderrStream.end();
+      combinedStream.end();
+      resolve(result);
+    };
+    const cleanupJob = () => terminateChildProcessTree(child, {
+      name: job.name,
+      logger: (message) => console.log(message),
+    });
+
+    activeBenchmarkJobCleanup = cleanupJob;
+
+    child = spawn(job.command[0], job.command[1], {
       cwd: REPO_ROOT,
       env: job.env,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     });
 
     child.stdout.on("data", (chunk) => {
@@ -543,36 +962,36 @@ async function runCommand(job, logDir, dryRun) {
     });
 
     child.on("close", (code) => {
-      stdoutStream.end();
-      stderrStream.end();
-      combinedStream.end();
-      resolve({
-        ok: code === 0,
-        code,
-        commandLine,
-        stdoutPath,
-        stderrPath,
-        combinedPath,
-        durationMs: Date.now() - startedAt,
-      });
+      void (async () => {
+        await cleanupJob();
+        await finalize({
+          ok: code === 0,
+          code,
+          commandLine,
+          stdoutPath,
+          stderrPath,
+          combinedPath,
+          durationMs: Date.now() - startedAt,
+        });
+      })();
     });
 
     child.on("error", (error) => {
-      stderrStream.write(`${error.stack || error.message}\n`);
-      combinedStream.write(`${error.stack || error.message}\n`);
-      stdoutStream.end();
-      stderrStream.end();
-      combinedStream.end();
-      resolve({
-        ok: false,
-        code: null,
-        commandLine,
-        stdoutPath,
-        stderrPath,
-        combinedPath,
-        durationMs: Date.now() - startedAt,
-        error: error.message,
-      });
+      void (async () => {
+        stderrStream.write(`${error.stack || error.message}\n`);
+        combinedStream.write(`${error.stack || error.message}\n`);
+        await cleanupJob();
+        await finalize({
+          ok: false,
+          code: null,
+          commandLine,
+          stdoutPath,
+          stderrPath,
+          combinedPath,
+          durationMs: Date.now() - startedAt,
+          error: error.message,
+        });
+      })();
     });
   });
 }
@@ -611,16 +1030,12 @@ async function runPreflight(config, jobs) {
     "src/streamer/data/wearable.acceleration.x/data.nt",
   ];
 
-  if (config.smoke) {
-    requiredData.push("src/streamer/data/custom_patterns/low_variability/smartphone.acceleration.x/data.nt");
-  } else {
-    requiredData.push(
-      "src/streamer/data/custom_patterns/low_variability/smartphone.acceleration.x/data.nt",
-      "src/streamer/data/custom_patterns/step_pattern/smartphone.acceleration.x/data.nt",
-      "src/streamer/data/custom_patterns/spike_pattern/smartphone.acceleration.x/data.nt",
-      "src/streamer/data/custom_patterns/low_freq_oscillation/smartphone.acceleration.x/data.nt",
-      "src/streamer/data/custom_patterns/high_freq_oscillation/smartphone.acceleration.x/data.nt",
-    );
+  const selectedPatterns = config.patterns && config.patterns.length > 0
+    ? config.patterns
+    : (config.smoke ? ["low_variability"] : Object.keys(PATTERN_DIR_MAP));
+
+  for (const patternName of selectedPatterns) {
+    requiredData.push(`src/streamer/data/custom_patterns/${patternName}/smartphone.acceleration.x/data.nt`);
   }
 
   for (const relativePath of requiredData) {
@@ -659,14 +1074,30 @@ async function runPreflight(config, jobs) {
     }
   }
 
-  const brokerReachability = await checkBrokerReachable(config.broker);
-  checks.push({
-    name: "mqtt-broker",
-    ok: brokerReachability.ok,
-    detail: brokerReachability.ok
-      ? `Connected to ${config.broker}`
-      : brokerReachability.message,
-  });
+  const skipBrokerPreflight = config.skipBrokerPreflight || process.env.STREAMING_QUERY_HIVE_SKIP_BROKER_PREFLIGHT === "1";
+  if (skipBrokerPreflight) {
+    console.warn(
+      `[preflight:mqtt-broker] skipped broker=${config.broker} reason=skip-flag-or-env`,
+    );
+    checks.push({
+      name: "mqtt-broker",
+      ok: true,
+      skipped: true,
+      detail: `Skipped broker preflight for ${config.broker}`,
+    });
+  } else {
+    const brokerReachability = await checkBrokerReachable(config.broker);
+    console.log(
+      `[preflight:mqtt-broker] runPreflightChecks broker=${config.broker} status=${brokerReachability.ok ? "ok" : "failed"} message=${brokerReachability.message || ""}`,
+    );
+    checks.push({
+      name: "mqtt-broker",
+      ok: brokerReachability.ok,
+      detail: brokerReachability.ok
+        ? `Connected to ${config.broker}`
+        : brokerReachability.message,
+    });
+  }
 
   if (config.broker !== "mqtt://localhost:1883") {
     checks.push({
@@ -689,6 +1120,15 @@ async function runPreflight(config, jobs) {
 
 async function main() {
   const config = parseArgs(process.argv.slice(2));
+  installBenchmarkSignalHandlers();
+  if (config.refreshSummaryOnly) {
+    const refreshTarget = path.isAbsolute(config.refreshSummaryOnly)
+      ? config.refreshSummaryOnly
+      : path.join(REPO_ROOT, config.refreshSummaryOnly);
+    const summaryPath = refreshExistingSummary(refreshTarget);
+    console.log(`Refreshed summary: ${summaryPath}`);
+    return;
+  }
   const jobsByName = createJobDefinitions(config);
   const requiredJobNames = [...new Set(config.suites.flatMap((suite) => SUITE_TO_JOBS[suite] || []))];
   const jobs = requiredJobNames.map((name) => jobsByName[name]);
@@ -702,6 +1142,10 @@ async function main() {
     ensureDir(path.join(config.outputDir, "resources"));
     ensureDir(path.join(config.outputDir, "accuracy"));
     ensureDir(path.join(config.outputDir, "naive-distributed"));
+    await cleanupStaleBenchmarkProcesses({
+      logger: (message) => console.log(message),
+      quiescenceMs: 500,
+    });
   }
 
   const metadata = {
@@ -714,6 +1158,8 @@ async function main() {
       arch: os.arch(),
     },
     cliConfiguration: config,
+    selectedPatterns: config.patterns && config.patterns.length > 0 ? config.patterns : (config.smoke ? ["low_variability"] : Object.keys(PATTERN_DIR_MAP)),
+    selectedApproaches: config.approaches && config.approaches.length > 0 ? config.approaches : ["fetching", "naive_distributed", "approximation", "chunked"],
     selectedSuites: config.suites,
     iterationCount: config.iterations,
     warmupRemoval: config.dropWarmup,
@@ -728,9 +1174,11 @@ async function main() {
     frequencyHz: config.frequency,
     timeoutMs: config.timeout,
     patternTestTimeoutMs: config.patternTestTimeout,
+    retryCountConfigured: config.retries,
     aggregation: config.aggregation,
     smokeMode: config.smoke,
     failedBenchmarkCommands: [],
+    copiedPatternLogSources: [],
     warnings: [],
   };
 
@@ -773,9 +1221,22 @@ async function main() {
 
   if (config.dryRun) {
     console.log("Dry run plan:");
+    const runtimeEstimate = formatEstimatedRuntime(config);
+    console.log(
+      `Custom-pattern filter: patterns=${runtimeEstimate.counts.patterns.join(",")}; approaches=${runtimeEstimate.counts.approaches.join(",")}`,
+    );
+    console.log(
+      `Estimated custom-pattern runtime: ${runtimeEstimate.display} (${runtimeEstimate.counts.testCount} tests × ${config.patternTestTimeout} ms timeout)`,
+    );
     for (const job of jobs) {
       const commandLine = [job.command[0], ...job.command[1]].join(" ");
       console.log(`- ${job.name}: ${commandLine}`);
+      if (job.name === "custom-pattern-core") {
+        console.log(
+          `  env: CUSTOM_PATTERN_SELECTED_PATTERNS=${job.env.CUSTOM_PATTERN_SELECTED_PATTERNS || "all"} CUSTOM_PATTERN_SELECTED_APPROACHES=${job.env.CUSTOM_PATTERN_SELECTED_APPROACHES || "all"}`,
+        );
+        console.log(`  retries: ${config.retries}`);
+      }
     }
     if (config.suites.includes("patterns") && !config.skipAnalysis) {
       const analysisJob = buildPatternAnalysisJob(config);
@@ -809,7 +1270,13 @@ async function main() {
     }
 
     if (!config.dryRun) {
-      job.snapshot(config.outputDir);
+      const snapshotInfo = job.snapshot(config.outputDir);
+      if (job.name === "custom-pattern-core" && snapshotInfo) {
+        metadata.copiedPatternLogSources = snapshotInfo.copiedSourceLogDirs || [];
+        metadata.copiedPatternCases = snapshotInfo.copiedCases || [];
+        metadata.patternSummarySourcePath = snapshotInfo.sourceSummaryPath || null;
+        writeJson(path.join(config.outputDir, "metadata.json"), metadata);
+      }
     }
   }
 
@@ -882,7 +1349,7 @@ async function main() {
     ? path.join("accuracy", "patterns", "custom-pattern-accuracy")
     : null;
 
-  const summary = {
+  const summary = attachPatternReporting({
     suitesRan: config.suites,
     suitesSucceeded,
     suitesFailed,
@@ -910,7 +1377,7 @@ async function main() {
         }
       : null,
     analysisFailed,
-  };
+  }, config.outputDir);
 
   if (!config.dryRun) {
     writeJson(path.join(config.outputDir, "metadata.json"), metadata);

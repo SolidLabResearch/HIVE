@@ -59,6 +59,7 @@ node experiments/pattern-analysis/run-custom-patterns-comparison.js --iterations
 - Runs: 4 approaches × 5 patterns × 35 iterations = 700 tests
 - Duration: ~3 min per test → ~35 hours total
 - Logs: `logs/custom-pattern-comparison/{approach}/{pattern}/iteration{N}/`
+- Targeted runs via `scripts/benchmark/run-all-paper-benchmarks.js --patterns ... --approaches ... --iterations ...` produce scoped accuracy summaries under `results/paper-benchmarks/<run>/accuracy/patterns/custom-pattern-accuracy/`. Those summaries read the copied run-local inputs from `results/paper-benchmarks/<run>/patterns/raw/` and only expect the selected pattern, approach, and iteration scope.
 
 > **Quick smoke test** (1 iteration, ~30 min):
 > ```bash

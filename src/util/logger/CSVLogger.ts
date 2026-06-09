@@ -28,7 +28,15 @@ export class CSVLogger {
     /**
      *
      */
-    close() {
-        this.stream.end();
+    close(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            this.stream.end((err: Error | null | undefined) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                resolve();
+            });
+        });
     }
 }

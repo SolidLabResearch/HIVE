@@ -31,11 +31,47 @@ node scripts/benchmark/run-all-paper-benchmarks.js --suite patterns
 
 The patterns suite runs the existing custom-pattern benchmark driver and, by default, follows it with the dedicated accuracy aggregation step that produces the paper-ready per-pattern summaries.
 
+Custom-pattern cases are normally stopped after the configured per-case benchmark duration. When a case reaches that duration and extraction succeeds, the run summary records:
+
+- `benchmarkStatus: "completed"`
+- `terminationReason: "duration_limit_reached"`
+- `extractionStatus: "success"`
+- `finalStatus: "success"`
+
+This distinguishes normal duration-limited completion from actual failures such as extraction failures, process crashes, startup timeouts, or manual interruption.
+
 For a smoke run that validates the full custom-pattern pipeline quickly, use:
 
 ```bash
 node scripts/benchmark/run-all-paper-benchmarks.js --suite patterns --smoke --iterations 1 --output-dir results/paper-benchmarks/smoke-patterns
 ```
+
+Targeted pattern examples:
+
+```bash
+node scripts/benchmark/run-all-paper-benchmarks.js --suite patterns --patterns low_variability
+```
+
+```bash
+node scripts/benchmark/run-all-paper-benchmarks.js --suite patterns --approaches fetching,approximation
+```
+
+```bash
+node scripts/benchmark/run-all-paper-benchmarks.js --suite patterns --patterns high_freq_oscillation --approaches approximation
+```
+
+For targeted extraction or debugging runs that omit the `fetching` baseline, add `--skip-analysis`:
+
+```bash
+node scripts/benchmark/run-all-paper-benchmarks.js \
+  --suite patterns \
+  --iterations 1 \
+  --approaches fetching,approximation,chunked \
+  --retries 1 \
+  --output-dir results/paper-benchmarks/patterns-1iter-accuracy-only-retry
+```
+
+Accuracy analysis requires the `fetching` baseline. If `fetching` is omitted, use `--skip-analysis` or include `fetching` in `--approaches`.
 
 Latency-only paper view:
 
@@ -108,6 +144,7 @@ The runner writes:
 - `summary.json`: suite/job status and runtime summary
 - `real-data/raw/`: snapshot of the existing real-data benchmark logs
 - `patterns/raw/`: snapshot of the existing custom-pattern benchmark logs
+- `patterns/raw/`: current-run-only snapshot of the selected custom-pattern case logs and attempt directories
 - `patterns/low-variability/`
 - `patterns/step/`
 - `patterns/spike/`
@@ -120,6 +157,8 @@ The runner writes:
 - `accuracy/patterns/custom-pattern-accuracy/summary.csv`: paper-friendly CSV export of the same custom-pattern accuracy summary
 - `naive-distributed/`: copied naive baseline artifacts from real-data and pattern runs
 - `logs/`: stdout, stderr, and combined command logs for each launched benchmark command
+
+For pattern runs, the paper snapshot is isolated to the cases recorded in the current run's `custom_pattern_comparison_summary.json`. Unrelated historical pattern logs under `logs/custom-pattern-comparison/` are not copied into `results/...`.
 
 ## Paper Claim Support Matrix
 

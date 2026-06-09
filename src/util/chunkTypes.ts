@@ -15,5 +15,7 @@ export type PartialChunkResult = {
   aggregateFunction?: string;
   value?: number;
   count?: number;
+  sum?: number;
+  avg?: number;
   rdfPayload?: string;
 };

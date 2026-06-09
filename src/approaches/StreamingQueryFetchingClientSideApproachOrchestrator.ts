@@ -5,17 +5,49 @@ import { v4 as uuidv4 } from "uuid";
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import {
   AggregationFunction,
+  buildBenchmarkStreamIri,
+  buildBenchmarkTopicName,
   buildBenchmarkResultPayload,
   buildOutputSelectClause,
+  getBenchmarkEventTimeAnchor,
   getConfiguredAggregation,
   getOutputWindowRange,
   getOutputWindowStep,
   getResultTopic,
   getSessionId,
+  getTimestampDomainMax,
+  getTimestampDomainMin,
+  useCleanMqttSessionsForBenchmark,
 } from "../util/runtimeConfig";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
+
+type DerivedLogicalWindow = {
+  start: number;
+  end: number;
+  isComplete: boolean;
+  key: string;
+};
+
+type FetchingWindowCandidate = {
+  logicalWindow: DerivedLogicalWindow;
+  eventCount: number;
+  sumValue: number;
+  avgValue: number;
+  firstEventTimestamp: string;
+  lastEventTimestamp: string;
+  resultValue: string;
+  completenessStatus: string;
+  completenessReason: string;
+  rspWindowStart: number | null;
+  rspWindowEnd: number | null;
+};
+
+type StreamObservation = {
+  timestamp: number;
+  value: number;
+};
 
 /**
  *
@@ -43,6 +75,23 @@ export class FetchingAllDataClientSide {
   private lastObservationReceivedTime: number = 0; // Track when last observation was received
   private aggregationFunction: AggregationFunction;
   private sessionId: string;
+  private diagnosticsLogStream!: fs.WriteStream;
+  private emittedLogicalWindows: Set<string> = new Set<string>();
+  private logicalWindowCandidates: Map<string, FetchingWindowCandidate> = new Map();
+  private expectedEventCount: number | null = null;
+  private expectedEventCountTolerance: number = 0;
+  private latestObservationTimestampByStream: Map<string, number> = new Map();
+  private observationsByStream: Map<string, StreamObservation[]> = new Map();
+  private benchmarkEventTimeAnchor: number | null = null;
+  private timestampDomainMin: number | null = null;
+  private timestampDomainMax: number | null = null;
+  private rejectedContaminatedTimestampCount: number = 0;
+  private firstObservedEventTimestampByStream: Map<string, number> = new Map();
+  private benchmarkFiniteReplayMode: boolean = ["1", "true", "yes", "on"].includes(
+    (process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY || "").trim().toLowerCase(),
+  );
+  private benchmarkReplayComplete: boolean = false;
+  private benchmarkControlTopic: string = buildBenchmarkTopicName("__benchmark_control__");
 
   /**
    *
@@ -65,6 +114,13 @@ export class FetchingAllDataClientSide {
     this.queryRegisteredTime = Date.now(); // Track when query was registered
     this.windowRange = getOutputWindowRange();
     this.expectedWindowInterval = getOutputWindowStep();
+    this.benchmarkEventTimeAnchor = getBenchmarkEventTimeAnchor();
+    this.timestampDomainMin = getTimestampDomainMin();
+    this.timestampDomainMax = getTimestampDomainMax();
+    this.expectedEventCount = this.deriveExpectedEventCount();
+    this.expectedEventCountTolerance = this.deriveExpectedEventCountTolerance(
+      this.expectedEventCount,
+    );
 
     // Initialize CSV logging for this approach
     this.initializeLogging();
@@ -95,9 +151,104 @@ export class FetchingAllDataClientSide {
 
     if (writeLatencyHeader) {
       this.latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_obs_ms,result_value\n",
+        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,result_value\n",
       );
     }
+
+    const diagnosticsLogFilePath = "fetching_window_diagnostics.csv";
+    const writeDiagnosticsHeader = !fs.existsSync(diagnosticsLogFilePath);
+    this.diagnosticsLogStream = fs.createWriteStream(diagnosticsLogFilePath, {
+      flags: "a",
+    });
+
+    if (writeDiagnosticsHeader) {
+      this.diagnosticsLogStream.write(
+        "benchmark_event_time_anchor,window_number,window_start,window_end,event_count,expected_event_count,sum,avg,first_event_timestamp,last_event_timestamp,completeness_status,accepted_or_suppressed,reason,result_value\n",
+      );
+    }
+  }
+
+  private deriveExpectedEventCount(): number | null {
+    const frequency = Number.parseFloat(process.env.WEARABLE_FREQUENCY || "");
+    if (!Number.isFinite(frequency) || frequency <= 0) {
+      return null;
+    }
+
+    const streamCount = this.returnStreams().length;
+    if (!Number.isFinite(streamCount) || streamCount <= 0) {
+      return null;
+    }
+
+    return streamCount * frequency * (this.windowRange / 1000);
+  }
+
+  private deriveExpectedEventCountTolerance(expectedEventCount: number | null): number {
+    if (!Number.isFinite(expectedEventCount ?? NaN)) {
+      return 0;
+    }
+
+    return Math.max(2, Math.ceil((expectedEventCount as number) * 0.01));
+  }
+
+  private extractBindingValue(binding: any, candidateKeys: string[]): string | null {
+    if (!binding) {
+      return null;
+    }
+
+    if (binding instanceof Map) {
+      for (const key of candidateKeys) {
+        const value = binding.get(`?${key}`)?.value ?? binding.get(key)?.value;
+        if (value !== undefined) {
+          return value;
+        }
+      }
+      return null;
+    }
+
+    if (binding.entries) {
+      if (typeof binding.entries.get === "function") {
+        for (const key of candidateKeys) {
+          const term = binding.entries.get(key) ?? binding.entries.get(`?${key}`);
+          if (term?.value !== undefined) {
+            return term.value;
+          }
+        }
+      } else {
+        for (const key of candidateKeys) {
+          const entry = binding.entries[key] ?? binding.entries[`?${key}`];
+          if (entry?.value !== undefined) {
+            return entry.value;
+          }
+        }
+      }
+    }
+
+    for (const key of candidateKeys) {
+      const direct = binding[key] ?? binding[`?${key}`];
+      if (direct?.value !== undefined) {
+        return direct.value;
+      }
+    }
+
+    return null;
+  }
+
+  private extractWindowBounds(rstreamObject: any): { start: number; end: number } | null {
+    const candidates: Array<{ start?: number; end?: number }> = [
+      { start: rstreamObject?.window?.open, end: rstreamObject?.window?.close },
+      { start: rstreamObject?.windowOpen, end: rstreamObject?.windowClose },
+      { start: rstreamObject?.open, end: rstreamObject?.close },
+      { start: rstreamObject?.start, end: rstreamObject?.end },
+      { start: rstreamObject?.timestamp_from, end: rstreamObject?.timestamp_to },
+    ];
+
+    for (const candidate of candidates) {
+      if (Number.isFinite(candidate.start) && Number.isFinite(candidate.end)) {
+        return { start: candidate.start as number, end: candidate.end as number };
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -110,7 +261,7 @@ export class FetchingAllDataClientSide {
     resultTime: number,
     value: string,
   ) {
-    // Metric 1: Latency from query registration (original calculation)
+    // Metric 1: Delay past the expected close time
     const latencyFromQueryReg = resultTime - expectedWindowClose;
 
     // Metric 2: Time from first data received to result (wall-clock)
@@ -131,10 +282,10 @@ export class FetchingAllDataClientSide {
     }
     console.log(`LATENCY: Window ${windowNumber}:`);
     console.log(
-      `  - From query registration: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
+      `  - Delay past expected close: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
     );
     console.log(
-      `  - From data start: ${latencyFromDataStart}ms (first data: ${this.firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
+      `  - Delay past data start: ${latencyFromDataStart}ms (first data: ${this.firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
     );
     console.log(
       `  - Processing time (last obs to result): ${latencyFromLastObs}ms`,
@@ -178,7 +329,10 @@ export class FetchingAllDataClientSide {
       const mqtt_broker = this.returnMQTTBroker(stream_name);
       // Generate a unique clientId for persistent session
       const clientId = "client-" + Math.random().toString(16).substr(2, 8);
-      const rsp_client = mqtt.connect(mqtt_broker, { clean: false, clientId });
+      const rsp_client = mqtt.connect(mqtt_broker, {
+        clean: useCleanMqttSessionsForBenchmark(),
+        clientId,
+      });
       const rsp_stream_object = this.rsp_engine.getStream(stream_name);
       const topic = new URL(stream_name).pathname.slice(1);
 
@@ -191,9 +345,37 @@ export class FetchingAllDataClientSide {
             console.log(`Subscribed to topic ${topic} with QoS 1`);
           }
         });
+        if (this.benchmarkFiniteReplayMode) {
+          rsp_client.subscribe(this.benchmarkControlTopic, { qos: 1 }, (err: any) => {
+            if (err) {
+              console.error(`Failed to subscribe to benchmark control topic ${this.benchmarkControlTopic}:`, err);
+            } else {
+              console.log(`Subscribed to benchmark control topic ${this.benchmarkControlTopic} with QoS 1`);
+            }
+          });
+        }
       });
 
       rsp_client.on("message", async (topic: any, message: any) => {
+        if (this.benchmarkFiniteReplayMode && topic === this.benchmarkControlTopic) {
+          try {
+            const parsed = JSON.parse(message.toString());
+            if (parsed?.type === "finite_replay_complete") {
+              this.benchmarkReplayComplete = true;
+              this.log(
+                `Finite replay complete signal received: ${JSON.stringify({
+                  topic: this.benchmarkControlTopic,
+                  source: parsed?.source ?? null,
+                })}`,
+              );
+              this.flushPendingFinalizedWindows();
+            }
+          } catch (error) {
+            console.error("Error parsing benchmark control message:", error);
+          }
+          return;
+        }
+
         try {
           const message_string = message.toString();
 
@@ -215,6 +397,32 @@ export class FetchingAllDataClientSide {
             null,
           )[0].object.value;
           const timestamp_epoch = Date.parse(timestamp);
+          if (this.isContaminatedTimestamp(timestamp_epoch, stream_name)) {
+            return;
+          }
+          const value = latest_event_store.getQuads(
+            null,
+            DataFactory.namedNode("https://saref.etsi.org/core/hasValue"),
+            null,
+            null,
+          )[0]?.object?.value;
+          const numericValue = Number.parseFloat(value ?? "NaN");
+
+          if (Number.isFinite(numericValue)) {
+            const observations = this.observationsByStream.get(stream_name) ?? [];
+            observations.push({
+              timestamp: timestamp_epoch,
+              value: numericValue,
+            });
+            this.observationsByStream.set(stream_name, observations);
+          }
+          if (!this.firstObservedEventTimestampByStream.has(stream_name)) {
+            this.firstObservedEventTimestampByStream.set(stream_name, timestamp_epoch);
+            this.log(
+              `First observed event timestamp for ${stream_name}: ${timestamp_epoch}`,
+            );
+          }
+          this.latestObservationTimestampByStream.set(stream_name, timestamp_epoch);
 
           if (rsp_stream_object) {
             await this.add_event_store_to_rsp_engine(
@@ -229,6 +437,50 @@ export class FetchingAllDataClientSide {
         }
       });
     }
+  }
+
+  private isContaminatedTimestamp(timestamp: number, streamName: string): boolean {
+    if (!Number.isFinite(timestamp)) {
+      return true;
+    }
+
+    if (
+      this.timestampDomainMin !== null &&
+      timestamp < this.timestampDomainMin
+    ) {
+      this.rejectedContaminatedTimestampCount += 1;
+      this.log(
+        `Rejected contaminated timestamp: ${JSON.stringify({
+          stream: streamName,
+          timestamp,
+          timestampDomainMin: this.timestampDomainMin,
+          timestampDomainMax: this.timestampDomainMax,
+          rejectedContaminatedTimestampCount:
+            this.rejectedContaminatedTimestampCount,
+        })}`,
+      );
+      return true;
+    }
+
+    if (
+      this.timestampDomainMax !== null &&
+      timestamp > this.timestampDomainMax
+    ) {
+      this.rejectedContaminatedTimestampCount += 1;
+      this.log(
+        `Rejected contaminated timestamp: ${JSON.stringify({
+          stream: streamName,
+          timestamp,
+          timestampDomainMin: this.timestampDomainMin,
+          timestampDomainMax: this.timestampDomainMax,
+          rejectedContaminatedTimestampCount:
+            this.rejectedContaminatedTimestampCount,
+        })}`,
+      );
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -326,6 +578,170 @@ export class FetchingAllDataClientSide {
     return isValid;
   }
 
+  private deriveLogicalWindow(
+    firstEventTimestamp: string,
+    lastEventTimestamp: string,
+  ): DerivedLogicalWindow | null {
+    const first = Date.parse(firstEventTimestamp);
+    const last = Date.parse(lastEventTimestamp);
+    if (!Number.isFinite(first) || !Number.isFinite(last) || last < first) {
+      return null;
+    }
+
+    const observedSpan = last - first;
+    const completionTolerance = 1000;
+    const isComplete = observedSpan >= this.windowRange - completionTolerance;
+    let start = first;
+    if (this.benchmarkEventTimeAnchor !== null) {
+      const relativeOffset = first - this.benchmarkEventTimeAnchor;
+      const windowIndex = Math.floor(
+        relativeOffset / this.expectedWindowInterval,
+      );
+      start =
+        this.benchmarkEventTimeAnchor +
+        Math.max(0, windowIndex) * this.expectedWindowInterval;
+    }
+    const end = start + this.windowRange;
+    return {
+      start,
+      end,
+      isComplete,
+      key: `${start}:${end}`,
+    };
+  }
+
+  private assessWindowCompleteness(
+    logicalWindow: DerivedLogicalWindow | null,
+    eventCount: number,
+  ): { status: string; reason: string; isSettled: boolean } {
+    if (!logicalWindow) {
+      return {
+        status: "invalid_window_bounds",
+        reason: "missing_or_invalid_logical_window_bounds",
+        isSettled: false,
+      };
+    }
+
+    if (!logicalWindow.isComplete) {
+      return {
+        status: "incomplete_span",
+        reason: "observed_timestamp_span_shorter_than_window_range",
+        isSettled: false,
+      };
+    }
+
+    if (Number.isFinite(this.expectedEventCount ?? NaN) && Number.isFinite(eventCount)) {
+      const minimumAcceptedCount =
+        (this.expectedEventCount as number) - this.expectedEventCountTolerance;
+      if (eventCount < minimumAcceptedCount) {
+        return {
+          status: "incomplete_count",
+          reason: `event_count_below_expected_threshold_${minimumAcceptedCount}`,
+          isSettled: false,
+        };
+      }
+    }
+
+    return {
+      status: "complete",
+      reason: Number.isFinite(this.expectedEventCount ?? NaN)
+        ? "event_count_meets_expected_threshold"
+        : "logical_window_span_complete",
+      isSettled: true,
+    };
+  }
+
+  private canFinalizeLogicalWindow(windowEnd: number): boolean {
+    const latestObservationSatisfied = this.returnStreams().every((stream) => {
+      const latestTimestamp = this.latestObservationTimestampByStream.get(
+        stream.stream_name,
+      );
+      return Number.isFinite(latestTimestamp) && (latestTimestamp as number) >= windowEnd;
+    });
+
+    return latestObservationSatisfied || (this.benchmarkFiniteReplayMode && this.benchmarkReplayComplete);
+  }
+
+  private flushPendingFinalizedWindows() {
+    if (!this.benchmarkFiniteReplayMode || !this.benchmarkReplayComplete) {
+      return;
+    }
+
+    const pendingCandidates = Array.from(this.logicalWindowCandidates.values())
+      .filter((candidate) => candidate.logicalWindow && !this.emittedLogicalWindows.has(candidate.logicalWindow.key))
+      .sort((a, b) => a.logicalWindow.start - b.logicalWindow.start);
+
+    for (const candidate of pendingCandidates) {
+      const windowStartIso = new Date(candidate.logicalWindow.start).toISOString();
+      const windowEndIso = new Date(candidate.logicalWindow.end).toISOString();
+      this.rstream_emitter.emit("RStream", {
+        window: {
+          open: candidate.logicalWindow.start,
+          close: candidate.logicalWindow.end,
+        },
+        bindings: [
+          new Map([
+            ["?resultValue", { value: candidate.resultValue }],
+            ["?eventCount", { value: String(candidate.eventCount) }],
+            ["?sumValue", { value: String(candidate.sumValue) }],
+            ["?avgValue", { value: String(candidate.avgValue) }],
+            ["?firstEventTimestamp", { value: windowStartIso }],
+            ["?lastEventTimestamp", { value: windowEndIso }],
+          ]),
+        ],
+      });
+    }
+  }
+
+  private computeSettledWindowAggregate(logicalWindow: DerivedLogicalWindow): {
+    eventCount: number;
+    sumValue: number;
+    avgValue: number;
+  } {
+    let eventCount = 0;
+    let sumValue = 0;
+
+    for (const observations of this.observationsByStream.values()) {
+      for (const observation of observations) {
+        if (
+          observation.timestamp >= logicalWindow.start &&
+          observation.timestamp < logicalWindow.end
+        ) {
+          eventCount += 1;
+          sumValue += observation.value;
+        }
+      }
+    }
+
+    return {
+      eventCount,
+      sumValue,
+      avgValue: eventCount > 0 ? sumValue / eventCount : 0,
+    };
+  }
+
+  private writeWindowDiagnostics(
+    windowNumber: number | "" | null,
+    logicalWindow: DerivedLogicalWindow | null,
+    eventCount: number,
+    sumValue: number,
+    avgValue: number,
+    firstEventTimestamp: string,
+    lastEventTimestamp: string,
+    completenessStatus: string,
+    acceptedOrSuppressed: string,
+    reason: string,
+    resultValue: string,
+  ) {
+    if (!this.diagnosticsLogStream || !logicalWindow) {
+      return;
+    }
+
+    this.diagnosticsLogStream.write(
+      `${this.benchmarkEventTimeAnchor ?? ""},${windowNumber ?? ""},${logicalWindow.start},${logicalWindow.end},${Number.isFinite(eventCount) ? eventCount : ""},${Number.isFinite(this.expectedEventCount ?? NaN) ? this.expectedEventCount : ""},${Number.isFinite(sumValue) ? sumValue : ""},${Number.isFinite(avgValue) ? avgValue : ""},${firstEventTimestamp},${lastEventTimestamp},${completenessStatus},${acceptedOrSuppressed},${reason},${resultValue}\n`,
+    );
+  }
+
   /**
    *
    */
@@ -413,10 +829,163 @@ export class FetchingAllDataClientSide {
 
         const data = resultValue;
         const currentTimestamp = Date.now();
+        const windowBounds = this.extractWindowBounds(object);
+        const eventCount = Number.parseFloat(
+          this.extractBindingValue(binding, ["eventCount", "countValue"]) ?? "NaN",
+        );
+        const sumValue = Number.parseFloat(
+          this.extractBindingValue(binding, ["sumValue"]) ?? "NaN",
+        );
+        const avgValue = Number.parseFloat(
+          this.extractBindingValue(binding, ["avgValue", "resultValue"]) ?? "NaN",
+        );
+        const firstEventTimestamp =
+          this.extractBindingValue(binding, ["firstEventTimestamp"]) ?? "";
+        const lastEventTimestamp =
+          this.extractBindingValue(binding, ["lastEventTimestamp"]) ?? "";
+        const logicalWindow = this.deriveLogicalWindow(
+          firstEventTimestamp,
+          lastEventTimestamp,
+        );
+        const completeness = this.assessWindowCompleteness(logicalWindow, eventCount);
 
         this.log(
           `RStream result generated: ${data} at timestamp: ${currentTimestamp}`,
         );
+
+        this.log(
+          `Fetching candidate row seen: ${JSON.stringify({
+            logicalWindowKey: logicalWindow?.key ?? null,
+            windowStart: logicalWindow?.start ?? null,
+            windowEnd: logicalWindow?.end ?? null,
+            eventCount: Number.isFinite(eventCount) ? eventCount : null,
+            expectedEventCount: this.expectedEventCount,
+            completenessStatus: completeness.status,
+            reason: completeness.reason,
+          })}`,
+        );
+
+        if (!logicalWindow) {
+          this.log(
+            `Delayed because incomplete: ${JSON.stringify({
+              reason: completeness.reason,
+              firstEventTimestamp,
+              lastEventTimestamp,
+            })}`,
+          );
+          continue;
+        }
+
+        const previousCandidate = this.logicalWindowCandidates.get(logicalWindow.key);
+        const shouldReplaceCandidate =
+          !previousCandidate ||
+          (Number.isFinite(eventCount) &&
+            (!Number.isFinite(previousCandidate.eventCount) ||
+              eventCount >= previousCandidate.eventCount));
+
+        if (shouldReplaceCandidate) {
+          this.logicalWindowCandidates.set(logicalWindow.key, {
+            logicalWindow,
+            eventCount,
+            sumValue,
+            avgValue,
+            firstEventTimestamp,
+            lastEventTimestamp,
+            resultValue: data,
+            completenessStatus: completeness.status,
+            completenessReason: completeness.reason,
+            rspWindowStart: windowBounds?.start ?? null,
+            rspWindowEnd: windowBounds?.end ?? null,
+          });
+          this.log(
+            `Updated candidate for same window: ${JSON.stringify({
+              logicalWindowKey: logicalWindow.key,
+              previousEventCount: previousCandidate?.eventCount ?? null,
+              nextEventCount: Number.isFinite(eventCount) ? eventCount : null,
+            })}`,
+          );
+        }
+
+        if (!this.canFinalizeLogicalWindow(logicalWindow.end)) {
+          this.writeWindowDiagnostics(
+            "",
+            logicalWindow,
+            eventCount,
+            sumValue,
+            avgValue,
+            firstEventTimestamp,
+            lastEventTimestamp,
+            completeness.status,
+            "suppressed",
+            "waiting_for_all_streams_to_progress_past_window_end",
+            data,
+          );
+          this.log(
+            `Delayed because incomplete: ${JSON.stringify({
+              logicalWindowKey: logicalWindow.key,
+              eventCount: Number.isFinite(eventCount) ? eventCount : null,
+              expectedEventCount: this.expectedEventCount,
+              completenessStatus: completeness.status,
+              reason: "waiting_for_all_streams_to_progress_past_window_end",
+            })}`,
+          );
+          continue;
+        }
+
+        const settledAggregate = this.computeSettledWindowAggregate(logicalWindow);
+        const settledCompleteness = this.assessWindowCompleteness(
+          logicalWindow,
+          settledAggregate.eventCount,
+        );
+
+        if (!settledCompleteness.isSettled) {
+          this.writeWindowDiagnostics(
+            "",
+            logicalWindow,
+            settledAggregate.eventCount,
+            settledAggregate.sumValue,
+            settledAggregate.avgValue,
+            firstEventTimestamp,
+            lastEventTimestamp,
+            settledCompleteness.status,
+            "suppressed",
+            settledCompleteness.reason,
+            data,
+          );
+          this.log(
+            `Delayed because incomplete: ${JSON.stringify({
+              logicalWindowKey: logicalWindow.key,
+              eventCount: settledAggregate.eventCount,
+              expectedEventCount: this.expectedEventCount,
+              completenessStatus: settledCompleteness.status,
+              reason: settledCompleteness.reason,
+            })}`,
+          );
+          continue;
+        }
+
+        if (this.emittedLogicalWindows.has(logicalWindow.key)) {
+          this.writeWindowDiagnostics(
+            "",
+            logicalWindow,
+            settledAggregate.eventCount,
+            settledAggregate.sumValue,
+            settledAggregate.avgValue,
+            firstEventTimestamp,
+            lastEventTimestamp,
+            settledCompleteness.status,
+            "suppressed",
+            "duplicate_after_finalization",
+            String(settledAggregate.avgValue),
+          );
+          this.log(
+            `Suppressed duplicate only after finalization: ${JSON.stringify({
+              logicalWindowKey: logicalWindow.key,
+              eventCount: settledAggregate.eventCount,
+            })}`,
+          );
+          continue;
+        }
 
         // Apply timing filter to ignore extra dynamic windows
         if (!this.isWithinExpectedWindowTiming(currentTimestamp)) {
@@ -425,10 +994,11 @@ export class FetchingAllDataClientSide {
           continue;
         }
 
-        this.log(`Processing valid result: ${data}`);
+        this.log(`Processing valid result: ${settledAggregate.avgValue}`);
 
         // Calculate and log latency with multiple metrics
         this.windowCount++;
+        this.emittedLogicalWindows.add(logicalWindow.key);
         const resultEmittedAt = Date.now();
         const expectedWindowClose = this.getExpectedWindowCloseTime(
           this.windowCount,
@@ -438,24 +1008,66 @@ export class FetchingAllDataClientSide {
           expectedWindowClose,
           this.lastObservationReceivedTime,
           resultEmittedAt,
-          data,
+          String(settledAggregate.avgValue),
+        );
+        this.writeWindowDiagnostics(
+          this.windowCount,
+          logicalWindow,
+          settledAggregate.eventCount,
+          settledAggregate.sumValue,
+          settledAggregate.avgValue,
+          firstEventTimestamp,
+          lastEventTimestamp,
+          settledCompleteness.status,
+          "accepted",
+          "finalized_settled_window",
+          String(settledAggregate.avgValue),
+        );
+        this.log(
+          `Accepted/finalized: ${JSON.stringify({
+            window_number: this.windowCount,
+            benchmark_event_time_anchor: this.benchmarkEventTimeAnchor,
+            window_start: logicalWindow.start,
+            window_end: logicalWindow.end,
+            rsp_window_start: windowBounds?.start ?? null,
+            rsp_window_end: windowBounds?.end ?? null,
+            event_count: settledAggregate.eventCount,
+            expected_event_count: this.expectedEventCount,
+            sum: settledAggregate.sumValue,
+            avg: settledAggregate.avgValue,
+            first_event_timestamp: firstEventTimestamp || null,
+            last_event_timestamp: lastEventTimestamp || null,
+            completeness_status: settledCompleteness.status,
+          })}`,
         );
 
         // Debug: print the full binding object
         // console.log("DEBUG: RStream binding:", binding);
 
-        const numericValue = Number.parseFloat(data);
+        const numericValue = settledAggregate.avgValue;
         const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
         const aggregation_object_string = useBenchmarkPayload
           ? JSON.stringify(
-              buildBenchmarkResultPayload(
-                "fetching",
-                this.aggregationFunction,
-                this.sessionId,
-                numericValue,
-                this.windowCount,
-              ),
-            )
+                buildBenchmarkResultPayload(
+                  "fetching",
+                  this.aggregationFunction,
+                  this.sessionId,
+                  numericValue,
+                  this.windowCount,
+                  {
+                    benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                    windowStart: logicalWindow.start,
+                    windowEnd: logicalWindow.end,
+                    rspWindowStart: windowBounds?.start ?? null,
+                    rspWindowEnd: windowBounds?.end ?? null,
+                    eventCount: settledAggregate.eventCount,
+                    sumValue: settledAggregate.sumValue,
+                    avgValue: settledAggregate.avgValue,
+                    firstEventTimestamp: firstEventTimestamp || null,
+                    lastEventTimestamp: lastEventTimestamp || null,
+                  },
+                ),
+              )
           : JSON.stringify(this.generate_aggregation_event(data));
         console.log(
           `Aggregation event generated: ${aggregation_object_string}`,
@@ -521,6 +1133,9 @@ export class FetchingAllDataClientSide {
     if (this.latencyLogStream) {
       this.latencyLogStream.end();
     }
+    if (this.diagnosticsLogStream) {
+      this.diagnosticsLogStream.end();
+    }
   }
 
   /**
@@ -566,6 +1181,10 @@ async function clientSideProcessing() {
   const aggregationFunction = getConfiguredAggregation();
   const outputWindowRange = getOutputWindowRange();
   const outputWindowStep = getOutputWindowStep();
+  const wearableTopicName = buildBenchmarkTopicName("wearableX");
+  const smartphoneTopicName = buildBenchmarkTopicName("smartphoneX");
+  const wearableStreamIri = buildBenchmarkStreamIri("wearableX");
+  const smartphoneStreamIri = buildBenchmarkStreamIri("smartphoneX");
   const query = `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
@@ -574,17 +1193,19 @@ PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
 SELECT ${buildOutputSelectClause(aggregationFunction)}
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <${wearableStreamIri}> ON STREAM mqtt_broker:${wearableTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <${smartphoneStreamIri}> ON STREAM mqtt_broker:${smartphoneTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
 WHERE {
     {
-        WINDOW <mqtt://localhost:1883/wearableX> {
+        WINDOW <${wearableStreamIri}> {
             ?s1 saref:hasValue ?value .
+            ?s1 saref:hasTimestamp ?ts .
             ?s1 saref:relatesToProperty dahccsensors:wearableX .
         }
     } UNION {
-        WINDOW <mqtt://localhost:1883/smartphoneX> {
+        WINDOW <${smartphoneStreamIri}> {
             ?s2 saref:hasValue ?value .
+            ?s2 saref:hasTimestamp ?ts .
             ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
         }
     }

@@ -11,6 +11,7 @@ import {
   getResultTopic,
   getSessionId,
 } from "../../util/runtimeConfig";
+import { hash_string_md5 } from "../../util/Util";
 
 /**
  * Configuration interface for inactivity detection
@@ -223,6 +224,29 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
    * @returns {Promise<void>} - Returns nothing.
    */
   async setMQTTTopicMap(): Promise<void> {
+    // Prefer the active benchmark attempt subqueries passed in by BeeWorker.
+    // Their MQTT result topics are deterministic: chunked/<md5(query)>.
+    if (this.subQueries.length > 0) {
+      this.queryMQTTTopicMap = new Map<string, string>();
+      this.extractedQueries = this.subQueries.map((query) => {
+        const queryHash = hash_string_md5(query);
+        const r2sTopic = `chunked/${queryHash}`;
+        this.queryMQTTTopicMap.set(queryHash, r2sTopic);
+        return {
+          rspql_query: query,
+          r2s_topic: r2sTopic,
+        };
+      });
+
+      console.log(
+        `Derived ${this.extractedQueries.length} active reusable-result topics from provided subqueries.`,
+      );
+      console.log(
+        `Active approximation MQTT topics: ${JSON.stringify(Array.from(this.queryMQTTTopicMap.values()))}`,
+      );
+      return;
+    }
+
     const response = await fetch(this.queryFetchLocation);
     if (!response.ok) {
       throw new Error("Failed to fetch subqueries");
@@ -413,7 +437,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       let averageDataInterval = 0; // Average time between data messages
       let previousDataTime = Date.now();
       let streamStartTime = Date.now(); // Track when the stream started
-      const MAX_STREAM_DURATION = 150000; // Maximum 150 seconds (2.5 minutes) total runtime
+      const MAX_STREAM_DURATION = 240000; // Allow enough time for three 60s output windows plus buffer
 
       rsp_client.on("message", (topic: string, message: any) => {
         // this.logger.log(`Received message on topic ${topic}: ${message.toString()}`);

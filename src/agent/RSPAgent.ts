@@ -4,6 +4,7 @@ import { EventEmitter } from "events";
 const { DataFactory } = require("n3");
 import { v4 as uuidv4 } from 'uuid';
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
+import { buildBenchmarkTopicName } from "../util/runtimeConfig";
 const mqtt = require('mqtt');
 
 
@@ -76,7 +77,10 @@ export class RSPAgent {
             const mqtt_broker: string = this.returnMQTTBroker(stream_name);
             const rsp_client = mqtt.connect(mqtt_broker);
             const rsp_stream_object = this.rsp_engine.getStream(stream_name);
-            const topic = new URL(stream_name).pathname.slice(1);
+            const rawTopic = new URL(stream_name).pathname.replace(/^\/+/, "");
+            const topic = rawTopic.startsWith("bench/")
+              ? rawTopic
+              : buildBenchmarkTopicName(rawTopic);
 
             rsp_client.on("connect", () => {
                 console.log(`Connected to MQTT broker at ${mqtt_broker}`);
@@ -85,7 +89,7 @@ export class RSPAgent {
                     if (err) {
                         console.error(`Failed to subscribe to stream ${stream_name}:`, err);
                     } else {
-                        console.log(`Subscribed to stream ${stream_name}`);
+                        console.log(`Subscribed to stream ${topic}`);
                     }
                 });
             });

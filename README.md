@@ -34,6 +34,10 @@ You can automatically fix some issues via
 npm run lint:ts:fix
 ```
 
+## Targeted Benchmark Accuracy Summaries
+
+Targeted custom-pattern benchmark runs now produce scoped accuracy summaries. When you run `scripts/benchmark/run-all-paper-benchmarks.js` with filters such as `--patterns`, `--approaches`, and `--iterations`, the custom-pattern accuracy analyzer reads from the copied run-local inputs under `results/paper-benchmarks/<run>/patterns/raw` and only expects the selected pattern, approach, and iteration scope for that run.
+
 ## Example Architecture
 
 The Streaming Query Hive can handle multiple streaming queries from different sources, and utilizes different streaming operators to process the data. The architecture is designed to be modular, allowing for easy integration of new sources and operators. An example architecture combining three different sources and the results from the RDF Stream Processing Agents to solve for a specific Query is shown below:

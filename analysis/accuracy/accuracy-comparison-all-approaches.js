@@ -263,7 +263,7 @@ class AllApproachesComparison {
       };
 
       console.log(`  Approximation:`);
-      console.log(`    First-event latency: ${approxMetadata.firstEventLatencySeconds}s (Δ ${(comparison.approximation.latencyDifference / 1000).toFixed(2)}s)`);
+      console.log(`    Finalized comparable latency: ${approxMetadata.firstEventLatencySeconds}s (Δ ${(comparison.approximation.latencyDifference / 1000).toFixed(2)}s)`);
       if (accuracyMetrics) {
         console.log(`    MAPE: ${accuracyMetrics.mape.toFixed(4)}%`);
         console.log(`    MAE: ${accuracyMetrics.mae.toFixed(6)}`);
@@ -284,6 +284,7 @@ class AllApproachesComparison {
         firstEventLatency: chunkedMetadata.firstEventLatency,
         firstEventLatencySeconds: chunkedMetadata.firstEventLatencySeconds,
         latencyDifference: chunkedMetadata.firstEventLatency - fetchingMetadata.firstEventLatency,
+        parentPartialAvailableElapsedMs: chunkedMetadata.parentPartialAvailableElapsedMs ?? null,
         resultCount: chunkedResults.length,
         avgValue: chunkedResults.length > 0
           ? chunkedResults.reduce((sum, r) => sum + r.resultValue, 0) / chunkedResults.length
@@ -292,7 +293,10 @@ class AllApproachesComparison {
       };
 
       console.log(`  Chunked:`);
-      console.log(`    First-event latency: ${chunkedMetadata.firstEventLatencySeconds}s (Δ ${(comparison.chunked.latencyDifference / 1000).toFixed(2)}s)`);
+      if (comparison.chunked.parentPartialAvailableElapsedMs !== null) {
+        console.log(`    Parent partial availability: ${comparison.chunked.parentPartialAvailableElapsedMs} ms`);
+      }
+      console.log(`    Finalized comparable latency: ${chunkedMetadata.firstEventLatencySeconds}s (Δ ${(comparison.chunked.latencyDifference / 1000).toFixed(2)}s)`);
       if (accuracyMetrics) {
         console.log(`    MAPE: ${accuracyMetrics.mape.toFixed(4)}%`);
         console.log(`    MAE: ${accuracyMetrics.mae.toFixed(6)}`);
@@ -321,7 +325,7 @@ class AllApproachesComparison {
       };
 
       console.log(`  Naive Distributed:`);
-      console.log(`    First-event latency: ${naiveMetadata.firstEventLatencySeconds}s (Δ ${(comparison.naive_distributed.latencyDifference / 1000).toFixed(2)}s)`);
+      console.log(`    Finalized comparable latency: ${naiveMetadata.firstEventLatencySeconds}s (Δ ${(comparison.naive_distributed.latencyDifference / 1000).toFixed(2)}s)`);
       if (accuracyMetrics) {
         console.log(`    MAPE: ${accuracyMetrics.mape.toFixed(4)}%`);
         console.log(`    MAE: ${accuracyMetrics.mae.toFixed(6)}`);
@@ -391,7 +395,7 @@ class AllApproachesComparison {
     console.log("\n" + "═".repeat(80));
     console.log("LATENCY COMPARISON TABLE");
     console.log("═".repeat(80));
-    console.log("Frequency | Approach      | First-Event Latency | Difference vs Fetching");
+    console.log("Frequency | Approach      | Finalized Comparable Latency | Difference vs Fetching");
     console.log("─".repeat(80));
 
     allComparisons.forEach((comp) => {
@@ -417,6 +421,11 @@ class AllApproachesComparison {
       if (comp.chunked) {
         const diff = (comp.chunked.latencyDifference / 1000).toFixed(2);
         const sign = comp.chunked.latencyDifference >= 0 ? "+" : "";
+        if (comp.chunked.parentPartialAvailableElapsedMs !== null && comp.chunked.parentPartialAvailableElapsedMs !== undefined) {
+          console.log(
+            `${" ".repeat(9)} | Chunked       | parent partial ${comp.chunked.parentPartialAvailableElapsedMs} ms`,
+          );
+        }
         console.log(
           `${" ".repeat(9)} | Chunked       | ${comp.chunked.firstEventLatencySeconds.padEnd(19)}s | ${sign}${diff}s`,
         );
@@ -477,7 +486,7 @@ class AllApproachesComparison {
 
     // Latency CSV
     const latencyPath = path.join(this.baseLogDir, "latency_comparison_all_approaches.csv");
-    let latencyCsv = "frequency,approach,first_event_latency_ms,first_event_latency_s,difference_vs_fetching_ms\n";
+    let latencyCsv = "frequency,approach,finalized_comparable_latency_ms,finalized_comparable_latency_s,difference_vs_fetching_ms\n";
 
     allComparisons.forEach((comp) => {
       if (!comp) return;

@@ -3,6 +3,7 @@ import { RDFStream, RSPEngine, RSPQLParser } from 'rsp-js';
 import { v4 as uuidv4 } from 'uuid';
 import { turtleStringToStore } from '../util/Util';
 import { PartialChunkResult } from '../util/chunkTypes';
+import { getTimestampDomainMax, getTimestampDomainMin, useCleanMqttSessionsForBenchmark } from '../util/runtimeConfig';
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
 
@@ -18,6 +19,11 @@ export class RSPQueryProcess {
     private queryId: string;
     private subqueryId: string;
     private debugChunksEnabled: boolean;
+    private benchmarkEventTimeAnchor: number | null;
+    private firstObservedWindowStart: number | null;
+    private timestampDomainMin: number | null;
+    private timestampDomainMax: number | null;
+    private rejectedContaminatedTimestampCount: number;
 
     /**
      *
@@ -33,6 +39,13 @@ export class RSPQueryProcess {
         this.queryId = queryId;
         this.subqueryId = subqueryId;
         this.debugChunksEnabled = process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
+        const anchorRaw = process.env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR;
+        const parsedAnchor = Number.parseInt(anchorRaw || "", 10);
+        this.benchmarkEventTimeAnchor = Number.isFinite(parsedAnchor) ? parsedAnchor : null;
+        this.firstObservedWindowStart = null;
+        this.timestampDomainMin = getTimestampDomainMin();
+        this.timestampDomainMax = getTimestampDomainMax();
+        this.rejectedContaminatedTimestampCount = 0;
         this.subscribeToResultStream();
     }
 
@@ -54,7 +67,9 @@ export class RSPQueryProcess {
                 const stream_name = stream.stream_name;
                 const stream_url = new URL(stream_name);
                 const mqtt_broker: string = `${stream_url.protocol}//${stream_url.hostname}:${stream_url.port}/`;
-                const rsp_client = mqtt.connect(mqtt_broker);
+                const rsp_client = mqtt.connect(mqtt_broker, {
+                    clean: useCleanMqttSessionsForBenchmark(),
+                });
                 const rsp_stream_object = this.rsp_engine.getStream(stream_name);
                 const topic = stream_url.pathname.slice(1);
                 console.log(`Connecting to MQTT broker at ${mqtt_broker} for stream ${stream_name}`);
@@ -84,6 +99,9 @@ export class RSPQueryProcess {
                             return;
                         }
                         const timestamp_epoch = Date.parse(timestamp);
+                        if (this.isContaminatedTimestamp(timestamp_epoch, stream_name)) {
+                            return;
+                        }
                         if (rsp_stream_object) {
                             await this.add_event_store_to_rsp_engine(latest_event_store, [rsp_stream_object], timestamp_epoch);
                         }
@@ -110,6 +128,30 @@ export class RSPQueryProcess {
         else {
             console.log(`Failed to parse query: ${this.query}`);
         }
+    }
+
+    private isContaminatedTimestamp(timestamp: number, streamName: string): boolean {
+        if (!Number.isFinite(timestamp)) {
+            return true;
+        }
+
+        if (this.timestampDomainMin !== null && timestamp < this.timestampDomainMin) {
+            this.rejectedContaminatedTimestampCount += 1;
+            console.log(
+                `[CONTAMINATION] stream=${streamName} timestamp=${timestamp} timestampDomainMin=${this.timestampDomainMin} timestampDomainMax=${this.timestampDomainMax} rejectedCount=${this.rejectedContaminatedTimestampCount}`,
+            );
+            return true;
+        }
+
+        if (this.timestampDomainMax !== null && timestamp > this.timestampDomainMax) {
+            this.rejectedContaminatedTimestampCount += 1;
+            console.log(
+                `[CONTAMINATION] stream=${streamName} timestamp=${timestamp} timestampDomainMin=${this.timestampDomainMin} timestampDomainMax=${this.timestampDomainMax} rejectedCount=${this.rejectedContaminatedTimestampCount}`,
+            );
+            return true;
+        }
+
+        return false;
     }
 
 
@@ -208,6 +250,8 @@ export class RSPQueryProcess {
         const aggregateFunction = aggregateFunctionMatch?.[1]?.toUpperCase();
         const value = this.extractNumericBinding(bindings, ["avg", "agg", "sum", "min", "max"]);
         const count = this.extractNumericBinding(bindings, ["count"]);
+        const sum = this.extractNumericBinding(bindings, ["sum"]);
+        const avg = this.extractNumericBinding(bindings, ["avg"]);
         const event_timestamp = new Date().getTime();
         const rdfPayload = this.generate_aggregation_event(bindings, event_timestamp);
         const chunkGroupId = `${this.queryId}:${windowBounds.start}:${windowBounds.end}`;
@@ -228,6 +272,8 @@ export class RSPQueryProcess {
             aggregateFunction,
             value,
             count,
+            sum,
+            avg,
             rdfPayload,
         };
     }
@@ -256,7 +302,8 @@ export class RSPQueryProcess {
         ];
         for (const candidate of candidates) {
             if (Number.isFinite(candidate.start) && Number.isFinite(candidate.end)) {
-                return { start: candidate.start as number, end: candidate.end as number };
+                const explicit = { start: candidate.start as number, end: candidate.end as number };
+                return this.remapWindowBoundsToBenchmarkAnchor(explicit, range, step);
             }
         }
 
@@ -266,7 +313,38 @@ export class RSPQueryProcess {
             return null;
         }
         const end = Math.floor(anchor / step) * step;
-        return { start: end - range, end };
+        return this.remapWindowBoundsToBenchmarkAnchor(
+            { start: end - range, end },
+            range,
+            step,
+        );
+    }
+
+    private remapWindowBoundsToBenchmarkAnchor(
+        bounds: { start: number; end: number },
+        range: number,
+        step: number,
+    ): { start: number; end: number } {
+        if (
+            this.benchmarkEventTimeAnchor === null ||
+            !Number.isFinite(step) ||
+            step <= 0 ||
+            !Number.isFinite(range) ||
+            range <= 0
+        ) {
+            return bounds;
+        }
+
+        if (this.firstObservedWindowStart === null) {
+            this.firstObservedWindowStart = bounds.start;
+        }
+
+        const windowIndex = Math.round((bounds.start - this.firstObservedWindowStart) / step);
+        const remappedStart = this.benchmarkEventTimeAnchor + (windowIndex * step);
+        return {
+            start: remappedStart,
+            end: remappedStart + range,
+        };
     }
 
     public generate_aggregation_event(bindings: any, timestamp: number) {

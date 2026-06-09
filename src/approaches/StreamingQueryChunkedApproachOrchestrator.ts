@@ -3,6 +3,8 @@ import { Orchestrator } from "../orchestrator/Orchestrator";
 
 import { CSVLogger } from "../util/logger/CSVLogger";
 import {
+  buildBenchmarkStreamIri,
+  buildBenchmarkTopicName,
   buildOutputSelectClause,
   buildSubQuerySelectClause,
   getConfiguredAggregation,
@@ -25,6 +27,10 @@ async function StreamingQueryHiveApproachOrchestrator() {
   const subWindowStep = getSubWindowStep();
   const outputWindowRange = getOutputWindowRange();
   const outputWindowStep = getOutputWindowStep();
+  const wearableTopicName = buildBenchmarkTopicName("wearableX");
+  const smartphoneTopicName = buildBenchmarkTopicName("smartphoneX");
+  const wearableStreamIri = buildBenchmarkStreamIri("wearableX");
+  const smartphoneStreamIri = buildBenchmarkStreamIri("smartphoneX");
 
   logger.log(
     `Chunked orchestrator config: aggregation=${aggFunc}, subWindowRange=${subWindowRange}, subWindowStep=${subWindowStep}`,
@@ -38,10 +44,11 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
 SELECT ${buildSubQuerySelectClause(aggFunc, "WearableX")}
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${subWindowRange} STEP ${subWindowStep}]
+FROM NAMED WINDOW <${wearableStreamIri}> ON STREAM mqtt_broker:${wearableTopicName} [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
-    WINDOW <mqtt://localhost:1883/wearableX> {
+    WINDOW <${wearableStreamIri}> {
         ?s1 saref:hasValue ?value .
+        ?s1 saref:hasTimestamp ?ts .
         ?s1 saref:relatesToProperty dahccsensors:wearableX .
 }
 }
@@ -53,10 +60,11 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <output> AS
     SELECT ${buildSubQuerySelectClause(aggFunc, "SmartphoneX")}
-    FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${subWindowRange} STEP ${subWindowStep}]
+    FROM NAMED WINDOW <${smartphoneStreamIri}> ON STREAM mqtt_broker:${smartphoneTopicName} [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
-    WINDOW <mqtt://localhost:1883/smartphoneX> {
+    WINDOW <${smartphoneStreamIri}> {
         ?s2 saref:hasValue ?value .
+        ?s2 saref:hasTimestamp ?ts .
         ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
     }
 }
@@ -76,17 +84,19 @@ PREFIX : <https://rsp.js>
 
 REGISTER RStream <sensor_averages> AS
 SELECT ${buildOutputSelectClause(aggFunc)}
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <${wearableStreamIri}> ON STREAM mqtt_broker:${wearableTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <${smartphoneStreamIri}> ON STREAM mqtt_broker:${smartphoneTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
 WHERE {
     {
-        WINDOW <mqtt://localhost:1883/wearableX> {
+        WINDOW <${wearableStreamIri}> {
             ?s1 saref:hasValue ?value .
+            ?s1 saref:hasTimestamp ?ts .
             ?s1 saref:relatesToProperty dahccsensors:wearableX .
         }
     } UNION {
-        WINDOW <mqtt://localhost:1883/smartphoneX> {
+        WINDOW <${smartphoneStreamIri}> {
             ?s2 saref:hasValue ?value .
+            ?s2 saref:hasTimestamp ?ts .
             ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
         }
     }

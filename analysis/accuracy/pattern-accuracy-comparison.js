@@ -346,7 +346,7 @@ class PatternAccuracyComparison {
 
       console.log(`  Approximation:`);
       console.log(
-        `    Latency: ${approxMetadata.firstEventLatencySeconds}s (Δ ${(comparison.approximation.latencyDifference / 1000).toFixed(2)}s)`,
+        `    Finalized comparable latency: ${approxMetadata.firstEventLatencySeconds}s (Δ ${(comparison.approximation.latencyDifference / 1000).toFixed(2)}s)`,
       );
       if (accuracyMetrics) {
         console.log(`    MAPE: ${accuracyMetrics.mape.toFixed(4)}%`);
@@ -386,8 +386,13 @@ class PatternAccuracyComparison {
       };
 
       console.log(`  Chunked:`);
+      if (chunkedMetadata.parentPartialAvailableElapsedMs !== null && chunkedMetadata.parentPartialAvailableElapsedMs !== undefined) {
+        console.log(
+          `    Parent partial availability: ${chunkedMetadata.parentPartialAvailableElapsedMs} ms`,
+        );
+      }
       console.log(
-        `    Latency: ${chunkedMetadata.firstEventLatencySeconds}s (Δ ${(comparison.chunked.latencyDifference / 1000).toFixed(2)}s)`,
+        `    Finalized comparable latency: ${chunkedMetadata.firstEventLatencySeconds}s (Δ ${(comparison.chunked.latencyDifference / 1000).toFixed(2)}s)`,
       );
       if (accuracyMetrics) {
         console.log(`    MAPE: ${accuracyMetrics.mape.toFixed(4)}%`);

@@ -1,4 +1,5 @@
 import fs from "fs";
+import * as path from "path";
 import { RewriteChunkQuery } from "hive-thought-rewriter";
 import mqtt from "mqtt";
 import { RSPQLParser } from "rsp-js";
@@ -10,8 +11,14 @@ import { R2ROperator } from "./r2r";
 import {
   AggregationFunction,
   buildBenchmarkResultPayload,
+  getBenchmarkEventTimeAnchor,
+  getChunkedUseImmediateTrigger,
   getResultTopic,
   getSessionId,
+  getTimestampDomainMax,
+  getTimestampDomainMin,
+  useCleanMqttSessionsForBenchmark,
+  useChunkedComparableOutputCadence,
 } from "../../util/runtimeConfig";
 import { PartialChunkResult } from "../../util/chunkTypes";
 const N3 = require("n3");
@@ -19,6 +26,60 @@ const N3 = require("n3");
 type SubqueryIdentity = {
   subqueryId: string;
   topic: string;
+};
+
+type ChunkWindowDiagnostics = {
+  chunkGroupId: string;
+  start: number;
+  end: number;
+  count: number | null;
+  sum: number | null;
+  avg: number | null;
+  subqueries: string[];
+};
+
+type ComparableWindowDiagnostics = {
+  externalWindowNumber: number;
+  externalWindowStart: number;
+  externalWindowEnd: number;
+  internalChunkGroupIds: string[];
+  internalChunks: ChunkWindowDiagnostics[];
+  recomposedCount: number | null;
+  recomposedSum: number | null;
+  recomposedAvg: number | null;
+  resultValue: number;
+};
+
+type WindowRecompositionSummary = {
+  externalWindowStart: number;
+  externalWindowEnd: number;
+  internalChunkGroupIds: string[];
+  internalChunks: ChunkWindowDiagnostics[];
+  recomposedCount: number | null;
+  recomposedSum: number | null;
+  recomposedAvg: number | null;
+  resultValue: number;
+};
+
+type ParentPartialDiagnostics = {
+  outputType: "parent_partial";
+  comparable: false;
+  benchmarkEventTimeAnchor: number | null;
+  parentWindowNumber: number;
+  parentWindowStart: number;
+  parentWindowEndOrCoveredUntil: number;
+  parentRangeMs: number;
+  coveredDurationMs: number;
+  chunksUsed: number;
+  eventCount: number | null;
+  sum: number | null;
+  avg: number | null;
+  resultValue: number;
+  emittedAtMs: number;
+  elapsedSinceRegistrationMs: number;
+  delayPastPartialTriggerMs: number;
+  internalChunkIds: string[];
+  internalChunks: ChunkWindowDiagnostics[];
 };
 
 function getLogicalChunkGroupId(partial: Pick<PartialChunkResult, "queryId" | "window">): string {
@@ -39,6 +100,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private mqttBroker: string = "mqtt://localhost:1883"; // Default MQTT broker URL, can be changed if needed
   private sessionId: string; // Unique session ID to isolate MQTT topics across iterations
   private latencyLogStream!: fs.WriteStream;
+  private diagnosticsLogStream!: fs.WriteStream;
+  private parentPartialDiagnosticsFilePath: string = "";
   private windowCount: number = 0; // Track window count for latency logging
   private queryRegisteredTime: number = 0; // Track when query was registered
   private windowRange: number = 120000; // 120 seconds based on RANGE 120000
@@ -48,9 +111,17 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private intervalTriggerTime: number = 0; // Track when the setInterval fires
   private lastProcessedTime: number = 0; // Track last time we processed (for immediate trigger)
   private processingInProgress: boolean = false; // Prevent concurrent processing
-  private useImmediateTrigger: boolean = true; // Enable immediate trigger optimization
+  private useImmediateTrigger: boolean;
+  private comparableOutputCadenceOnly: boolean;
   private debugChunksEnabled: boolean = process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
   private ignoredLegacyChunkCount: number = 0;
+  private benchmarkEventTimeAnchor: number | null;
+  private timestampDomainMin: number | null;
+  private timestampDomainMax: number | null;
+  private rejectedContaminatedTimestampCount: number = 0;
+  private firstObservedEventTimestampByTopic: Map<string, number> = new Map();
+  private lastObservedEventTimestampByTopic: Map<string, number> = new Map();
+  private parentPartialAvailabilityLogged: boolean = false;
   /**
    *
    */
@@ -58,17 +129,28 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.subQueries = [];
     this.parser = new RSPQLParser();
     this.chunkGCD = 0;
+    this.comparableOutputCadenceOnly = useChunkedComparableOutputCadence();
+    this.useImmediateTrigger = getChunkedUseImmediateTrigger();
     this.logger = new CSVLogger("streaming_query_chunk_aggregator_log.csv");
     this.sessionId = getSessionId();
+    this.benchmarkEventTimeAnchor = getBenchmarkEventTimeAnchor();
+    this.timestampDomainMin = getTimestampDomainMin();
+    this.timestampDomainMax = getTimestampDomainMax();
     this.initializeLatencyLogging();
     this.queryRegisteredTime = Date.now(); // Record when query is registered
+  }
+
+  private resolveLogFilePath(fileName: string): string {
+    const logRoot = process.env.LOG_PATH || ".";
+    fs.mkdirSync(logRoot, { recursive: true });
+    return path.join(logRoot, fileName);
   }
 
   /**
    * Initialize latency logging
    */
   private initializeLatencyLogging() {
-    const latencyLogFilePath = "chunked_latency_log.csv";
+    const latencyLogFilePath = this.resolveLogFilePath("chunked_latency_log.csv");
     const writeLatencyHeader = !fs.existsSync(latencyLogFilePath);
     this.latencyLogStream = fs.createWriteStream(latencyLogFilePath, {
       flags: "a",
@@ -76,7 +158,29 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
     if (writeLatencyHeader) {
       this.latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,interval_wait_ms,computation_ms,result_value\n",
+        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,interval_wait_ms,computation_ms,result_value\n",
+      );
+    }
+
+    const diagnosticsLogFilePath = this.resolveLogFilePath("chunked_window_diagnostics.csv");
+    const writeDiagnosticsHeader = !fs.existsSync(diagnosticsLogFilePath);
+    this.diagnosticsLogStream = fs.createWriteStream(diagnosticsLogFilePath, {
+      flags: "a",
+    });
+
+    if (writeDiagnosticsHeader) {
+      this.diagnosticsLogStream.write(
+        "benchmark_event_time_anchor,external_window_number,external_window_start,external_window_end,internal_chunk_ids,internal_chunks_json,recomposed_count,recomposed_sum,recomposed_avg,result_value\n",
+      );
+    }
+
+    this.parentPartialDiagnosticsFilePath = this.resolveLogFilePath(
+      "chunked_parent_partial_latency_log.csv",
+    );
+    if (!fs.existsSync(this.parentPartialDiagnosticsFilePath)) {
+      fs.writeFileSync(
+        this.parentPartialDiagnosticsFilePath,
+        "output_type,comparable,benchmark_event_time_anchor,parent_window_number,parent_window_start,parent_window_end_or_covered_until,parent_range_ms,covered_duration_ms,chunks_used,event_count,sum,avg,result_value,emitted_at_ms,elapsed_since_registration_ms,delay_past_partial_trigger_ms,internal_chunk_ids,internal_chunks_json\n",
       );
     }
   }
@@ -92,7 +196,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     resultTime: number,
     value: string,
   ) {
-    // Metric 1: Latency from query registration
+    // Metric 1: Delay past the expected close time
     // Expected window close = queryRegisteredTime + RANGE + (N-1) * STEP
     const latencyFromQueryReg = resultTime - expectedWindowClose;
 
@@ -117,10 +221,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     }
     console.log(`LATENCY: Window ${windowNumber}:`);
     console.log(
-      `  - From query registration: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
+      `  - Delay past expected close: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
     );
     console.log(
-      `  - From data start: ${latencyFromDataStart}ms (first data: ${this.firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
+      `  - Delay past data start: ${latencyFromDataStart}ms (first data: ${this.firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
     );
     console.log(
       `  - Interval wait time (last chunk to interval trigger): ${intervalWaitTime}ms`,
@@ -174,6 +278,12 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           count: Number.isFinite(Number(parsed.count))
             ? Number(parsed.count)
             : undefined,
+          sum: Number.isFinite(Number(parsed.sum))
+            ? Number(parsed.sum)
+            : undefined,
+          avg: Number.isFinite(Number(parsed.avg))
+            ? Number(parsed.avg)
+            : undefined,
           rdfPayload: typeof parsed.rdfPayload === "string" ? parsed.rdfPayload : undefined,
         };
       }
@@ -202,6 +312,249 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       missingSubqueryIds,
       isComplete: missingSubqueryIds.length === 0,
     };
+  }
+
+  private summarizeChunkGroup(
+    chunkGroupId: string,
+    bySubquery: Map<string, PartialChunkResult>,
+  ): ChunkWindowDiagnostics {
+    const partials = Array.from(bySubquery.values());
+    const start = partials[0]?.window.start ?? 0;
+    const end = partials[0]?.window.end ?? 0;
+    let countTotal = 0;
+    let countAvailable = false;
+    let sumTotal = 0;
+    let sumAvailable = false;
+
+    for (const partial of partials) {
+      if (Number.isFinite(partial.count)) {
+        countTotal += partial.count as number;
+        countAvailable = true;
+      }
+      if (Number.isFinite(partial.sum)) {
+        sumTotal += partial.sum as number;
+        sumAvailable = true;
+      } else if (
+        Number.isFinite(partial.avg) &&
+        Number.isFinite(partial.count)
+      ) {
+        sumTotal += (partial.avg as number) * (partial.count as number);
+        sumAvailable = true;
+      } else if (
+        partial.aggregateFunction === "SUM" &&
+        Number.isFinite(partial.value)
+      ) {
+        sumTotal += partial.value as number;
+        sumAvailable = true;
+      }
+    }
+
+    const avg =
+      countAvailable && countTotal > 0 && sumAvailable
+        ? sumTotal / countTotal
+        : null;
+
+    return {
+      chunkGroupId,
+      start,
+      end,
+      count: countAvailable ? countTotal : null,
+      sum: sumAvailable ? sumTotal : null,
+      avg,
+      subqueries: partials.map((partial) => partial.subqueryId),
+    };
+  }
+
+  private summarizeWindowRecomposition(
+    windowChunkGroups: Array<[string, Map<string, PartialChunkResult>]>,
+    aggregationFunction: AggregationFunction,
+  ): WindowRecompositionSummary | null {
+    if (windowChunkGroups.length === 0) {
+      return null;
+    }
+
+    const internalChunks = windowChunkGroups.map(([chunkGroupId, bySubquery]) =>
+      this.summarizeChunkGroup(chunkGroupId, bySubquery),
+    );
+    const allPartials = windowChunkGroups.flatMap(([, bySubquery]) =>
+      Array.from(bySubquery.values()),
+    );
+    const externalWindowStart = internalChunks[0].start;
+    const externalWindowEnd = internalChunks[internalChunks.length - 1].end;
+    let recomposedCount: number | null = null;
+    let recomposedSum: number | null = null;
+    let recomposedAvg: number | null = null;
+    let resultValue: number | null = null;
+
+    if (aggregationFunction === "COUNT") {
+      const totalCount = allPartials.reduce(
+        (sum, partial) => sum + (Number.isFinite(partial.count) ? (partial.count as number) : 0),
+        0,
+      );
+      recomposedCount = totalCount;
+      resultValue = totalCount;
+    } else if (aggregationFunction === "SUM") {
+      const totalSum = allPartials.reduce((sum, partial) => {
+        if (Number.isFinite(partial.sum)) {
+          return sum + (partial.sum as number);
+        }
+        if (Number.isFinite(partial.value)) {
+          return sum + (partial.value as number);
+        }
+        return sum;
+      }, 0);
+      recomposedSum = totalSum;
+      resultValue = totalSum;
+    } else if (aggregationFunction === "AVG") {
+      const totalCount = allPartials.reduce(
+        (sum, partial) => sum + (Number.isFinite(partial.count) ? (partial.count as number) : 0),
+        0,
+      );
+      const totalSum = allPartials.reduce((sum, partial) => {
+        if (Number.isFinite(partial.sum)) {
+          return sum + (partial.sum as number);
+        }
+        if (Number.isFinite(partial.avg) && Number.isFinite(partial.count)) {
+          return sum + (partial.avg as number) * (partial.count as number);
+        }
+        if (Number.isFinite(partial.value) && Number.isFinite(partial.count)) {
+          return sum + (partial.value as number) * (partial.count as number);
+        }
+        return sum;
+      }, 0);
+      recomposedCount = totalCount;
+      recomposedSum = totalSum;
+      recomposedAvg = totalCount > 0 ? totalSum / totalCount : null;
+      resultValue = recomposedAvg;
+    } else if (aggregationFunction === "MIN") {
+      const mins = allPartials
+        .map((partial) => partial.value)
+        .filter((value): value is number => Number.isFinite(value));
+      resultValue = mins.length > 0 ? Math.min(...mins) : null;
+    } else if (aggregationFunction === "MAX") {
+      const maxs = allPartials
+        .map((partial) => partial.value)
+        .filter((value): value is number => Number.isFinite(value));
+      resultValue = maxs.length > 0 ? Math.max(...maxs) : null;
+    }
+
+    if (!Number.isFinite(resultValue)) {
+      return null;
+    }
+
+    return {
+      externalWindowStart,
+      externalWindowEnd,
+      internalChunkGroupIds: internalChunks.map((chunk) => chunk.chunkGroupId),
+      internalChunks,
+      recomposedCount,
+      recomposedSum,
+      recomposedAvg,
+      resultValue: resultValue as number,
+    };
+  }
+
+  private recomposeComparableWindow(
+    windowChunkGroups: Array<[string, Map<string, PartialChunkResult>]>,
+    aggregationFunction: AggregationFunction,
+  ): ComparableWindowDiagnostics | null {
+    const summary = this.summarizeWindowRecomposition(
+      windowChunkGroups,
+      aggregationFunction,
+    );
+
+    if (!summary) {
+      return null;
+    }
+
+    return {
+      externalWindowNumber: this.windowCount + 1,
+      externalWindowStart: summary.externalWindowStart,
+      externalWindowEnd: summary.externalWindowEnd,
+      internalChunkGroupIds: summary.internalChunkGroupIds,
+      internalChunks: summary.internalChunks,
+      recomposedCount: summary.recomposedCount,
+      recomposedSum: summary.recomposedSum,
+      recomposedAvg: summary.recomposedAvg,
+      resultValue: summary.resultValue,
+    };
+  }
+
+  private writeComparableDiagnostics(diagnostics: ComparableWindowDiagnostics): void {
+    if (this.diagnosticsLogStream) {
+      this.diagnosticsLogStream.write(
+        `${this.benchmarkEventTimeAnchor ?? ""},${diagnostics.externalWindowNumber},${diagnostics.externalWindowStart},${diagnostics.externalWindowEnd},"${diagnostics.internalChunkGroupIds.join("|")}","${JSON.stringify(diagnostics.internalChunks).replace(/"/g, '""')}",${diagnostics.recomposedCount ?? ""},${diagnostics.recomposedSum ?? ""},${diagnostics.recomposedAvg ?? ""},${diagnostics.resultValue}\n`,
+      );
+    }
+    this.logger.log(
+      `Chunked window diagnostics: ${JSON.stringify({
+        benchmark_event_time_anchor: this.benchmarkEventTimeAnchor,
+        external_window_number: diagnostics.externalWindowNumber,
+        external_window_start: diagnostics.externalWindowStart,
+        external_window_end: diagnostics.externalWindowEnd,
+        internal_chunks_used: diagnostics.internalChunkGroupIds,
+        internal_chunks: diagnostics.internalChunks,
+        recomposed_count: diagnostics.recomposedCount,
+        recomposed_sum: diagnostics.recomposedSum,
+        recomposed_avg: diagnostics.recomposedAvg,
+        result_value: diagnostics.resultValue,
+      })}`,
+    );
+  }
+
+  private writeParentPartialDiagnostics(
+    diagnostics: ParentPartialDiagnostics,
+  ): void {
+    if (this.parentPartialDiagnosticsFilePath) {
+      const internalChunksJson = JSON.stringify(diagnostics.internalChunks).replace(
+        /"/g,
+        '""',
+      );
+      const line = [
+        diagnostics.outputType,
+        String(diagnostics.comparable),
+        diagnostics.benchmarkEventTimeAnchor ?? "",
+        diagnostics.parentWindowNumber,
+        diagnostics.parentWindowStart,
+        diagnostics.parentWindowEndOrCoveredUntil,
+        diagnostics.parentRangeMs,
+        diagnostics.coveredDurationMs,
+        diagnostics.chunksUsed,
+        diagnostics.eventCount ?? "",
+        diagnostics.sum ?? "",
+        diagnostics.avg ?? "",
+        diagnostics.resultValue,
+        diagnostics.emittedAtMs,
+        diagnostics.elapsedSinceRegistrationMs,
+        diagnostics.delayPastPartialTriggerMs,
+        `"${diagnostics.internalChunkIds.join("|")}"`,
+        `"${internalChunksJson}"`,
+      ].join(",");
+      fs.appendFileSync(this.parentPartialDiagnosticsFilePath, `${line}\n`);
+    }
+
+    this.logger.log(
+      `Chunked parent partial diagnostics: ${JSON.stringify({
+        output_type: diagnostics.outputType,
+        comparable: diagnostics.comparable,
+        benchmark_event_time_anchor: diagnostics.benchmarkEventTimeAnchor,
+        parent_window_number: diagnostics.parentWindowNumber,
+        parent_window_start: diagnostics.parentWindowStart,
+        parent_window_end_or_covered_until: diagnostics.parentWindowEndOrCoveredUntil,
+        parent_range_ms: diagnostics.parentRangeMs,
+        covered_duration_ms: diagnostics.coveredDurationMs,
+        chunks_used: diagnostics.chunksUsed,
+        event_count: diagnostics.eventCount,
+        sum: diagnostics.sum,
+        avg: diagnostics.avg,
+        result_value: diagnostics.resultValue,
+        emitted_at_ms: diagnostics.emittedAtMs,
+        elapsed_since_registration_ms: diagnostics.elapsedSinceRegistrationMs,
+        delay_past_partial_trigger_ms: diagnostics.delayPastPartialTriggerMs,
+        internal_chunk_ids: diagnostics.internalChunkIds,
+        internal_chunks: diagnostics.internalChunks,
+      })}`,
+    );
   }
 
   /**
@@ -298,7 +651,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
     const outputQueryWidth = outputQueryParsed.s2r[0].width;
     const outputQuerySlide = outputQueryParsed.s2r[0].slide;
-    const resultTopic = getResultTopic("output");
+    const comparableWindowWidth = outputQueryWidth;
+    const outputAggregationFunction = this.detectAggregationFunction(
+      this.outputQuery,
+    ) as AggregationFunction | null;
     this.windowRange = outputQueryWidth;
     this.windowSlide = outputQuerySlide;
     if (outputQueryWidth <= 0 || outputQuerySlide <= 0) {
@@ -307,8 +663,14 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       );
       return;
     }
+    if (!outputAggregationFunction) {
+      console.error("No aggregation function detected in the output query.");
+      return;
+    }
 
-    const rsp_client = mqtt.connect(this.mqttBroker);
+    const rsp_client = mqtt.connect(this.mqttBroker, {
+      clean: useCleanMqttSessionsForBenchmark(),
+    });
     this.logger.log(`Connecting to MQTT broker at ${this.mqttBroker}...`);
     rsp_client.on("error", (err) => {
       console.error("MQTT connection error:", err);
@@ -368,9 +730,59 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       }
 
       const chunksByWindow: Map<string, Map<string, PartialChunkResult>> = new Map();
+      const completedChunkGroups: Map<string, Map<string, PartialChunkResult>> = new Map();
+      let nextComparableWindowStartIndex = 0;
       this.logger.log(
         `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
       );
+      this.logger.log(
+        `Chunked emission mode: comparableOutputCadenceOnly=${this.comparableOutputCadenceOnly}, useImmediateTrigger=${this.useImmediateTrigger}`,
+      );
+
+      const chunksPerComparableWindow = Math.max(
+        1,
+        Math.ceil(
+          (this.comparableOutputCadenceOnly
+            ? comparableWindowWidth
+            : outputQueryWidth) / this.chunkGCD,
+        ),
+      );
+      const chunkGroupsPerOutputStep = Math.max(
+        1,
+        Math.ceil(outputQuerySlide / this.chunkGCD),
+      );
+      this.logger.log(
+        `Comparable window sizing: comparableWindowWidth=${comparableWindowWidth}, chunksPerComparableWindow=${chunksPerComparableWindow}, chunkGroupsPerOutputStep=${chunkGroupsPerOutputStep}`,
+      );
+
+      const sortCompletedChunkGroups = () =>
+        Array.from(completedChunkGroups.entries()).sort((a, b) => {
+          const aStart = a[1].values().next().value?.window?.start ?? 0;
+          const bStart = b[1].values().next().value?.window?.start ?? 0;
+          return aStart - bStart;
+        });
+
+      const getCompleteChunkGroupsForPartial = () => {
+        const mergedGroups = new Map<string, Map<string, PartialChunkResult>>();
+
+        for (const [chunkGroupId, bySubquery] of completedChunkGroups.entries()) {
+          mergedGroups.set(chunkGroupId, new Map(bySubquery));
+        }
+
+        for (const [chunkGroupId, bySubquery] of chunksByWindow.entries()) {
+          if (
+            expectedSubqueryIds.every((subqueryId) => bySubquery.has(subqueryId))
+          ) {
+            mergedGroups.set(chunkGroupId, new Map(bySubquery));
+          }
+        }
+
+        return Array.from(mergedGroups.entries()).sort((a, b) => {
+          const aStart = a[1].values().next().value?.window?.start ?? 0;
+          const bStart = b[1].values().next().value?.window?.start ?? 0;
+          return aStart - bStart;
+        });
+      };
 
       // Helper function to process chunks - used by both immediate trigger and interval fallback
       const processChunks = async (triggerSource: string) => {
@@ -419,14 +831,81 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           }
 
           if (chunksForAggregation.length === expectedSubqueryIds.length) {
-            this.debugChunkLog(
-              `final emission chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
-            );
-            await this.executeR2ROperator(chunksForAggregation, chunkGroupId);
+            if (this.comparableOutputCadenceOnly) {
+              completedChunkGroups.set(chunkGroupId, new Map(bySubquery));
+              this.debugChunkLog(
+                `buffered complete chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
+              );
+            } else {
+              this.debugChunkLog(
+                `final emission chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
+              );
+              await this.executeR2ROperator(chunksForAggregation, chunkGroupId);
+            }
             chunksByWindow.delete(chunkGroupId);
           } else {
             this.logger.log(
               `${triggerSource}: chunkGroupId=${chunkGroupId} skipped due to incomplete rdfPayload coverage (${chunksForAggregation.length}/${expectedSubqueryIds.length})`,
+            );
+          }
+        }
+
+        if (this.comparableOutputCadenceOnly) {
+          const orderedGroups = sortCompletedChunkGroups();
+          while (
+            nextComparableWindowStartIndex + chunksPerComparableWindow <=
+            orderedGroups.length
+          ) {
+            const windowChunkGroups = orderedGroups.slice(
+              nextComparableWindowStartIndex,
+              nextComparableWindowStartIndex + chunksPerComparableWindow,
+            );
+            const comparableChunkPayloads: string[] = [];
+
+            for (const [, bySubquery] of windowChunkGroups) {
+              for (const subqueryId of expectedSubqueryIds) {
+                const partial = bySubquery.get(subqueryId);
+                if (partial?.rdfPayload) {
+                  comparableChunkPayloads.push(partial.rdfPayload);
+                }
+              }
+            }
+
+            const firstGroupId = windowChunkGroups[0]?.[0] ?? "unknown";
+            const lastGroupId =
+              windowChunkGroups[windowChunkGroups.length - 1]?.[0] ?? "unknown";
+            const comparableWindowId = `${firstGroupId}..${lastGroupId}`;
+            const comparableDiagnostics = this.recomposeComparableWindow(
+              windowChunkGroups,
+              outputAggregationFunction,
+            );
+
+            this.debugChunkLog(
+              `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}; payloads=${comparableChunkPayloads.length}`,
+            );
+            await this.executeR2ROperator(
+              comparableChunkPayloads,
+              comparableWindowId,
+              comparableDiagnostics ?? undefined,
+            );
+            nextComparableWindowStartIndex += chunkGroupsPerOutputStep;
+          }
+
+          if (nextComparableWindowStartIndex > 0) {
+            const orderedGroups = sortCompletedChunkGroups();
+            const retainedGroups = orderedGroups.slice(
+              Math.max(
+                0,
+                nextComparableWindowStartIndex - chunkGroupsPerOutputStep,
+              ),
+            );
+            completedChunkGroups.clear();
+            for (const [chunkGroupId, bySubquery] of retainedGroups) {
+              completedChunkGroups.set(chunkGroupId, bySubquery);
+            }
+            nextComparableWindowStartIndex = Math.min(
+              chunkGroupsPerOutputStep,
+              completedChunkGroups.size,
             );
           }
         }
@@ -473,6 +952,17 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
         const normalized = this.normalizeChunkPayload(message.toString());
         if (normalized) {
+          const chunkTimestamp = normalized.window.start;
+          if (this.isContaminatedTimestamp(chunkTimestamp, topic)) {
+            return;
+          }
+          if (!this.firstObservedEventTimestampByTopic.has(topic)) {
+            this.firstObservedEventTimestampByTopic.set(topic, chunkTimestamp);
+            this.logger.log(
+              `First observed event timestamp for topic=${topic}: ${chunkTimestamp}`,
+            );
+          }
+          this.lastObservedEventTimestampByTopic.set(topic, normalized.window.end);
           const expectedSubqueryId = topicToSubqueryId.get(topic);
           const effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
           const chunkGroupId = `${normalized.queryId}:${normalized.window.windowName}:${normalized.window.start}:${normalized.window.end}`;
@@ -487,12 +977,63 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               },
               expectedSubqueryIds,
             );
-            this.debugChunkLog(
-              `received chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${outcome.chunkGroupId}; completeness=${expectedSubqueryIds.length - outcome.missingSubqueryIds.length}/${expectedSubqueryIds.length}; missing=${outcome.missingSubqueryIds.join(",") || "none"}`,
-            );
-          } else {
-            this.debugChunkLog(
-              `duplicate chunk ignored chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${chunkGroupId}; existingChunkId=${existing.chunkId}`,
+                      this.debugChunkLog(
+                        `received chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${outcome.chunkGroupId}; completeness=${expectedSubqueryIds.length - outcome.missingSubqueryIds.length}/${expectedSubqueryIds.length}; missing=${outcome.missingSubqueryIds.join(",") || "none"}`,
+                      );
+                      if (
+                        this.comparableOutputCadenceOnly &&
+                        !this.parentPartialAvailabilityLogged
+                      ) {
+                        const readyGroupsForPartial =
+                          getCompleteChunkGroupsForPartial();
+                        if (readyGroupsForPartial.length >= chunkGroupsPerOutputStep) {
+                          const parentPartialGroups = readyGroupsForPartial.slice(
+                            0,
+                            chunkGroupsPerOutputStep,
+                          );
+                          const parentPartialSummary =
+                            this.summarizeWindowRecomposition(
+                              parentPartialGroups,
+                              outputAggregationFunction,
+                            );
+                          if (parentPartialSummary) {
+                            const emittedAtMs = Date.now();
+                            this.writeParentPartialDiagnostics({
+                              outputType: "parent_partial",
+                              comparable: false,
+                              benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                              parentWindowNumber: 1,
+                              parentWindowStart:
+                                this.benchmarkEventTimeAnchor ??
+                                this.queryRegisteredTime,
+                              parentWindowEndOrCoveredUntil:
+                                (this.benchmarkEventTimeAnchor ??
+                                  this.queryRegisteredTime) +
+                                this.windowSlide,
+                              parentRangeMs: this.windowRange,
+                              coveredDurationMs: this.windowSlide,
+                              chunksUsed: chunkGroupsPerOutputStep,
+                              eventCount: parentPartialSummary.recomposedCount,
+                              sum: parentPartialSummary.recomposedSum,
+                              avg: parentPartialSummary.recomposedAvg,
+                              resultValue: parentPartialSummary.resultValue,
+                              emittedAtMs,
+                              elapsedSinceRegistrationMs:
+                                emittedAtMs - this.queryRegisteredTime,
+                              delayPastPartialTriggerMs:
+                                emittedAtMs -
+                                (this.queryRegisteredTime + this.windowSlide),
+                              internalChunkIds:
+                                parentPartialSummary.internalChunkGroupIds,
+                              internalChunks: parentPartialSummary.internalChunks,
+                            });
+                            this.parentPartialAvailabilityLogged = true;
+                          }
+                        }
+                      }
+                    } else {
+                      this.debugChunkLog(
+                        `duplicate chunk ignored chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${chunkGroupId}; existingChunkId=${existing.chunkId}`,
             );
           }
         } else {
@@ -518,6 +1059,44 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     });
   }
 
+  private isContaminatedTimestamp(timestamp: number, topic: string): boolean {
+    if (!Number.isFinite(timestamp)) {
+      return true;
+    }
+
+    if (this.timestampDomainMin !== null && timestamp < this.timestampDomainMin) {
+      this.rejectedContaminatedTimestampCount += 1;
+      this.logger.log(
+        `Rejected contaminated timestamp: ${JSON.stringify({
+          topic,
+          timestamp,
+          timestampDomainMin: this.timestampDomainMin,
+          timestampDomainMax: this.timestampDomainMax,
+          rejectedContaminatedTimestampCount:
+            this.rejectedContaminatedTimestampCount,
+        })}`,
+      );
+      return true;
+    }
+
+    if (this.timestampDomainMax !== null && timestamp > this.timestampDomainMax) {
+      this.rejectedContaminatedTimestampCount += 1;
+      this.logger.log(
+        `Rejected contaminated timestamp: ${JSON.stringify({
+          topic,
+          timestamp,
+          timestampDomainMin: this.timestampDomainMin,
+          timestampDomainMax: this.timestampDomainMax,
+          rejectedContaminatedTimestampCount:
+            this.rejectedContaminatedTimestampCount,
+        })}`,
+      );
+      return true;
+    }
+
+    return false;
+  }
+
   /**
    *
    * @param chunks
@@ -525,6 +1104,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   async executeR2ROperator(
     chunks: string[],
     chunkGroupId?: string,
+    comparableDiagnostics?: ComparableWindowDiagnostics,
   ): Promise<void> {
     this.logger.log(`Executing the R2R Operator with results: ${chunks}`);
 
@@ -568,6 +1148,70 @@ For example, the allResults object might look like this:
     );
     if (!detectAggregationFunction) {
       console.error("No aggregation function detected in the output query.");
+      return;
+    }
+    if (comparableDiagnostics) {
+      this.writeComparableDiagnostics(comparableDiagnostics);
+      const resultValue = String(comparableDiagnostics.resultValue);
+      const outputQueryEvent = this.generateOutputQueryEvent(resultValue);
+      this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
+      this.windowCount++;
+      const resultEmittedAt = Date.now();
+      const expectedWindowClose = this.getExpectedWindowCloseTime(
+        this.windowCount,
+      );
+      this.logLatency(
+        this.windowCount,
+        expectedWindowClose,
+        this.lastChunkReceivedTime,
+        this.intervalTriggerTime,
+        resultEmittedAt,
+        resultValue,
+      );
+
+      await new Promise<void>((resolve) => {
+        const rsp_client = mqtt.connect(this.mqttBroker);
+        rsp_client.on("connect", () => {
+          const resultTopic = getResultTopic("output");
+          const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
+          const payload = useBenchmarkPayload
+            ? JSON.stringify(
+                buildBenchmarkResultPayload(
+                  "chunked",
+                  detectAggregationFunction as AggregationFunction,
+                  this.sessionId,
+                  comparableDiagnostics.resultValue,
+                  this.windowCount,
+                  {
+                    benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                    windowStart: comparableDiagnostics.externalWindowStart,
+                    windowEnd: comparableDiagnostics.externalWindowEnd,
+                    recomposedCount: comparableDiagnostics.recomposedCount,
+                    recomposedSum: comparableDiagnostics.recomposedSum,
+                    recomposedAvg: comparableDiagnostics.recomposedAvg,
+                    internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
+                    internalChunks: comparableDiagnostics.internalChunks,
+                  },
+                ),
+              )
+            : outputQueryEvent;
+          this.logger.log(`calculated result ${payload}`);
+          rsp_client.publish(resultTopic, payload, (err: any) => {
+            if (err) {
+              console.error(
+                `Error publishing output query event to topic ${resultTopic}:`,
+                err,
+              );
+            } else {
+              this.logger.log(
+                `Output query event published to topic ${resultTopic}`,
+              );
+            }
+            rsp_client.end();
+            resolve();
+          });
+        });
+      });
       return;
     }
     const aggregationSPARQLQuery = this.getAggregationSPARQLQuery(
@@ -883,7 +1527,14 @@ For example, the allResults object might look like this:
    * @param query
    */
   detectAggregationFunction(query: string): string | null {
-    const aggregationFunctions = ["SUM", "AVG", "COUNT", "MIN", "MAX"];
+    const resultValueAliasMatch = query.match(
+      /\((AVG|SUM|COUNT|MIN|MAX)\s*\([^)]+\)\s+AS\s+\?resultValue\)/i,
+    );
+    if (resultValueAliasMatch?.[1]) {
+      return resultValueAliasMatch[1].toUpperCase();
+    }
+
+    const aggregationFunctions = ["AVG", "SUM", "COUNT", "MIN", "MAX"];
     for (const func of aggregationFunctions) {
       if (query.includes(func)) {
         return func;

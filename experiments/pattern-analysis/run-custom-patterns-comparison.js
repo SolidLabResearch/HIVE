@@ -18,23 +18,144 @@
  * Usage:
  *   node run-custom-patterns-comparison.js                    # Run all patterns (default 35 iterations)
  *   node run-custom-patterns-comparison.js --iterations 10    # Run with 10 iterations
+ *   node run-custom-patterns-comparison.js --retries 1        # Retry failed cases once
  *   node run-custom-patterns-comparison.js -i 35              # Short flag
  *   node run-custom-patterns-comparison.js low_variability    # Run specific pattern
  */
 
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
+const {
+  cleanupStaleBenchmarkProcesses,
+  delay,
+  terminateChildProcessTree,
+} = require("../utils/processCleanup");
 
 const SMOKE_PATTERN_TYPE = "low_variability";
 const SMOKE_APPROACHES = ["fetching", "approximation"];
+const ALL_PATTERN_TYPES = [
+  "low_variability",
+  "step_pattern",
+  "spike_pattern",
+  "low_freq_oscillation",
+  "high_freq_oscillation",
+];
+const ALL_APPROACHES = [
+  "fetching",
+  "naive_distributed",
+  "approximation",
+  "chunked",
+];
+
+function extractFirstDatasetTimestampMs(filePath) {
+  const content = fs.readFileSync(filePath, "utf8");
+  const matches = content.matchAll(
+    /<https:\/\/saref\.etsi\.org\/core\/hasTimestamp>\s+"([^"]+)"/g,
+  );
+
+  let firstTimestamp = null;
+  for (const match of matches) {
+    const epoch = Date.parse(match[1]);
+    if (!Number.isFinite(epoch)) {
+      continue;
+    }
+    if (firstTimestamp === null || epoch < firstTimestamp) {
+      firstTimestamp = epoch;
+    }
+  }
+
+  return firstTimestamp;
+}
+
+function extractDatasetTimestampBoundsMs(filePath) {
+  const content = fs.readFileSync(filePath, "utf8");
+  const matches = content.matchAll(
+    /<https:\/\/saref\.etsi\.org\/core\/hasTimestamp>\s+"([^"]+)"/g,
+  );
+
+  let minTimestamp = null;
+  let maxTimestamp = null;
+  for (const match of matches) {
+    const epoch = Date.parse(match[1]);
+    if (!Number.isFinite(epoch)) {
+      continue;
+    }
+    if (minTimestamp === null || epoch < minTimestamp) {
+      minTimestamp = epoch;
+    }
+    if (maxTimestamp === null || epoch > maxTimestamp) {
+      maxTimestamp = epoch;
+    }
+  }
+
+  return {
+    minTimestamp,
+    maxTimestamp,
+    durationMs:
+      minTimestamp !== null && maxTimestamp !== null
+        ? maxTimestamp - minTimestamp
+        : null,
+  };
+}
+
+function parseSelectionList(value, allowedValues) {
+  if (!value) {
+    return null;
+  }
+
+  const entries = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const filtered = entries.filter((entry) => allowedValues.includes(entry));
+  return [...new Set(filtered)];
+}
+
+function inferTerminationReason(result) {
+  if (result?.terminationReason) {
+    return result.terminationReason;
+  }
+
+  if (result?.extractionStatus && !["success", "skipped"].includes(result.extractionStatus)) {
+    return "extraction_failed";
+  }
+
+  if (result?.reachedDurationLimit) {
+    return "duration_limit_reached";
+  }
+
+  if (result?.benchmarkStatus === "interrupted") {
+    return "manual_interrupt";
+  }
+
+  if (result?.benchmarkStatus === "completed") {
+    return "process_exit";
+  }
+
+  if (result?.timedOut) {
+    return "startup_timeout";
+  }
+
+  if (result?.benchmarkStatus === "failed" || result?.error) {
+    return "process_error";
+  }
+
+  return "process_exit";
+}
 
 class CustomPatternComparisonRunner {
   constructor(iterations = 35, options = {}) {
     this.iterations = iterations;
     this.smokeMode = Boolean(options.smokeMode ?? process.env.PAPER_BENCHMARK_SMOKE === "1");
-    this.allApproaches = ["fetching", "naive_distributed", "approximation", "chunked"];
+    this.retries = resolveRetryCount(options.retries, process.env.CUSTOM_PATTERN_RETRIES);
+    this.allApproaches = ALL_APPROACHES;
     this.allPatterns = [
       {
         type: "low_variability",
@@ -62,15 +183,51 @@ class CustomPatternComparisonRunner {
         params: "μ=-23.0, A=3.0, f=0.5Hz",
       },
     ];
-    this.approaches = this.smokeMode ? SMOKE_APPROACHES : this.allApproaches;
+    this.selectedPatternTypes = parseSelectionList(
+      process.env.CUSTOM_PATTERN_SELECTED_PATTERNS,
+      ALL_PATTERN_TYPES,
+    );
+    this.selectedApproaches = parseSelectionList(
+      process.env.CUSTOM_PATTERN_SELECTED_APPROACHES,
+      ALL_APPROACHES,
+    );
+    this.activeAttemptCleanup = null;
+    this.shutdownInProgress = false;
+
+    const baseApproaches = this.smokeMode ? SMOKE_APPROACHES : this.allApproaches;
     const smokePattern = this.allPatterns.find((pattern) => pattern.type === SMOKE_PATTERN_TYPE);
-    this.patterns = this.smokeMode
+    const basePatterns = this.smokeMode
       ? (smokePattern ? [smokePattern] : [])
       : this.allPatterns;
+
+    this.patterns = this.selectedPatternTypes
+      ? basePatterns.filter((pattern) => this.selectedPatternTypes.includes(pattern.type))
+      : basePatterns;
+    this.approaches = this.selectedApproaches
+      ? baseApproaches.filter((approach) => this.selectedApproaches.includes(approach))
+      : baseApproaches;
     this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
     this.baseLogDir = "./logs/custom-pattern-comparison";
     this.timeout = resolvePatternTestTimeoutMs(options.patternTestTimeoutMs, this.smokeMode);
+    this.installSignalHandlers();
+  }
+
+  getIterationRootDir(approach, patternName, iterationNum) {
+    return path.join(
+      this.baseLogDir,
+      approach,
+      patternName,
+      `iteration${iterationNum}`,
+    );
+  }
+
+  getAttemptLogDir(approach, patternName, iterationNum, attemptNumber) {
+    const iterationRootDir = this.getIterationRootDir(approach, patternName, iterationNum);
+    if (this.retries <= 0) {
+      return iterationRootDir;
+    }
+    return path.join(iterationRootDir, `attempt${attemptNumber}`);
   }
 
   getDataPath(pattern) {
@@ -94,13 +251,116 @@ class CustomPatternComparisonRunner {
   }
 
   cleanupStaleProcesses() {
-    try { execSync('pkill -f "dist/approaches" 2>/dev/null || true', { stdio: 'ignore' }); } catch (_) {}
-    try { execSync('pkill -f "dist/services/BeeWorker" 2>/dev/null || true', { stdio: 'ignore' }); } catch (_) {}
-    try { execSync('lsof -ti:8080 | xargs kill -9 2>/dev/null || true', { stdio: 'ignore' }); } catch (_) {}
-    return new Promise(resolve => setTimeout(resolve, 1500));
+    return cleanupStaleBenchmarkProcesses({ logger: (message) => console.log(message) });
   }
 
-  async runSingleTest(approach, pattern, iterationNum = 1) {
+  installSignalHandlers() {
+    if (CustomPatternComparisonRunner.signalHandlersInstalled) {
+      return;
+    }
+
+    CustomPatternComparisonRunner.signalHandlersInstalled = true;
+
+    const handleSignal = (signal, exitCode) => {
+      void (async () => {
+        if (this.shutdownInProgress) {
+          return;
+        }
+        this.shutdownInProgress = true;
+        console.log(`Received ${signal}; cleaning up benchmark processes...`);
+        await this.cleanupActiveAttempt();
+        await this.cleanupStaleProcesses();
+        process.exit(exitCode);
+      })();
+    };
+
+    process.on("SIGINT", () => handleSignal("SIGINT", 130));
+    process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
+  }
+
+  async cleanupActiveAttempt() {
+    const cleanup = this.activeAttemptCleanup;
+    if (!cleanup) {
+      return;
+    }
+
+    this.activeAttemptCleanup = null;
+    await cleanup();
+  }
+
+  cleanupAttemptArtifacts(logDir, iterationRootDir) {
+    if (fs.existsSync(logDir)) {
+      fs.rmSync(logDir, { recursive: true, force: true });
+    }
+
+    const rootArtifacts = [
+      "streaming_query_chunk_aggregator_log.csv",
+      "chunked_latency_log.csv",
+      "chunked_parent_partial_latency_log.csv",
+      "chunked_window_diagnostics.csv",
+      "chunked_results.csv",
+      "chunked_metadata.json",
+      "fetching_client_side_log.csv",
+      "fetching_latency_log.csv",
+      "fetching_window_diagnostics.csv",
+      "fetching_resource_usage.csv",
+      "fetching_results.csv",
+      "fetching_metadata.json",
+      "approximation_approach_log.csv",
+      "approximation_latency_log.csv",
+      "approximation_approach_resource_usage.csv",
+      "approximation_results.csv",
+      "approximation_metadata.json",
+      "naive_distributed_approach_log.csv",
+      "naive_distributed_latency_log.csv",
+      "naive_distributed_approach_resource_usage.csv",
+      "naive_distributed_results.csv",
+      "naive_distributed_metadata.json",
+      "streaming_query_hive_resource_log.csv",
+      "replayer-log.csv",
+    ];
+
+    for (const fileName of rootArtifacts) {
+      const filePath = path.join(iterationRootDir, fileName);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+  }
+
+  cleanupApproximationScratchFiles() {
+    const scratchFiles = [
+      "approximation_approach_log.csv",
+      "approximation_latency_log.csv",
+      "approximation_approach_resource_usage.csv",
+    ];
+
+    for (const fileName of scratchFiles) {
+      if (!fs.existsSync(fileName)) {
+        continue;
+      }
+
+      fs.rmSync(fileName, { force: true });
+      console.log(`[cleanup] approximation-scratch removed=${fileName}`);
+    }
+  }
+
+  async runSingleTest(approach, pattern, iterationNum = 1, attemptNumber = 1) {
+    const lifecycleTs = () => new Date().toISOString();
+    const lifecycleLog = (event, details = {}) => {
+      const parts = Object.entries(details)
+        .filter(([, value]) => value !== undefined && value !== null && value !== "")
+        .map(([key, value]) => `${key}=${value}`);
+      const suffix = parts.length > 0 ? ` ${parts.join(" ")}` : "";
+      console.log(`[lifecycle ${lifecycleTs()}] ${event}${suffix}`);
+    };
+
+    lifecycleLog("runSingleTest.entered", {
+      approach,
+      pattern: pattern?.type,
+      iteration: iterationNum,
+      attempt: attemptNumber,
+    });
     await this.cleanupStaleProcesses();
     const patternName = this.getPatternName(pattern);
     const dataPath = this.getDataPath(pattern);
@@ -109,16 +369,31 @@ class CustomPatternComparisonRunner {
     console.log(
       `TESTING: ${approach.toUpperCase()} - ${pattern.name} - Iteration ${iterationNum}/${this.iterations}`,
     );
+    console.log(`Attempt: ${attemptNumber}/${this.retries + 1}`);
     console.log(`Pattern: ${pattern.params}`);
     console.log(`Data: ${dataPath}`);
     console.log("=".repeat(80));
 
-    const logDir = path.join(
-      this.baseLogDir,
-      approach,
-      patternName,
-      `iteration${iterationNum}`,
-    );
+    const iterationRootDir = this.getIterationRootDir(approach, patternName, iterationNum);
+    const logDir = this.getAttemptLogDir(approach, patternName, iterationNum, attemptNumber);
+    const expectedResultPaths = {
+      extractionSummary: path.join(logDir, `${approach}_results.csv`),
+      attemptMetadata: path.join(logDir, "attempt_metadata.json"),
+      publisherLog: path.join(logDir, "publisher.log"),
+      orchestratorLog: path.join(logDir, `${approach}_orchestrator.log`),
+    };
+    lifecycleLog("runSingleTest.paths", {
+      attemptDir: logDir,
+      iterationRootDir,
+      expectedResultPaths: JSON.stringify(expectedResultPaths),
+      });
+      this.cleanupAttemptArtifacts(logDir, iterationRootDir);
+      if (approach === "approximation") {
+        this.cleanupApproximationScratchFiles();
+      }
+      if (!fs.existsSync(iterationRootDir)) {
+        fs.mkdirSync(iterationRootDir, { recursive: true });
+      }
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true });
     }
@@ -138,57 +413,349 @@ class CustomPatternComparisonRunner {
       return { success: false, error: "Data not found" };
     }
 
+    const benchmarkEventTimeAnchor =
+      extractFirstDatasetTimestampMs(smartphoneDataPath);
+    if (!Number.isFinite(benchmarkEventTimeAnchor)) {
+      return {
+        success: false,
+        error: `Unable to derive first dataset timestamp from ${smartphoneDataPath}`,
+      };
+    }
+
+    const attemptId = `${approach}-${patternName}-iter${iterationNum}-attempt${attemptNumber}`;
+    const topicPrefix = `bench/${attemptId}`;
+    const timestampBounds = extractDatasetTimestampBoundsMs(smartphoneDataPath);
+    const timestampDomainMin = benchmarkEventTimeAnchor;
+    const timestampDomainMax =
+      benchmarkEventTimeAnchor +
+      this.timeout +
+      120000 +
+      Math.max(0, timestampBounds.durationMs || 0);
+
+    const attemptMetadata = {
+      attempt_id: attemptId,
+      topic_prefix: topicPrefix,
+      benchmark_event_time_anchor: benchmarkEventTimeAnchor,
+      timestamp_domain_min: timestampDomainMin,
+      timestamp_domain_max: timestampDomainMax,
+      output_window_range: process.env.OUTPUT_WINDOW_RANGE || "120000",
+      output_window_step: process.env.OUTPUT_WINDOW_STEP || "60000",
+      sub_window_range: process.env.SUB_WINDOW_RANGE || "60000",
+      sub_window_step: process.env.SUB_WINDOW_STEP || "30000",
+      data_path: dataPath,
+      approach,
+      pattern: patternName,
+      iteration: iterationNum,
+      attempt: attemptNumber,
+    };
+    fs.writeFileSync(
+      path.join(logDir, "attempt_metadata.json"),
+      JSON.stringify(attemptMetadata, null, 2),
+    );
+    lifecycleLog("attempt.metadata.written", {
+      attemptDir: logDir,
+      attemptMetadataPath: path.join(logDir, "attempt_metadata.json"),
+    });
+
     const env = this.replayEnv.withBenchmarkReplayEnv({
       ...process.env,
       DATA_PATH: dataPath,
       LOG_PATH: logDir,
+      STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX: topicPrefix,
+      STREAMING_QUERY_HIVE_BENCHMARK_START_TIME: String(
+        benchmarkEventTimeAnchor,
+      ),
+      STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: String(
+        benchmarkEventTimeAnchor,
+      ),
+      STREAMING_QUERY_HIVE_TIMESTAMP_DOMAIN_MIN: String(timestampDomainMin),
+      STREAMING_QUERY_HIVE_TIMESTAMP_DOMAIN_MAX: String(timestampDomainMax),
     });
+
+    console.log(
+      `Attempt start: id=${attemptId} topicPrefix=${topicPrefix} benchmarkAnchor=${benchmarkEventTimeAnchor} timestampRewriteMode=deterministic expectedTimestampDomain=[${timestampDomainMin},${timestampDomainMax}]`,
+    );
 
     return new Promise((resolve) => {
       const startTime = Date.now();
+      let reachedDurationLimit = false;
+      let finalized = false;
+      let cleanupPromise = null;
+      let timeoutId = null;
+      let publisherStartTimer = null;
+      let approachProc = null;
+      let publisherProc = null;
+      let publisherActivitySeen = false;
+      let childActivitySeen = false;
+      let lastPublisherActivityAt = null;
+      let lastChildActivityAt = null;
+      let currentWaitState = "initializing";
+
+      const cleanupAttempt = () => {
+        lifecycleLog("cleanup.start", {
+          attemptId,
+          waitState: currentWaitState,
+          lastPublisherActivityAt,
+          lastChildActivityAt,
+        });
+        if (!cleanupPromise) {
+          cleanupPromise = (async () => {
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+              timeoutId = null;
+            }
+            if (publisherStartTimer) {
+              clearTimeout(publisherStartTimer);
+              publisherStartTimer = null;
+            }
+
+            await terminateChildProcessTree(publisherProc, {
+              name: `${attemptId} publisher`,
+              logger: (message) => console.log(message),
+            });
+            await terminateChildProcessTree(approachProc, {
+              name: `${attemptId} ${approach}`,
+              logger: (message) => console.log(message),
+            });
+            await delay(500);
+            lifecycleLog("cleanup.finish", {
+              attemptId,
+              waitState: currentWaitState,
+              lastPublisherActivityAt,
+              lastChildActivityAt,
+            });
+          })();
+        }
+
+        return cleanupPromise;
+      };
+
+      const finalizeAttempt = async (result) => {
+        if (finalized) {
+          return;
+        }
+        finalized = true;
+        lifecycleLog("runSingleTest.finalize.entered", {
+          attemptId,
+          benchmarkStatus: result?.benchmarkStatus,
+          extractionStatus: result?.extractionStatus,
+          finalStatus: result?.finalStatus,
+          waitState: currentWaitState,
+        });
+        this.activeAttemptCleanup = null;
+        await cleanupAttempt();
+        this.moveLogFiles(approach, logDir);
+        lifecycleLog("runSingleTest.finalize.resolved", {
+          attemptId,
+          benchmarkStatus: result?.benchmarkStatus,
+          extractionStatus: result?.extractionStatus,
+          finalStatus: result?.finalStatus,
+          waitState: currentWaitState,
+        });
+        resolve(result);
+      };
+
+      this.activeAttemptCleanup = cleanupAttempt;
 
       // Start approach
       console.log(`Starting ${approach} approach...`);
-      const approachProc = spawn("node", [this.getApproachScript(approach)], {
+      lifecycleLog("child.spawn.requested", {
+        attemptId,
+        command: `node ${this.getApproachScript(approach)}`,
+      });
+      approachProc = spawn("node", [this.getApproachScript(approach)], {
         env,
         stdio: "pipe",
+        detached: true,
+      });
+      lifecycleLog("child.spawned", {
+        attemptId,
+        pid: approachProc.pid,
+        command: `node ${this.getApproachScript(approach)}`,
       });
 
       // Capture logs
       const approachLogPath = path.join(logDir, `${approach}_orchestrator.log`);
       const approachLogStream = fs.createWriteStream(approachLogPath);
-      approachProc.stdout.pipe(approachLogStream);
-      approachProc.stderr.pipe(approachLogStream);
+      approachProc.stdout.on("data", (chunk) => {
+        const ts = lifecycleTs();
+        childActivitySeen = true;
+        lastChildActivityAt = ts;
+        if (!approachProc.__lifecycleStdoutSeen) {
+          approachProc.__lifecycleStdoutSeen = true;
+          lifecycleLog("child.stdout.firstLine", {
+            attemptId,
+            pid: approachProc.pid,
+            timestamp: ts,
+          });
+        }
+        approachLogStream.write(chunk);
+      });
+      approachProc.stderr.on("data", (chunk) => {
+        const ts = lifecycleTs();
+        childActivitySeen = true;
+        lastChildActivityAt = ts;
+        if (!approachProc.__lifecycleStderrSeen) {
+          approachProc.__lifecycleStderrSeen = true;
+          lifecycleLog("child.stderr.firstLine", {
+            attemptId,
+            pid: approachProc.pid,
+            timestamp: ts,
+          });
+        }
+        approachLogStream.write(chunk);
+      });
 
       // Start publisher after delay
-      setTimeout(() => {
+      approachProc.on("error", (err) => {
+        console.log(`✗ ${approach} process error: ${err.message}`);
+        void finalizeAttempt({
+            approach,
+            pattern: patternName,
+            patternDisplayName: pattern.name,
+            patternParams: pattern.params,
+            iteration: iterationNum,
+            attempt: attemptNumber,
+            benchmarkStatus: "failed",
+            terminationReason: "process_error",
+            timedOut: false,
+            reachedDurationLimit,
+            exitCode: null,
+            duration: Date.now() - startTime,
+            durationMs: Date.now() - startTime,
+            configuredTimeoutMs: this.timeout,
+            logDir,
+            iterationRootDir,
+            benchmarkEventTimeAnchor,
+            topicPrefix,
+            error: err.message,
+          });
+      });
+      approachProc.on("close", (code, signal) => {
+        lifecycleLog("child.close", {
+          attemptId,
+          pid: approachProc.pid,
+          code,
+          signal,
+          durationMs: Date.now() - startTime,
+          lastChildActivityAt,
+        });
+      });
+
+      publisherStartTimer = setTimeout(() => {
+        if (finalized) {
+          return;
+        }
         console.log("Starting data publisher...");
-        const publisherProc = spawn("node", ["dist/streamer/src/publish.js"], {
+        lifecycleLog("publisher.start.requested", {
+          attemptId,
+          waitState: currentWaitState,
+        });
+        currentWaitState = "waiting_for_publisher_close";
+        publisherProc = spawn("node", ["dist/streamer/src/publish.js"], {
           env,
           stdio: "pipe",
+          detached: true,
+        });
+        lifecycleLog("publisher.spawned", {
+          attemptId,
+          pid: publisherProc.pid,
+          command: "node dist/streamer/src/publish.js",
         });
 
         const publisherLogPath = path.join(logDir, "publisher.log");
         const publisherLogStream = fs.createWriteStream(publisherLogPath);
-        publisherProc.stdout.pipe(publisherLogStream);
-        publisherProc.stderr.pipe(publisherLogStream);
+        publisherProc.stdout.on("data", (chunk) => {
+          const ts = lifecycleTs();
+          publisherActivitySeen = true;
+          lastPublisherActivityAt = ts;
+          if (!publisherProc.__lifecycleStdoutSeen) {
+            publisherProc.__lifecycleStdoutSeen = true;
+            lifecycleLog("publisher.stdout.firstLine", {
+              attemptId,
+              pid: publisherProc.pid,
+              timestamp: ts,
+            });
+          }
+          publisherLogStream.write(chunk);
+        });
+        publisherProc.stderr.on("data", (chunk) => {
+          const ts = lifecycleTs();
+          publisherActivitySeen = true;
+          lastPublisherActivityAt = ts;
+          if (!publisherProc.__lifecycleStderrSeen) {
+            publisherProc.__lifecycleStderrSeen = true;
+            lifecycleLog("publisher.stderr.firstLine", {
+              attemptId,
+              pid: publisherProc.pid,
+              timestamp: ts,
+            });
+          }
+          publisherLogStream.write(chunk);
+        });
 
-        const timeout = setTimeout(() => {
-          console.log("⏰ Test timeout reached");
-          publisherProc.kill();
-          approachProc.kill();
+        timeoutId = setTimeout(() => {
+          lifecycleLog("timeout.watchdog.fired", {
+            attemptId,
+            timeoutMs: this.timeout,
+            timestamp: lifecycleTs(),
+            lastPublisherActivityAt,
+            lastChildActivityAt,
+            waitState: currentWaitState,
+          });
+          console.log("⏰ Benchmark duration limit reached");
+          reachedDurationLimit = true;
+          void cleanupAttempt();
         }, this.timeout);
+        lifecycleLog("timeout.watchdog.armed", {
+          attemptId,
+          timeoutMs: this.timeout,
+          armedAt: lifecycleTs(),
+          waitState: currentWaitState,
+        });
+
+        publisherProc.on("error", (err) => {
+          console.log(`✗ Publisher error: ${err.message}`);
+          void finalizeAttempt({
+            approach,
+            pattern: patternName,
+            patternDisplayName: pattern.name,
+            patternParams: pattern.params,
+            iteration: iterationNum,
+            attempt: attemptNumber,
+            benchmarkStatus: "failed",
+            terminationReason: "process_error",
+            timedOut: false,
+            reachedDurationLimit,
+            exitCode: null,
+            duration: Date.now() - startTime,
+            durationMs: Date.now() - startTime,
+            configuredTimeoutMs: this.timeout,
+            logDir,
+            iterationRootDir,
+            benchmarkEventTimeAnchor,
+            topicPrefix,
+            error: err.message,
+          });
+        });
 
         publisherProc.on("close", (code) => {
-          clearTimeout(timeout);
-          const duration = Date.now() - startTime;
-
-          // Wait for final processing
-          setTimeout(() => {
-            approachProc.kill();
-
-            // Move log files
-            this.moveLogFiles(approach, logDir);
+          void (async () => {
+            lifecycleLog("publisher.close", {
+              attemptId,
+              pid: publisherProc.pid,
+              code,
+              signal: publisherProc.signalCode || null,
+              durationMs: Date.now() - startTime,
+              lastPublisherActivityAt,
+            });
+            currentWaitState = "waiting_for_extraction";
+            const durationMs = Date.now() - startTime;
+            const benchmarkStatus =
+              reachedDurationLimit || code === 0 ? "completed" : "failed";
+            const terminationReason = reachedDurationLimit
+              ? "duration_limit_reached"
+              : (code === 0 ? "process_exit" : "process_error");
 
             const result = {
               approach,
@@ -196,31 +763,33 @@ class CustomPatternComparisonRunner {
               patternDisplayName: pattern.name,
               patternParams: pattern.params,
               iteration: iterationNum,
-              success: code === 0,
+              attempt: attemptNumber,
+              benchmarkStatus,
+              terminationReason,
+              timedOut: false,
+              reachedDurationLimit,
               exitCode: code,
-              duration: duration,
-              logDir: logDir,
+              duration: durationMs,
+              durationMs,
+              configuredTimeoutMs: this.timeout,
+              logDir,
+              iterationRootDir,
+              benchmarkEventTimeAnchor,
+              topicPrefix,
             };
 
-            console.log(`✓ Test completed in ${(duration / 1000).toFixed(1)}s`);
-            resolve(result);
-          }, 2000);
-        });
-
-        publisherProc.on("error", (err) => {
-          clearTimeout(timeout);
-          approachProc.kill();
-          console.log(`✗ Publisher error: ${err.message}`);
-          resolve({
-            approach,
-            pattern: patternName,
-            patternDisplayName: pattern.name,
-            iteration: iterationNum,
-            success: false,
-            error: err.message,
-          });
+            await delay(2000);
+            console.log(`✓ Test completed in ${(durationMs / 1000).toFixed(1)}s`);
+            await finalizeAttempt(result);
+          })();
         });
       }, 2000);
+      lifecycleLog("runSingleTest.waiting", {
+        attemptId,
+        waitState: "waiting_for_publisher_spawn",
+        attemptDir: logDir,
+        expectedResultPaths: JSON.stringify(expectedResultPaths),
+      });
     });
   }
 
@@ -229,6 +798,7 @@ class CustomPatternComparisonRunner {
       fetching: [
         "fetching_client_side_log.csv",
         "fetching_latency_log.csv",
+        "fetching_window_diagnostics.csv",
         "fetching_resource_usage.csv",
         "replayer-log.csv",
       ],
@@ -241,6 +811,8 @@ class CustomPatternComparisonRunner {
       chunked: [
         "streaming_query_chunk_aggregator_log.csv",
         "chunked_latency_log.csv",
+        "chunked_parent_partial_latency_log.csv",
+        "chunked_window_diagnostics.csv",
         "streaming_query_hive_resource_log.csv",
         "replayer-log.csv",
       ],
@@ -270,19 +842,22 @@ class CustomPatternComparisonRunner {
     });
   }
 
-  async extractResults(approach, pattern, iterationNum = 1) {
+  async extractResults(approach, pattern, iterationNum = 1, attemptNumber = 1, explicitLogDir = null) {
     const patternName = this.getPatternName(pattern);
     console.log(
-      `\n📊 Extracting results for ${approach} - ${pattern.name} - Iteration ${iterationNum}...`,
+      `\n📊 Extracting results for ${approach} - ${pattern.name} - Iteration ${iterationNum} - Attempt ${attemptNumber}...`,
+    );
+    console.log(
+      `[lifecycle ${new Date().toISOString()}] extraction.start approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} logDir=${explicitLogDir || this.getAttemptLogDir(approach, patternName, iterationNum, attemptNumber)}`,
     );
 
+    if (approach === "naive_distributed") {
+      console.log("  Skipping extraction for naive_distributed; it is not part of the custom pattern accuracy comparison.");
+      return { status: "skipped" };
+    }
+
     return new Promise((resolve) => {
-      const logDir = path.join(
-        this.baseLogDir,
-        approach,
-        patternName,
-        `iteration${iterationNum}`,
-      );
+      const logDir = explicitLogDir || this.getAttemptLogDir(approach, patternName, iterationNum, attemptNumber);
 
       // Call extraction script with custom parameters
       const proc = spawn(
@@ -299,18 +874,188 @@ class CustomPatternComparisonRunner {
       proc.on("close", (code) => {
         if (code === 0) {
           console.log(`✓ Extraction completed`);
-          resolve(true);
+          console.log(
+            `[lifecycle ${new Date().toISOString()}] extraction.finish approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} status=success code=${code}`,
+          );
+          resolve({ status: "success" });
         } else {
           console.log(`⚠️  Extraction had issues (code ${code})`);
-          resolve(false);
+          console.log(
+            `[lifecycle ${new Date().toISOString()}] extraction.finish approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} status=failed code=${code}`,
+          );
+          resolve({ status: "failed" });
         }
       });
 
       proc.on("error", (err) => {
         console.log(`✗ Extraction error: ${err.message}`);
-        resolve(false);
+        console.log(
+          `[lifecycle ${new Date().toISOString()}] extraction.finish approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} status=failed error=${err.message}`,
+        );
+        resolve({ status: "failed" });
       });
     });
+  }
+
+  finalizeTestResult(baseResult, extractionResult) {
+    const extractionStatus = extractionResult?.status || "failed";
+    const success = extractionStatus === "success" || extractionStatus === "skipped";
+    const terminationReason = success
+      ? (baseResult?.terminationReason || "process_exit")
+      : "extraction_failed";
+
+    return {
+      ...baseResult,
+      extractionStatus,
+      finalExtractionStatus: extractionStatus,
+      finalStatus: success ? "success" : "failed",
+      terminationReason,
+      success,
+    };
+  }
+
+  buildAttemptFailureReason(result) {
+    if (result?.success) {
+      return null;
+    }
+    if (result?.error) {
+      return result.error;
+    }
+    if (result?.extractionStatus && !["success", "skipped"].includes(result.extractionStatus)) {
+      return `Extraction ${result.extractionStatus}`;
+    }
+    if (result?.benchmarkStatus && result.benchmarkStatus !== "completed") {
+      return `Benchmark ${result.benchmarkStatus}`;
+    }
+    if (result?.terminationReason && result?.terminationReason !== "duration_limit_reached") {
+      return `Termination ${result.terminationReason}`;
+    }
+    return null;
+  }
+
+  normalizeAttemptResult(result, attemptNumber) {
+    const extractionStatus = result?.extractionStatus || "failed";
+    const success = Boolean(result?.success);
+    const benchmarkStatus = result?.benchmarkStatus || (success ? "completed" : "failed");
+    const durationMs = Number.isFinite(result?.durationMs) ? result.durationMs : (result?.duration ?? null);
+    const configuredTimeoutMs = Number.isFinite(result?.configuredTimeoutMs)
+      ? result.configuredTimeoutMs
+      : null;
+    const reachedDurationLimit = Boolean(result?.reachedDurationLimit);
+    const terminationReason = result?.terminationReason
+      || inferTerminationReason({ benchmarkStatus, extractionStatus, success, reachedDurationLimit });
+
+    return {
+      approach: result?.approach || null,
+      pattern: result?.pattern || null,
+      patternDisplayName: result?.patternDisplayName || null,
+      patternParams: result?.patternParams || null,
+      iteration: result?.iteration || null,
+      attempt: attemptNumber,
+      success,
+      benchmarkStatus,
+      terminationReason,
+      extractionStatus,
+      finalStatus: result?.finalStatus || (success ? "success" : "failed"),
+      timedOut: Boolean(result?.timedOut),
+      reachedDurationLimit,
+      exitCode: result?.exitCode ?? null,
+      duration: durationMs,
+      durationMs,
+      configuredTimeoutMs,
+      logDir: result?.logDir || null,
+      error: result?.error || null,
+      failureReason: this.buildAttemptFailureReason({
+        ...result,
+        extractionStatus,
+        benchmarkStatus,
+        terminationReason,
+        success,
+      }),
+    };
+  }
+
+  buildCaseResult(pattern, approach, iterationNum, attemptResults) {
+    const finalAttempt = attemptResults[attemptResults.length - 1] || {};
+    const firstFailedAttempt = attemptResults.find((attempt) => !attempt.success) || null;
+
+    return {
+      approach,
+      pattern: pattern.type,
+      patternDisplayName: pattern.name,
+      patternParams: pattern.params,
+      iteration: iterationNum,
+      success: Boolean(finalAttempt.success),
+      finalStatus: finalAttempt.success ? "success" : "failed",
+      benchmarkStatus: finalAttempt.benchmarkStatus || (finalAttempt.success ? "completed" : "failed"),
+      terminationReason: finalAttempt.terminationReason
+        || inferTerminationReason(finalAttempt),
+      extractionStatus: finalAttempt.extractionStatus || "failed",
+      finalExtractionStatus: finalAttempt.extractionStatus || "failed",
+      timedOut: Boolean(finalAttempt.timedOut),
+      reachedDurationLimit: Boolean(finalAttempt.reachedDurationLimit),
+      exitCode: finalAttempt.exitCode ?? null,
+      duration: finalAttempt.duration ?? null,
+      durationMs: finalAttempt.durationMs ?? finalAttempt.duration ?? null,
+      configuredTimeoutMs: finalAttempt.configuredTimeoutMs ?? this.timeout,
+      logDir: finalAttempt.logDir || null,
+      finalLogDir: finalAttempt.logDir || null,
+      finalAttemptNumber: finalAttempt.attempt || attemptResults.length,
+      attemptCount: attemptResults.length,
+      retriesConfigured: this.retries,
+      retryUsed: attemptResults.length > 1,
+      firstFailureReason: firstFailedAttempt?.failureReason || null,
+      error: finalAttempt.error || null,
+      attempts: attemptResults,
+    };
+  }
+
+  async runCaseWithRetries(approach, pattern, iterationNum) {
+    const attemptResults = [];
+    const maxAttempts = this.retries + 1;
+
+    for (let attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber += 1) {
+      try {
+        const benchmarkResult = await this.runSingleTest(approach, pattern, iterationNum, attemptNumber);
+        const extractionResult = await this.extractResults(
+          approach,
+          pattern,
+          iterationNum,
+          attemptNumber,
+          benchmarkResult.logDir,
+        );
+        const finalizedResult = this.finalizeTestResult(benchmarkResult, extractionResult);
+        attemptResults.push(this.normalizeAttemptResult(finalizedResult, attemptNumber));
+
+        if (finalizedResult.success) {
+          break;
+        }
+      } catch (error) {
+        attemptResults.push(this.normalizeAttemptResult({
+          approach,
+          pattern: pattern.type,
+          patternDisplayName: pattern.name,
+          patternParams: pattern.params,
+          iteration: iterationNum,
+          success: false,
+          benchmarkStatus: "failed",
+          terminationReason: "process_error",
+          extractionStatus: "failed",
+          error: error.message,
+          logDir: this.getAttemptLogDir(approach, pattern.type, iterationNum, attemptNumber),
+          configuredTimeoutMs: this.timeout,
+        }, attemptNumber));
+      }
+
+      if (attemptNumber < maxAttempts) {
+        console.log(
+          `↻ Retrying ${approach} - ${pattern.name} - iteration ${iterationNum} (attempt ${attemptNumber + 1}/${maxAttempts})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
+
+    return this.buildCaseResult(pattern, approach, iterationNum, attemptResults);
   }
 
   async runAllPatterns() {
@@ -337,29 +1082,11 @@ class CustomPatternComparisonRunner {
         console.log(`\n  Approach: ${approach.toUpperCase()}`);
 
         for (let iter = 1; iter <= this.iterations; iter++) {
-          try {
-            const result = await this.runSingleTest(approach, pattern, iter);
-            results.push(result);
+          const caseResult = await this.runCaseWithRetries(approach, pattern, iter);
+          results.push(caseResult);
 
-            // Extract results
-            await this.extractResults(approach, pattern, iter);
-
-            // Wait between iterations
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          } catch (error) {
-            console.error(
-              `Failed ${approach} on ${pattern.name} iteration ${iter}:`,
-              error.message,
-            );
-            results.push({
-              approach,
-              pattern: pattern.type,
-              patternDisplayName: pattern.name,
-              iteration: iter,
-              success: false,
-              error: error.message,
-            });
-          }
+          // Wait between iterations
+          await new Promise((resolve) => setTimeout(resolve, 2000));
         }
 
         // Wait between approaches
@@ -391,17 +1118,9 @@ class CustomPatternComparisonRunner {
 
     for (const approach of this.approaches) {
       for (let iter = 1; iter <= this.iterations; iter++) {
-        try {
-          const result = await this.runSingleTest(approach, pattern, iter);
-          results.push(result);
-          await this.extractResults(approach, pattern, iter);
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-        } catch (error) {
-          console.error(
-            `Failed ${approach} iteration ${iter}:`,
-            error.message,
-          );
-        }
+        const caseResult = await this.runCaseWithRetries(approach, pattern, iter);
+        results.push(caseResult);
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
       await new Promise((resolve) => setTimeout(resolve, 3000));
     }
@@ -416,11 +1135,16 @@ class CustomPatternComparisonRunner {
 
     const successful = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);
+    const retried = results.filter((r) => r.retryUsed);
+    const totalAttempts = results.reduce((sum, result) => sum + (result.attemptCount || 0), 0);
 
     console.log(`\nTotal tests: ${results.length}`);
     console.log(`Successful: ${successful.length}`);
     console.log(`Failed: ${failed.length}`);
     console.log(`Iterations per test: ${this.iterations}`);
+    console.log(`Retries configured: ${this.retries}`);
+    console.log(`Retried cases: ${retried.length}`);
+    console.log(`Total attempts: ${totalAttempts}`);
 
     // Group by approach
     const byApproach = {};
@@ -461,7 +1185,18 @@ class CustomPatternComparisonRunner {
         console.log(
           `  ✗ ${r.approach} - ${r.patternDisplayName || r.pattern} - iteration ${r.iteration || "?"}`,
         );
-        if (r.error) console.log(`    Error: ${r.error}`);
+        if (r.firstFailureReason) console.log(`    First failure: ${r.firstFailureReason}`);
+        if (r.error) console.log(`    Final error: ${r.error}`);
+      });
+    }
+
+    if (retried.length > 0) {
+      console.log("\n" + "─".repeat(80));
+      console.log("Retried Cases:");
+      retried.forEach((r) => {
+        console.log(
+          `  ↻ ${r.approach} - ${r.patternDisplayName || r.pattern} - iteration ${r.iteration}: ${r.attemptCount} attempt(s), final=${r.finalStatus}`,
+        );
       });
     }
 
@@ -474,14 +1209,49 @@ class CustomPatternComparisonRunner {
       timestamp: new Date().toISOString(),
       totalTests: results.length,
       iterations: this.iterations,
+      retries: this.retries,
       smokeMode: this.smokeMode,
       selectedPatterns: this.patterns.map((pattern) => pattern.type),
       selectedApproaches: this.approaches,
       successful: successful.length,
       failed: failed.length,
+      totalAttempts,
+      retryCountConfigured: this.retries,
+      retryUsed: retried.length > 0,
+      retriedCases: retried.map((result) => ({
+        approach: result.approach,
+        pattern: result.pattern,
+        iteration: result.iteration,
+        attemptCount: result.attemptCount,
+        finalStatus: result.finalStatus,
+        finalLogDir: result.finalLogDir,
+      })),
+      failedAfterRetries: failed.map((result) => ({
+        approach: result.approach,
+        pattern: result.pattern,
+        iteration: result.iteration,
+        attemptCount: result.attemptCount,
+        finalStatus: result.finalStatus,
+        benchmarkStatus: result.benchmarkStatus,
+        terminationReason: result.terminationReason,
+        firstFailureReason: result.firstFailureReason,
+        finalLogDir: result.finalLogDir,
+        finalExtractionStatus: result.finalExtractionStatus,
+      })),
       byApproach: byApproach,
       byPattern: byPattern,
-      results: results,
+      results: results.map((result) => ({
+        ...result,
+        extractionStatus: result.extractionStatus || "failed",
+        finalExtractionStatus: result.finalExtractionStatus || result.extractionStatus || "failed",
+        benchmarkStatus: result.benchmarkStatus || (result.success ? "completed" : "failed"),
+        finalStatus: result.finalStatus || (result.success ? "success" : "failed"),
+        terminationReason: result.terminationReason
+          || inferTerminationReason(result),
+        durationMs: result.durationMs ?? result.duration ?? null,
+        configuredTimeoutMs: result.configuredTimeoutMs ?? this.timeout,
+        reachedDurationLimit: Boolean(result.reachedDurationLimit),
+      })),
     };
 
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
@@ -534,6 +1304,21 @@ function resolvePatternTestTimeoutMs(explicitTimeoutMs, smokeMode = false) {
   return defaultTimeoutMs;
 }
 
+function resolveRetryCount(explicitRetries, envRetries) {
+  if (Number.isFinite(explicitRetries)) {
+    return Math.max(0, explicitRetries);
+  }
+
+  if (envRetries !== undefined) {
+    const parsedRetries = Number.parseInt(envRetries, 10);
+    if (Number.isFinite(parsedRetries)) {
+      return Math.max(0, parsedRetries);
+    }
+  }
+
+  return 0;
+}
+
 // Main execution
 async function main() {
   const args = process.argv.slice(2);
@@ -541,6 +1326,7 @@ async function main() {
   // Check for iterations flag
   let iterations = 35; // default
   let patternTestTimeoutMs;
+  let retries = 0;
   let filteredArgs = args;
 
   const iterFlag = args.findIndex(
@@ -563,21 +1349,37 @@ async function main() {
     );
   }
 
+  const retriesFlag = filteredArgs.findIndex((arg) => arg === "--retries");
+  if (retriesFlag !== -1 && filteredArgs[retriesFlag + 1]) {
+    retries = Number.parseInt(filteredArgs[retriesFlag + 1], 10);
+    filteredArgs = filteredArgs.filter(
+      (_, idx) => idx !== retriesFlag && idx !== retriesFlag + 1,
+    );
+  }
+
   const runner = new CustomPatternComparisonRunner(iterations, {
     patternTestTimeoutMs,
+    retries,
     smokeMode: process.env.PAPER_BENCHMARK_SMOKE === "1",
   });
 
   console.log(`\n${"=".repeat(80)}`);
   console.log(`Configuration: Running ${iterations} iteration(s) per test`);
   console.log(`Pattern test timeout: ${runner.timeout} ms`);
+  console.log(`Retries per failed case: ${runner.retries}`);
   console.log(`Smoke mode: ${runner.smokeMode ? "enabled" : "disabled"}`);
   console.log(`Total patterns: ${runner.patterns.length} custom pattern(s)`);
   console.log(`Approaches: ${runner.approaches.join(", ")}`);
+  console.log(`Selected patterns: ${runner.patterns.map((pattern) => pattern.type).join(", ") || "none"}`);
+  console.log(`Selected approaches: ${runner.approaches.join(", ") || "none"}`);
   console.log(
     `Expected total tests: ${runner.patterns.length * runner.approaches.length * iterations} (${runner.patterns.length} patterns × ${runner.approaches.length} approaches × ${iterations} iterations)`,
   );
-  console.log(`Expected runtime: ~${Math.ceil((runner.patterns.length * runner.approaches.length * iterations * 3) / 60)} minutes`);
+  const estimatedRuntimeMs = runner.patterns.length * runner.approaches.length * iterations * runner.timeout;
+  const estimatedRuntimeMinutes = estimatedRuntimeMs / 60000;
+  console.log(
+    `Expected runtime: ~${estimatedRuntimeMinutes >= 60 ? `${(estimatedRuntimeMinutes / 60).toFixed(1)} hours` : `${Math.ceil(estimatedRuntimeMinutes)} minutes`} (${estimatedRuntimeMs} ms total)`,
+  );
   console.log("=".repeat(80));
 
   try {
@@ -617,6 +1419,9 @@ async function main() {
       );
       console.log(
         "  --pattern-test-timeout MS  Per-test timeout in milliseconds (default: 240000)",
+      );
+      console.log(
+        "  --retries N    Retry failed cases up to N additional attempts (default: 0)",
       );
       process.exit(1);
     }
