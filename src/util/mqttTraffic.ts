@@ -208,6 +208,14 @@ function inferMessageType(
 }
 
 function estimateRawInputSubscribers(approach: string): number {
+  const configuredOverride = Number.parseInt(
+    process.env.BENCHMARK_RAW_INPUT_SUBSCRIBERS || "",
+    10,
+  );
+  if (Number.isFinite(configuredOverride) && configuredOverride >= 0) {
+    return configuredOverride;
+  }
+
   switch (approach) {
     case "fetching":
       return 1;

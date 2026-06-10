@@ -15,6 +15,52 @@ This orchestrates the two existing core benchmark jobs used by the paper workflo
 
 The additional suite names (`latency`, `resources`, `accuracy`, `naive-distributed`) are exposed as paper-oriented views over those same shared benchmark runs rather than as separate reimplementations.
 
+## Scalability runner
+
+`S2` is now implemented through a dedicated scalability runner:
+
+```bash
+node scripts/benchmark/run-scalability-benchmarks.js \
+  --scenario same_query_different_windows \
+  --scales 2,4,6,8,10 \
+  --approaches naive_distributed,approximation,chunked \
+  --iterations 1 \
+  --pattern low_variability \
+  --replay-duration 210s
+```
+
+Supported flags:
+
+- `--scenario same_query_different_windows`
+- `--scales 2,4,6,8,10`
+- `--approaches naive_distributed,approximation,chunked`
+- `--iterations <n>`
+- `--pattern low_variability|step_pattern`
+- `--duration <value>` or `--replay-duration <value>` where `<value>` accepts `150`, `150s`, or `150000ms`
+- `--smoke`
+
+Output layout:
+
+```text
+logs/scalability/same_query_different_windows/
+├── _ground_truth/<pattern>/iteration1/
+├── scale_2/<approach>/iteration1/
+├── scale_4/<approach>/iteration1/
+├── scale_6/<approach>/iteration1/
+├── scale_8/<approach>/iteration1/
+├── scale_10/<approach>/iteration1/
+└── scalability_summary.csv
+```
+
+Each approach iteration directory includes:
+
+- `summary.json`
+- `mqtt_traffic_summary.json`
+- `mqtt_traffic.csv`
+- `resource_usage.csv` when available
+- `results.csv`
+- `ground_truth_results.csv`
+
 ## Run A Single Suite
 
 Real-world DAHCC data:
