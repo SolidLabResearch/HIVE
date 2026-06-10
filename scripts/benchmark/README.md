@@ -23,7 +23,7 @@ The additional suite names (`latency`, `resources`, `accuracy`, `naive-distribut
 node scripts/benchmark/run-scalability-benchmarks.js \
   --scenario same_query_different_windows \
   --scales 2,4,6,8,10 \
-  --approaches naive_distributed,approximation,chunked \
+  --approaches fetching,naive_distributed,approximation,chunked \
   --iterations 1 \
   --pattern low_variability \
   --replay-duration 210s
@@ -33,7 +33,7 @@ Supported flags:
 
 - `--scenario same_query_different_windows`
 - `--scales 2,4,6,8,10`
-- `--approaches naive_distributed,approximation,chunked`
+- `--approaches fetching,naive_distributed,approximation,chunked`
 - `--iterations <n>`
 - `--pattern low_variability|step_pattern`
 - `--duration <value>` or `--replay-duration <value>` where `<value>` accepts `150`, `150s`, or `150000ms`

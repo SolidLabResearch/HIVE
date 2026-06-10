@@ -14,7 +14,7 @@ const { finalizeMqttTrafficArtifacts } = require("../../dist/util/mqttTraffic");
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const SCENARIO = "same_query_different_windows";
 const DEFAULT_SCALES = [2, 4, 6, 8, 10];
-const DEFAULT_APPROACHES = ["naive_distributed", "approximation", "chunked"];
+const DEFAULT_APPROACHES = ["fetching", "naive_distributed", "approximation", "chunked"];
 const DEFAULT_PATTERN = "low_variability";
 const DEFAULT_ITERATIONS = 1;
 const DEFAULT_FREQUENCY = 4;
@@ -90,11 +90,14 @@ function printHelp() {
 Options:
   --scenario <name>           same_query_different_windows
   --scales <list>             Comma-separated: 2,4,6,8,10
-  --approaches <list>         Comma-separated: naive_distributed,approximation,chunked
+  --approaches <list>         Comma-separated: fetching,naive_distributed,approximation,chunked
   --iterations <n>            Default: 1
   --pattern <name>            low_variability | step_pattern
   --duration <value>          Replay duration alias, accepts 150 / 150s / 150000ms
   --replay-duration <value>   Replay duration alias, accepts 150 / 150s / 150000ms
+  --output-dir <path>         Optional benchmark output root
+  --resume                    Reuse completed runs in the output dir, rerun incomplete ones
+  --iteration <n>             Run only a single iteration number
   --smoke                     Reduced default matrix: scale 2 only, 150s replay
   --help                      Show this help
 `);
@@ -108,6 +111,9 @@ function parseArgs(argv) {
     iterations: DEFAULT_ITERATIONS,
     pattern: DEFAULT_PATTERN,
     replayDurationSeconds: DEFAULT_REPLAY_DURATION_SECONDS,
+    outputDir: null,
+    resume: false,
+    iteration: null,
     smoke: false,
   };
 
@@ -138,6 +144,17 @@ function parseArgs(argv) {
       case "--duration":
       case "--replay-duration":
         args.replayDurationSeconds = parseDurationSeconds(arg, next);
+        index += 1;
+        break;
+      case "--output-dir":
+        args.outputDir = requireValue(arg, next);
+        index += 1;
+        break;
+      case "--resume":
+        args.resume = true;
+        break;
+      case "--iteration":
+        args.iteration = parsePositiveInteger(arg, next);
         index += 1;
         break;
       case "--smoke":
@@ -453,8 +470,12 @@ function getRawInputSubscribers(approach, scale) {
   }
 }
 
-function computeValidationSummary(approach, mqttSummary, options = {}) {
-  const { chunkedDebugSummary = null, reconstructedResultRowCount = 0 } = options;
+function computeValidationSummary(approach, scale, mqttSummary, options = {}) {
+  const {
+    chunkedDebugSummary = null,
+    reconstructedResultRowCount = 0,
+    expectedRawInputSubscriberCount = getRawInputSubscribers(approach, scale),
+  } = options;
   const validations = [];
   const warnings = [];
 
@@ -482,6 +503,12 @@ function computeValidationSummary(approach, mqttSummary, options = {}) {
     actual: mqttSummary.raw_input_estimated_delivery_bytes,
     expected: expectedRawInputDeliveryBytes,
   });
+  validations.push({
+    name: "raw_input_subscriber_count_matches_expected",
+    passed: Number(mqttSummary.raw_input_subscriber_count || 0) === Number(expectedRawInputSubscriberCount),
+    actual: mqttSummary.raw_input_subscriber_count,
+    expected: expectedRawInputSubscriberCount,
+  });
 
   if (approach === "chunked") {
     validations.push({
@@ -503,6 +530,33 @@ function computeValidationSummary(approach, mqttSummary, options = {}) {
       name: "reconstructed_superquery_result_rows_positive",
       passed: Number(reconstructedResultRowCount) > 0,
       actual: reconstructedResultRowCount,
+    });
+  }
+
+  if (approach === "fetching") {
+    validations.push({
+      name: "chunk_result_count_zero",
+      passed: Number(mqttSummary.chunk_result_count || 0) === 0,
+      actual: mqttSummary.chunk_result_count,
+      expected: 0,
+    });
+    validations.push({
+      name: "chunk_result_estimated_delivery_bytes_zero",
+      passed: Number(mqttSummary.chunk_result_estimated_delivery_bytes || 0) === 0,
+      actual: mqttSummary.chunk_result_estimated_delivery_bytes,
+      expected: 0,
+    });
+    const exactRate = Number(options.exactRate ?? 0);
+    const mae = Number(options.mae ?? Number.POSITIVE_INFINITY);
+    const mape = Number(options.mape ?? Number.POSITIVE_INFINITY);
+    validations.push({
+      name: "accuracy_exact_or_near_exact",
+      passed: exactRate >= 0.99 || mae <= RESULT_EPSILON || mape <= 1e-6,
+      actual: {
+        exactRate: options.exactRate,
+        mae: options.mae,
+        mape: options.mape,
+      },
     });
   }
 
@@ -532,12 +586,45 @@ function formatMetric(value) {
   return value === null || value === undefined || Number.isNaN(value) ? "" : String(value);
 }
 
+function mqttSummaryMatches(summary, mqttSummary) {
+  if (!summary || !mqttSummary) {
+    return false;
+  }
+  const keysToCheck = [
+    "published_application_bytes",
+    "estimated_delivery_bytes",
+    "published_bandwidth_kb_s",
+    "estimated_delivery_bandwidth_kb_s",
+    "raw_input_published_bytes",
+    "raw_input_estimated_delivery_bytes",
+    "raw_input_estimated_delivery_bandwidth_kb_s",
+    "raw_input_subscriber_count",
+    "reuse_layer_estimated_delivery_bytes",
+    "reuse_layer_bandwidth_kb_s",
+    "chunk_result_count",
+    "chunk_result_estimated_delivery_bytes",
+    "chunk_bandwidth_kb_s",
+    "unknown_published_bytes",
+    "unknown_estimated_delivery_bytes",
+    "steady_state_duration_seconds",
+  ];
+  return keysToCheck.every((key) => Number(summary[key] ?? NaN) === Number(mqttSummary[key] ?? NaN));
+}
+
 class ScalabilityRunner {
   constructor(config) {
     this.config = config;
     this.replayEnv = createBenchmarkReplayRunEnv(process.env);
-    this.scenarioRoot = path.join(REPO_ROOT, "logs", "scalability", config.scenario);
+    this.scenarioRoot = config.outputDir
+      ? path.resolve(REPO_ROOT, config.outputDir)
+      : path.join(REPO_ROOT, "logs", "scalability", config.scenario);
     this.groundTruthRoot = path.join(this.scenarioRoot, "_ground_truth", config.pattern);
+    if (config.outputDir && !config.resume && fs.existsSync(this.scenarioRoot)) {
+      const existingEntries = fs.readdirSync(this.scenarioRoot);
+      if (existingEntries.length > 0) {
+        throw new Error(`Output directory already exists and is not empty: ${this.scenarioRoot}`);
+      }
+    }
     ensureDir(this.scenarioRoot);
     ensureDir(this.groundTruthRoot);
   }
@@ -557,6 +644,20 @@ class ScalabilityRunner {
 
   getGroundTruthIterationDir(iteration) {
     return path.join(this.groundTruthRoot, `iteration${iteration}`);
+  }
+
+  isValidCompletedRun(iterationDir) {
+    const summaryPath = path.join(iterationDir, "summary.json");
+    const mqttSummaryPath = path.join(iterationDir, "mqtt_traffic_summary.json");
+    if (!fs.existsSync(summaryPath) || !fs.existsSync(mqttSummaryPath)) {
+      return false;
+    }
+    try {
+      const summary = readJsonIfExists(summaryPath);
+      return Boolean(summary?.validation?.allPassed);
+    } catch {
+      return false;
+    }
   }
 
   getDatasetPath() {
@@ -630,6 +731,10 @@ class ScalabilityRunner {
     ensureDir(logDir);
     this.cleanupScratchFiles();
     await cleanupStaleBenchmarkProcesses({ logger: () => {} });
+
+    console.log(
+      `[benchmark] scenario=${this.config.scenario} scale=${scale} approach=${approach} iteration=${iteration} output_dir=${logDir}`,
+    );
 
     const orchestrator = spawn("node", [config.orchestrator], {
       cwd: REPO_ROOT,
@@ -709,7 +814,8 @@ class ScalabilityRunner {
   async ensureGroundTruth(iteration) {
     const groundTruthDir = this.getGroundTruthIterationDir(iteration);
     const existingResults = path.join(groundTruthDir, "ground_truth_results.csv");
-    if (fs.existsSync(existingResults)) {
+    const existingSummary = path.join(groundTruthDir, "fetching_summary.json");
+    if (fs.existsSync(existingResults) && fs.existsSync(existingSummary)) {
       return groundTruthDir;
     }
 
@@ -735,6 +841,15 @@ class ScalabilityRunner {
 
   async runApproach(scale, approach, iteration, groundTruthDir) {
     const iterationDir = this.getIterationDir(scale, approach, iteration);
+    if (this.config.resume && this.isValidCompletedRun(iterationDir)) {
+      console.log(
+        `[benchmark] resume=skip scenario=${this.config.scenario} scale=${scale} approach=${approach} iteration=${iteration} output_dir=${iterationDir}`,
+      );
+      return readJsonIfExists(path.join(iterationDir, "summary.json"));
+    }
+    if (fs.existsSync(iterationDir)) {
+      fs.rmSync(iterationDir, { recursive: true, force: true });
+    }
     ensureDir(iterationDir);
     const outcome = await this.runSingleProcessCase(approach, scale, iteration, iterationDir);
     this.moveApproachFiles(approach, iterationDir);
@@ -760,9 +875,13 @@ class ScalabilityRunner {
         outcome.mqttSummary.steady_state_duration_seconds,
       ),
     };
-    const validationSummary = computeValidationSummary(approach, outcome.mqttSummary, {
+    const validationSummary = computeValidationSummary(approach, scale, outcome.mqttSummary, {
       chunkedDebugSummary,
       reconstructedResultRowCount: latencyRows.length,
+      expectedRawInputSubscriberCount: getRawInputSubscribers(approach, scale),
+      exactRate: accuracyMetrics.exactRate,
+      mae: accuracyMetrics.mae,
+      mape: accuracyMetrics.mape,
     });
 
     const summary = {
@@ -791,6 +910,9 @@ class ScalabilityRunner {
       },
     };
     writeJson(path.join(iterationDir, "summary.json"), summary);
+    console.log(
+      `[benchmark] validation=${validationSummary.allPassed ? "pass" : "fail"} scenario=${this.config.scenario} scale=${scale} approach=${approach} iteration=${iteration}`,
+    );
     return summary;
   }
 
@@ -859,7 +981,8 @@ class ScalabilityRunner {
 
   async run() {
     const rows = [];
-    for (let iteration = 1; iteration <= this.config.iterations; iteration += 1) {
+    const iterations = this.config.iteration ? [this.config.iteration] : Array.from({ length: this.config.iterations }, (_, idx) => idx + 1);
+    for (const iteration of iterations) {
       const groundTruthDir = await this.ensureGroundTruth(iteration);
       for (const scale of this.config.scales) {
         for (const approach of this.config.approaches) {
