@@ -83,6 +83,24 @@ type ParentPartialDiagnostics = {
   internalChunks: ChunkWindowDiagnostics[];
 };
 
+type ChunkedDebugSummary = {
+  chunkSizeMs: number;
+  comparableOutputCadenceOnly: boolean;
+  useImmediateTrigger: boolean;
+  expectedSubqueryCount: number;
+  expectedSubqueryIds: string[];
+  subscribedTopics: string[];
+  receivedChunkMessageCount: number;
+  structuredChunkMessageCount: number;
+  duplicateChunkCount: number;
+  ignoredLegacyChunkCount: number;
+  completedChunkGroupCount: number;
+  comparableWindowEmissionCount: number;
+  reconstructedSuperqueryResultCount: number;
+  lastComparableWindowStart: number | null;
+  lastComparableWindowEnd: number | null;
+};
+
 function getLogicalChunkGroupId(partial: Pick<PartialChunkResult, "queryId" | "window">): string {
   return `${partial.queryId}:${partial.window.start}:${partial.window.end}`;
 }
@@ -102,6 +120,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private sessionId: string; // Unique session ID to isolate MQTT topics across iterations
   private latencyLogStream!: fs.WriteStream;
   private diagnosticsLogStream!: fs.WriteStream;
+  private chunkedDebugSummaryPath: string;
+  private chunkedDebugSummary: ChunkedDebugSummary;
   private parentPartialDiagnosticsFilePath: string = "";
   private windowCount: number = 0; // Track window count for latency logging
   private queryRegisteredTime: number = 0; // Track when query was registered
@@ -116,6 +136,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private comparableOutputCadenceOnly: boolean;
   private debugChunksEnabled: boolean = process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
   private ignoredLegacyChunkCount: number = 0;
+  private duplicateChunkCount: number = 0;
   private benchmarkEventTimeAnchor: number | null;
   private timestampDomainMin: number | null;
   private timestampDomainMax: number | null;
@@ -137,7 +158,26 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.benchmarkEventTimeAnchor = getBenchmarkEventTimeAnchor();
     this.timestampDomainMin = getTimestampDomainMin();
     this.timestampDomainMax = getTimestampDomainMax();
+    this.chunkedDebugSummaryPath = this.resolveLogFilePath("chunked_debug_summary.json");
+    this.chunkedDebugSummary = {
+      chunkSizeMs: 0,
+      comparableOutputCadenceOnly: this.comparableOutputCadenceOnly,
+      useImmediateTrigger: this.useImmediateTrigger,
+      expectedSubqueryCount: 0,
+      expectedSubqueryIds: [],
+      subscribedTopics: [],
+      receivedChunkMessageCount: 0,
+      structuredChunkMessageCount: 0,
+      duplicateChunkCount: 0,
+      ignoredLegacyChunkCount: 0,
+      completedChunkGroupCount: 0,
+      comparableWindowEmissionCount: 0,
+      reconstructedSuperqueryResultCount: 0,
+      lastComparableWindowStart: null,
+      lastComparableWindowEnd: null,
+    };
     this.initializeLatencyLogging();
+    this.persistChunkedDebugSummary();
     this.queryRegisteredTime = Date.now(); // Record when query is registered
   }
 
@@ -253,6 +293,13 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     if (this.debugChunksEnabled) {
       this.logger.log(`[DEBUG_CHUNKS] ${message}`);
     }
+  }
+
+  private persistChunkedDebugSummary(): void {
+    fs.writeFileSync(
+      this.chunkedDebugSummaryPath,
+      JSON.stringify(this.chunkedDebugSummary, null, 2),
+    );
   }
 
   private normalizeChunkPayload(message: string): PartialChunkResult | null {
@@ -699,6 +746,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       const topicToSubqueryId = new Map(
         subqueryIdentities.map((entry) => [entry.topic, entry.subqueryId]),
       );
+      this.chunkedDebugSummary.expectedSubqueryCount = expectedSubqueryIds.length;
+      this.chunkedDebugSummary.expectedSubqueryIds = [...expectedSubqueryIds];
       this.logger.log(`topics to subscribe: ${topics}`);
       // TODO : Remove hardcoded topics, use the topics from subQueryMQTTTopicMap but currently there is a bug in the subQueryMQTTTopicMap that prevents it from being used correctly.
       // TODO : Such that only one topic is subscribed to at a time.
@@ -708,6 +757,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       ];
 
       topicsOfProcesses = topics;
+      this.chunkedDebugSummary.subscribedTopics = [...topicsOfProcesses];
+      this.persistChunkedDebugSummary();
 
       this.logger.log(
         `DEBUG: topicsOfProcesses after loop: ${topicsOfProcesses}, length: ${topicsOfProcesses.length}`,
@@ -834,6 +885,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           if (chunksForAggregation.length === expectedSubqueryIds.length) {
             if (this.comparableOutputCadenceOnly) {
               completedChunkGroups.set(chunkGroupId, new Map(bySubquery));
+              this.chunkedDebugSummary.completedChunkGroupCount += 1;
               this.debugChunkLog(
                 `buffered complete chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
               );
@@ -880,6 +932,13 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               windowChunkGroups,
               outputAggregationFunction,
             );
+            if (comparableDiagnostics) {
+              this.chunkedDebugSummary.comparableWindowEmissionCount += 1;
+              this.chunkedDebugSummary.lastComparableWindowStart =
+                comparableDiagnostics.externalWindowStart;
+              this.chunkedDebugSummary.lastComparableWindowEnd =
+                comparableDiagnostics.externalWindowEnd;
+            }
 
             this.debugChunkLog(
               `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}; payloads=${comparableChunkPayloads.length}`,
@@ -889,6 +948,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               comparableWindowId,
               comparableDiagnostics ?? undefined,
             );
+            this.persistChunkedDebugSummary();
             nextComparableWindowStartIndex += chunkGroupsPerOutputStep;
           }
 
@@ -950,9 +1010,11 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           );
         }
         this.lastChunkReceivedTime = now;
+        this.chunkedDebugSummary.receivedChunkMessageCount += 1;
 
         const normalized = this.normalizeChunkPayload(message.toString());
         if (normalized) {
+          this.chunkedDebugSummary.structuredChunkMessageCount += 1;
           const chunkTimestamp = normalized.window.start;
           if (this.isContaminatedTimestamp(chunkTimestamp, topic)) {
             return;
@@ -966,7 +1028,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           this.lastObservedEventTimestampByTopic.set(topic, normalized.window.end);
           const expectedSubqueryId = topicToSubqueryId.get(topic);
           const effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
-          const chunkGroupId = `${normalized.queryId}:${normalized.window.windowName}:${normalized.window.start}:${normalized.window.end}`;
+          const chunkGroupId = getLogicalChunkGroupId(normalized);
           const bySubquery = chunksByWindow.get(chunkGroupId) ?? new Map<string, PartialChunkResult>();
           const existing = bySubquery.get(effectiveSubqueryId);
           if (!existing) {
@@ -1029,20 +1091,27 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
                               internalChunks: parentPartialSummary.internalChunks,
                             });
                             this.parentPartialAvailabilityLogged = true;
+                            this.persistChunkedDebugSummary();
                           }
                         }
                       }
                     } else {
+                      this.duplicateChunkCount += 1;
+                      this.chunkedDebugSummary.duplicateChunkCount =
+                        this.duplicateChunkCount;
                       this.debugChunkLog(
                         `duplicate chunk ignored chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${chunkGroupId}; existingChunkId=${existing.chunkId}`,
             );
           }
         } else {
           this.ignoredLegacyChunkCount++;
+          this.chunkedDebugSummary.ignoredLegacyChunkCount =
+            this.ignoredLegacyChunkCount;
           this.debugChunkLog(
             `ignored legacy/unstructured chunk on topic=${topic}; ignoredLegacyChunkCount=${this.ignoredLegacyChunkCount}`,
           );
         }
+        this.persistChunkedDebugSummary();
 
         // IMMEDIATE TRIGGER OPTIMIZATION:
         // Process immediately when message arrives; only complete chunk groups emit.
@@ -1208,6 +1277,8 @@ For example, the allResults object might look like this:
                 `Output query event published to topic ${resultTopic}`,
               );
             }
+            this.chunkedDebugSummary.reconstructedSuperqueryResultCount += 1;
+            this.persistChunkedDebugSummary();
             rsp_client.end();
             resolve();
           });
@@ -1297,6 +1368,8 @@ For example, the allResults object might look like this:
                 `Output query event published to topic ${resultTopic}`,
               );
             }
+            this.chunkedDebugSummary.reconstructedSuperqueryResultCount += 1;
+            this.persistChunkedDebugSummary();
           });
         });
         rsp_client.on("error", (err) => {
@@ -1348,6 +1421,8 @@ For example, the allResults object might look like this:
     const chunkSize = this.findGCDChunk(this.subQueries, this.outputQuery);
     this.logger.log(`Calculated GCD Chunk Size: ${chunkSize}`);
     this.chunkGCD = chunkSize;
+    this.chunkedDebugSummary.chunkSizeMs = chunkSize;
+    this.persistChunkedDebugSummary();
     const rewrittenChunkQueries: string[] = [];
     if (chunkSize > 0) {
       const rewriteChunkQuery = new RewriteChunkQuery(chunkSize, chunkSize);
