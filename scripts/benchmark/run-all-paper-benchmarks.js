@@ -60,7 +60,7 @@ function parseArgs(argv) {
     frequency: 4,
     aggregation: "AVG",
     timeout: 300000,
-    patternTestTimeout: 240000,
+    patternTestTimeout: 300000,
     retries: 0,
     outputDir: `results/paper-benchmarks/${DEFAULT_TIMESTAMP}`,
     outputDirProvided: false,
@@ -208,7 +208,7 @@ Options:
   --frequency <hz>            Default replay frequency: 4
   --aggregation <type>        Default: AVG
   --timeout <ms>              Default: 300000
-  --pattern-test-timeout <ms> Default: 240000
+  --pattern-test-timeout <ms> Default: 300000
   --retries <n>               Retry failed custom-pattern cases N additional times
   --patterns <list>           Comma-separated custom-pattern types
   --approaches <list>         Comma-separated custom-pattern approaches
@@ -327,6 +327,17 @@ function copyFileIfExists(sourcePath, destinationPath) {
   ensureDir(path.dirname(destinationPath));
   fs.copyFileSync(sourcePath, destinationPath);
   return true;
+}
+
+function formatCommandLine(commandParts) {
+  return commandParts
+    .map((part) => {
+      if (part === "") {
+        return '""';
+      }
+      return /\s/.test(part) ? JSON.stringify(part) : part;
+    })
+    .join(" ");
 }
 
 function copyDirectory(sourceDir, destinationDir) {
@@ -516,15 +527,49 @@ function refreshExistingSummary(outputDir) {
   return summaryPath;
 }
 
-function buildPatternAnalysisJob(config) {
+function buildIterationList(iterationCount, startIteration = 1, endIteration = iterationCount) {
+  if (!Number.isFinite(iterationCount) || iterationCount <= 0) {
+    return [];
+  }
+
+  const firstIteration = Math.max(1, startIteration);
+  const lastIteration = Math.min(iterationCount, endIteration);
+  if (lastIteration < firstIteration) {
+    return [];
+  }
+
+  return Array.from(
+    { length: lastIteration - firstIteration + 1 },
+    (_, index) => firstIteration + index,
+  );
+}
+
+function buildTrimmedIterationSelection(config) {
+  const iterations = buildIterationList(
+    config.iterations,
+    config.dropWarmup + 1,
+    config.iterations - config.dropCooldown,
+  );
+
+  return {
+    iterations,
+    startIteration: iterations[0] || null,
+    endIteration: iterations[iterations.length - 1] || null,
+    label: iterations.length > 0
+      ? `trimmed-${iterations[0]}-${iterations[iterations.length - 1]}`
+      : "trimmed-empty",
+  };
+}
+
+function buildPatternAnalysisJob(config, options = {}) {
   const analysisArgs = [
     "analysis/accuracy/accuracy-comparison-custom-patterns.js",
     "--input-root",
-    path.join(config.outputDir, "patterns", "raw"),
+    options.inputRoot || path.join(config.outputDir, "patterns", "raw"),
     "--output-dir",
-    path.join(config.outputDir, "accuracy", "patterns", "custom-pattern-accuracy"),
+    options.outputDir || path.join(config.outputDir, "accuracy", "patterns", "custom-pattern-accuracy"),
     "--execution-summary",
-    path.join(config.outputDir, "patterns", "raw", "custom_pattern_comparison_summary.json"),
+    options.executionSummary || path.join(config.outputDir, "patterns", "raw", "custom_pattern_comparison_summary.json"),
   ];
 
   if (config.patterns && config.patterns.length > 0) {
@@ -535,19 +580,72 @@ function buildPatternAnalysisJob(config) {
     analysisArgs.push("--approaches", config.approaches.join(","));
   }
 
-  if (Number.isFinite(config.iterations) && config.iterations > 0) {
+  if (Array.isArray(options.iterations) && options.iterations.length > 0) {
+    analysisArgs.push("--iterations", options.iterations.join(","));
+  } else if (Number.isFinite(config.iterations) && config.iterations > 0) {
     const explicitIterations = Array.from({ length: config.iterations }, (_, index) => String(index + 1));
     analysisArgs.push("--iterations", explicitIterations.join(","));
   }
 
   return {
-    name: "custom-pattern-accuracy-analysis",
-    description: "Aggregate custom-pattern accuracy against the fetching baseline",
+    name: options.name || "custom-pattern-accuracy-analysis",
+    description: options.description || "Aggregate custom-pattern accuracy against the fetching baseline",
     command: [
       "node",
       analysisArgs,
     ],
     env: buildBenchmarkEnv(config),
+    outputDir: options.outputDir || path.join(config.outputDir, "accuracy", "patterns", "custom-pattern-accuracy"),
+    summaryTag: options.summaryTag || null,
+  };
+}
+
+function buildPatternAnalysisJobs(config) {
+  const rawIterations = buildIterationList(config.iterations);
+  const trimmedSelection = buildTrimmedIterationSelection(config);
+  const baseOutputDir = path.join(config.outputDir, "accuracy", "patterns", "custom-pattern-accuracy");
+  const rawOutputDir = path.join(baseOutputDir, "_analysis", `raw-${config.iterations}`);
+
+  return {
+    raw: buildPatternAnalysisJob(config, {
+      name: "custom-pattern-accuracy-raw",
+      description: "Aggregate custom-pattern accuracy against the fetching baseline using all iterations",
+      outputDir: rawOutputDir,
+      inputRoot: path.join(config.outputDir, "patterns", "raw"),
+      executionSummary: path.join(config.outputDir, "patterns", "raw", "custom_pattern_comparison_summary.json"),
+      iterations: rawIterations.map(String),
+      summaryTag: `raw-${config.iterations}`,
+    }),
+    trimmed: buildPatternAnalysisJob(config, {
+      name: "custom-pattern-accuracy-trimmed",
+      description: `Aggregate custom-pattern accuracy against the fetching baseline using kept iterations ${trimmedSelection.startIteration}-${trimmedSelection.endIteration}`,
+      outputDir: baseOutputDir,
+      inputRoot: path.join(config.outputDir, "patterns", "raw"),
+      executionSummary: path.join(config.outputDir, "patterns", "raw", "custom_pattern_comparison_summary.json"),
+      iterations: trimmedSelection.iterations.map(String),
+      summaryTag: trimmedSelection.label,
+    }),
+    trimmedSelection,
+    rawOutputDir,
+    baseOutputDir,
+  };
+}
+
+function copyAnalysisSummaryArtifacts(sourceDir, destinationDir, tag) {
+  ensureDir(destinationDir);
+  const jsonSource = path.join(sourceDir, "summary.json");
+  const csvSource = path.join(sourceDir, "summary.csv");
+  const jsonDestination = path.join(destinationDir, `summary.${tag}.json`);
+  const csvDestination = path.join(destinationDir, `summary.${tag}.csv`);
+
+  const copiedJson = copyFileIfExists(jsonSource, jsonDestination);
+  const copiedCsv = copyFileIfExists(csvSource, csvDestination);
+
+  return {
+    jsonSource: copiedJson ? jsonSource : null,
+    csvSource: copiedCsv ? csvSource : null,
+    jsonDestination: copiedJson ? jsonDestination : null,
+    csvDestination: copiedCsv ? csvDestination : null,
   };
 }
 
@@ -898,7 +996,7 @@ async function runCommand(job, logDir, dryRun) {
   const stdoutPath = path.join(logDir, `${job.name}.stdout.log`);
   const stderrPath = path.join(logDir, `${job.name}.stderr.log`);
   const combinedPath = path.join(logDir, `${job.name}.combined.log`);
-  const commandLine = [job.command[0], ...job.command[1]].join(" ");
+  const commandLine = formatCommandLine([job.command[0], ...job.command[1]]);
 
   if (dryRun) {
     return {
@@ -1177,6 +1275,20 @@ async function main() {
     retryCountConfigured: config.retries,
     aggregation: config.aggregation,
     smokeMode: config.smoke,
+    paperConfiguration: {
+      broker: config.broker,
+      windowWidth: config.windowWidth,
+      windowSlide: config.windowSlide,
+      subWindowRange: config.subWindowRange,
+      subWindowStep: config.subWindowStep,
+      frequency: config.frequency,
+      aggregation: config.aggregation,
+      iterations: config.iterations,
+      dropWarmup: config.dropWarmup,
+      dropCooldown: config.dropCooldown,
+      timeout: config.timeout,
+      patternTestTimeout: config.patternTestTimeout,
+    },
     failedBenchmarkCommands: [],
     copiedPatternLogSources: [],
     warnings: [],
@@ -1185,7 +1297,7 @@ async function main() {
   const preflightChecks = await runPreflight(config, jobs);
   metadata.preflightChecks = preflightChecks;
   metadata.warnings.push(
-    "Warm-up and cool-down dropping are recorded in metadata for downstream analysis; the existing benchmark scripts still execute the full iteration count.",
+    "Warm-up and cool-down dropping are applied by the paper analysis step; raw 35-iteration benchmark outputs are preserved alongside trimmed summaries.",
   );
   metadata.warnings.push(
     "ASF is represented by sub-window range and step parameters because the repo does not expose a dedicated ASF sweep in the existing benchmark scripts.",
@@ -1229,7 +1341,7 @@ async function main() {
       `Estimated custom-pattern runtime: ${runtimeEstimate.display} (${runtimeEstimate.counts.testCount} tests × ${config.patternTestTimeout} ms timeout)`,
     );
     for (const job of jobs) {
-      const commandLine = [job.command[0], ...job.command[1]].join(" ");
+      const commandLine = formatCommandLine([job.command[0], ...job.command[1]]);
       console.log(`- ${job.name}: ${commandLine}`);
       if (job.name === "custom-pattern-core") {
         console.log(
@@ -1239,9 +1351,9 @@ async function main() {
       }
     }
     if (config.suites.includes("patterns") && !config.skipAnalysis) {
-      const analysisJob = buildPatternAnalysisJob(config);
-      const commandLine = [analysisJob.command[0], ...analysisJob.command[1]].join(" ");
-      console.log(`- ${analysisJob.name}: ${commandLine}`);
+      const analysisJobs = buildPatternAnalysisJobs(config);
+      console.log(`- ${analysisJobs.raw.name}: ${formatCommandLine([analysisJobs.raw.command[0], ...analysisJobs.raw.command[1]])}`);
+      console.log(`- ${analysisJobs.trimmed.name}: ${formatCommandLine([analysisJobs.trimmed.command[0], ...analysisJobs.trimmed.command[1]])}`);
     }
   }
 
@@ -1281,32 +1393,66 @@ async function main() {
   }
 
   let analysisResult = null;
+  let analysisRuns = [];
   if (config.suites.includes("patterns") && !config.skipAnalysis) {
-    const analysisJob = buildPatternAnalysisJob(config);
-    analysisResult = await runCommand(analysisJob, path.join(config.outputDir, "logs"), config.dryRun);
-    jobResults[analysisJob.name] = analysisResult;
+    const analysisJobs = buildPatternAnalysisJobs(config);
 
-    if (!analysisResult.ok) {
-      metadata.failedAnalysisCommands = metadata.failedAnalysisCommands || [];
-      metadata.failedAnalysisCommands.push({
-        job: analysisJob.name,
-        command: analysisResult.commandLine,
-        exitCode: analysisResult.code,
-        error: analysisResult.error || null,
-        combinedLog: path.relative(config.outputDir, analysisResult.combinedPath),
+    for (const analysisJob of [analysisJobs.raw, analysisJobs.trimmed]) {
+      const result = await runCommand(analysisJob, path.join(config.outputDir, "logs"), config.dryRun);
+      jobResults[analysisJob.name] = result;
+      analysisRuns.push({
+        name: analysisJob.name,
+        summaryTag: analysisJob.summaryTag,
+        outputDir: analysisJob.outputDir,
+        ...result,
       });
-      if (!config.dryRun) {
-        writeJson(path.join(config.outputDir, "metadata.json"), metadata);
+
+      if (!result.ok) {
+        metadata.failedAnalysisCommands = metadata.failedAnalysisCommands || [];
+        metadata.failedAnalysisCommands.push({
+          job: analysisJob.name,
+          command: result.commandLine,
+          exitCode: result.code,
+          error: result.error || null,
+          combinedLog: path.relative(config.outputDir, result.combinedPath),
+        });
+        if (!config.dryRun) {
+          writeJson(path.join(config.outputDir, "metadata.json"), metadata);
+        }
+
+        if (config.failFast) {
+          process.exitCode = 1;
+          return;
+        }
+        continue;
       }
 
-      if (config.failFast) {
-        process.exitCode = 1;
-        return;
+      if (!config.dryRun) {
+        copyAnalysisSummaryArtifacts(
+          analysisJob.outputDir,
+          analysisJobs.baseOutputDir,
+          analysisJob.summaryTag,
+        );
       }
+    }
+
+    if (analysisRuns.length > 0) {
+      analysisResult = analysisRuns.find((run) => String(run.summaryTag || "").startsWith("trimmed-"))
+        || analysisRuns[analysisRuns.length - 1];
+      metadata.analysisRuns = analysisRuns.map((run) => ({
+        name: run.name,
+        summaryTag: run.summaryTag,
+        outputDir: path.relative(config.outputDir, run.outputDir),
+        ok: run.ok,
+        code: run.code,
+        durationMs: run.durationMs,
+        dryRun: Boolean(run.dryRun),
+        command: run.commandLine,
+      }));
     }
   }
 
-  const analysisFailed = Boolean(analysisResult && !analysisResult.ok);
+  const analysisFailed = analysisRuns.some((run) => !run.ok);
 
   const runtimePerSuiteMs = {};
   const resultPaths = {};
@@ -1374,6 +1520,7 @@ async function main() {
           durationMs: analysisResult.durationMs,
           dryRun: Boolean(analysisResult.dryRun),
           outputPath: resultPaths.patternAccuracy,
+          summaryTag: analysisResult.summaryTag || null,
         }
       : null,
     analysisFailed,
@@ -1389,7 +1536,21 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error.stack || error.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error.stack || error.message);
+    process.exit(1);
+  });
+} else {
+  module.exports = {
+    parseArgs,
+    buildBenchmarkEnv,
+    buildPatternAnalysisJob,
+    buildPatternAnalysisJobs,
+    buildTrimmedIterationSelection,
+    buildIterationList,
+    formatCommandLine,
+    createJobDefinitions,
+    runCommand,
+  };
+}

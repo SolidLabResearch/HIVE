@@ -98,6 +98,10 @@ def safe_mean(values: Iterable[float]) -> float | None:
 
 def safe_stdev(values: Iterable[float]) -> float | None:
     values = [v for v in values if v is not None and not math.isnan(v)]
+    if len(values) == 0:
+        return None
+    if len(values) == 1:
+        return 0.0
     if len(values) < 2:
         return None
     return statistics.stdev(values)
@@ -106,6 +110,10 @@ def safe_stdev(values: Iterable[float]) -> float | None:
 def mean_and_std(values: Iterable[float]) -> tuple[float | None, float | None]:
     clean = [v for v in values if v is not None and not math.isnan(v)]
     return safe_mean(clean), safe_stdev(clean)
+
+
+def mean_std_csv_name(column: str) -> str:
+    return f"{column.replace('_kb_s', '_kbps')}"
 
 
 def linear_regression_slope(xs: list[float], ys: list[float]) -> float | None:
@@ -370,6 +378,7 @@ def main() -> int:
                 mqtt_summary = read_json(mqtt_path) if mqtt_path.exists() else None
                 if mqtt_summary is None:
                     missing_mqtt_files += 1
+                csv_row = rows_by_key.get((scale, approach, iteration))
                 validation = summary.get("validation", {})
                 metrics = summary.get("metrics", {})
                 mqtt_metrics = metrics.get("mqttTraffic", {})
@@ -387,10 +396,10 @@ def main() -> int:
                         "scale": scale,
                         "approach": approach,
                         "iteration": iteration,
-                        "raw_input_subscriber_count": parse_float(row.get("raw_input_subscriber_count")),
-                        "csv_unknown_estimated_delivery_bytes": parse_float(row.get("unknown_estimated_delivery_bytes")),
-                        "chunk_result_count": parse_float(row.get("chunk_result_count")),
-                        "chunk_result_estimated_delivery_bytes": parse_float(row.get("chunk_result_estimated_delivery_bytes")),
+                        "raw_input_subscriber_count": parse_float(csv_row.get("raw_input_subscriber_count")) if csv_row else None,
+                        "csv_unknown_estimated_delivery_bytes": parse_float(csv_row.get("unknown_estimated_delivery_bytes")) if csv_row else None,
+                        "chunk_result_count": parse_float(csv_row.get("chunk_result_count")) if csv_row else None,
+                        "chunk_result_estimated_delivery_bytes": parse_float(csv_row.get("chunk_result_estimated_delivery_bytes")) if csv_row else None,
                         "validation_all_passed": bool(validation.get("allPassed")),
                         "summary_file_exists": summary_path.exists(),
                         "mqtt_file_exists": mqtt_path.exists(),
@@ -407,22 +416,7 @@ def main() -> int:
                 )
 
     # Aggregate metrics by scale/approach across iterations.
-    metric_columns = [
-        "mean_cpu_percent",
-        "peak_memory_mb",
-        "estimated_delivery_bandwidth_kb_s",
-        "raw_input_estimated_delivery_bandwidth_kb_s",
-        "reuse_layer_bandwidth_kb_s",
-        "chunk_bandwidth_kb_s",
-        "mae",
-        "mape",
-        "chunk_result_count",
-        "raw_input_subscriber_count",
-        "estimated_delivery_bytes",
-        "raw_input_estimated_delivery_bytes",
-        "reuse_layer_estimated_delivery_bytes",
-        "chunk_result_estimated_delivery_bytes",
-    ]
+    metric_columns = numeric_columns
 
     def rows_for(scale: int, approach: str) -> list[dict[str, str]]:
         return [rows_by_key[(scale, approach, iteration)] for iteration in iterations if (scale, approach, iteration) in rows_by_key]
@@ -437,11 +431,13 @@ def main() -> int:
     metric_stats: dict[tuple[int, str], dict[str, dict[str, float | None | list[float | None]]]] = {}
     metric_means: dict[tuple[int, str], dict[str, float | None]] = {}
     metric_stds: dict[tuple[int, str], dict[str, float | None]] = {}
+    iteration_counts: dict[tuple[int, str], int] = {}
     for scale in scales:
         for approach in APPROACHES:
             group_rows = rows_for(scale, approach)
             if not group_rows:
                 continue
+            iteration_counts[(scale, approach)] = len(group_rows)
             metric_stats[(scale, approach)] = {}
             metric_means[(scale, approach)] = {}
             metric_stds[(scale, approach)] = {}
@@ -455,6 +451,37 @@ def main() -> int:
                 }
                 metric_means[(scale, approach)][column] = mean_value
                 metric_stds[(scale, approach)][column] = std_value
+
+    mean_std_csv_path = base_dir / "scalability_summary_mean_std.csv"
+    mean_std_rows: list[dict[str, Any]] = []
+    for scale in scales:
+        for approach in APPROACHES:
+            if (scale, approach) not in metric_means:
+                continue
+            row: dict[str, Any] = {
+                "scale": scale,
+                "approach": approach,
+                "iteration_count": iteration_counts.get((scale, approach), 0),
+            }
+            for column in metric_columns:
+                csv_name = mean_std_csv_name(column)
+                row[f"{csv_name}_mean"] = metric_means[(scale, approach)].get(column)
+                row[f"{csv_name}_std"] = metric_stds[(scale, approach)].get(column)
+            mean_std_rows.append(row)
+
+    mean_std_headers = ["scale", "approach", "iteration_count"]
+    for column in metric_columns:
+        csv_name = mean_std_csv_name(column)
+        mean_std_headers.extend([f"{csv_name}_mean", f"{csv_name}_std"])
+
+    with mean_std_csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=mean_std_headers)
+        writer.writeheader()
+        for row in mean_std_rows:
+            writer.writerow({
+                key: ("" if value is None else value)
+                for key, value in row.items()
+            })
 
     def saving_ratio(baseline: float | None, current: float | None) -> float | None:
         if baseline is None or current is None or baseline == 0:
@@ -707,6 +734,7 @@ def main() -> int:
         for approach in APPROACHES:
             agg = metric_means[(scale, approach)]
             stds = metric_stds[(scale, approach)]
+            count = iteration_counts.get((scale, approach), 0)
             validation = next(
                 (r for r in run_records if r["scale"] == scale and r["approach"] == approach),
                 None,
@@ -715,6 +743,7 @@ def main() -> int:
                 [
                     str(scale),
                     approach,
+                    str(count),
                     fmt_mean_std(agg.get("mean_cpu_percent"), stds.get("mean_cpu_percent")),
                     fmt_mean_std(agg.get("peak_memory_mb"), stds.get("peak_memory_mb")),
                     fmt_mean_std(agg.get("estimated_delivery_bandwidth_kb_s"), stds.get("estimated_delivery_bandwidth_kb_s")),
@@ -736,10 +765,12 @@ def main() -> int:
     for scale in scales:
         for approach in ["approximation", "chunked"]:
             saving = savings[(scale, approach)]
+            count = iteration_counts.get((scale, approach), 0)
             resource_rows.append(
                 [
                     str(scale),
                     approach,
+                    str(count),
                     fmt_pct_mean_std(saving["mean_cpu_percent"]["mean"], saving["mean_cpu_percent"]["std"]),
                     fmt_pct_mean_std(saving["peak_memory_mb"]["mean"], saving["peak_memory_mb"]["std"]),
                     fmt_pct_mean_std(
@@ -753,10 +784,12 @@ def main() -> int:
     for scale in scales:
         for approach in ["naive_distributed", "approximation", "chunked"]:
             overhead = overheads[(scale, approach)]
+            count = iteration_counts.get((scale, approach), 0)
             overhead_rows.append(
                 [
                     str(scale),
                     approach,
+                    str(count),
                     fmt_pct_mean_std(overhead["mean_cpu_percent"]["mean"], overhead["mean_cpu_percent"]["std"]),
                     fmt_pct_mean_std(overhead["peak_memory_mb"]["mean"], overhead["peak_memory_mb"]["std"]),
                     fmt_pct_mean_std(
@@ -771,11 +804,14 @@ def main() -> int:
         for approach in APPROACHES:
             agg = metric_means[(scale, approach)]
             stds = metric_stds[(scale, approach)]
+            count = iteration_counts.get((scale, approach), 0)
             accuracy_rows.append(
                 [
                     str(scale),
                     approach,
+                    str(count),
                     fmt_mean_std(agg.get("mae"), stds.get("mae"), 6),
+                    fmt_mean_std(agg.get("rmse"), stds.get("rmse"), 6),
                     fmt_mean_std(agg.get("mape"), stds.get("mape"), 6),
                     fmt_mean_std(agg.get("exact_rate"), stds.get("exact_rate"), 3),
                     fmt_mean_std(agg.get("chunk_result_count"), stds.get("chunk_result_count")),
@@ -787,10 +823,12 @@ def main() -> int:
         for approach in APPROACHES:
             agg = metric_means[(scale, approach)]
             stds = metric_stds[(scale, approach)]
+            count = iteration_counts.get((scale, approach), 0)
             mqtt_rows.append(
                 [
                     str(scale),
                     approach,
+                    str(count),
                     fmt_mean_std(agg.get("raw_input_subscriber_count"), stds.get("raw_input_subscriber_count")),
                     fmt_mean_std(
                         agg.get("raw_input_estimated_delivery_bandwidth_kb_s"),
@@ -855,6 +893,7 @@ def main() -> int:
                 f"- Approaches: {', '.join(APPROACHES)}",
                 f"- CSV rows analyzed: {len(rows)}",
                 f"- Unique iterations in the CSV: {len(iterations)} ({', '.join(map(str, iterations))})",
+                "- Grouped scalability summaries are reported as mean ± sample standard deviation (ddof=1).",
                 "- Current run status: intermediate 3-iteration run, preliminary only",
             ]
         ),
@@ -904,6 +943,7 @@ def main() -> int:
             [
                 "scale",
                 "approach",
+                "iterations",
                 "mean CPU %",
                 "peak memory MB",
                 "estimated delivery bw KB/s",
@@ -922,6 +962,7 @@ def main() -> int:
             [
                 "scale",
                 "approach",
+                "iterations",
                 "CPU saving",
                 "memory saving",
                 "bandwidth saving",
@@ -933,6 +974,7 @@ def main() -> int:
             [
                 "scale",
                 "approach",
+                "iterations",
                 "CPU overhead",
                 "memory overhead",
                 "bandwidth overhead",
@@ -944,7 +986,9 @@ def main() -> int:
             [
                 "scale",
                 "approach",
+                "iterations",
                 "MAE",
+                "RMSE",
                 "MAPE",
                 "exact rate",
                 "chunk result count",
@@ -956,6 +1000,7 @@ def main() -> int:
             [
                 "scale",
                 "approach",
+                "iterations",
                 "raw input subscribers",
                 "raw input bw KB/s",
                 "reuse layer bw KB/s",

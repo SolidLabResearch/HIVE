@@ -152,7 +152,7 @@ The runner defaults to the paper settings described in the request:
 - Replay frequency: `4 Hz`
 - Aggregation: `AVG`
 - Timeout metadata: `300000 ms`
-- Custom-pattern per-test timeout: `240000 ms` by default (`CUSTOM_PATTERN_TEST_TIMEOUT_MS` / `--pattern-test-timeout`)
+- Custom-pattern per-test timeout: `300000 ms` by default (`CUSTOM_PATTERN_TEST_TIMEOUT_MS` / `--pattern-test-timeout`)
 - Iterations: `35`
 - Analysis trimming metadata: drop first `3`, drop last `2`
 
@@ -172,7 +172,7 @@ node scripts/benchmark/run-all-paper-benchmarks.js \
   --frequency 4 \
   --aggregation AVG \
   --timeout 300000 \
-  --pattern-test-timeout 240000 \
+  --pattern-test-timeout 300000 \
   --output-dir results/paper-benchmarks/<timestamp>
 ```
 
@@ -201,6 +201,9 @@ The runner writes:
 - `accuracy/`: copied result and metadata files from the pattern benchmark outputs
 - `accuracy/patterns/custom-pattern-accuracy/summary.json`: per-pattern accuracy summary against the fetching baseline
 - `accuracy/patterns/custom-pattern-accuracy/summary.csv`: paper-friendly CSV export of the same custom-pattern accuracy summary
+- `accuracy/patterns/custom-pattern-accuracy/summary.raw-35.json`: raw 35-iteration accuracy summary
+- `accuracy/patterns/custom-pattern-accuracy/summary.trimmed-4-33.json`: trimmed paper summary using iterations 4 through 33
+- `accuracy/patterns/custom-pattern-accuracy/summary.trimmed-4-33.csv`: trimmed paper CSV using iterations 4 through 33
 - `naive-distributed/`: copied naive baseline artifacts from real-data and pattern runs
 - `logs/`: stdout, stderr, and combined command logs for each launched benchmark command
 
@@ -219,7 +222,7 @@ All paths below are relative to `results/paper-benchmarks/<timestamp>/` unless n
 | CPU / memory resource comparison | Partially supported | `scripts/benchmark/run-all-paper-benchmarks.js --suite resources`<br>`experiments/real-data-comparison/run-real-data-4-approaches.js` | `resources/real-data/fetching/iteration*/fetching_client_side_resource_usage.csv`<br>`resources/real-data/approximation/iteration*/approximation_approach_resource_usage.csv`<br>`resources/real-data/chunked/iteration*/streaming_query_hive_resource_log.csv`<br>`resources/real-data/naive_distributed/iteration*/naive_distributed_approach_resource_usage.csv` | Raw per-iteration resource logs are preserved, but the unified runner does not produce a paper-ready aggregated CPU / memory summary table. |
 | Accuracy against client-side ground truth | Partially supported | `experiments/real-data-comparison/run-real-data-4-approaches.js`<br>`scripts/benchmark/run-all-paper-benchmarks.js --suite real-data` | `real-data/raw/real_data_comparison_results.csv`<br>`real-data/raw/real_data_comparison_results.json` | Real-data accuracy is computed against `fetching` inside the underlying experiment and is preserved in `real-data/raw/`. The unified runner does not expose a dedicated real-data `accuracy/` output, and the underlying script compares against the first collected fetching iteration rather than an explicitly trimmed aggregate. |
 | Synthetic stream-pattern accuracy comparison | Supported | `scripts/benchmark/run-all-paper-benchmarks.js --suite patterns`<br>`analysis/accuracy/accuracy-comparison-custom-patterns.js`<br>`experiments/pattern-analysis/run-custom-patterns-comparison.js` | `accuracy/patterns/custom-pattern-accuracy/summary.json`<br>`accuracy/patterns/custom-pattern-accuracy/summary.csv`<br>`accuracy/patterns/*/<approach>/iteration*/` | The aggregation compares extracted per-window result CSVs against the `fetching` baseline and reports MAE, RMSE, MAPE, matched-window counts, and missing/unmatched counts for the five paper patterns. |
-| 35 iterations with first 3 and last 2 dropped in analysis | Partially supported | `scripts/benchmark/run-all-paper-benchmarks.js` | `metadata.json`<br>`summary.json` | Defaults are `--iterations 35 --drop-warmup 3 --drop-cooldown 2`, and those values are recorded in metadata. The runner and current aggregation scripts do not apply the trimming themselves; the full iteration count is still executed and preserved. |
+| 35 iterations with first 3 and last 2 dropped in analysis | Supported | `scripts/benchmark/run-all-paper-benchmarks.js`<br>`analysis/accuracy/accuracy-comparison-custom-patterns.js` | `accuracy/patterns/custom-pattern-accuracy/summary.json`<br>`accuracy/patterns/custom-pattern-accuracy/summary.csv`<br>`accuracy/patterns/custom-pattern-accuracy/summary.raw-35.json`<br>`accuracy/patterns/custom-pattern-accuracy/summary.trimmed-4-33.json`<br>`accuracy/patterns/custom-pattern-accuracy/summary.trimmed-4-33.csv` | The runner preserves raw 35-iteration outputs and also runs a trimmed analysis pass over iterations 4 through 33 so the paper summaries do not average all 35 runs. |
 | ASF represented through sub-window range / step | Partially supported | `scripts/benchmark/run-all-paper-benchmarks.js`<br>`experiments/real-data-comparison/run-real-data-4-approaches.js`<br>`experiments/pattern-analysis/run-custom-patterns-comparison.js` | `metadata.json` | The runner passes `SUB_WINDOW_RANGE` and `SUB_WINDOW_STEP` into the benchmark environment and records them in metadata. This is only a proxy for ASF; there is no dedicated ASF sweep or ASF-specific analysis output in the repo. |
 | Limitations around naive-distributed custom-pattern accuracy outputs | Supported | `analysis/accuracy/accuracy-comparison-custom-patterns.js`<br>`scripts/benchmark/run-all-paper-benchmarks.js --suite patterns`<br>`experiments/pattern-analysis/run-custom-patterns-comparison.js` | `accuracy/patterns/custom-pattern-accuracy/summary.json`<br>`naive-distributed/patterns/*/naive_distributed/iteration*/`<br>`patterns/raw/naive_distributed/*/iteration*/` | `naive_distributed` is treated as an optional approach by the aggregation script. It is included in `summary.json` under `optionalApproaches` when present, but it is not emitted in `summary.csv` and is not counted as a required comparison for pattern-level completeness. |
 
