@@ -459,10 +459,15 @@ class PatternResultExtractor {
           windowStart: parseInt(parts[idx.get("window_start")], 10),
           windowEnd: parseInt(parts[idx.get("window_end")], 10),
           eventCount: parseFloat(parts[idx.get("event_count")]),
+          expectedEventCount: parseFloat(parts[idx.get("expected_event_count")]),
           sumValue: parseFloat(parts[idx.get("sum")]),
           avgValue: parseFloat(parts[idx.get("avg")]),
           firstEventTimestamp: parts[idx.get("first_event_timestamp")],
           lastEventTimestamp: parts[idx.get("last_event_timestamp")],
+          completenessStatus: parts[idx.get("completeness_status")],
+          acceptedOrSuppressed: parts[idx.get("accepted_or_suppressed")],
+          reason: parts[idx.get("reason")],
+          resultValue: parseFloat(parts[idx.get("result_value")]),
         });
       }
       return rows;
@@ -580,6 +585,31 @@ class PatternResultExtractor {
       const latencyRowsByWindow = this.readFetchingLatencyRows();
       const emittedTimestamps = this.readFetchingEmissionTimestamps(clientLogContent);
       const finalizedRows = this.readFetchingFinalizedRows();
+      const finalizedRowsFromDiagnosticsMap = finalizedRows.length === 0
+        ? Array.from(diagnosticsByWindow.entries())
+            .filter(([windowNumber, row]) =>
+              Number.isFinite(windowNumber) && Number.isFinite(row?.avgValue),
+            )
+            .map(([windowNumber, row]) => ({
+              windowNumber,
+              windowStart: row.windowStart ?? null,
+              windowEnd: row.windowEnd ?? null,
+              eventCount: row.eventCount ?? null,
+              expectedEventCount: row.expectedEventCount ?? null,
+              sumValue: row.sumValue ?? null,
+              avgValue: row.avgValue ?? null,
+              firstEventTimestamp: row.firstEventTimestamp ?? null,
+              lastEventTimestamp: row.lastEventTimestamp ?? null,
+              completenessStatus: row.completenessStatus ?? null,
+              acceptedOrSuppressed: row.acceptedOrSuppressed ?? null,
+              reason: row.reason ?? null,
+              resultValue: row.resultValue ?? row.avgValue,
+            }))
+            .sort((a, b) => a.windowNumber - b.windowNumber)
+        : [];
+      const effectiveFinalizedRows = finalizedRows.length > 0
+        ? finalizedRows
+        : finalizedRowsFromDiagnosticsMap;
 
       const firstLatencyRow = Array.from(latencyRowsByWindow.values())
         .find((row) => Number.isFinite(row?.queryRegisteredAt));
@@ -597,8 +627,8 @@ class PatternResultExtractor {
         }
       }
 
-      if (finalizedRows.length > 0) {
-        finalizedRows.forEach((row, index) => {
+      if (effectiveFinalizedRows.length > 0) {
+        effectiveFinalizedRows.forEach((row, index) => {
           const latencyRow = latencyRowsByWindow.get(row.windowNumber);
           const timestamp = Number.isFinite(latencyRow?.resultEmittedAt)
             ? latencyRow.resultEmittedAt

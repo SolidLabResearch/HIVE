@@ -5,6 +5,8 @@ import { turtleStringToStore } from '../util/Util';
 import { PartialChunkResult } from '../util/chunkTypes';
 import { recordPublishedMqttMessage } from '../util/mqttTraffic';
 import { getTimestampDomainMax, getTimestampDomainMin, useCleanMqttSessionsForBenchmark } from '../util/runtimeConfig';
+import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
+import { resourceTraceSnapshot } from "../util/resourceTrace";
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
 
@@ -25,6 +27,8 @@ export class RSPQueryProcess {
     private timestampDomainMin: number | null;
     private timestampDomainMax: number | null;
     private rejectedContaminatedTimestampCount: number;
+    private mqttClients: any[] = [];
+    private cleanupRegistered: boolean = false;
 
     /**
      *
@@ -47,7 +51,44 @@ export class RSPQueryProcess {
         this.timestampDomainMin = getTimestampDomainMin();
         this.timestampDomainMax = getTimestampDomainMax();
         this.rejectedContaminatedTimestampCount = 0;
+        this.registerCleanupHook();
         this.subscribeToResultStream();
+        resourceTraceSnapshot("startup", "rsp query process constructed", {
+            queryId: this.queryId,
+            subqueryId: this.subqueryId,
+        });
+    }
+
+    private registerCleanupHook(): void {
+        if (this.cleanupRegistered) {
+            return;
+        }
+
+        this.cleanupRegistered = true;
+        process.once("exit", () => {
+            this.cleanup();
+        });
+    }
+
+    public cleanup(): void {
+        resourceTraceSnapshot("before_cleanup", "rsp query process cleanup", {
+            queryId: this.queryId,
+            subqueryId: this.subqueryId,
+        });
+        profileSync("cleanup_time_ms", () => {
+            for (const client of this.mqttClients.splice(0)) {
+                try {
+                    client.end(true);
+                } catch (error) {
+                    console.error("Failed to clean up MQTT client:", error);
+                }
+            }
+        });
+        writeProfileArtifact();
+        resourceTraceSnapshot("after_cleanup", "rsp query process cleanup complete", {
+            queryId: this.queryId,
+            subqueryId: this.subqueryId,
+        });
     }
 
     /**
@@ -63,7 +104,6 @@ export class RSPQueryProcess {
         if (parsed_query) {
             const streams: any[] = [...parsed_query.s2r];
             console.log(`Parsed query successfully. Found ${streams.length} streams.`);
-            console.log(`The streams are: ${JSON.stringify(streams)}`);
             for (const stream of streams) {
                 const stream_name = stream.stream_name;
                 const stream_url = new URL(stream_name);
@@ -71,11 +111,16 @@ export class RSPQueryProcess {
                 const rsp_client = mqtt.connect(mqtt_broker, {
                     clean: useCleanMqttSessionsForBenchmark(),
                 });
+                this.mqttClients.push(rsp_client);
+                profileCount("mqtt_clients_created");
                 const rsp_stream_object = this.rsp_engine.getStream(stream_name);
                 const topic = stream_url.pathname.slice(1);
-                console.log(`Connecting to MQTT broker at ${mqtt_broker} for stream ${stream_name}`);
                 rsp_client.on("connect", () => {
-                    console.log(`Connected to MQTT broker`);
+                    resourceTraceSnapshot("after_mqtt_subscription_connect", "rsp stream subscriber connected", {
+                        queryId: this.queryId,
+                        subqueryId: this.subqueryId,
+                        topic,
+                    });
                     rsp_client.subscribe(topic, (err: any) => {
                         if (err) {
                             console.error(`Failed to subscribe to stream ${stream_name}:`, err);
@@ -93,6 +138,7 @@ export class RSPQueryProcess {
 
                     try {
                         const message_string = message.toString();
+                        profileCount("mqtt_messages_received");
                         const latest_event_store = await turtleStringToStore(message_string);
                         const timestamp = latest_event_store.getQuads(null, DataFactory.namedNode('https://saref.etsi.org/core/hasTimestamp'), null, null)[0]?.object.value;
                         if (!timestamp) {
@@ -168,12 +214,15 @@ export class RSPQueryProcess {
 
         const mqtt_broker = "mqtt://localhost:1883";
         const rstream_publisher = mqtt.connect(mqtt_broker);
+        this.mqttClients.push(rstream_publisher);
+        profileCount("mqtt_clients_created");
+        resourceTraceSnapshot("after_result_publisher_created", "rsp result publisher created", {
+            queryId: this.queryId,
+            subqueryId: this.subqueryId,
+        });
 
         this.rstream_emitter.on("RStream", async (object: any) => {
-            console.log(`Received RStream object: ${JSON.stringify(object)}`);
-
             if (!object || !object.bindings || object.bindings.length === 0) {
-                console.log(`No bindings found in the RStream object.`);
                 return;
             }
 
@@ -189,17 +238,10 @@ export class RSPQueryProcess {
                      if (Array.isArray(binding) && binding.length >= 2) {
                          const varName = binding[0].value;
                          const varValue = binding[1].value;
-                         console.log(`DEBUG: Extracted binding: ${varName} = ${varValue}`);
                          mergedBinding[varName] = varValue;
-                     } else {
-                         console.log(`DEBUG: Unexpected binding format: ${JSON.stringify(binding)}`);
                      }
                 }
-            } else {
-                 console.log(`DEBUG: object.bindings is not iterable: ${typeof object.bindings}`);
             }
-            
-            console.log(`DEBUG: Final Merged Binding: ${JSON.stringify(mergedBinding)}`);
 
             const partialChunkResult = this.generate_partial_chunk_result(mergedBinding, object);
 
@@ -214,15 +256,14 @@ export class RSPQueryProcess {
                     if (err) {
                         console.error(`Error publishing aggregation event: ${err}`);
                     } else {
+                        profileCount("mqtt_messages_published");
                         recordPublishedMqttMessage({
                             topic: this.rstream_topic,
                             payload: aggregation_object_string,
                             messageType: "chunk_result",
                         });
-                        console.log(`Successfully published aggregation event: ${aggregation_object_string}`);
                     }
                 });
-                console.log(`Published aggregation event: ${aggregation_object_string}`);
             }
         });
     }

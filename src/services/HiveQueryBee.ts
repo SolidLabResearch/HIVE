@@ -25,6 +25,13 @@ export class HiveQueryBee {
                 QUERY: query,
                 TOPIC: topic,
                 OPERATOR_TYPE: operator,
+                HIVE_PROCESS_ROLE:
+                    operator === "StreamingQueryChunkAggregatorOperator"
+                        ? "chunked_bee_worker"
+                        : operator === "ApproximationApproachOperator" ||
+                          operator === "RateBasedApproximationApproachOperator"
+                        ? "approximation_bee_worker"
+                        : "bee_worker",
                 SUB_QUERIES: subQueries ? JSON.stringify(subQueries) : undefined
             }
         });

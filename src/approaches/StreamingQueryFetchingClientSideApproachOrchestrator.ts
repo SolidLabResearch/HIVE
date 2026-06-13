@@ -20,6 +20,8 @@ import {
   useCleanMqttSessionsForBenchmark,
 } from "../util/runtimeConfig";
 import { recordPublishedMqttMessage } from "../util/mqttTraffic";
+import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
+import { resourceTraceSnapshot } from "../util/resourceTrace";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -93,6 +95,9 @@ export class FetchingAllDataClientSide {
   );
   private benchmarkReplayComplete: boolean = false;
   private benchmarkControlTopic: string = buildBenchmarkTopicName("__benchmark_control__");
+  private mqttClients: any[] = [];
+  private resourceUsageInterval: NodeJS.Timeout | null = null;
+  private cleanupRegistered: boolean = false;
 
   /**
    *
@@ -104,6 +109,8 @@ export class FetchingAllDataClientSide {
     r2s_topic: string,
     aggregationFunction: AggregationFunction,
   ) {
+    process.env.HIVE_PROCESS_ROLE =
+      process.env.HIVE_PROCESS_ROLE || "fetching_orchestrator";
     this.query = query;
     this.r2s_topic = r2s_topic;
     this.aggregationFunction = aggregationFunction;
@@ -127,8 +134,10 @@ export class FetchingAllDataClientSide {
     this.initializeLogging();
     this.log("fetching_query_registered");
 
+    this.registerCleanupHook();
     this.subscribeRStream();
     this.startResourceUsageLogging();
+    resourceTraceSnapshot("startup", "fetching orchestrator initialized");
   }
 
   /**
@@ -334,6 +343,8 @@ export class FetchingAllDataClientSide {
         clean: useCleanMqttSessionsForBenchmark(),
         clientId,
       });
+      this.mqttClients.push(rsp_client);
+      profileCount("mqtt_clients_created");
       const rsp_stream_object = this.rsp_engine.getStream(stream_name);
       const topic = new URL(stream_name).pathname.slice(1);
 
@@ -379,6 +390,7 @@ export class FetchingAllDataClientSide {
 
         try {
           const message_string = message.toString();
+          profileCount("mqtt_messages_received");
 
           // Track when data is received for latency calculations
           const now = Date.now();
@@ -1083,6 +1095,8 @@ export class FetchingAllDataClientSide {
           clean: false,
           clientId,
         });
+        this.mqttClients.push(pubClient);
+        profileCount("mqtt_clients_created");
         pubClient.on("connect", () => {
           const publishStartTime = Date.now();
           pubClient.publish(
@@ -1098,6 +1112,8 @@ export class FetchingAllDataClientSide {
                 this.log(`Error publishing result: ${err}`);
               } else {
                 const publishEndTime = Date.now();
+                profileCount("mqtt_messages_published");
+                profileCount("emitted_results");
                 recordPublishedMqttMessage({
                   topic: this.r2s_topic,
                   payload: aggregation_object_string,
@@ -1134,15 +1150,29 @@ export class FetchingAllDataClientSide {
    * Clean up resources
    */
   public cleanup() {
-    if (this.logStream) {
-      this.logStream.end();
-    }
-    if (this.latencyLogStream) {
-      this.latencyLogStream.end();
-    }
-    if (this.diagnosticsLogStream) {
-      this.diagnosticsLogStream.end();
-    }
+    profileSync("cleanup_time_ms", () => {
+      if (this.resourceUsageInterval) {
+        clearInterval(this.resourceUsageInterval);
+        this.resourceUsageInterval = null;
+      }
+      if (this.logStream) {
+        this.logStream.end();
+      }
+      if (this.latencyLogStream) {
+        this.latencyLogStream.end();
+      }
+      if (this.diagnosticsLogStream) {
+        this.diagnosticsLogStream.end();
+      }
+      for (const client of this.mqttClients.splice(0)) {
+        try {
+          client.end(true);
+        } catch (error) {
+          console.error("Failed to clean up fetching MQTT client:", error);
+        }
+      }
+    });
+    writeProfileArtifact();
   }
 
   /**
@@ -1161,7 +1191,7 @@ export class FetchingAllDataClientSide {
         "timestamp,cpu_user,cpu_system,rss,heapTotal,heapUsed,heapUsedMB,external\n",
       );
     }
-    setInterval(() => {
+    this.resourceUsageInterval = setInterval(() => {
       const mem = process.memoryUsage();
       const cpu = process.cpuUsage();
       const now = Date.now();
@@ -1175,9 +1205,20 @@ export class FetchingAllDataClientSide {
           mem.heapUsed,
           (mem.heapUsed / 1024 / 1024).toFixed(2),
           mem.external,
-        ].join(",") + "\n";
+      ].join(",") + "\n";
       logStream.write(line);
     }, intervalMs);
+  }
+
+  private registerCleanupHook() {
+    if (this.cleanupRegistered) {
+      return;
+    }
+
+    this.cleanupRegistered = true;
+    process.once("exit", () => {
+      this.cleanup();
+    });
   }
 }
 

@@ -1,7 +1,8 @@
 const mockMqttClient = {
     on: jest.fn().mockReturnThis(),
     subscribe: jest.fn(),
-    publish: jest.fn()
+    publish: jest.fn(),
+    end: jest.fn()
 };
 
 jest.mock('mqtt', () => ({
@@ -128,6 +129,18 @@ describe('RSPQueryProcess', () => {
             expect(partial?.value).toBe(22.5);
             expect(partial?.count).toBe(4);
             expect(partial?.chunkId).toContain('1779449067922:1779449097922');
+        });
+    });
+
+    describe('cleanup', () => {
+        test('should close tracked MQTT clients', () => {
+            (process as any).mqttClients = [];
+            const cleanupClient = { end: jest.fn() };
+            (process as any).mqttClients.push(cleanupClient);
+
+            process.cleanup();
+
+            expect(cleanupClient.end).toHaveBeenCalledWith(true);
         });
     });
 });

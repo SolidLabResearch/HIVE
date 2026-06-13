@@ -13,6 +13,8 @@ import {
 } from "../../util/runtimeConfig";
 import { hash_string_md5 } from "../../util/Util";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
+import { getCachedParsedQuery } from "../../util/queryCache";
+import { profileCount, profileSync, writeProfileArtifact } from "../../util/profiling";
 
 /**
  * Configuration interface for inactivity detection
@@ -48,6 +50,11 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private firstDataReceivedTime: number = 0; // Track when first data arrives (wall-clock)
   private lastDataReceivedTime: number = 0; // Track when last data was received
   private sessionId: string = getSessionId();
+  private mqttPublisherClient: any = null;
+  private activeMqttClients: any[] = [];
+  private cleanupRegistered: boolean = false;
+  private cachedOutputQuery: string = "";
+  private cachedOutputQueryParsed: any = null;
 
   /**
    * The constructor class with optional inactivity configuration.
@@ -64,6 +71,83 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     };
     this.initializeLatencyLogging();
     this.queryRegisteredTime = Date.now(); // Record when query is registered
+    this.registerCleanupHook();
+  }
+
+  private registerCleanupHook(): void {
+    if (this.cleanupRegistered) {
+      return;
+    }
+
+    this.cleanupRegistered = true;
+    process.once("exit", () => {
+      this.cleanup();
+    });
+  }
+
+  public cleanup(): void {
+    profileSync("cleanup_time_ms", () => {
+      if (this.mqttPublisherClient) {
+        try {
+          this.mqttPublisherClient.end(true);
+        } catch (error) {
+          console.error("Failed to close approximation publisher client:", error);
+        }
+        this.mqttPublisherClient = null;
+      }
+
+      for (const client of this.activeMqttClients.splice(0)) {
+        try {
+          client.end(true);
+        } catch (error) {
+          console.error("Failed to close approximation MQTT client:", error);
+        }
+      }
+
+      if (this.latencyLogStream) {
+        this.latencyLogStream.end();
+      }
+    });
+    writeProfileArtifact();
+  }
+
+  private getOrCreatePublisherClient(): any {
+    if (this.mqttPublisherClient) {
+      return this.mqttPublisherClient;
+    }
+
+    this.mqttPublisherClient = mqtt.connect(CONFIG.mqttBroker, {
+      clientId: "approximation-operator-" + Math.random().toString(16).substr(2, 8),
+      clean: true,
+      keepalive: 60,
+      reconnectPeriod: 1000,
+    });
+    this.activeMqttClients.push(this.mqttPublisherClient);
+    profileCount("mqtt_clients_created");
+    return this.mqttPublisherClient;
+  }
+
+  private publishWithSharedClient(topic: string, payload: string, qos = 1): Promise<void> {
+    const client = this.getOrCreatePublisherClient();
+    return new Promise((resolve) => {
+      const publish = () => {
+        client.publish(topic, payload, { qos }, (error: any) => {
+          if (error) {
+            console.error("Failed to publish aggregated results:", error);
+            this.logger.log(`Failed to publish aggregated results: ${error}`);
+          } else {
+            profileCount("mqtt_messages_published");
+          }
+          resolve();
+        });
+      };
+
+      if (client.connected) {
+        publish();
+      } else {
+        client.once("connect", publish);
+      }
+    });
   }
 
   /**
@@ -198,7 +282,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
     for (const topic of topics) {
       try {
-        const parsed = this.parser.parse(topic.rspql_query);
+        const parsed = getCachedParsedQuery<any>(this.parser, topic.rspql_query);
 
         const width = parsed.s2r[0]?.width;
         const aggregationMatch = topic.rspql_query.match(/SELECT\s*\((\w+)\(/i);
@@ -314,7 +398,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     }
 
     // Parsing the output RSP-QL query with it's width and the slide.
-    const outputQueryParsed = this.parser.parse(this.outputQuery);
+    const outputQueryParsed = getCachedParsedQuery<any>(this.parser, this.outputQuery);
+    this.cachedOutputQuery = this.outputQuery;
+    this.cachedOutputQueryParsed = outputQueryParsed;
     const outputQueryWidth = outputQueryParsed.s2r[0].width;
     const outputQuerySlide = outputQueryParsed.s2r[0].slide;
     const resultTopic = getResultTopic("approximation/output");
@@ -340,7 +426,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     }
 
     const s2rQueries = this.extractedQueries.map(
-      (query) => this.parser.parse(query.rspql_query).s2r[0],
+      (query) => getCachedParsedQuery<any>(this.parser, query.rspql_query).s2r[0],
     );
     if (s2rQueries.length === 0) {
       throw new Error("No valid s2r queries found for aggregation.");
@@ -360,6 +446,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       keepalive: 60,
       reconnectPeriod: 1000,
     });
+    this.activeMqttClients.push(rsp_client);
+    profileCount("mqtt_clients_created");
 
     rsp_client.on("error", (error: any) => {
       console.error("MQTT Client Error:", error);
@@ -455,6 +543,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
         try {
           const data = message.toString();
+          profileCount("mqtt_messages_received");
           // Parse the RDF triple to extract the numeric value
           // Look for patterns like: hasValue> "number"^^<type>
           const valueMatch = data.match(
@@ -534,6 +623,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
               windowBuffers.set(topic, []);
             }
             windowBuffers.get(topic)!.push(result);
+            profileCount("buffered_subwindow_results");
             return;
           }
 
@@ -542,6 +632,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             windowBuffers.set(topic, []);
           }
           windowBuffers.get(topic)!.push(result);
+          profileCount("buffered_subwindow_results");
 
           // ALWAYS update global latest values for ALL topics receiving data
           globalLatestValues.set(topic, { value: value, timestamp: now });
@@ -549,27 +640,15 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             `Updated global latest value for topic ${topic}: ${value} at ${now}`,
           );
 
-          // Log current buffer state for all topics
-          this.logger.log(
-            `After adding result - Topic ${topic} buffer size: ${windowBuffers.get(topic)!.length}`,
-          );
-          const allTopicBufferSizes: Record<string, number> = {};
-          windowBuffers.forEach((buffer, topicKey) => {
-            allTopicBufferSizes[topicKey] = buffer.length;
-          });
-          this.logger.log(
-            `All topic buffer sizes after message: ${JSON.stringify(allTopicBufferSizes)}`,
-          );
-
-          // Log all global latest values
-          const globalLatestValuesObj: Record<string, any> = {};
-          globalLatestValues.forEach((valData, topicKey) => {
-            globalLatestValuesObj[topicKey] = {
-              value: valData.value,
-              timestamp: valData.timestamp,
-            };
-          });
-          // this.logger.log(`Global latest values: ${JSON.stringify(globalLatestValuesObj)}`);
+          if (process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1") {
+            const allTopicBufferSizes: Record<string, number> = {};
+            windowBuffers.forEach((buffer, topicKey) => {
+              allTopicBufferSizes[topicKey] = buffer.length;
+            });
+            this.logger.log(
+              `After adding result - Topic ${topic} buffer size: ${windowBuffers.get(topic)!.length}; all topic buffer sizes: ${JSON.stringify(allTopicBufferSizes)}`,
+            );
+          }
 
           if (Date.now() - lastTriggerTime >= outputQuerySlide) {
             // Check maximum stream duration first
@@ -619,11 +698,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
             // Check how many topics have valid data in the current window BEFORE cleanup
             let topicsWithValidData = 0;
-            windowBuffers.forEach((buffer, topicKey) => {
-              const validWindowData = buffer.filter(
-                (w) => w.end >= windowStartGlobal,
-              );
-              if (validWindowData.length > 0) {
+            windowBuffers.forEach((buffer) => {
+              if (buffer.length > 0 && buffer[buffer.length - 1].end >= windowStartGlobal) {
                 topicsWithValidData++;
               }
             });
@@ -884,6 +960,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                         messageType: "superquery_result",
                         warmup: this.windowCount === 1,
                       });
+                      profileCount("mqtt_messages_published");
+                      profileCount("emitted_results");
                       console.log(
                         `Successfully published unified cross-sensor ${outputAggregationType.toLowerCase()}: ${unifiedResult} (from ${allAvailableValues.length} topics)`,
                       );

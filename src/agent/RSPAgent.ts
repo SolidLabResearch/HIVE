@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import { buildBenchmarkTopicName } from "../util/runtimeConfig";
 import { recordPublishedMqttMessage } from "../util/mqttTraffic";
+import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
 const mqtt = require('mqtt');
 
 
@@ -20,6 +21,8 @@ export class RSPAgent {
     public rsp_engine: RSPEngine;
     public rspql_parser: RSPQLParser;
     public http_server_location: string;
+    private mqttClients: any[] = [];
+    private cleanupRegistered: boolean = false;
 
     /**
      *
@@ -33,6 +36,7 @@ export class RSPAgent {
         this.rsp_engine = new RSPEngine(query);
         this.rstream_emitter = this.rsp_engine.register();
         this.http_server_location = "http://localhost:8080/";
+        this.registerCleanupHook();
         this.registerToQueryRegistry();
         this.subscribeRStream();
 
@@ -77,6 +81,8 @@ export class RSPAgent {
             const stream_name = stream.stream_name;
             const mqtt_broker: string = this.returnMQTTBroker(stream_name);
             const rsp_client = mqtt.connect(mqtt_broker);
+            this.mqttClients.push(rsp_client);
+            profileCount("mqtt_clients_created");
             const rsp_stream_object = this.rsp_engine.getStream(stream_name);
             const rawTopic = new URL(stream_name).pathname.replace(/^\/+/, "");
             const topic = rawTopic.startsWith("bench/")
@@ -98,6 +104,7 @@ export class RSPAgent {
             rsp_client.on("message", async (topic: any, message: any) => {
                 try {
                     const message_string = message.toString();
+                    profileCount("mqtt_messages_received");
                     const latest_event_store = await turtleStringToStore(message_string);
                     const timestamp = latest_event_store.getQuads(null, DataFactory.namedNode("https://saref.etsi.org/core/hasTimestamp"), null, null)[0].object.value;
                     const timestamp_epoch = Date.parse(timestamp);
@@ -139,6 +146,8 @@ export class RSPAgent {
     public async subscribeRStream() {
         const mqtt_broker = "mqtt://localhost:1883";
         const rstream_publisher = mqtt.connect(mqtt_broker);
+        this.mqttClients.push(rstream_publisher);
+        profileCount("mqtt_clients_created");
         const query_hash = hash_string_md5(this.query);
 
         rstream_publisher.on("connect", () => {
@@ -155,6 +164,7 @@ export class RSPAgent {
                 for (const item of iterables) {
                     const data = item.value;
                     console.log("Binding data received:", data);
+                    profileCount("mqtt_messages_published");
                     rstream_publisher.publish(this.r2s_topic, data, (err: any) => {
                         if (err) {
                             console.error("MQTT publisher error:", err);
@@ -211,6 +221,30 @@ export class RSPAgent {
                 stream.add(quadWithGraph, timestamp);
             }
         });
+    }
+
+    private registerCleanupHook(): void {
+        if (this.cleanupRegistered) {
+            return;
+        }
+
+        this.cleanupRegistered = true;
+        process.once("exit", () => {
+            this.cleanup();
+        });
+    }
+
+    public cleanup(): void {
+        profileSync("cleanup_time_ms", () => {
+            for (const client of this.mqttClients.splice(0)) {
+                try {
+                    client.end(true);
+                } catch (error) {
+                    console.error("Failed to clean up RSPAgent MQTT client:", error);
+                }
+            }
+        });
+        writeProfileArtifact();
     }
 
 

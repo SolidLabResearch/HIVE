@@ -121,30 +121,42 @@ export class NaiveApproximationApproachOperator implements IStreamQueryOperator 
             return 0;
         }
 
-        // Filter windows that overlap with the target window
-        const relevantWindows = windows.filter(window => 
-            window.end > target.start && window.start < target.end
-        );
+        let relevantCount = 0;
+        let sum = 0;
+        let min = Number.POSITIVE_INFINITY;
+        let max = Number.NEGATIVE_INFINITY;
 
-        if (relevantWindows.length === 0) {
+        for (const window of windows) {
+            if (window.end <= target.start || window.start >= target.end) {
+                continue;
+            }
+            relevantCount += 1;
+            sum += window.value;
+            if (window.value < min) {
+                min = window.value;
+            }
+            if (window.value > max) {
+                max = window.value;
+            }
+        }
+
+        if (relevantCount === 0) {
             return 0;
         }
 
-        const values = relevantWindows.map(window => window.value);
-
         switch (aggregation) {
             case 'SUM':
-                return values.reduce((sum, val) => sum + val, 0);
+                return sum;
             case 'AVG':
-                return values.reduce((sum, val) => sum + val, 0) / values.length;
+                return sum / relevantCount;
             case 'COUNT':
-                return values.length;
+                return relevantCount;
             case 'MAX':
-                return Math.max(...values);
+                return max;
             case 'MIN':
-                return Math.min(...values);
+                return min;
             default:
-                return values.reduce((sum, val) => sum + val, 0) / values.length;
+                return sum / relevantCount;
         }
     }
 

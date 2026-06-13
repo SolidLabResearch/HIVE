@@ -2,12 +2,21 @@ jest.mock('mqtt', () => ({
     connect: jest.fn().mockReturnValue({
         on: jest.fn().mockReturnThis(),
         subscribe: jest.fn(),
-        publish: jest.fn()
+        publish: jest.fn(),
+        end: jest.fn()
     })
 }));
 
 jest.mock('../../util/logger/CSVLogger', () => ({
     CSVLogger: jest.fn().mockImplementation(() => ({ log: jest.fn() }))
+}));
+
+const executeR2RMock = jest.fn();
+
+jest.mock('./r2r', () => ({
+    R2ROperator: jest.fn().mockImplementation(() => ({
+        execute: executeR2RMock,
+    })),
 }));
 
 // Prevent latency log file creation during tests
@@ -569,6 +578,114 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(ids1Hz).toHaveLength(5);
             expect(ids16Hz).toHaveLength(5);
             expect(ids1Hz).toEqual(ids16Hz);
+        });
+    });
+
+    describe('caching and cleanup', () => {
+        test('executeR2ROperator uses structured comparable diagnostics before RDF parsing fallback', async () => {
+            const mqtt = require('mqtt');
+            const parserParseSpy = jest.spyOn(require('n3').Parser.prototype, 'parse');
+            const publisherClient = {
+                connected: true,
+                publish: jest.fn((topic, payload, options, callback) => callback?.()),
+                once: jest.fn(),
+                end: jest.fn(),
+            };
+            mqtt.connect.mockReturnValueOnce(publisherClient);
+            executeR2RMock.mockReset();
+
+            await operator.executeR2ROperator(
+                [
+                    {
+                        queryId: 'q1',
+                        subqueryId: 'wearable',
+                        window: {
+                            windowName: 'w1',
+                            start: 0,
+                            end: 30000,
+                            range: 30000,
+                            step: 30000,
+                            semantics: '[start,end)' as const,
+                        },
+                        chunkId: 'c1',
+                        value: 10,
+                        count: 2,
+                        sum: 20,
+                        rdfPayload: '<s> <p> "10" .',
+                    },
+                ],
+                'group-1',
+                {
+                    externalWindowNumber: 1,
+                    externalWindowStart: 0,
+                    externalWindowEnd: 30000,
+                    internalChunkGroupIds: ['group-1'],
+                    internalChunks: [],
+                    recomposedCount: 2,
+                    recomposedSum: 20,
+                    recomposedAvg: 10,
+                    resultValue: 10,
+                },
+                'AVG',
+            );
+
+            expect(parserParseSpy).not.toHaveBeenCalled();
+            expect(executeR2RMock).not.toHaveBeenCalled();
+            expect(publisherClient.publish).toHaveBeenCalled();
+        });
+
+        test('reuses a single MQTT publisher client across emissions', async () => {
+            const mqtt = require('mqtt');
+            const publisherClient = {
+                connected: true,
+                publish: jest.fn((topic, payload, options, callback) => callback?.()),
+                once: jest.fn(),
+                end: jest.fn(),
+            };
+            mqtt.connect.mockReturnValue(publisherClient);
+
+            await (operator as any).publishWithSharedClient('topic/a', 'payload-a', { qos: 1 });
+            await (operator as any).publishWithSharedClient('topic/b', 'payload-b', { qos: 1 });
+
+            expect(mqtt.connect).toHaveBeenCalledTimes(1);
+            expect(publisherClient.publish).toHaveBeenCalledTimes(2);
+        });
+
+        test('reuses parsed chunk plans across repeated registrations', () => {
+            operator.addSubQuery(QUERY_SINGLE_WINDOW);
+            operator.setOutputQuery(QUERY_SINGLE_WINDOW);
+
+            const parseSpy = jest.spyOn((operator as any).parser, 'parse');
+            const firstPlan = (operator as any).getOrBuildChunkPlan();
+            const callsAfterFirstPlan = parseSpy.mock.calls.length;
+            const secondPlan = (operator as any).getOrBuildChunkPlan();
+
+            expect(secondPlan).toBe(firstPlan);
+            expect(parseSpy.mock.calls.length).toBe(callsAfterFirstPlan);
+        });
+
+        test('cleanup closes tracked MQTT clients and log streams', () => {
+            const clientA = { end: jest.fn() };
+            const clientB = { end: jest.fn() };
+            const publisher = { end: jest.fn() };
+            const latencyStream = { end: jest.fn() };
+            const diagnosticsStream = { end: jest.fn() };
+            const parentPartialStream = { end: jest.fn() };
+
+            (operator as any).activeMqttClients = [clientA, clientB];
+            (operator as any).mqttPublisherClient = publisher;
+            (operator as any).latencyLogStream = latencyStream;
+            (operator as any).diagnosticsLogStream = diagnosticsStream;
+            (operator as any).parentPartialDiagnosticsStream = parentPartialStream;
+
+            operator.cleanup();
+
+            expect(clientA.end).toHaveBeenCalledWith(true);
+            expect(clientB.end).toHaveBeenCalledWith(true);
+            expect(publisher.end).toHaveBeenCalledWith(true);
+            expect(latencyStream.end).toHaveBeenCalled();
+            expect(diagnosticsStream.end).toHaveBeenCalled();
+            expect(parentPartialStream.end).toHaveBeenCalled();
         });
     });
 });

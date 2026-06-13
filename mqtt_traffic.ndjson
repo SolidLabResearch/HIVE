@@ -1,0 +1,2 @@
+{"timestamp":1781312304065,"scenario":"default","approach":"unknown","scale":"default","iteration":"0","topic":"output","messageType":"superquery_result","topicBytes":6,"payloadBytes":159,"publishedBytes":165,"subscriberCount":1,"estimatedDeliveryBytes":165}
+{"timestamp":1781312315793,"scenario":"default","approach":"unknown","scale":"default","iteration":"0","topic":"output","messageType":"superquery_result","topicBytes":6,"payloadBytes":159,"publishedBytes":165,"subscriberCount":1,"estimatedDeliveryBytes":165}

@@ -23,7 +23,7 @@
  *   node run-custom-patterns-comparison.js low_variability    # Run specific pattern
  */
 
-const { spawn } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
@@ -117,6 +117,350 @@ function parseSelectionList(value, allowedValues) {
 
   const filtered = entries.filter((entry) => allowedValues.includes(entry));
   return [...new Set(filtered)];
+}
+
+function parsePsSnapshot(psOutput) {
+  const rows = [];
+  const lines = psOutput
+    .trim()
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    const parts = line.split(/\s+/, 5);
+    if (parts.length < 4) {
+      continue;
+    }
+
+    const pid = Number.parseInt(parts[0], 10);
+    const ppid = Number.parseInt(parts[1], 10);
+    const cpu = Number.parseFloat(parts[2]);
+    const rssKb = Number.parseFloat(parts[3]);
+    const command = parts[4] || "";
+
+    if (!Number.isFinite(pid) || !Number.isFinite(ppid)) {
+      continue;
+    }
+
+    rows.push({
+      pid,
+      ppid,
+      cpu: Number.isFinite(cpu) ? cpu : 0,
+      rssKb: Number.isFinite(rssKb) ? rssKb : 0,
+      command,
+    });
+  }
+
+  return rows;
+}
+
+function collectTreeStatsFromPs(rootPids) {
+  const liveRootPids = [...new Set((rootPids || []).filter((pid) => Number.isFinite(pid)))];
+  if (liveRootPids.length === 0) {
+    return null;
+  }
+
+  let snapshot;
+  try {
+    snapshot = parsePsSnapshot(
+      execFileSync("ps", ["-A", "-o", "pid=,ppid=,pcpu=,rss=,comm="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        maxBuffer: 1024 * 1024 * 8,
+      }),
+    );
+  } catch (err) {
+    return null;
+  }
+
+  if (snapshot.length === 0) {
+    return null;
+  }
+
+  const childrenByParent = new Map();
+  for (const proc of snapshot) {
+    const children = childrenByParent.get(proc.ppid) || [];
+    children.push(proc.pid);
+    childrenByParent.set(proc.ppid, children);
+  }
+
+  const pidMap = new Map(snapshot.map((proc) => [proc.pid, proc]));
+  const seen = new Set();
+  const queue = [...liveRootPids];
+  const tree = [];
+
+  while (queue.length > 0) {
+    const pid = queue.shift();
+    if (seen.has(pid)) {
+      continue;
+    }
+    seen.add(pid);
+
+    const proc = pidMap.get(pid);
+    if (!proc) {
+      continue;
+    }
+
+    tree.push(proc);
+
+    const children = childrenByParent.get(pid) || [];
+    for (const childPid of children) {
+      if (!seen.has(childPid)) {
+        queue.push(childPid);
+      }
+    }
+  }
+
+  if (tree.length === 0) {
+    return null;
+  }
+
+  const totalCpuPct = tree.reduce((sum, proc) => sum + proc.cpu, 0);
+  const totalRssKb = tree.reduce((sum, proc) => sum + proc.rssKb, 0);
+
+  return {
+    rootPids: liveRootPids,
+    tree,
+    processCount: tree.length,
+    totalCpuPct,
+    meanCpuPct: totalCpuPct,
+    peakCpuPct: totalCpuPct,
+    totalRssMb: totalRssKb / 1024,
+    meanRssMb: totalRssKb / 1024,
+    peakRssMb: tree.reduce((max, proc) => Math.max(max, proc.rssKb / 1024), 0),
+  };
+}
+
+class AttemptResourceSampler {
+  constructor(logDir, options = {}) {
+    this.logDir = logDir;
+    this.sampleIntervalMs = options.sampleIntervalMs || 500;
+    this.getRootPids = options.getRootPids || (() => []);
+    this.startedAt = null;
+    this.samples = [];
+    this.timer = null;
+    this.stopped = false;
+    this.running = false;
+    this.pidSamples = new Map();
+  }
+
+  start() {
+    if (this.timer) {
+      return;
+    }
+
+    this.startedAt = Date.now();
+    this.timer = setInterval(() => {
+      void this.sample();
+    }, this.sampleIntervalMs);
+    this.timer.unref?.();
+    void this.sample();
+  }
+
+  async sample() {
+    if (this.stopped || this.running) {
+      return;
+    }
+
+    this.running = true;
+    try {
+      const stats = collectTreeStatsFromPs(this.getRootPids());
+      if (!stats) {
+        return;
+      }
+
+      this.samples.push({
+        timestamp: Date.now(),
+        elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
+        ...stats,
+      });
+      for (const proc of stats.tree || []) {
+        const bucket = this.pidSamples.get(proc.pid) || [];
+        bucket.push({
+          timestamp: Date.now(),
+          elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
+          pid: proc.pid,
+          ppid: proc.ppid,
+          cpuPct: proc.cpu,
+          rssMb: proc.rssKb / 1024,
+          command: proc.command,
+        });
+        this.pidSamples.set(proc.pid, bucket);
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  summarize() {
+    const sampleCount = this.samples.length;
+    const wallTimeMs = this.startedAt ? Date.now() - this.startedAt : 0;
+    const meanCpuPct = sampleCount > 0
+      ? this.samples.reduce((sum, sample) => sum + sample.totalCpuPct, 0) / sampleCount
+      : 0;
+    const peakCpuPct = sampleCount > 0
+      ? Math.max(...this.samples.map((sample) => sample.totalCpuPct))
+      : 0;
+    const meanRssMb = sampleCount > 0
+      ? this.samples.reduce((sum, sample) => sum + sample.totalRssMb, 0) / sampleCount
+      : 0;
+    const peakRssMb = sampleCount > 0
+      ? Math.max(...this.samples.map((sample) => sample.totalRssMb))
+      : 0;
+    const peakProcessCount = sampleCount > 0
+      ? Math.max(...this.samples.map((sample) => sample.processCount))
+      : 0;
+    const cpuSeconds = (meanCpuPct / 100) * (wallTimeMs / 1000);
+
+    return {
+      sampleIntervalMs: this.sampleIntervalMs,
+      sampleCount,
+      wallTimeMs,
+      wallTimeSec: wallTimeMs / 1000,
+      meanCpuPct,
+      peakCpuPct,
+      cpuSeconds,
+      meanRssMb,
+      peakRssMb,
+      peakProcessCount,
+    };
+  }
+
+  writeArtifacts(metadata = {}) {
+    if (!fs.existsSync(this.logDir)) {
+      fs.mkdirSync(this.logDir, { recursive: true });
+    }
+
+    const csvPath = path.join(this.logDir, "resource_usage.csv");
+    const summaryPath = path.join(this.logDir, "resource_summary.json");
+    const perPidPath = path.join(this.logDir, "resource_per_pid_summary.json");
+    const lines = [
+      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,mean_cpu_pct,peak_cpu_pct,total_rss_mb,mean_rss_mb,peak_rss_mb",
+      ...this.samples.map((sample) =>
+        [
+          sample.timestamp,
+          sample.elapsedMs,
+          sample.rootPids.length,
+          sample.processCount,
+          sample.totalCpuPct.toFixed(4),
+          sample.meanCpuPct.toFixed(4),
+          sample.peakCpuPct.toFixed(4),
+          sample.totalRssMb.toFixed(3),
+          sample.meanRssMb.toFixed(3),
+          sample.peakRssMb.toFixed(3),
+        ].join(",")
+      ),
+    ];
+
+    fs.writeFileSync(csvPath, `${lines.join("\n")}\n`);
+    const pidMetadata = this.readPidMetadata();
+    const perPidSummary = Array.from(this.pidSamples.entries())
+      .map(([pid, samples]) => {
+        const sampleCount = samples.length;
+        const meanCpuPct = sampleCount > 0
+          ? samples.reduce((sum, sample) => sum + sample.cpuPct, 0) / sampleCount
+          : 0;
+        const peakCpuPct = sampleCount > 0
+          ? Math.max(...samples.map((sample) => sample.cpuPct))
+          : 0;
+        const meanRssMb = sampleCount > 0
+          ? samples.reduce((sum, sample) => sum + sample.rssMb, 0) / sampleCount
+          : 0;
+        const peakRssMb = sampleCount > 0
+          ? Math.max(...samples.map((sample) => sample.rssMb))
+          : 0;
+        const wallTimeSec = sampleCount > 1
+          ? (samples[samples.length - 1].elapsedMs - samples[0].elapsedMs) / 1000
+          : 0;
+        const cpuSeconds = (meanCpuPct / 100) * wallTimeSec;
+        const meta = pidMetadata.get(pid) || null;
+        return {
+          pid,
+          ppid: samples[0]?.ppid ?? null,
+          role: meta?.role || this.inferRole(pid, samples[0]?.ppid, metadata),
+          command: meta?.command || samples[0]?.command || "",
+          sampleCount,
+          wallTimeSec,
+          cpuSeconds,
+          meanCpuPct,
+          peakCpuPct,
+          meanRssMb,
+          peakRssMb,
+        };
+      })
+      .sort((a, b) => b.cpuSeconds - a.cpuSeconds);
+    fs.writeFileSync(perPidPath, JSON.stringify(perPidSummary, null, 2));
+    fs.writeFileSync(
+      summaryPath,
+      JSON.stringify(
+        {
+          ...metadata,
+          ...this.summarize(),
+          csvPath: path.resolve(csvPath),
+          summaryPath: path.resolve(summaryPath),
+          perPidSummaryPath: path.resolve(perPidPath),
+        },
+        null,
+        2,
+      ),
+    );
+
+    return { csvPath, summaryPath, perPidPath };
+  }
+
+  readPidMetadata() {
+    const results = new Map();
+    if (!fs.existsSync(this.logDir)) {
+      return results;
+    }
+    for (const fileName of fs.readdirSync(this.logDir)) {
+      if (!/^resource_trace_process_\\d+\\.json$/.test(fileName)) {
+        continue;
+      }
+      try {
+        const meta = JSON.parse(
+          fs.readFileSync(path.join(this.logDir, fileName), "utf8"),
+        );
+        if (Number.isFinite(meta?.pid)) {
+          results.set(meta.pid, meta);
+        }
+      } catch (_err) {
+      }
+    }
+    return results;
+  }
+
+  inferRole(pid, ppid, metadata = {}) {
+    if (pid === metadata.approachPid) {
+      return "approach_orchestrator";
+    }
+    if (pid === metadata.publisherPid) {
+      return "publisher";
+    }
+    if (ppid === metadata.approachPid) {
+      return "approach_child";
+    }
+    if (ppid === metadata.publisherPid) {
+      return "publisher_child";
+    }
+    return "unknown";
+  }
+
+  async stop(metadata = {}) {
+    if (this.stopped) {
+      return this.writeArtifacts(metadata);
+    }
+
+    this.stopped = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+
+    await this.sample();
+    return this.writeArtifacts(metadata);
+  }
 }
 
 function inferTerminationReason(result) {
@@ -490,6 +834,16 @@ class CustomPatternComparisonRunner {
       let publisherStartTimer = null;
       let approachProc = null;
       let publisherProc = null;
+      const resourceMonitor = new AttemptResourceSampler(logDir, {
+        sampleIntervalMs: Number.parseInt(
+          process.env.HIVE_RESOURCE_SAMPLE_INTERVAL_MS || "500",
+          10,
+        ),
+        getRootPids: () =>
+          [approachProc?.pid, publisherProc?.pid].filter((pid) =>
+            Number.isFinite(pid),
+          ),
+      });
       let publisherActivitySeen = false;
       let childActivitySeen = false;
       let lastPublisherActivityAt = null;
@@ -523,6 +877,15 @@ class CustomPatternComparisonRunner {
               logger: (message) => console.log(message),
             });
             await delay(500);
+            await resourceMonitor.stop({
+              attemptId,
+              approach,
+              pattern: patternName,
+              iteration: iterationNum,
+              attempt: attemptNumber,
+              approachPid: approachProc?.pid ?? null,
+              publisherPid: publisherProc?.pid ?? null,
+            });
             lifecycleLog("cleanup.finish", {
               attemptId,
               waitState: currentWaitState,
@@ -573,10 +936,14 @@ class CustomPatternComparisonRunner {
         command: `node ${this.getApproachScript(approach)}`,
       });
       approachProc = spawn("node", [this.getApproachScript(approach)], {
-        env,
+        env: {
+          ...env,
+          HIVE_PROCESS_ROLE: `${approach}_orchestrator`,
+        },
         stdio: "pipe",
         detached: true,
       });
+      resourceMonitor.start();
       lifecycleLog("child.spawned", {
         attemptId,
         pid: approachProc.pid,
@@ -662,7 +1029,10 @@ class CustomPatternComparisonRunner {
         });
         currentWaitState = "waiting_for_publisher_close";
         publisherProc = spawn("node", ["dist/streamer/src/publish.js"], {
-          env,
+          env: {
+            ...env,
+            HIVE_PROCESS_ROLE: "benchmark_publisher",
+          },
           stdio: "pipe",
           detached: true,
         });

@@ -5,6 +5,12 @@ function createBenchmarkReplayRunEnv(baseEnv = process.env) {
   function withBenchmarkReplayEnv(env = {}) {
     return {
       ...env,
+      LOG_PATH: env.LOG_PATH || baseEnv.LOG_PATH || "",
+      HIVE_PROFILE: env.HIVE_PROFILE || baseEnv.HIVE_PROFILE || "",
+      HIVE_PROFILE_OUTPUT_DIR:
+        env.HIVE_PROFILE_OUTPUT_DIR || baseEnv.HIVE_PROFILE_OUTPUT_DIR || "",
+      HIVE_PROFILE_OUTPUT_FILE:
+        env.HIVE_PROFILE_OUTPUT_FILE || baseEnv.HIVE_PROFILE_OUTPUT_FILE || "",
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME:
         env.STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME ||
         baseEnv.STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME ||

@@ -10,8 +10,12 @@ import {
     getSubWindowRange,
     getSubWindowStep,
 } from "../util/runtimeConfig";
+import { resourceTraceSnapshot } from "../util/resourceTrace";
 
 async function StreamingQueryApproximationApproachOrchestrator() {
+    process.env.HIVE_PROCESS_ROLE =
+        process.env.HIVE_PROCESS_ROLE || "approximation_orchestrator";
+    resourceTraceSnapshot("startup", "approximation orchestrator boot");
     const logger = new CSVLogger('approximation_approach_log.csv');
     const orchestrator = new Orchestrator("ApproximationApproachOperator");
     const aggregationFunction = getConfiguredAggregation();

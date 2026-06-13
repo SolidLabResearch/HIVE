@@ -13,10 +13,14 @@ import {
   getSubWindowRange,
   getSubWindowStep,
 } from "../util/runtimeConfig";
+import { resourceTraceSnapshot } from "../util/resourceTrace";
 /**
  *
  */
 async function StreamingQueryHiveApproachOrchestrator() {
+  process.env.HIVE_PROCESS_ROLE =
+    process.env.HIVE_PROCESS_ROLE || "chunked_orchestrator";
+  resourceTraceSnapshot("startup", "chunked orchestrator boot");
   const logger = new CSVLogger("streaming_query_chunk_aggregator_log.csv");
   const orchestrator = new Orchestrator(
     "StreamingQueryChunkAggregatorOperator",
@@ -109,6 +113,10 @@ WHERE {
   // Run sub-queries
   // Run registered query
   orchestrator.runRegisteredQuery();
+  resourceTraceSnapshot(
+    "registered_query_started",
+    "chunked orchestrator handed off to BeeWorker",
+  );
 }
 
 StreamingQueryHiveApproachOrchestrator().catch((error) => {

@@ -7,6 +7,8 @@ import { RSPQueryProcess } from "../../rsp/RSPQueryProcess";
 import { IStreamQueryOperator } from "../../util/Interfaces";
 import { CSVLogger } from "../../util/logger/CSVLogger";
 import { hash_string_md5, storeToString } from "../../util/Util";
+import { getCachedChunkRewrite, getCachedParsedQuery } from "../../util/queryCache";
+import { profileAsync, profileCount, profileSync, writeProfileArtifact } from "../../util/profiling";
 import { R2ROperator } from "./r2r";
 import {
   AggregationFunction,
@@ -22,6 +24,7 @@ import {
 } from "../../util/runtimeConfig";
 import { PartialChunkResult } from "../../util/chunkTypes";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
+import { resourceTraceSnapshot } from "../../util/resourceTrace";
 const N3 = require("n3");
 
 type SubqueryIdentity = {
@@ -36,6 +39,7 @@ type ChunkWindowDiagnostics = {
   count: number | null;
   sum: number | null;
   avg: number | null;
+  value: number | null;
   subqueries: string[];
 };
 
@@ -83,6 +87,13 @@ type ParentPartialDiagnostics = {
   internalChunks: ChunkWindowDiagnostics[];
 };
 
+type CompletedChunkGroupState = {
+  chunkGroupId: string;
+  start: number;
+  end: number;
+  summary: ChunkWindowDiagnostics;
+};
+
 type ChunkedDebugSummary = {
   chunkSizeMs: number;
   comparableOutputCadenceOnly: boolean;
@@ -120,8 +131,11 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private sessionId: string; // Unique session ID to isolate MQTT topics across iterations
   private latencyLogStream!: fs.WriteStream;
   private diagnosticsLogStream!: fs.WriteStream;
+  private parentPartialDiagnosticsStream!: fs.WriteStream;
   private chunkedDebugSummaryPath: string;
   private chunkedDebugSummary: ChunkedDebugSummary;
+  private chunkedDebugSummaryDirty: boolean = false;
+  private chunkedDebugSummaryFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private parentPartialDiagnosticsFilePath: string = "";
   private windowCount: number = 0; // Track window count for latency logging
   private queryRegisteredTime: number = 0; // Track when query was registered
@@ -144,6 +158,16 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private firstObservedEventTimestampByTopic: Map<string, number> = new Map();
   private lastObservedEventTimestampByTopic: Map<string, number> = new Map();
   private parentPartialAvailabilityLogged: boolean = false;
+  private cachedParsedQueries: Map<string, any> = new Map();
+  private cachedOutputQuery: string = "";
+  private cachedOutputQueryParsed: any = null;
+  private cachedChunkPlanKey: string = "";
+  private cachedChunkPlan: { chunkSize: number; rewrittenQueries: string[] } | null = null;
+  private mqttPublisherClient: any = null;
+  private activeMqttClients: any[] = [];
+  private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  private firstTickTimeout: ReturnType<typeof setTimeout> | null = null;
+  private cleanupRegistered: boolean = false;
   /**
    *
    */
@@ -177,8 +201,69 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       lastComparableWindowEnd: null,
     };
     this.initializeLatencyLogging();
-    this.persistChunkedDebugSummary();
+    this.persistChunkedDebugSummary(true);
     this.queryRegisteredTime = Date.now(); // Record when query is registered
+    this.registerCleanupHook();
+    resourceTraceSnapshot("startup", "chunked bee worker constructed");
+  }
+
+  private registerCleanupHook(): void {
+    if (this.cleanupRegistered) {
+      return;
+    }
+
+    this.cleanupRegistered = true;
+    process.once("exit", () => {
+      this.cleanup();
+    });
+  }
+
+  public cleanup(): void {
+    resourceTraceSnapshot("before_cleanup", "chunked bee worker cleanup");
+    profileSync("cleanup_time_ms", () => {
+      if (this.intervalHandle) {
+        clearInterval(this.intervalHandle);
+        this.intervalHandle = null;
+      }
+      if (this.firstTickTimeout) {
+        clearTimeout(this.firstTickTimeout);
+        this.firstTickTimeout = null;
+      }
+      if (this.chunkedDebugSummaryFlushTimer) {
+        clearTimeout(this.chunkedDebugSummaryFlushTimer);
+        this.chunkedDebugSummaryFlushTimer = null;
+      }
+
+      if (this.mqttPublisherClient) {
+        try {
+          this.mqttPublisherClient.end(true);
+        } catch (error) {
+          console.error("Failed to close chunked publisher client:", error);
+        }
+        this.mqttPublisherClient = null;
+      }
+
+      for (const client of this.activeMqttClients.splice(0)) {
+        try {
+          client.end(true);
+        } catch (error) {
+          console.error("Failed to close chunked MQTT client:", error);
+        }
+      }
+
+      if (this.latencyLogStream) {
+        this.latencyLogStream.end();
+      }
+      if (this.diagnosticsLogStream) {
+        this.diagnosticsLogStream.end();
+      }
+      if (this.parentPartialDiagnosticsStream) {
+        this.parentPartialDiagnosticsStream.end();
+      }
+    });
+    this.persistChunkedDebugSummary(true);
+    writeProfileArtifact();
+    resourceTraceSnapshot("after_cleanup", "chunked bee worker cleanup complete");
   }
 
   private resolveLogFilePath(fileName: string): string {
@@ -218,9 +303,15 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.parentPartialDiagnosticsFilePath = this.resolveLogFilePath(
       "chunked_parent_partial_latency_log.csv",
     );
-    if (!fs.existsSync(this.parentPartialDiagnosticsFilePath)) {
-      fs.writeFileSync(
-        this.parentPartialDiagnosticsFilePath,
+    const writeParentPartialHeader = !fs.existsSync(
+      this.parentPartialDiagnosticsFilePath,
+    );
+    this.parentPartialDiagnosticsStream = fs.createWriteStream(
+      this.parentPartialDiagnosticsFilePath,
+      { flags: "a" },
+    );
+    if (writeParentPartialHeader) {
+      this.parentPartialDiagnosticsStream.write(
         "output_type,comparable,benchmark_event_time_anchor,parent_window_number,parent_window_start,parent_window_end_or_covered_until,parent_range_ms,covered_duration_ms,chunks_used,event_count,sum,avg,result_value,emitted_at_ms,elapsed_since_registration_ms,delay_past_partial_trigger_ms,internal_chunk_ids,internal_chunks_json\n",
       );
     }
@@ -295,7 +386,25 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     }
   }
 
-  private persistChunkedDebugSummary(): void {
+  private persistChunkedDebugSummary(force = false): void {
+    this.chunkedDebugSummaryDirty = true;
+    if (!force) {
+      if (this.chunkedDebugSummaryFlushTimer) {
+        return;
+      }
+      this.chunkedDebugSummaryFlushTimer = setTimeout(() => {
+        this.chunkedDebugSummaryFlushTimer = null;
+        this.persistChunkedDebugSummary(true);
+      }, 250);
+      this.chunkedDebugSummaryFlushTimer.unref?.();
+      return;
+    }
+
+    if (!this.chunkedDebugSummaryDirty) {
+      return;
+    }
+
+    this.chunkedDebugSummaryDirty = false;
     fs.writeFileSync(
       this.chunkedDebugSummaryPath,
       JSON.stringify(this.chunkedDebugSummary, null, 2),
@@ -304,41 +413,112 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
   private normalizeChunkPayload(message: string): PartialChunkResult | null {
     try {
-      const parsed = JSON.parse(message);
-      if (
-        parsed &&
-        typeof parsed.queryId === "string" &&
-        typeof parsed.subqueryId === "string" &&
-        parsed.window &&
-        Number.isFinite(parsed.window.start) &&
-        Number.isFinite(parsed.window.end)
-      ) {
-        const chunkGroupId = getLogicalChunkGroupId(parsed);
-        return {
-          queryId: parsed.queryId,
-          subqueryId: parsed.subqueryId,
-          window: parsed.window,
-          chunkId: parsed.chunkId || `${chunkGroupId}:${parsed.subqueryId}`,
-          aggregateFunction: parsed.aggregateFunction,
-          value: Number.isFinite(Number(parsed.value))
-            ? Number(parsed.value)
-            : undefined,
-          count: Number.isFinite(Number(parsed.count))
-            ? Number(parsed.count)
-            : undefined,
-          sum: Number.isFinite(Number(parsed.sum))
-            ? Number(parsed.sum)
-            : undefined,
-          avg: Number.isFinite(Number(parsed.avg))
-            ? Number(parsed.avg)
-            : undefined,
-          rdfPayload: typeof parsed.rdfPayload === "string" ? parsed.rdfPayload : undefined,
-        };
-      }
+      return profileSync("serialization_parsing_ms", () => {
+        const parsed = JSON.parse(message);
+        if (
+          parsed &&
+          typeof parsed.queryId === "string" &&
+          typeof parsed.subqueryId === "string" &&
+          parsed.window &&
+          Number.isFinite(parsed.window.start) &&
+          Number.isFinite(parsed.window.end)
+        ) {
+          const chunkGroupId = getLogicalChunkGroupId(parsed);
+          return {
+            queryId: parsed.queryId,
+            subqueryId: parsed.subqueryId,
+            window: parsed.window,
+            chunkId: parsed.chunkId || `${chunkGroupId}:${parsed.subqueryId}`,
+            aggregateFunction: parsed.aggregateFunction,
+            value: Number.isFinite(Number(parsed.value))
+              ? Number(parsed.value)
+              : undefined,
+            count: Number.isFinite(Number(parsed.count))
+              ? Number(parsed.count)
+              : undefined,
+            sum: Number.isFinite(Number(parsed.sum))
+              ? Number(parsed.sum)
+              : undefined,
+            avg: Number.isFinite(Number(parsed.avg))
+              ? Number(parsed.avg)
+              : undefined,
+            rdfPayload: typeof parsed.rdfPayload === "string" ? parsed.rdfPayload : undefined,
+          };
+        }
+        return null;
+      });
     } catch {
       // legacy payload, keep null to skip structured aggregation
     }
     return null;
+  }
+
+  private canRecomposeStructuredPartial(
+    partial: PartialChunkResult,
+    aggregationFunction: AggregationFunction,
+  ): boolean {
+    if (aggregationFunction === "COUNT") {
+      return Number.isFinite(partial.count) || Number.isFinite(partial.value);
+    }
+    if (aggregationFunction === "SUM") {
+      return Number.isFinite(partial.sum) || Number.isFinite(partial.value);
+    }
+    if (aggregationFunction === "AVG") {
+      return (
+        Number.isFinite(partial.count) &&
+        (Number.isFinite(partial.sum) ||
+          Number.isFinite(partial.avg) ||
+          Number.isFinite(partial.value))
+      );
+    }
+    if (aggregationFunction === "MIN" || aggregationFunction === "MAX") {
+      return Number.isFinite(partial.value);
+    }
+    return false;
+  }
+
+  private compactStructuredPartial(
+    partial: PartialChunkResult,
+    aggregationFunction: AggregationFunction,
+  ): PartialChunkResult {
+    if (!this.canRecomposeStructuredPartial(partial, aggregationFunction)) {
+      return partial;
+    }
+
+    const { rdfPayload: _rdfPayload, ...compactPartial } = partial;
+    return compactPartial;
+  }
+
+  private insertCompletedChunkGroupOrdered(
+    orderedGroups: CompletedChunkGroupState[],
+    group: CompletedChunkGroupState,
+  ): void {
+    const lastGroup = orderedGroups[orderedGroups.length - 1];
+    if (!lastGroup || lastGroup.start <= group.start) {
+      orderedGroups.push(group);
+      return;
+    }
+
+    let low = 0;
+    let high = orderedGroups.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (orderedGroups[mid].start <= group.start) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    orderedGroups.splice(low, 0, group);
+  }
+
+  private hasContiguousChunkGroups(groups: CompletedChunkGroupState[]): boolean {
+    for (let index = 1; index < groups.length; index += 1) {
+      if (groups[index - 1].end !== groups[index].start) {
+        return false;
+      }
+    }
+    return true;
   }
 
   public collectChunkByWindow(
@@ -365,6 +545,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private summarizeChunkGroup(
     chunkGroupId: string,
     bySubquery: Map<string, PartialChunkResult>,
+    aggregationFunction: AggregationFunction,
   ): ChunkWindowDiagnostics {
     const partials = Array.from(bySubquery.values());
     const start = partials[0]?.window.start ?? 0;
@@ -401,6 +582,25 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       countAvailable && countTotal > 0 && sumAvailable
         ? sumTotal / countTotal
         : null;
+    let value: number | null = null;
+
+    if (aggregationFunction === "COUNT") {
+      value = countAvailable ? countTotal : null;
+    } else if (aggregationFunction === "SUM") {
+      value = sumAvailable ? sumTotal : null;
+    } else if (aggregationFunction === "AVG") {
+      value = avg;
+    } else if (aggregationFunction === "MIN") {
+      const mins = partials
+        .map((partial) => partial.value)
+        .filter((entry): entry is number => Number.isFinite(entry));
+      value = mins.length > 0 ? Math.min(...mins) : null;
+    } else if (aggregationFunction === "MAX") {
+      const maxs = partials
+        .map((partial) => partial.value)
+        .filter((entry): entry is number => Number.isFinite(entry));
+      value = maxs.length > 0 ? Math.max(...maxs) : null;
+    }
 
     return {
       chunkGroupId,
@@ -409,24 +609,20 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       count: countAvailable ? countTotal : null,
       sum: sumAvailable ? sumTotal : null,
       avg,
+      value,
       subqueries: partials.map((partial) => partial.subqueryId),
     };
   }
 
   private summarizeWindowRecomposition(
-    windowChunkGroups: Array<[string, Map<string, PartialChunkResult>]>,
+    windowChunkGroups: CompletedChunkGroupState[],
     aggregationFunction: AggregationFunction,
   ): WindowRecompositionSummary | null {
     if (windowChunkGroups.length === 0) {
       return null;
     }
 
-    const internalChunks = windowChunkGroups.map(([chunkGroupId, bySubquery]) =>
-      this.summarizeChunkGroup(chunkGroupId, bySubquery),
-    );
-    const allPartials = windowChunkGroups.flatMap(([, bySubquery]) =>
-      Array.from(bySubquery.values()),
-    );
+    const internalChunks = windowChunkGroups.map((group) => group.summary);
     const externalWindowStart = internalChunks[0].start;
     const externalWindowEnd = internalChunks[internalChunks.length - 1].end;
     let recomposedCount: number | null = null;
@@ -435,38 +631,32 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     let resultValue: number | null = null;
 
     if (aggregationFunction === "COUNT") {
-      const totalCount = allPartials.reduce(
-        (sum, partial) => sum + (Number.isFinite(partial.count) ? (partial.count as number) : 0),
+      const totalCount = internalChunks.reduce(
+        (sum, chunk) => sum + (Number.isFinite(chunk.count) ? (chunk.count as number) : 0),
         0,
       );
       recomposedCount = totalCount;
       resultValue = totalCount;
     } else if (aggregationFunction === "SUM") {
-      const totalSum = allPartials.reduce((sum, partial) => {
-        if (Number.isFinite(partial.sum)) {
-          return sum + (partial.sum as number);
+      const totalSum = internalChunks.reduce((sum, chunk) => {
+        if (Number.isFinite(chunk.sum)) {
+          return sum + (chunk.sum as number);
         }
-        if (Number.isFinite(partial.value)) {
-          return sum + (partial.value as number);
+        if (Number.isFinite(chunk.value)) {
+          return sum + (chunk.value as number);
         }
         return sum;
       }, 0);
       recomposedSum = totalSum;
       resultValue = totalSum;
     } else if (aggregationFunction === "AVG") {
-      const totalCount = allPartials.reduce(
-        (sum, partial) => sum + (Number.isFinite(partial.count) ? (partial.count as number) : 0),
+      const totalCount = internalChunks.reduce(
+        (sum, chunk) => sum + (Number.isFinite(chunk.count) ? (chunk.count as number) : 0),
         0,
       );
-      const totalSum = allPartials.reduce((sum, partial) => {
-        if (Number.isFinite(partial.sum)) {
-          return sum + (partial.sum as number);
-        }
-        if (Number.isFinite(partial.avg) && Number.isFinite(partial.count)) {
-          return sum + (partial.avg as number) * (partial.count as number);
-        }
-        if (Number.isFinite(partial.value) && Number.isFinite(partial.count)) {
-          return sum + (partial.value as number) * (partial.count as number);
+      const totalSum = internalChunks.reduce((sum, chunk) => {
+        if (Number.isFinite(chunk.sum)) {
+          return sum + (chunk.sum as number);
         }
         return sum;
       }, 0);
@@ -475,13 +665,13 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       recomposedAvg = totalCount > 0 ? totalSum / totalCount : null;
       resultValue = recomposedAvg;
     } else if (aggregationFunction === "MIN") {
-      const mins = allPartials
-        .map((partial) => partial.value)
+      const mins = internalChunks
+        .map((chunk) => chunk.value)
         .filter((value): value is number => Number.isFinite(value));
       resultValue = mins.length > 0 ? Math.min(...mins) : null;
     } else if (aggregationFunction === "MAX") {
-      const maxs = allPartials
-        .map((partial) => partial.value)
+      const maxs = internalChunks
+        .map((chunk) => chunk.value)
         .filter((value): value is number => Number.isFinite(value));
       resultValue = maxs.length > 0 ? Math.max(...maxs) : null;
     }
@@ -503,12 +693,11 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   }
 
   private recomposeComparableWindow(
-    windowChunkGroups: Array<[string, Map<string, PartialChunkResult>]>,
+    windowChunkGroups: CompletedChunkGroupState[],
     aggregationFunction: AggregationFunction,
   ): ComparableWindowDiagnostics | null {
-    const summary = this.summarizeWindowRecomposition(
-      windowChunkGroups,
-      aggregationFunction,
+    const summary = profileSync("structured_recomposition_time_ms", () =>
+      this.summarizeWindowRecomposition(windowChunkGroups, aggregationFunction),
     );
 
     if (!summary) {
@@ -529,80 +718,88 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   }
 
   private writeComparableDiagnostics(diagnostics: ComparableWindowDiagnostics): void {
-    if (this.diagnosticsLogStream) {
-      this.diagnosticsLogStream.write(
-        `${this.benchmarkEventTimeAnchor ?? ""},${diagnostics.externalWindowNumber},${diagnostics.externalWindowStart},${diagnostics.externalWindowEnd},"${diagnostics.internalChunkGroupIds.join("|")}","${JSON.stringify(diagnostics.internalChunks).replace(/"/g, '""')}",${diagnostics.recomposedCount ?? ""},${diagnostics.recomposedSum ?? ""},${diagnostics.recomposedAvg ?? ""},${diagnostics.resultValue}\n`,
+    profileSync("diagnostics_write_time_ms", () => {
+      if (this.diagnosticsLogStream) {
+        this.diagnosticsLogStream.write(
+          `${this.benchmarkEventTimeAnchor ?? ""},${diagnostics.externalWindowNumber},${diagnostics.externalWindowStart},${diagnostics.externalWindowEnd},"${diagnostics.internalChunkGroupIds.join("|")}","${JSON.stringify(diagnostics.internalChunks).replace(/"/g, '""')}",${diagnostics.recomposedCount ?? ""},${diagnostics.recomposedSum ?? ""},${diagnostics.recomposedAvg ?? ""},${diagnostics.resultValue}\n`,
+        );
+      }
+    });
+    if (this.debugChunksEnabled) {
+      this.logger.log(
+        `Chunked window diagnostics: ${JSON.stringify({
+          benchmark_event_time_anchor: this.benchmarkEventTimeAnchor,
+          external_window_number: diagnostics.externalWindowNumber,
+          external_window_start: diagnostics.externalWindowStart,
+          external_window_end: diagnostics.externalWindowEnd,
+          internal_chunks_used: diagnostics.internalChunkGroupIds,
+          internal_chunks: diagnostics.internalChunks,
+          recomposed_count: diagnostics.recomposedCount,
+          recomposed_sum: diagnostics.recomposedSum,
+          recomposed_avg: diagnostics.recomposedAvg,
+          result_value: diagnostics.resultValue,
+        })}`,
       );
     }
-    this.logger.log(
-      `Chunked window diagnostics: ${JSON.stringify({
-        benchmark_event_time_anchor: this.benchmarkEventTimeAnchor,
-        external_window_number: diagnostics.externalWindowNumber,
-        external_window_start: diagnostics.externalWindowStart,
-        external_window_end: diagnostics.externalWindowEnd,
-        internal_chunks_used: diagnostics.internalChunkGroupIds,
-        internal_chunks: diagnostics.internalChunks,
-        recomposed_count: diagnostics.recomposedCount,
-        recomposed_sum: diagnostics.recomposedSum,
-        recomposed_avg: diagnostics.recomposedAvg,
-        result_value: diagnostics.resultValue,
-      })}`,
-    );
   }
 
   private writeParentPartialDiagnostics(
     diagnostics: ParentPartialDiagnostics,
   ): void {
-    if (this.parentPartialDiagnosticsFilePath) {
-      const internalChunksJson = JSON.stringify(diagnostics.internalChunks).replace(
-        /"/g,
-        '""',
-      );
-      const line = [
-        diagnostics.outputType,
-        String(diagnostics.comparable),
-        diagnostics.benchmarkEventTimeAnchor ?? "",
-        diagnostics.parentWindowNumber,
-        diagnostics.parentWindowStart,
-        diagnostics.parentWindowEndOrCoveredUntil,
-        diagnostics.parentRangeMs,
-        diagnostics.coveredDurationMs,
-        diagnostics.chunksUsed,
-        diagnostics.eventCount ?? "",
-        diagnostics.sum ?? "",
-        diagnostics.avg ?? "",
-        diagnostics.resultValue,
-        diagnostics.emittedAtMs,
-        diagnostics.elapsedSinceRegistrationMs,
-        diagnostics.delayPastPartialTriggerMs,
-        `"${diagnostics.internalChunkIds.join("|")}"`,
-        `"${internalChunksJson}"`,
-      ].join(",");
-      fs.appendFileSync(this.parentPartialDiagnosticsFilePath, `${line}\n`);
-    }
+    profileSync("diagnostics_write_time_ms", () => {
+      if (this.parentPartialDiagnosticsStream) {
+        const internalChunksJson = JSON.stringify(diagnostics.internalChunks).replace(
+          /"/g,
+          '""',
+        );
+        const line = [
+          diagnostics.outputType,
+          String(diagnostics.comparable),
+          diagnostics.benchmarkEventTimeAnchor ?? "",
+          diagnostics.parentWindowNumber,
+          diagnostics.parentWindowStart,
+          diagnostics.parentWindowEndOrCoveredUntil,
+          diagnostics.parentRangeMs,
+          diagnostics.coveredDurationMs,
+          diagnostics.chunksUsed,
+          diagnostics.eventCount ?? "",
+          diagnostics.sum ?? "",
+          diagnostics.avg ?? "",
+          diagnostics.resultValue,
+          diagnostics.emittedAtMs,
+          diagnostics.elapsedSinceRegistrationMs,
+          diagnostics.delayPastPartialTriggerMs,
+          `"${diagnostics.internalChunkIds.join("|")}"`,
+          `"${internalChunksJson}"`,
+        ].join(",");
+        this.parentPartialDiagnosticsStream.write(`${line}\n`);
+      }
+    });
 
-    this.logger.log(
-      `Chunked parent partial diagnostics: ${JSON.stringify({
-        output_type: diagnostics.outputType,
-        comparable: diagnostics.comparable,
-        benchmark_event_time_anchor: diagnostics.benchmarkEventTimeAnchor,
-        parent_window_number: diagnostics.parentWindowNumber,
-        parent_window_start: diagnostics.parentWindowStart,
-        parent_window_end_or_covered_until: diagnostics.parentWindowEndOrCoveredUntil,
-        parent_range_ms: diagnostics.parentRangeMs,
-        covered_duration_ms: diagnostics.coveredDurationMs,
-        chunks_used: diagnostics.chunksUsed,
-        event_count: diagnostics.eventCount,
-        sum: diagnostics.sum,
-        avg: diagnostics.avg,
-        result_value: diagnostics.resultValue,
-        emitted_at_ms: diagnostics.emittedAtMs,
-        elapsed_since_registration_ms: diagnostics.elapsedSinceRegistrationMs,
-        delay_past_partial_trigger_ms: diagnostics.delayPastPartialTriggerMs,
-        internal_chunk_ids: diagnostics.internalChunkIds,
-        internal_chunks: diagnostics.internalChunks,
-      })}`,
-    );
+    if (this.debugChunksEnabled) {
+      this.logger.log(
+        `Chunked parent partial diagnostics: ${JSON.stringify({
+          output_type: diagnostics.outputType,
+          comparable: diagnostics.comparable,
+          benchmark_event_time_anchor: diagnostics.benchmarkEventTimeAnchor,
+          parent_window_number: diagnostics.parentWindowNumber,
+          parent_window_start: diagnostics.parentWindowStart,
+          parent_window_end_or_covered_until: diagnostics.parentWindowEndOrCoveredUntil,
+          parent_range_ms: diagnostics.parentRangeMs,
+          covered_duration_ms: diagnostics.coveredDurationMs,
+          chunks_used: diagnostics.chunksUsed,
+          event_count: diagnostics.eventCount,
+          sum: diagnostics.sum,
+          avg: diagnostics.avg,
+          result_value: diagnostics.resultValue,
+          emitted_at_ms: diagnostics.emittedAtMs,
+          elapsed_since_registration_ms: diagnostics.elapsedSinceRegistrationMs,
+          delay_past_partial_trigger_ms: diagnostics.delayPastPartialTriggerMs,
+          internal_chunk_ids: diagnostics.internalChunkIds,
+          internal_chunks: diagnostics.internalChunks,
+        })}`,
+      );
+    }
   }
 
   /**
@@ -661,6 +858,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   async handleAggregation(): Promise<void> {
     this.logger.log("Starting aggregation process for subqueries.");
     await this.initializeSubQueryProcesses();
+    resourceTraceSnapshot(
+      "after_subquery_processes_start",
+      "chunked subquery processes initialized",
+    );
     this.logger.log("SubQuery Processes initialized for aggregation.");
 
     if (this.subQueries.length === 0) {
@@ -691,7 +892,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       console.error("Output query is not set or is undefined.");
       return;
     }
-    const outputQueryParsed = this.parser.parse(this.outputQuery);
+    const outputQueryParsed = getCachedParsedQuery<any>(this.parser, this.outputQuery);
+    this.cachedOutputQuery = this.outputQuery;
+    this.cachedOutputQueryParsed = outputQueryParsed;
     if (!outputQueryParsed) {
       console.error(`Failed to parse output query: ${this.outputQuery}`);
       return;
@@ -716,25 +919,34 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       return;
     }
 
-    const rsp_client = mqtt.connect(this.mqttBroker, {
+    const chunkClient = mqtt.connect(this.mqttBroker, {
       clean: useCleanMqttSessionsForBenchmark(),
     });
+    this.activeMqttClients.push(chunkClient);
+    profileCount("mqtt_clients_created");
     this.logger.log(`Connecting to MQTT broker at ${this.mqttBroker}...`);
-    rsp_client.on("error", (err) => {
+    chunkClient.on("error", (err) => {
       console.error("MQTT connection error:", err);
     });
-    rsp_client.on("offline", () => {
+    chunkClient.on("offline", () => {
       console.error(
         "MQTT client is offline. Please check the broker connection.",
       );
     });
-    rsp_client.on("reconnect", () => {
+    chunkClient.on("reconnect", () => {
       this.logger.log("Reconnecting to MQTT broker...");
     });
 
     const that = this;
 
-    rsp_client.on("connect", () => {
+    chunkClient.on("connect", () => {
+      resourceTraceSnapshot(
+        "after_mqtt_subscriptions_ready",
+        "chunk aggregator connected and subscribing",
+        {
+          expectedSubqueryTopics: that.subQueryMQTTTopicMap.size,
+        },
+      );
       this.logger.log(
         `subQueryTopicMap : ${JSON.stringify(that.subQueryMQTTTopicMap)}`,
       );
@@ -748,15 +960,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       );
       this.chunkedDebugSummary.expectedSubqueryCount = expectedSubqueryIds.length;
       this.chunkedDebugSummary.expectedSubqueryIds = [...expectedSubqueryIds];
-      this.logger.log(`topics to subscribe: ${topics}`);
-      // TODO : Remove hardcoded topics, use the topics from subQueryMQTTTopicMap but currently there is a bug in the subQueryMQTTTopicMap that prevents it from being used correctly.
-      // TODO : Such that only one topic is subscribed to at a time.
-      let topicsOfProcesses: string[] = [
-        "chunked/f8eec45a01e39e93d117673df8915525",
-        "chunked/b22681cadced9975b3b35cb47f82bb40",
-      ];
-
-      topicsOfProcesses = topics;
+      const topicsOfProcesses = Array.from(new Set(topics));
+      this.logger.log(`topics to subscribe: ${topicsOfProcesses}`);
       this.chunkedDebugSummary.subscribedTopics = [...topicsOfProcesses];
       this.persistChunkedDebugSummary();
 
@@ -770,7 +975,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         return;
       }
       for (const mqttTopic of topicsOfProcesses) {
-        rsp_client.subscribe(`${mqttTopic}`, (err) => {
+        chunkClient.subscribe(`${mqttTopic}`, (err) => {
           if (err) {
             this.logger.log(
               `Failed to subscribe to topic ${mqttTopic}: ${err}`,
@@ -782,7 +987,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       }
 
       const chunksByWindow: Map<string, Map<string, PartialChunkResult>> = new Map();
-      const completedChunkGroups: Map<string, Map<string, PartialChunkResult>> = new Map();
+      const completedChunkGroups: Map<string, CompletedChunkGroupState> = new Map();
+      const orderedCompletedChunkGroups: CompletedChunkGroupState[] = [];
+      const readyChunkGroupIds: string[] = [];
+      const readyChunkGroupSet = new Set<string>();
       let nextComparableWindowStartIndex = 0;
       this.logger.log(
         `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
@@ -807,35 +1015,6 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         `Comparable window sizing: comparableWindowWidth=${comparableWindowWidth}, chunksPerComparableWindow=${chunksPerComparableWindow}, chunkGroupsPerOutputStep=${chunkGroupsPerOutputStep}`,
       );
 
-      const sortCompletedChunkGroups = () =>
-        Array.from(completedChunkGroups.entries()).sort((a, b) => {
-          const aStart = a[1].values().next().value?.window?.start ?? 0;
-          const bStart = b[1].values().next().value?.window?.start ?? 0;
-          return aStart - bStart;
-        });
-
-      const getCompleteChunkGroupsForPartial = () => {
-        const mergedGroups = new Map<string, Map<string, PartialChunkResult>>();
-
-        for (const [chunkGroupId, bySubquery] of completedChunkGroups.entries()) {
-          mergedGroups.set(chunkGroupId, new Map(bySubquery));
-        }
-
-        for (const [chunkGroupId, bySubquery] of chunksByWindow.entries()) {
-          if (
-            expectedSubqueryIds.every((subqueryId) => bySubquery.has(subqueryId))
-          ) {
-            mergedGroups.set(chunkGroupId, new Map(bySubquery));
-          }
-        }
-
-        return Array.from(mergedGroups.entries()).sort((a, b) => {
-          const aStart = a[1].values().next().value?.window?.start ?? 0;
-          const bStart = b[1].values().next().value?.window?.start ?? 0;
-          return aStart - bStart;
-        });
-      };
-
       // Helper function to process chunks - used by both immediate trigger and interval fallback
       const processChunks = async (triggerSource: string) => {
         // Prevent concurrent processing
@@ -851,17 +1030,17 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         // Record when processing is triggered (before any processing)
         this.intervalTriggerTime = Date.now();
 
-        const readyGroups = Array.from(chunksByWindow.entries()).filter(
-          ([, bySubquery]) => expectedSubqueryIds.every((subqueryId) => bySubquery.has(subqueryId)),
-        );
+        const readyGroups: Array<[string, Map<string, PartialChunkResult>]> = [];
+        while (readyChunkGroupIds.length > 0) {
+          const chunkGroupId = readyChunkGroupIds.shift()!;
+          readyChunkGroupSet.delete(chunkGroupId);
+          const bySubquery = chunksByWindow.get(chunkGroupId);
+          if (bySubquery) {
+            readyGroups.push([chunkGroupId, bySubquery]);
+          }
+        }
 
         if (readyGroups.length === 0) {
-          for (const [chunkGroupId, bySubquery] of chunksByWindow.entries()) {
-            const missing = expectedSubqueryIds.filter((subqueryId) => !bySubquery.has(subqueryId));
-            this.debugChunkLog(
-              `${triggerSource}: waiting chunkGroupId=${chunkGroupId}; received=${Array.from(bySubquery.keys()).join(",") || "none"}; missing=${missing.join(",") || "none"}`,
-            );
-          }
           this.processingInProgress = false;
           return;
         }
@@ -873,19 +1052,34 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         });
 
         for (const [chunkGroupId, bySubquery] of readyGroups) {
-          const chunksForAggregation: string[] = [];
+          const partialsForAggregation: PartialChunkResult[] = [];
           for (const subqueryId of expectedSubqueryIds) {
             const partial = bySubquery.get(subqueryId);
-            if (!partial) continue;
-            if (partial.rdfPayload) {
-              chunksForAggregation.push(partial.rdfPayload);
+            if (partial) {
+              partialsForAggregation.push(partial);
             }
           }
 
-          if (chunksForAggregation.length === expectedSubqueryIds.length) {
+          if (partialsForAggregation.length === expectedSubqueryIds.length) {
             if (this.comparableOutputCadenceOnly) {
-              completedChunkGroups.set(chunkGroupId, new Map(bySubquery));
+              const summary = this.summarizeChunkGroup(
+                chunkGroupId,
+                bySubquery,
+                outputAggregationFunction,
+              );
+              const completedGroup = {
+                chunkGroupId,
+                start: summary.start,
+                end: summary.end,
+                summary,
+              };
+              completedChunkGroups.set(chunkGroupId, completedGroup);
+              this.insertCompletedChunkGroupOrdered(
+                orderedCompletedChunkGroups,
+                completedGroup,
+              );
               this.chunkedDebugSummary.completedChunkGroupCount += 1;
+              profileCount("chunk_groups_completed");
               this.debugChunkLog(
                 `buffered complete chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
               );
@@ -893,47 +1087,58 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               this.debugChunkLog(
                 `final emission chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
               );
-              await this.executeR2ROperator(chunksForAggregation, chunkGroupId);
+              await this.executeR2ROperator(
+                partialsForAggregation,
+                chunkGroupId,
+                undefined,
+                outputAggregationFunction,
+              );
             }
             chunksByWindow.delete(chunkGroupId);
           } else {
             this.logger.log(
-              `${triggerSource}: chunkGroupId=${chunkGroupId} skipped due to incomplete rdfPayload coverage (${chunksForAggregation.length}/${expectedSubqueryIds.length})`,
+              `${triggerSource}: chunkGroupId=${chunkGroupId} skipped due to incomplete coverage (${partialsForAggregation.length}/${expectedSubqueryIds.length})`,
             );
           }
         }
 
         if (this.comparableOutputCadenceOnly) {
-          const orderedGroups = sortCompletedChunkGroups();
           while (
             nextComparableWindowStartIndex + chunksPerComparableWindow <=
-            orderedGroups.length
+            orderedCompletedChunkGroups.length
           ) {
-            const windowChunkGroups = orderedGroups.slice(
+            const windowChunkGroups = orderedCompletedChunkGroups.slice(
               nextComparableWindowStartIndex,
               nextComparableWindowStartIndex + chunksPerComparableWindow,
             );
-            const comparableChunkPayloads: string[] = [];
-
-            for (const [, bySubquery] of windowChunkGroups) {
-              for (const subqueryId of expectedSubqueryIds) {
-                const partial = bySubquery.get(subqueryId);
-                if (partial?.rdfPayload) {
-                  comparableChunkPayloads.push(partial.rdfPayload);
-                }
-              }
+            if (!this.hasContiguousChunkGroups(windowChunkGroups)) {
+              profileCount("missingChunkGroups");
+              break;
             }
 
-            const firstGroupId = windowChunkGroups[0]?.[0] ?? "unknown";
+            const firstGroupId = windowChunkGroups[0]?.chunkGroupId ?? "unknown";
             const lastGroupId =
-              windowChunkGroups[windowChunkGroups.length - 1]?.[0] ?? "unknown";
+              windowChunkGroups[windowChunkGroups.length - 1]?.chunkGroupId ??
+              "unknown";
             const comparableWindowId = `${firstGroupId}..${lastGroupId}`;
             const comparableDiagnostics = this.recomposeComparableWindow(
               windowChunkGroups,
               outputAggregationFunction,
             );
             if (comparableDiagnostics) {
+              if (this.windowCount === 0) {
+                resourceTraceSnapshot(
+                  "after_first_comparable_window_emitted",
+                  "first comparable window ready",
+                  {
+                    externalWindowStart:
+                      comparableDiagnostics.externalWindowStart,
+                    externalWindowEnd: comparableDiagnostics.externalWindowEnd,
+                  },
+                );
+              }
               this.chunkedDebugSummary.comparableWindowEmissionCount += 1;
+              profileCount("comparable_windows_emitted");
               this.chunkedDebugSummary.lastComparableWindowStart =
                 comparableDiagnostics.externalWindowStart;
               this.chunkedDebugSummary.lastComparableWindowEnd =
@@ -941,32 +1146,73 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             }
 
             this.debugChunkLog(
-              `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}; payloads=${comparableChunkPayloads.length}`,
+              `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}`,
             );
             await this.executeR2ROperator(
-              comparableChunkPayloads,
+              [],
               comparableWindowId,
               comparableDiagnostics ?? undefined,
+              outputAggregationFunction,
             );
             this.persistChunkedDebugSummary();
             nextComparableWindowStartIndex += chunkGroupsPerOutputStep;
           }
 
-          if (nextComparableWindowStartIndex > 0) {
-            const orderedGroups = sortCompletedChunkGroups();
-            const retainedGroups = orderedGroups.slice(
-              Math.max(
-                0,
-                nextComparableWindowStartIndex - chunkGroupsPerOutputStep,
-              ),
+          if (
+            !this.parentPartialAvailabilityLogged &&
+            orderedCompletedChunkGroups.length >= chunkGroupsPerOutputStep
+          ) {
+            const parentPartialGroups = orderedCompletedChunkGroups.slice(
+              0,
+              chunkGroupsPerOutputStep,
             );
-            completedChunkGroups.clear();
-            for (const [chunkGroupId, bySubquery] of retainedGroups) {
-              completedChunkGroups.set(chunkGroupId, bySubquery);
+            const parentPartialSummary = this.summarizeWindowRecomposition(
+              parentPartialGroups,
+              outputAggregationFunction,
+            );
+            if (parentPartialSummary) {
+              const emittedAtMs = Date.now();
+              this.writeParentPartialDiagnostics({
+                outputType: "parent_partial",
+                comparable: false,
+                benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                parentWindowNumber: 1,
+                parentWindowStart:
+                  this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime,
+                parentWindowEndOrCoveredUntil:
+                  (this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime) +
+                  this.windowSlide,
+                parentRangeMs: this.windowRange,
+                coveredDurationMs: this.windowSlide,
+                chunksUsed: chunkGroupsPerOutputStep,
+                eventCount: parentPartialSummary.recomposedCount,
+                sum: parentPartialSummary.recomposedSum,
+                avg: parentPartialSummary.recomposedAvg,
+                resultValue: parentPartialSummary.resultValue,
+                emittedAtMs,
+                elapsedSinceRegistrationMs:
+                  emittedAtMs - this.queryRegisteredTime,
+                delayPastPartialTriggerMs:
+                  emittedAtMs - (this.queryRegisteredTime + this.windowSlide),
+                internalChunkIds: parentPartialSummary.internalChunkGroupIds,
+                internalChunks: parentPartialSummary.internalChunks,
+              });
+              this.parentPartialAvailabilityLogged = true;
+            }
+          }
+
+          if (nextComparableWindowStartIndex > 0) {
+            const retainFrom = Math.max(
+              0,
+              nextComparableWindowStartIndex - chunkGroupsPerOutputStep,
+            );
+            const evictedGroups = orderedCompletedChunkGroups.splice(0, retainFrom);
+            for (const group of evictedGroups) {
+              completedChunkGroups.delete(group.chunkGroupId);
             }
             nextComparableWindowStartIndex = Math.min(
               chunkGroupsPerOutputStep,
-              completedChunkGroups.size,
+              orderedCompletedChunkGroups.length,
             );
           }
         }
@@ -975,16 +1221,19 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       };
 
       // Interval handle — will be started (and restarted) aligned to first data arrival
-      let intervalHandle: ReturnType<typeof setInterval> | null = null;
-
-      rsp_client.on("message", async (topic, message) => {
-        this.logger.log(
-          `Received message on topic ${topic}: ${message.toString()}`,
-        );
+      chunkClient.on("message", async (topic: string, message: any) => {
+        if (this.debugChunksEnabled) {
+          this.logger.log(`Received chunk message on topic ${topic}`);
+        }
 
         // Track when data is received for latency calculations
         const now = Date.now();
         if (this.firstDataReceivedTime === 0) {
+          resourceTraceSnapshot(
+            "after_first_chunk_received",
+            "first chunk result received",
+            { topic },
+          );
           this.firstDataReceivedTime = now;
           this.lastProcessedTime = 0; // Reset to allow first processing
           this.logger.log(
@@ -995,13 +1244,13 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           // t0 + N * outputQuerySlide rather than firstDataReceivedTime + N *
           // outputQuerySlide. This removes the artificial sub-window-step delay
           // that inflated chunked latency measurements (BUG-001).
-          if (intervalHandle) clearInterval(intervalHandle);
+          if (this.intervalHandle) clearInterval(this.intervalHandle);
           const elapsed = now - this.queryRegisteredTime;
           const firstTickDelay =
             outputQuerySlide - (elapsed % outputQuerySlide);
-          setTimeout(() => {
-            processChunks("Interval");
-            intervalHandle = setInterval(async () => {
+          this.firstTickTimeout = setTimeout(() => {
+            void processChunks("Interval");
+            this.intervalHandle = setInterval(async () => {
               await processChunks("Interval");
             }, outputQuerySlide);
           }, firstTickDelay);
@@ -1011,6 +1260,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
         this.lastChunkReceivedTime = now;
         this.chunkedDebugSummary.receivedChunkMessageCount += 1;
+        profileCount("mqtt_messages_received");
 
         const normalized = this.normalizeChunkPayload(message.toString());
         if (normalized) {
@@ -1029,78 +1279,40 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           const expectedSubqueryId = topicToSubqueryId.get(topic);
           const effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
           const chunkGroupId = getLogicalChunkGroupId(normalized);
-          const bySubquery = chunksByWindow.get(chunkGroupId) ?? new Map<string, PartialChunkResult>();
+          const bySubquery =
+            chunksByWindow.get(chunkGroupId) ??
+            new Map<string, PartialChunkResult>();
           const existing = bySubquery.get(effectiveSubqueryId);
           if (!existing) {
             const outcome = this.collectChunkByWindow(
               chunksByWindow,
               {
-              ...normalized,
-              subqueryId: effectiveSubqueryId,
+                ...this.compactStructuredPartial(
+                  normalized,
+                  outputAggregationFunction,
+                ),
+                subqueryId: effectiveSubqueryId,
               },
               expectedSubqueryIds,
             );
-                      this.debugChunkLog(
-                        `received chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${outcome.chunkGroupId}; completeness=${expectedSubqueryIds.length - outcome.missingSubqueryIds.length}/${expectedSubqueryIds.length}; missing=${outcome.missingSubqueryIds.join(",") || "none"}`,
-                      );
-                      if (
-                        this.comparableOutputCadenceOnly &&
-                        !this.parentPartialAvailabilityLogged
-                      ) {
-                        const readyGroupsForPartial =
-                          getCompleteChunkGroupsForPartial();
-                        if (readyGroupsForPartial.length >= chunkGroupsPerOutputStep) {
-                          const parentPartialGroups = readyGroupsForPartial.slice(
-                            0,
-                            chunkGroupsPerOutputStep,
-                          );
-                          const parentPartialSummary =
-                            this.summarizeWindowRecomposition(
-                              parentPartialGroups,
-                              outputAggregationFunction,
-                            );
-                          if (parentPartialSummary) {
-                            const emittedAtMs = Date.now();
-                            this.writeParentPartialDiagnostics({
-                              outputType: "parent_partial",
-                              comparable: false,
-                              benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                              parentWindowNumber: 1,
-                              parentWindowStart:
-                                this.benchmarkEventTimeAnchor ??
-                                this.queryRegisteredTime,
-                              parentWindowEndOrCoveredUntil:
-                                (this.benchmarkEventTimeAnchor ??
-                                  this.queryRegisteredTime) +
-                                this.windowSlide,
-                              parentRangeMs: this.windowRange,
-                              coveredDurationMs: this.windowSlide,
-                              chunksUsed: chunkGroupsPerOutputStep,
-                              eventCount: parentPartialSummary.recomposedCount,
-                              sum: parentPartialSummary.recomposedSum,
-                              avg: parentPartialSummary.recomposedAvg,
-                              resultValue: parentPartialSummary.resultValue,
-                              emittedAtMs,
-                              elapsedSinceRegistrationMs:
-                                emittedAtMs - this.queryRegisteredTime,
-                              delayPastPartialTriggerMs:
-                                emittedAtMs -
-                                (this.queryRegisteredTime + this.windowSlide),
-                              internalChunkIds:
-                                parentPartialSummary.internalChunkGroupIds,
-                              internalChunks: parentPartialSummary.internalChunks,
-                            });
-                            this.parentPartialAvailabilityLogged = true;
-                            this.persistChunkedDebugSummary();
-                          }
-                        }
-                      }
-                    } else {
-                      this.duplicateChunkCount += 1;
-                      this.chunkedDebugSummary.duplicateChunkCount =
-                        this.duplicateChunkCount;
-                      this.debugChunkLog(
-                        `duplicate chunk ignored chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${chunkGroupId}; existingChunkId=${existing.chunkId}`,
+            this.debugChunkLog(
+              `received chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${outcome.chunkGroupId}; completeness=${expectedSubqueryIds.length - outcome.missingSubqueryIds.length}/${expectedSubqueryIds.length}; missing=${outcome.missingSubqueryIds.join(",") || "none"}`,
+            );
+            profileCount("buffered_chunk_results");
+            if (
+              outcome.isComplete &&
+              !readyChunkGroupSet.has(outcome.chunkGroupId)
+            ) {
+              readyChunkGroupSet.add(outcome.chunkGroupId);
+              readyChunkGroupIds.push(outcome.chunkGroupId);
+            }
+          } else {
+            this.duplicateChunkCount += 1;
+            this.chunkedDebugSummary.duplicateChunkCount =
+              this.duplicateChunkCount;
+            profileCount("duplicateChunkCount");
+            this.debugChunkLog(
+              `duplicate chunk ignored chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${chunkGroupId}; existingChunkId=${existing.chunkId}`,
             );
           }
         } else {
@@ -1123,7 +1335,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       // Initial interval — runs at startup as a safety net before first data arrives.
       // Once the first chunk is received, this is cleared and restarted aligned to
       // firstDataReceivedTime so that subsequent ticks fire at exact STEP boundaries.
-      intervalHandle = setInterval(async () => {
+      this.intervalHandle = setInterval(async () => {
         await processChunks("Interval");
       }, outputQuerySlide);
     });
@@ -1167,16 +1379,156 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     return false;
   }
 
+  private getChunkPlanCacheKey(): string {
+    return `${this.outputQuery}::${this.subQueries.join("\u0001")}`;
+  }
+
+  private buildChunkPlan(): { chunkSize: number; rewrittenQueries: string[] } {
+    const chunkSize = this.findGCDChunk(this.subQueries, this.outputQuery);
+    const rewriteChunkQuery = new RewriteChunkQuery(chunkSize, chunkSize);
+    const rewrittenQueries = this.subQueries.map((subQuery) =>
+      profileSync("query_rewriting_ms", () =>
+        getCachedChunkRewrite(rewriteChunkQuery, subQuery, chunkSize),
+      ),
+    );
+
+    return { chunkSize, rewrittenQueries };
+  }
+
+  private getOrBuildChunkPlan(): { chunkSize: number; rewrittenQueries: string[] } {
+    const cacheKey = this.getChunkPlanCacheKey();
+    if (this.cachedChunkPlan && this.cachedChunkPlanKey === cacheKey) {
+      return this.cachedChunkPlan;
+    }
+
+    const plan = profileSync("chunk_plan_ms", () => this.buildChunkPlan());
+    this.cachedChunkPlan = plan;
+    this.cachedChunkPlanKey = cacheKey;
+    return plan;
+  }
+
+  private getOrCreatePublisherClient(): any {
+    if (this.mqttPublisherClient) {
+      return this.mqttPublisherClient;
+    }
+
+    this.mqttPublisherClient = mqtt.connect(this.mqttBroker, {
+      clean: useCleanMqttSessionsForBenchmark(),
+    });
+    this.activeMqttClients.push(this.mqttPublisherClient);
+    profileCount("mqtt_clients_created");
+    return this.mqttPublisherClient;
+  }
+
+  private publishWithSharedClient(
+    topic: string,
+    payload: string,
+    options: { qos?: number } = {},
+  ): Promise<void> {
+    const client = this.getOrCreatePublisherClient();
+    return new Promise((resolve) => {
+      const publish = () => {
+        client.publish(topic, payload, options, (err: any) => {
+          if (err) {
+            console.error(`Error publishing to topic ${topic}:`, err);
+          }
+          profileCount("mqtt_messages_published");
+          resolve();
+        });
+      };
+
+      if (client.connected) {
+        publish();
+      } else {
+        client.once("connect", publish);
+      }
+    });
+  }
+
+  private recomputeExactResultFromPartials(
+    partials: PartialChunkResult[],
+    aggregationFunction: AggregationFunction,
+  ): number | null {
+    if (partials.length === 0) {
+      return null;
+    }
+
+    if (aggregationFunction === "COUNT") {
+      const totalCount = partials.reduce((sum, partial) => {
+        if (Number.isFinite(partial.count)) {
+          return sum + (partial.count as number);
+        }
+        if (Number.isFinite(partial.value)) {
+          return sum + (partial.value as number);
+        }
+        return sum;
+      }, 0);
+      return totalCount;
+    }
+
+    if (aggregationFunction === "SUM") {
+      const totalSum = partials.reduce((sum, partial) => {
+        if (Number.isFinite(partial.sum)) {
+          return sum + (partial.sum as number);
+        }
+        if (Number.isFinite(partial.value)) {
+          return sum + (partial.value as number);
+        }
+        return sum;
+      }, 0);
+      return totalSum;
+    }
+
+    if (aggregationFunction === "AVG") {
+      let totalCount = 0;
+      let totalSum = 0;
+
+      for (const partial of partials) {
+        if (Number.isFinite(partial.count)) {
+          totalCount += partial.count as number;
+        }
+        if (Number.isFinite(partial.sum)) {
+          totalSum += partial.sum as number;
+        } else if (Number.isFinite(partial.avg) && Number.isFinite(partial.count)) {
+          totalSum += (partial.avg as number) * (partial.count as number);
+        } else if (Number.isFinite(partial.value) && Number.isFinite(partial.count)) {
+          totalSum += (partial.value as number) * (partial.count as number);
+        }
+      }
+
+      return totalCount > 0 ? totalSum / totalCount : null;
+    }
+
+    if (aggregationFunction === "MIN") {
+      const values = partials
+        .map((partial) => partial.value)
+        .filter((value): value is number => Number.isFinite(value));
+      return values.length > 0 ? Math.min(...values) : null;
+    }
+
+    if (aggregationFunction === "MAX") {
+      const values = partials
+        .map((partial) => partial.value)
+        .filter((value): value is number => Number.isFinite(value));
+      return values.length > 0 ? Math.max(...values) : null;
+    }
+
+    return null;
+  }
+
   /**
    *
    * @param chunks
    */
   async executeR2ROperator(
-    chunks: string[],
+    partials: PartialChunkResult[],
     chunkGroupId?: string,
     comparableDiagnostics?: ComparableWindowDiagnostics,
+    aggregationFunction?: AggregationFunction | null,
   ): Promise<void> {
-    this.logger.log(`Executing the R2R Operator with results: ${chunks}`);
+    this.logger.log(`Executing the R2R Operator with ${partials.length} partial results.`);
+    const detectAggregationFunction =
+      aggregationFunction ?? this.detectAggregationFunction(this.outputQuery);
 
     /*
 For example, the allResults object might look like this:
@@ -1191,40 +1543,32 @@ For example, the allResults object might look like this:
     '"<https://rsp.js/aggregation_event/327ae8b1-52a1-48f8-9749-324000a75a45> <https://saref.etsi.org/core/hasTimestamp> \\"1749592770747\\"^^<http://www.w3.org/2001/XMLSchema#long> .\\n    <https://rsp.js/aggregation_event/327ae8b1-52a1-48f8-9749-324000a75a45> <https://saref.etsi.org/core/hasValue> \\"-23\\"^^<http://www.w3.org/2001/XMLSchema#float> ."'
   ]
         */
-    const store = new N3.Store();
-    const parser = new N3.Parser();
-    for (const chunk of chunks) {
-      let chunkString = chunk;
-      // If chunk is a JSON string, parse it
-      try {
-        if (chunkString.startsWith('"') && chunkString.endsWith('"')) {
-          chunkString = JSON.parse(chunkString);
-        }
-      } catch (e) {
-        this.logger.log(`DEBUG: Could not JSON.parse chunk: ${chunkString}`);
-      }
-      try {
-        const quads = parser.parse(chunkString);
-        store.addQuads(quads);
-      } catch (e) {
-        this.logger.log(
-          `DEBUG: Could not parse chunk as Turtle: ${chunkString}`,
-        );
-      }
-    }
-    this.logger.log(storeToString(store));
-    const detectAggregationFunction = this.detectAggregationFunction(
-      this.outputQuery,
-    );
     if (!detectAggregationFunction) {
       console.error("No aggregation function detected in the output query.");
       return;
     }
-    if (comparableDiagnostics) {
-      this.writeComparableDiagnostics(comparableDiagnostics);
-      const resultValue = String(comparableDiagnostics.resultValue);
+    const directResult = profileSync("structured_recomposition_time_ms", () =>
+      comparableDiagnostics
+        ? comparableDiagnostics.resultValue
+        : this.recomputeExactResultFromPartials(
+            partials,
+            detectAggregationFunction as AggregationFunction,
+          ),
+    );
+
+    if (Number.isFinite(directResult)) {
+      const resultValue = String(directResult);
+      if (comparableDiagnostics) {
+        this.writeComparableDiagnostics(comparableDiagnostics);
+      }
       const outputQueryEvent = this.generateOutputQueryEvent(resultValue);
       this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
+      if (chunkGroupId) {
+        this.debugChunkLog(
+          `final emission chunkGroupId=${chunkGroupId}; recomposedResult=${resultValue}`,
+        );
+      }
+
       this.windowCount++;
       const resultEmittedAt = Date.now();
       const expectedWindowClose = this.getExpectedWindowCloseTime(
@@ -1239,52 +1583,67 @@ For example, the allResults object might look like this:
         resultValue,
       );
 
-      await new Promise<void>((resolve) => {
-        const rsp_client = mqtt.connect(this.mqttBroker);
-        rsp_client.on("connect", () => {
-          const resultTopic = getResultTopic("output");
-          const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
-          const payload = useBenchmarkPayload
-            ? JSON.stringify(
-                buildBenchmarkResultPayload(
-                  "chunked",
-                  detectAggregationFunction as AggregationFunction,
-                  this.sessionId,
-                  comparableDiagnostics.resultValue,
-                  this.windowCount,
-                  {
-                    benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                    windowStart: comparableDiagnostics.externalWindowStart,
-                    windowEnd: comparableDiagnostics.externalWindowEnd,
-                    recomposedCount: comparableDiagnostics.recomposedCount,
-                    recomposedSum: comparableDiagnostics.recomposedSum,
-                    recomposedAvg: comparableDiagnostics.recomposedAvg,
-                    internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
-                    internalChunks: comparableDiagnostics.internalChunks,
-                  },
-                ),
-              )
-            : outputQueryEvent;
-          this.logger.log(`calculated result ${payload}`);
-          rsp_client.publish(resultTopic, payload, (err: any) => {
-            if (err) {
-              console.error(
-                `Error publishing output query event to topic ${resultTopic}:`,
-                err,
-              );
-            } else {
-              this.logger.log(
-                `Output query event published to topic ${resultTopic}`,
-              );
-            }
-            this.chunkedDebugSummary.reconstructedSuperqueryResultCount += 1;
-            this.persistChunkedDebugSummary();
-            rsp_client.end();
-            resolve();
-          });
-        });
+      const resultTopic = getResultTopic("output");
+      const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
+      const payload = profileSync("serialization_parsing_ms", () =>
+        useBenchmarkPayload
+          ? JSON.stringify(
+              buildBenchmarkResultPayload(
+                "chunked",
+                detectAggregationFunction as AggregationFunction,
+                this.sessionId,
+                Number.parseFloat(resultValue),
+                this.windowCount,
+                comparableDiagnostics
+                  ? {
+                      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                      windowStart: comparableDiagnostics.externalWindowStart,
+                      windowEnd: comparableDiagnostics.externalWindowEnd,
+                      recomposedCount: comparableDiagnostics.recomposedCount,
+                      recomposedSum: comparableDiagnostics.recomposedSum,
+                      recomposedAvg: comparableDiagnostics.recomposedAvg,
+                      internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
+                      internalChunks: comparableDiagnostics.internalChunks,
+                    }
+                  : {},
+              ),
+            )
+          : outputQueryEvent,
+      );
+      this.logger.log(`calculated result ${payload}`);
+      await this.publishWithSharedClient(resultTopic, payload, { qos: 1 });
+      recordPublishedMqttMessage({
+        topic: resultTopic,
+        payload,
+        messageType: "superquery_result",
       });
+      this.logger.log(
+        `Output query event published to topic ${resultTopic}`,
+      );
+      this.chunkedDebugSummary.reconstructedSuperqueryResultCount += 1;
+      profileCount("reconstructed_superquery_results");
+      profileCount("emitted_results");
+      this.persistChunkedDebugSummary();
       return;
+    }
+
+    const rdfChunks = partials
+      .map((partial) => partial.rdfPayload)
+      .filter((rdfPayload): rdfPayload is string => typeof rdfPayload === "string");
+    const store = new N3.Store();
+    const parser = new N3.Parser();
+    profileSync("rdf_parse_time_ms", () => {
+      for (const chunkString of rdfChunks) {
+        try {
+          const quads = parser.parse(chunkString);
+          store.addQuads(quads);
+        } catch (e) {
+          this.debugChunkLog(`Could not parse chunk as Turtle for fallback`);
+        }
+      }
+    });
+    if (process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1") {
+      this.logger.log(storeToString(store));
     }
     const aggregationSPARQLQuery = this.getAggregationSPARQLQuery(
       detectAggregationFunction,
@@ -1298,7 +1657,9 @@ For example, the allResults object might look like this:
       `Generated Aggregation SPARQL Query: ${aggregationSPARQLQuery}`,
     );
     const r2rOperator = new R2ROperator(aggregationSPARQLQuery);
-    const bindingStream = await r2rOperator.execute(store);
+    const bindingStream = await profileAsync("r2r_execution_time_ms", () =>
+      r2rOperator.execute(store),
+    );
     if (!bindingStream) {
       console.error("Failed to execute R2R Operator.");
       return;
@@ -1340,51 +1701,32 @@ For example, the allResults object might look like this:
         );
 
         // Publish the output query event to the MQTT broker
-        const rsp_client = mqtt.connect(this.mqttBroker);
-        rsp_client.on("connect", () => {
-          const resultTopic = getResultTopic("output");
-          const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
-          const payload = useBenchmarkPayload
-            ? JSON.stringify(
-                buildBenchmarkResultPayload(
-                  "chunked",
-                  detectAggregationFunction as AggregationFunction,
-                  this.sessionId,
-                  Number.parseFloat(resultValue),
-                  this.windowCount,
-                ),
-              )
-            : outputQueryEvent;
-          this.logger.log(`calculated result ${payload}`);
-
-          rsp_client.publish(resultTopic, payload, (err: any) => {
-            if (err) {
-              console.error(
-                `Error publishing output query event to topic ${resultTopic}:`,
-                err,
-              );
-            } else {
-              this.logger.log(
-                `Output query event published to topic ${resultTopic}`,
-              );
-            }
+        const resultTopic = getResultTopic("output");
+        const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
+        const payload = useBenchmarkPayload
+          ? JSON.stringify(
+              buildBenchmarkResultPayload(
+                "chunked",
+                detectAggregationFunction as AggregationFunction,
+                this.sessionId,
+                Number.parseFloat(resultValue),
+                this.windowCount,
+              ),
+            )
+          : outputQueryEvent;
+        this.logger.log(`calculated result ${payload}`);
+        void this.publishWithSharedClient(resultTopic, payload, { qos: 1 }).then(
+          () => {
+                        this.logger.log(
+              `Output query event published to topic ${resultTopic}`,
+            );
             this.chunkedDebugSummary.reconstructedSuperqueryResultCount += 1;
+            profileCount("reconstructed_superquery_results");
             this.persistChunkedDebugSummary();
-          });
-        });
-        rsp_client.on("error", (err) => {
-          console.error("MQTT connection error:", err);
-        });
-        rsp_client.on("offline", () => {
-          console.error(
-            "MQTT client is offline. Please check the broker connection.",
-          );
-        });
-        rsp_client.on("reconnect", () => {
-          this.logger.log("Reconnecting to MQTT broker...");
-        });
-
-        finalize();
+            profileCount("emitted_results");
+            finalize();
+          },
+        );
       });
 
       bindingStream.on("end", () => {
@@ -1418,64 +1760,52 @@ For example, the allResults object might look like this:
     this.logger.log(`DEBUG: subQueries length: ${this.subQueries.length}`);
     this.logger.log(`DEBUG: subQueries: ${JSON.stringify(this.subQueries)}`);
     this.logger.log(`DEBUG: outputQuery: ${this.outputQuery}`);
-    const chunkSize = this.findGCDChunk(this.subQueries, this.outputQuery);
-    this.logger.log(`Calculated GCD Chunk Size: ${chunkSize}`);
-    this.chunkGCD = chunkSize;
-    this.chunkedDebugSummary.chunkSizeMs = chunkSize;
+    const chunkPlan = this.getOrBuildChunkPlan();
+    this.logger.log(`Calculated GCD Chunk Size: ${chunkPlan.chunkSize}`);
+    this.chunkGCD = chunkPlan.chunkSize;
+    this.chunkedDebugSummary.chunkSizeMs = chunkPlan.chunkSize;
     this.persistChunkedDebugSummary();
-    const rewrittenChunkQueries: string[] = [];
-    if (chunkSize > 0) {
-      const rewriteChunkQuery = new RewriteChunkQuery(chunkSize, chunkSize);
-      for (let i = 0; i < this.subQueries.length; i++) {
-        const subQuery = this.subQueries[i];
-        this.logger.log(`DEBUG: Rewriting subQuery ${i}: ${subQuery}`);
-        const rewrittenQuery =
-          rewriteChunkQuery.rewriteQueryWithNewChunkSize(subQuery);
-        this.logger.log(`Rewritten SubQuery ${i}: ${rewrittenQuery}`);
-        rewrittenChunkQueries.push(rewrittenQuery);
-      }
-
-      // Collect all promises
+    if (chunkPlan.chunkSize > 0) {
       const allPromises: Promise<void>[] = [];
-      for (let i = 0; i < rewrittenChunkQueries.length; i++) {
-        const hash_subQuery = hash_string_md5(rewrittenChunkQueries[i]);
+      const uniqueRewrittenQueries = Array.from(new Set(chunkPlan.rewrittenQueries));
+
+      for (let i = 0; i < uniqueRewrittenQueries.length; i++) {
+        const rewrittenQuery = uniqueRewrittenQueries[i];
+        profileCount("query_rewrites");
+        const hash_subQuery = hash_string_md5(rewrittenQuery);
         const topicName = `chunked/${this.sessionId}/${hash_subQuery}`;
-        this.logger.log(
-          `DEBUG: Setting subQueryMQTTTopicMap[${hash_subQuery}] = ${topicName}`,
-        );
         this.subQueryMQTTTopicMap.set(hash_subQuery, topicName);
-        this.logger.log(
-          `DEBUG: subQueryMQTTTopicMap after set: ${JSON.stringify(Array.from(this.subQueryMQTTTopicMap.entries()))}`,
-        );
         const rspQueryProcess = new RSPQueryProcess(
-          rewrittenChunkQueries[i],
+          rewrittenQuery,
           topicName,
           this.sessionId,
           hash_subQuery,
         );
-        this.logger.log(
-          `${topicName} topic created for rewrittenChunkQueries: ${rewrittenChunkQueries[i]}: ${rewrittenChunkQueries[i]}`,
-        );
+        profileCount("rsp_query_processes_started");
         const p = rspQueryProcess
           .stream_process()
           .then(() => {
             this.logger.log(
-              `Topic chunked/${hash_subQuery} created for subquery ${i}`,
-            );
-            this.logger.log(
-              `RSP Query Process started for subquery ${i}: ${rewrittenChunkQueries[i]}`,
+              `RSP Query Process started for rewritten subquery ${i}: ${rewrittenQuery}`,
             );
           })
           .catch((error) => {
             console.error(
-              `Error starting RSP Query Process for subquery ${i}: ${rewrittenChunkQueries[i]}`,
+              `Error starting RSP Query Process for rewritten subquery ${i}: ${rewrittenQuery}`,
               error,
             );
           });
         allPromises.push(p);
       }
-      // Wait for all subquery processes to finish initializing
+
       await Promise.all(allPromises);
+      resourceTraceSnapshot(
+        "after_subquery_streams_started",
+        "chunked rsp query processes subscribed",
+        {
+          rspQueryProcessCount: uniqueRewrittenQueries.length,
+        },
+      );
       this.logger.log(
         `DEBUG: Final subQueryMQTTTopicMap: ${JSON.stringify(Array.from(this.subQueryMQTTTopicMap.entries()))}`,
       );
@@ -1493,33 +1823,23 @@ For example, the allResults object might look like this:
   findGCDChunk(subQueries: string[], outputQuery: string): number {
     const window_parameters: number[] = [];
     for (let i = 0; i < subQueries.length; i++) {
-      const subQueryParsed = this.parser.parse(subQueries[i]);
-      this.logger.log(
-        `Parsed subquery ${i}: ${JSON.stringify(subQueryParsed)}`,
-      );
+      const subQueryParsed = getCachedParsedQuery<any>(this.parser, subQueries[i]);
 
       if (subQueryParsed) {
         for (const s2r of subQueryParsed.s2r) {
           window_parameters.push(s2r.width);
           window_parameters.push(s2r.slide);
         }
-      } else {
-        console.error(`Failed to parse subquery: ${subQueries[i]}`);
       }
     }
 
-    const outputQueryParsed = this.parser.parse(outputQuery);
-    this.logger.log(
-      `Parsed output query: ${JSON.stringify(outputQueryParsed)}`,
-    );
+    const outputQueryParsed = getCachedParsedQuery<any>(this.parser, outputQuery);
 
     if (outputQueryParsed) {
       for (const s2r of outputQueryParsed.s2r) {
         window_parameters.push(s2r.width);
         window_parameters.push(s2r.slide);
       }
-    } else {
-      console.error(`Failed to parse output query: ${outputQuery}`);
     }
     // Find the GCD of the window parameters
     return this.findGCD(window_parameters);
@@ -1843,34 +2163,18 @@ For example, the allResults object might look like this:
    * @param finalResult
    */
   publishCombinedResults(finalResult: any): void {
-    const rsp_client = mqtt.connect(this.mqttBroker);
-    rsp_client.on("connect", () => {
-      const resultTopic = getResultTopic("chunked/output");
-      rsp_client.publish(
-        resultTopic,
-        JSON.stringify(finalResult),
-        { qos: 1 },
-        (error) => {
-          if (error) {
-            console.error("Failed to publish chunked results:", error);
-            this.logger.log(`Failed to publish chunked results: ${error}`);
-          } else {
-            recordPublishedMqttMessage({
-              topic: resultTopic,
-              payload: JSON.stringify(finalResult),
-              messageType: "superquery_result",
-              warmup: this.windowCount === 1,
-            });
-            console.log(
-              "Successfully published chunked results to chunked/output",
-            );
-            this.logger.log(
-              "Successfully published chunked results to chunked/output",
-            );
-          }
-          rsp_client.end();
-        },
-      );
+    const resultTopic = getResultTopic("chunked/output");
+    const payload = JSON.stringify(finalResult);
+    this.publishWithSharedClient(resultTopic, payload, { qos: 1 }).then(() => {
+      recordPublishedMqttMessage({
+        topic: resultTopic,
+        payload,
+        messageType: "superquery_result",
+        warmup: this.windowCount === 1,
+      });
+      console.log("Successfully published chunked results to chunked/output");
+      this.logger.log("Successfully published chunked results to chunked/output");
+      profileCount("emitted_results");
     });
   }
 }
