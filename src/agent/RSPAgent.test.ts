@@ -1,3 +1,19 @@
+const mockMqttClient = {
+    on: jest.fn().mockReturnThis(),
+    subscribe: jest.fn(),
+    publish: jest.fn(),
+    end: jest.fn(),
+};
+
+jest.mock("mqtt", () => ({
+    connect: jest.fn().mockReturnValue(mockMqttClient),
+}));
+
+global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    json: jest.fn().mockResolvedValue({}),
+}) as jest.Mock;
+
 import { RSPAgent } from "./RSPAgent";
 
 describe("RSPAgent", () => {
@@ -7,6 +23,11 @@ describe("RSPAgent", () => {
         const rstream_topic = "test_topic";
         const agent = new RSPAgent(query, rstream_topic);
         expect(agent).toBeInstanceOf(RSPAgent);
+    });
+
+    beforeEach(() => {
+        jest.clearAllMocks();
+        mockMqttClient.on.mockReturnThis();
     });
 
     test("should set child query and rstream topic", () => {
