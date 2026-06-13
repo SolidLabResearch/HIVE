@@ -12,10 +12,17 @@ export type PartialChunkResult = {
   subqueryId: string;
   window: WindowDescriptor;
   chunkId: string;
+  reuseClassKey?: string;
+  sourceStreamId?: string;
+  sourceTopic?: string;
   aggregateFunction?: string;
   value?: number;
   count?: number;
   sum?: number;
   avg?: number;
+  state?: {
+    count?: number;
+    sum?: number;
+  };
   rdfPayload?: string;
 };

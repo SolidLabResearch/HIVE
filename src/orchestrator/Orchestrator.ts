@@ -3,6 +3,8 @@ import { BeeKeeper } from "../services/BeeKeeper";
 import { HTTPServer } from "../services/server/HTTPServer";
 import config from '../config/httpServerConfig.json';
 import { hash_string_md5 } from "../util/Util";
+import { detectCompatibleAvgChunkReuse } from "../util/chunkStateReuse";
+import { profileCount } from "../util/profiling";
 
 /**
  *
@@ -33,8 +35,35 @@ export class Orchestrator {
     addSubQuery(query: string): void {
         this.subQueriesToRun.push(query);
         const query_hash = hash_string_md5(query);
+        const compatibleReuse =
+            this.operatorType === "StreamingQueryChunkAggregatorOperator"
+                ? detectCompatibleAvgChunkReuse(query)
+                : null;
+
+        if (compatibleReuse) {
+            profileCount("compatible_queries_detected");
+            profileCount("original_agent_rsps_skipped");
+            RSPAgent.registerQueryDefinition(query, `chunked/${query_hash}`, {
+                chunk_state_primary_reuse: true,
+                compatibility_kind: "avg_sum_count_vertical_slice",
+                reuse_class_key: compatibleReuse.reuseClassKey,
+                source_topic: compatibleReuse.sourceTopic,
+                source_stream_id: compatibleReuse.sourceStreamId,
+                original_window_range: compatibleReuse.originalWindowRange,
+                original_window_step: compatibleReuse.originalWindowStep,
+            }).then(() => {
+                console.log(`Registered compatible chunk-reuse sub-query without raw RSPAgent: ${query}`);
+            }).catch((error: Error) => {
+                console.error(`Error registering compatible sub-query "${query}":`, error);
+            });
+            console.log(`Sub-query added via compatible chunk-state reuse: ${query}`);
+            return;
+        }
 
         const queryAgent = new RSPAgent(query, `chunked/${query_hash}`);
+        if (this.operatorType === "StreamingQueryChunkAggregatorOperator") {
+            profileCount("fallback_original_agent_rsps_started");
+        }
         queryAgent.process_streams()
             .then(() => {
                 console.log(`Added sub-query: ${query}`);

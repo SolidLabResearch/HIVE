@@ -6,7 +6,14 @@ export type RSPAgentQuery = {
     id: string,
     rspql_query: string,
     r2s_topic: string,
-    data_topic: string
+    data_topic: string,
+    chunk_state_primary_reuse?: boolean,
+    compatibility_kind?: string,
+    reuse_class_key?: string,
+    source_topic?: string,
+    source_stream_id?: string,
+    original_window_range?: number,
+    original_window_step?: number
 }
 
 export const RSPAgentQueryRecord: Record<string, RSPAgentQuery> = {};

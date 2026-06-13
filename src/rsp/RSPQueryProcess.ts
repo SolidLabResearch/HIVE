@@ -7,6 +7,7 @@ import { recordPublishedMqttMessage } from '../util/mqttTraffic';
 import { getTimestampDomainMax, getTimestampDomainMin, useCleanMqttSessionsForBenchmark } from '../util/runtimeConfig';
 import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
 import { resourceTraceSnapshot } from "../util/resourceTrace";
+import { detectCompatibleAvgChunkReuse } from '../util/chunkStateReuse';
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
 
@@ -39,6 +40,7 @@ export class RSPQueryProcess {
         this.query = query;
         this.rstream_topic = rstream_topic;
         this.rsp_engine = new RSPEngine(query);
+        profileCount("rsp_engines_created");
         this.rstream_emitter = this.rsp_engine.register();
         this.rspql_parser = new RSPQLParser();
         this.queryId = queryId;
@@ -257,6 +259,7 @@ export class RSPQueryProcess {
                         console.error(`Error publishing aggregation event: ${err}`);
                     } else {
                         profileCount("mqtt_messages_published");
+                        profileCount("chunk_state_messages_published");
                         recordPublishedMqttMessage({
                             topic: this.rstream_topic,
                             payload: aggregation_object_string,
@@ -303,6 +306,7 @@ export class RSPQueryProcess {
         const rdfPayload = this.generate_aggregation_event(bindings, event_timestamp);
         const chunkGroupId = `${this.queryId}:${windowBounds.start}:${windowBounds.end}`;
         const chunkId = `${chunkGroupId}:${this.subqueryId}`;
+        const compatibleReuse = detectCompatibleAvgChunkReuse(this.query);
 
         return {
             queryId: this.queryId,
@@ -316,11 +320,18 @@ export class RSPQueryProcess {
                 semantics: "[start,end)",
             },
             chunkId,
+            reuseClassKey: compatibleReuse?.reuseClassKey,
+            sourceStreamId: compatibleReuse?.sourceStreamId,
+            sourceTopic: compatibleReuse?.sourceTopic,
             aggregateFunction,
             value,
             count,
             sum,
             avg,
+            state: {
+                count,
+                sum,
+            },
             rdfPayload,
         };
     }

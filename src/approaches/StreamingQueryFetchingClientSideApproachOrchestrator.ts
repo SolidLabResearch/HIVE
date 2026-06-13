@@ -117,6 +117,7 @@ export class FetchingAllDataClientSide {
     this.sessionId = getSessionId();
     this.rspql_parser = new RSPQLParser();
     this.rsp_engine = new RSPEngine(query);
+    profileCount("rsp_engines_created");
     this.rstream_emitter = this.rsp_engine.register();
     this.startTime = 0; // Will be set when first result arrives
     this.queryRegisteredTime = Date.now(); // Track when query was registered

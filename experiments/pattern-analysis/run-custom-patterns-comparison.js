@@ -232,6 +232,143 @@ function collectTreeStatsFromPs(rootPids) {
   };
 }
 
+function sumNumericFields(records, fieldNames) {
+  const result = {};
+  for (const fieldName of fieldNames) {
+    result[fieldName] = records.reduce(
+      (sum, record) =>
+        sum + (Number.isFinite(Number(record?.[fieldName])) ? Number(record[fieldName]) : 0),
+      0,
+    );
+  }
+  return result;
+}
+
+function buildProfileAggregate(logDir, metadata = {}) {
+  if (!fs.existsSync(logDir)) {
+    return null;
+  }
+
+  const profileFiles = fs
+    .readdirSync(logDir)
+    .filter(
+      (fileName) =>
+        /^hive_profile_summary\.[^.]+\.json$/.test(fileName) &&
+        fileName !== "hive_profile_summary.aggregate.json",
+    )
+    .sort();
+
+  const processProfiles = profileFiles.map((fileName) => {
+    const filePath = path.join(logDir, fileName);
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return {
+      fileName,
+      filePath: path.resolve(filePath),
+      ...parsed,
+    };
+  });
+
+  const summedCounterNames = [
+    "compatible_queries_detected",
+    "original_agent_outputs_derived_from_chunks",
+    "original_agent_rsps_skipped",
+    "fallback_original_agent_rsps_started",
+    "shared_chunk_producers_created",
+    "chunk_state_messages_published",
+    "chunk_consumers_registered",
+    "rsp_engines_created",
+    "mqtt_clients_created",
+    "emitted_results",
+    "reconstructed_superquery_results",
+  ];
+
+  const aggregate = {
+    timestamp: new Date().toISOString(),
+    approach: metadata.approach || null,
+    pattern: metadata.pattern || null,
+    iteration: metadata.iteration ?? null,
+    logDir: path.resolve(logDir),
+    processCount: processProfiles.length,
+    processProfiles: processProfiles.map((profile) => ({
+      fileName: profile.fileName,
+      filePath: profile.filePath,
+      pid: profile.processId,
+      processRole: profile.processRole || null,
+      processRoleGroup: profile.processRoleGroup || null,
+      approach: profile.approach || metadata.approach || null,
+      pattern: profile.pattern || metadata.pattern || null,
+      iteration: profile.iteration || metadata.iteration || null,
+      counters: profile.counters || {},
+      timingsMs: profile.timingsMs || {},
+      compatible_queries_detected: Number(profile.compatible_queries_detected || 0),
+      original_agent_outputs_derived_from_chunks: Number(
+        profile.original_agent_outputs_derived_from_chunks || 0,
+      ),
+      original_agent_rsps_skipped: Number(profile.original_agent_rsps_skipped || 0),
+      fallback_original_agent_rsps_started: Number(
+        profile.fallback_original_agent_rsps_started || 0,
+      ),
+      shared_chunk_producers_created: Number(
+        profile.shared_chunk_producers_created || 0,
+      ),
+      chunk_state_messages_published: Number(
+        profile.chunk_state_messages_published || 0,
+      ),
+      chunk_consumers_registered: Number(profile.chunk_consumers_registered || 0),
+      rsp_engines_created: Number(profile.rsp_engines_created || 0),
+      mqtt_clients_created: Number(profile.mqtt_clients_created || 0),
+      emitted_results: Number(profile.emitted_results || 0),
+      reconstructed_superquery_results: Number(
+        profile.reconstructed_superquery_results || 0,
+      ),
+    })),
+    countersByProcessRole: Object.fromEntries(
+      processProfiles.map((profile) => [
+        profile.processRoleGroup || profile.processRole || "unknown",
+        {
+          pid: profile.processId,
+          processRole: profile.processRole || null,
+          approach: profile.approach || metadata.approach || null,
+          pattern: profile.pattern || metadata.pattern || null,
+          iteration: profile.iteration || metadata.iteration || null,
+          counters: profile.counters || {},
+          timingsMs: profile.timingsMs || {},
+          compatible_queries_detected: Number(profile.compatible_queries_detected || 0),
+          original_agent_outputs_derived_from_chunks: Number(
+            profile.original_agent_outputs_derived_from_chunks || 0,
+          ),
+          original_agent_rsps_skipped: Number(profile.original_agent_rsps_skipped || 0),
+          fallback_original_agent_rsps_started: Number(
+            profile.fallback_original_agent_rsps_started || 0,
+          ),
+          shared_chunk_producers_created: Number(
+            profile.shared_chunk_producers_created || 0,
+          ),
+          chunk_state_messages_published: Number(
+            profile.chunk_state_messages_published || 0,
+          ),
+          chunk_consumers_registered: Number(profile.chunk_consumers_registered || 0),
+          rsp_engines_created: Number(profile.rsp_engines_created || 0),
+          mqtt_clients_created: Number(profile.mqtt_clients_created || 0),
+          emitted_results: Number(profile.emitted_results || 0),
+          reconstructed_superquery_results: Number(
+            profile.reconstructed_superquery_results || 0,
+          ),
+        },
+      ]),
+    ),
+    summedCounters: sumNumericFields(processProfiles, summedCounterNames),
+  };
+
+  const aggregatePath = path.join(logDir, "hive_profile_summary.aggregate.json");
+  fs.writeFileSync(aggregatePath, `${JSON.stringify(aggregate, null, 2)}\n`);
+  return {
+    aggregatePath: path.resolve(aggregatePath),
+    processProfiles: aggregate.processProfiles,
+    summedCounters: aggregate.summedCounters,
+  };
+}
+
 class AttemptResourceSampler {
   constructor(logDir, options = {}) {
     this.logDir = logDir;
@@ -914,6 +1051,11 @@ class CustomPatternComparisonRunner {
         await cleanupAttempt();
         this.moveLogFiles(approach, logDir);
         const mqttTrafficSummary = finalizeMqttTrafficArtifacts({ logDir });
+        const profileArtifactSummary = buildProfileAggregate(logDir, {
+          approach,
+          pattern: patternName,
+          iteration: iterationNum,
+        });
         lifecycleLog("runSingleTest.finalize.resolved", {
           attemptId,
           benchmarkStatus: result?.benchmarkStatus,
@@ -924,6 +1066,7 @@ class CustomPatternComparisonRunner {
         resolve({
           ...result,
           mqttTrafficSummary,
+          profileArtifactSummary,
         });
       };
 

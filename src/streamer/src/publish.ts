@@ -4,6 +4,7 @@ import * as mqtt from "mqtt";
 import { StreamToMQTT } from './publishing/StreamToMQTT';
 import { buildBenchmarkTopicName, useCleanMqttSessionsForBenchmark } from "../../util/runtimeConfig";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
+import { profileCount, writeProfileArtifact } from "../../util/profiling";
 
 /**
  *
@@ -33,6 +34,7 @@ async function publishFiniteReplayCompleteSignal(): Promise<void> {
         clean: useCleanMqttSessionsForBenchmark(),
         clientId,
     });
+    profileCount("mqtt_clients_created");
 
     await new Promise<void>((resolve, reject) => {
         let settled = false;
@@ -196,6 +198,7 @@ async function main() {
                 process.exitCode = 1;
             }
         }
+        writeProfileArtifact();
         lifecycleLog("publisher.complete", { exitCode: process.exitCode ?? 0, finiteReplayMode: isBenchmarkFiniteReplayMode() });
         lifecycleLog("publisher.exit", { exitCode: process.exitCode ?? 0 });
     }

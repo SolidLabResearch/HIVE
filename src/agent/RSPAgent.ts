@@ -34,6 +34,7 @@ export class RSPAgent {
         this.r2s_topic = r2s_topic;
         this.rspql_parser = new RSPQLParser();
         this.rsp_engine = new RSPEngine(query);
+        profileCount("rsp_engines_created");
         this.rstream_emitter = this.rsp_engine.register();
         this.http_server_location = "http://localhost:8080/";
         this.registerCleanupHook();
@@ -48,26 +49,12 @@ export class RSPAgent {
      */
     public async registerToQueryRegistry() {
         console.log(`Registering query: ${this.query} to the query registry.`);
-        const register_location = `${this.http_server_location}register`;
-        const request = await fetch(register_location, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                rspql_query: this.query,
-                r2s_topic: this.r2s_topic,
-                data_topic: this.r2s_topic,
-                id: hash_string_md5(this.query)
-            })
-        });
-        if (!request.ok) {
-            throw new Error(`Failed to register query: ${this.query}. Status: ${request.status}`);
-        }
-        const response = await request.json();
-        if (response.error) {
-            throw new Error(`Error registering query: ${response.error}`);
-        }
+        const response = await RSPAgent.registerQueryDefinition(
+            this.query,
+            this.r2s_topic,
+            {},
+            this.http_server_location,
+        );
         console.log(`Successfully registered query: ${this.query}`);
         return response;
     }
@@ -245,6 +232,36 @@ export class RSPAgent {
             }
         });
         writeProfileArtifact();
+    }
+
+    public static async registerQueryDefinition(
+        query: string,
+        r2s_topic: string,
+        metadata: Record<string, unknown> = {},
+        httpServerLocation = "http://localhost:8080/",
+    ) {
+        const register_location = `${httpServerLocation}register`;
+        const request = await fetch(register_location, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                rspql_query: query,
+                r2s_topic,
+                data_topic: r2s_topic,
+                id: hash_string_md5(query),
+                ...metadata,
+            })
+        });
+        if (!request.ok) {
+            throw new Error(`Failed to register query: ${query}. Status: ${request.status}`);
+        }
+        const response = await request.json();
+        if (response.error) {
+            throw new Error(`Error registering query: ${response.error}`);
+        }
+        return response;
     }
 
 

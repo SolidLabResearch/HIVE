@@ -6,6 +6,53 @@ type ProfileBucket = {
   timingsMs: Map<string, number>;
 };
 
+type ProfileSummary = {
+  processId: number;
+  parentProcessId: number;
+  processRole: string;
+  processRoleGroup: string;
+  approach: string | null;
+  pattern: string | null;
+  iteration: string | null;
+  benchmarkTimestamp: string;
+  startedAt: string | null;
+  finishedAt: string;
+  artifactPath: string | null;
+  counters: Record<string, number>;
+  timingsMs: Record<string, number>;
+  mqtt_clients_created: number;
+  mqtt_messages_received: number;
+  mqtt_messages_published: number;
+  compatible_queries_detected: number;
+  original_agent_outputs_derived_from_chunks: number;
+  original_agent_rsps_skipped: number;
+  fallback_original_agent_rsps_started: number;
+  shared_chunk_producers_created: number;
+  chunk_state_messages_published: number;
+  chunk_consumers_registered: number;
+  rsp_engines_created: number;
+  emitted_results: number;
+  query_rewrites: number;
+  query_rewrite_cache_hits: number;
+  query_rewrite_cache_misses: number;
+  parsed_query_cache_hits: number;
+  parsed_query_cache_misses: number;
+  rsp_query_processes_started: number;
+  chunk_groups_completed: number;
+  comparable_windows_emitted: number;
+  reconstructed_superquery_results: number;
+  duplicateChunkCount: number;
+  missingChunkGroups: number;
+  rdf_parse_time_ms: number;
+  r2r_execution_time_ms: number;
+  structured_recomposition_time_ms: number;
+  diagnostics_write_time_ms: number;
+  cleanup_time_ms: number;
+  derived: {
+    buffer_scans_per_emitted_result: number;
+  };
+};
+
 const enabled = ["1", "true", "yes", "on"].includes(
   (process.env.HIVE_PROFILE || "").trim().toLowerCase(),
 );
@@ -19,6 +66,28 @@ let exitHookRegistered = false;
 let flushed = false;
 let signalHooksRegistered = false;
 
+function sanitize(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, "_");
+}
+
+function getProcessRole(): string {
+  const raw = (process.env.HIVE_PROCESS_ROLE || "unknown").trim();
+  return raw || "unknown";
+}
+
+function getProcessRoleGroup(role: string): string {
+  if (role.includes("orchestrator")) {
+    return "orchestrator";
+  }
+  if (role.includes("worker")) {
+    return "worker";
+  }
+  if (role.includes("publisher")) {
+    return "publisher";
+  }
+  return sanitize(role);
+}
+
 function add(map: Map<string, number>, key: string, delta: number) {
   map.set(key, (map.get(key) ?? 0) + delta);
 }
@@ -27,24 +96,26 @@ function toSortedObject(map: Map<string, number>): Record<string, number> {
   return Object.fromEntries(Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b)));
 }
 
-function flushProfileSummary() {
-  if (!enabled || flushed) {
-    return;
-  }
-
-  flushed = true;
-  const finishedAt = new Date().toISOString();
-  const counters = toSortedObject(bucket.counters);
-  const timingsMs = toSortedObject(bucket.timingsMs);
+function buildSummary(
+  counters: Record<string, number>,
+  timingsMs: Record<string, number>,
+  artifactPath: string | null,
+  finishedAt: string,
+): ProfileSummary {
   const emittedResults = counters.emitted_results ?? 0;
   const bufferScans = counters.buffer_scans ?? 0;
-  const artifactPath = resolveArtifactPath();
   const flattenCounter = (name: string) => counters[name] ?? 0;
   const flattenTiming = (name: string) => timingsMs[name] ?? 0;
-
-  const summary = {
+  const processRole = getProcessRole();
+  return {
     processId: process.pid,
     parentProcessId: process.ppid,
+    processRole,
+    processRoleGroup: getProcessRoleGroup(processRole),
+    approach: process.env.BENCHMARK_APPROACH || null,
+    pattern: process.env.BENCHMARK_SCALE || null,
+    iteration: process.env.BENCHMARK_ITERATION || null,
+    benchmarkTimestamp: new Date().toISOString(),
     startedAt: process.env.HIVE_PROFILE_STARTED_AT || null,
     finishedAt,
     artifactPath,
@@ -53,6 +124,22 @@ function flushProfileSummary() {
     mqtt_clients_created: flattenCounter("mqtt_clients_created"),
     mqtt_messages_received: flattenCounter("mqtt_messages_received"),
     mqtt_messages_published: flattenCounter("mqtt_messages_published"),
+    compatible_queries_detected: flattenCounter("compatible_queries_detected"),
+    original_agent_outputs_derived_from_chunks: flattenCounter(
+      "original_agent_outputs_derived_from_chunks",
+    ),
+    original_agent_rsps_skipped: flattenCounter("original_agent_rsps_skipped"),
+    fallback_original_agent_rsps_started: flattenCounter(
+      "fallback_original_agent_rsps_started",
+    ),
+    shared_chunk_producers_created: flattenCounter(
+      "shared_chunk_producers_created",
+    ),
+    chunk_state_messages_published: flattenCounter(
+      "chunk_state_messages_published",
+    ),
+    chunk_consumers_registered: flattenCounter("chunk_consumers_registered"),
+    rsp_engines_created: flattenCounter("rsp_engines_created"),
     emitted_results: emittedResults,
     query_rewrites: flattenCounter("query_rewrites"),
     query_rewrite_cache_hits: flattenCounter("query_rewrite_cache_hits"),
@@ -75,9 +162,23 @@ function flushProfileSummary() {
     diagnostics_write_time_ms: flattenTiming("diagnostics_write_time_ms"),
     cleanup_time_ms: flattenTiming("cleanup_time_ms"),
     derived: {
-      buffer_scans_per_emitted_result: emittedResults > 0 ? bufferScans / emittedResults : 0,
+      buffer_scans_per_emitted_result:
+        emittedResults > 0 ? bufferScans / emittedResults : 0,
     },
   };
+}
+
+function flushProfileSummary() {
+  if (!enabled || flushed) {
+    return;
+  }
+
+  flushed = true;
+  const finishedAt = new Date().toISOString();
+  const counters = toSortedObject(bucket.counters);
+  const timingsMs = toSortedObject(bucket.timingsMs);
+  const artifactPath = resolveArtifactPath();
+  const summary = buildSummary(counters, timingsMs, artifactPath, finishedAt);
 
   if (artifactPath) {
     fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
@@ -97,8 +198,11 @@ function resolveArtifactPath(): string | null {
   if (!outputDir) {
     return null;
   }
-
-  return path.resolve(outputDir, "hive_profile_summary.json");
+  const processRoleGroup = getProcessRoleGroup(getProcessRole());
+  return path.resolve(
+    outputDir,
+    `hive_profile_summary.${sanitize(processRoleGroup)}.json`,
+  );
 }
 
 function registerExitHook() {
@@ -188,46 +292,12 @@ export function writeProfileArtifact(): void {
 
   const counters = toSortedObject(bucket.counters);
   const timingsMs = toSortedObject(bucket.timingsMs);
-  const emittedResults = counters.emitted_results ?? 0;
-  const bufferScans = counters.buffer_scans ?? 0;
-  const flattenCounter = (name: string) => counters[name] ?? 0;
-  const flattenTiming = (name: string) => timingsMs[name] ?? 0;
-  const summary = {
-    processId: process.pid,
-    parentProcessId: process.ppid,
-    startedAt: process.env.HIVE_PROFILE_STARTED_AT || null,
-    finishedAt: new Date().toISOString(),
-    artifactPath,
+  const summary = buildSummary(
     counters,
     timingsMs,
-    mqtt_clients_created: flattenCounter("mqtt_clients_created"),
-    mqtt_messages_received: flattenCounter("mqtt_messages_received"),
-    mqtt_messages_published: flattenCounter("mqtt_messages_published"),
-    emitted_results: emittedResults,
-    query_rewrites: flattenCounter("query_rewrites"),
-    query_rewrite_cache_hits: flattenCounter("query_rewrite_cache_hits"),
-    query_rewrite_cache_misses: flattenCounter("query_rewrite_cache_misses"),
-    parsed_query_cache_hits: flattenCounter("parsed_query_cache_hits"),
-    parsed_query_cache_misses: flattenCounter("parsed_query_cache_misses"),
-    rsp_query_processes_started: flattenCounter("rsp_query_processes_started"),
-    chunk_groups_completed: flattenCounter("chunk_groups_completed"),
-    comparable_windows_emitted: flattenCounter("comparable_windows_emitted"),
-    reconstructed_superquery_results: flattenCounter(
-      "reconstructed_superquery_results",
-    ),
-    duplicateChunkCount: flattenCounter("duplicateChunkCount"),
-    missingChunkGroups: flattenCounter("missingChunkGroups"),
-    rdf_parse_time_ms: flattenTiming("rdf_parse_time_ms"),
-    r2r_execution_time_ms: flattenTiming("r2r_execution_time_ms"),
-    structured_recomposition_time_ms: flattenTiming(
-      "structured_recomposition_time_ms",
-    ),
-    diagnostics_write_time_ms: flattenTiming("diagnostics_write_time_ms"),
-    cleanup_time_ms: flattenTiming("cleanup_time_ms"),
-    derived: {
-      buffer_scans_per_emitted_result: emittedResults > 0 ? bufferScans / emittedResults : 0,
-    },
-  };
+    artifactPath,
+    new Date().toISOString(),
+  );
 
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
   fs.writeFileSync(artifactPath, `${JSON.stringify(summary, null, 2)}\n`);

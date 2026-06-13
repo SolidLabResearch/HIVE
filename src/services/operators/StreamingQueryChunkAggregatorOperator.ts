@@ -25,6 +25,11 @@ import {
 import { PartialChunkResult } from "../../util/chunkTypes";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 import { resourceTraceSnapshot } from "../../util/resourceTrace";
+import {
+  CompatibleAvgChunkReuseSpec,
+  deriveAvgProjectionValues,
+  detectCompatibleAvgChunkReuse,
+} from "../../util/chunkStateReuse";
 const N3 = require("n3");
 
 type SubqueryIdentity = {
@@ -92,6 +97,24 @@ type CompletedChunkGroupState = {
   start: number;
   end: number;
   summary: ChunkWindowDiagnostics;
+};
+
+type DerivedOriginalChunkSummary = {
+  chunkId: string;
+  start: number;
+  end: number;
+  sum: number;
+  count: number;
+};
+
+type DerivedOriginalOutputConsumer = {
+  emittedWindowCount: number;
+  nextWindowStartIndex: number;
+  orderedChunks: DerivedOriginalChunkSummary[];
+  originalOutputTopic: string;
+  originalQueryHash: string;
+  projectionTerms: CompatibleAvgChunkReuseSpec["projectionTerms"];
+  reuseSpec: CompatibleAvgChunkReuseSpec;
 };
 
 type ChunkedDebugSummary = {
@@ -429,6 +452,18 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             subqueryId: parsed.subqueryId,
             window: parsed.window,
             chunkId: parsed.chunkId || `${chunkGroupId}:${parsed.subqueryId}`,
+            reuseClassKey:
+              typeof parsed.reuseClassKey === "string"
+                ? parsed.reuseClassKey
+                : undefined,
+            sourceStreamId:
+              typeof parsed.sourceStreamId === "string"
+                ? parsed.sourceStreamId
+                : undefined,
+            sourceTopic:
+              typeof parsed.sourceTopic === "string"
+                ? parsed.sourceTopic
+                : undefined,
             aggregateFunction: parsed.aggregateFunction,
             value: Number.isFinite(Number(parsed.value))
               ? Number(parsed.value)
@@ -442,6 +477,19 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             avg: Number.isFinite(Number(parsed.avg))
               ? Number(parsed.avg)
               : undefined,
+            state:
+              parsed.state &&
+              (Number.isFinite(Number(parsed.state.count)) ||
+                Number.isFinite(Number(parsed.state.sum)))
+                ? {
+                    count: Number.isFinite(Number(parsed.state.count))
+                      ? Number(parsed.state.count)
+                      : undefined,
+                    sum: Number.isFinite(Number(parsed.state.sum))
+                      ? Number(parsed.state.sum)
+                      : undefined,
+                  }
+                : undefined,
             rdfPayload: typeof parsed.rdfPayload === "string" ? parsed.rdfPayload : undefined,
           };
         }
@@ -519,6 +567,91 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       }
     }
     return true;
+  }
+
+  private hasContiguousDerivedChunks(groups: DerivedOriginalChunkSummary[]): boolean {
+    for (let index = 1; index < groups.length; index += 1) {
+      if (groups[index - 1].end !== groups[index].start) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private buildDerivedOriginalConsumers(): Map<string, DerivedOriginalOutputConsumer> {
+    const consumers = new Map<string, DerivedOriginalOutputConsumer>();
+    for (const query of this.subQueries) {
+      const reuseSpec = detectCompatibleAvgChunkReuse(query);
+      if (!reuseSpec) {
+        continue;
+      }
+
+      consumers.set(reuseSpec.sourceTopic, {
+        emittedWindowCount: 0,
+        nextWindowStartIndex: 0,
+        orderedChunks: [],
+        originalOutputTopic: reuseSpec.originalOutputTopic,
+        originalQueryHash: reuseSpec.originalQueryHash,
+        projectionTerms: reuseSpec.projectionTerms,
+        reuseSpec,
+      });
+    }
+    return consumers;
+  }
+
+  private async publishDerivedOriginalOutputFromChunks(
+    consumer: DerivedOriginalOutputConsumer,
+  ): Promise<void> {
+    const chunksPerWindow = Math.max(
+      1,
+      Math.ceil(consumer.reuseSpec.originalWindowRange / this.chunkGCD),
+    );
+    const chunksPerStep = Math.max(
+      1,
+      Math.ceil(consumer.reuseSpec.originalWindowStep / this.chunkGCD),
+    );
+
+    while (
+      consumer.nextWindowStartIndex + chunksPerWindow <=
+      consumer.orderedChunks.length
+    ) {
+      const windowChunks = consumer.orderedChunks.slice(
+        consumer.nextWindowStartIndex,
+        consumer.nextWindowStartIndex + chunksPerWindow,
+      );
+      if (!this.hasContiguousDerivedChunks(windowChunks)) {
+        break;
+      }
+
+      const totalCount = windowChunks.reduce((sum, chunk) => sum + chunk.count, 0);
+      const totalSum = windowChunks.reduce((sum, chunk) => sum + chunk.sum, 0);
+      const payloads = deriveAvgProjectionValues(
+        consumer.projectionTerms,
+        totalSum,
+        totalCount,
+      );
+      for (const payload of payloads) {
+        await this.publishWithSharedClient(consumer.originalOutputTopic, payload, {
+          qos: 1,
+        });
+        recordPublishedMqttMessage({
+          topic: consumer.originalOutputTopic,
+          payload,
+          messageType: "reusable_result",
+        });
+      }
+      consumer.emittedWindowCount += 1;
+      profileCount("original_agent_outputs_derived_from_chunks");
+
+      consumer.nextWindowStartIndex += chunksPerStep;
+      if (consumer.nextWindowStartIndex > 0) {
+        const retainFrom = Math.max(0, consumer.nextWindowStartIndex - chunksPerStep);
+        if (retainFrom > 0) {
+          consumer.orderedChunks.splice(0, retainFrom);
+          consumer.nextWindowStartIndex -= retainFrom;
+        }
+      }
+    }
   }
 
   public collectChunkByWindow(
@@ -924,6 +1057,11 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     });
     this.activeMqttClients.push(chunkClient);
     profileCount("mqtt_clients_created");
+    const derivedOriginalConsumers = this.buildDerivedOriginalConsumers();
+    profileCount(
+      "chunk_consumers_registered",
+      derivedOriginalConsumers.size + 1,
+    );
     this.logger.log(`Connecting to MQTT broker at ${this.mqttBroker}...`);
     chunkClient.on("error", (err) => {
       console.error("MQTT connection error:", err);
@@ -958,6 +1096,14 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       const topicToSubqueryId = new Map(
         subqueryIdentities.map((entry) => [entry.topic, entry.subqueryId]),
       );
+      const sourceTopicToChunkTopic = new Map<string, string>();
+      for (let index = 0; index < this.subQueries.length; index += 1) {
+        const reuseSpec = detectCompatibleAvgChunkReuse(this.subQueries[index]);
+        const rewrittenTopic = topics[index];
+        if (reuseSpec && rewrittenTopic) {
+          sourceTopicToChunkTopic.set(reuseSpec.sourceTopic, rewrittenTopic);
+        }
+      }
       this.chunkedDebugSummary.expectedSubqueryCount = expectedSubqueryIds.length;
       this.chunkedDebugSummary.expectedSubqueryIds = [...expectedSubqueryIds];
       const topicsOfProcesses = Array.from(new Set(topics));
@@ -1276,6 +1422,36 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             );
           }
           this.lastObservedEventTimestampByTopic.set(topic, normalized.window.end);
+          const derivedConsumer = normalized.sourceTopic
+            ? derivedOriginalConsumers.get(normalized.sourceTopic)
+            : undefined;
+          if (
+            derivedConsumer &&
+            sourceTopicToChunkTopic.get(derivedConsumer.reuseSpec.sourceTopic) === topic
+          ) {
+            const count =
+              normalized.state?.count ??
+              (Number.isFinite(normalized.count) ? normalized.count : undefined);
+            const sum =
+              normalized.state?.sum ??
+              (Number.isFinite(normalized.sum) ? normalized.sum : undefined);
+            if (Number.isFinite(count) && Number.isFinite(sum)) {
+              const alreadySeen = derivedConsumer.orderedChunks.some(
+                (chunk) => chunk.chunkId === normalized.chunkId,
+              );
+              if (!alreadySeen) {
+                derivedConsumer.orderedChunks.push({
+                  chunkId: normalized.chunkId,
+                  start: normalized.window.start,
+                  end: normalized.window.end,
+                  sum: sum as number,
+                  count: count as number,
+                });
+                derivedConsumer.orderedChunks.sort((a, b) => a.start - b.start);
+                await this.publishDerivedOriginalOutputFromChunks(derivedConsumer);
+              }
+            }
+          }
           const expectedSubqueryId = topicToSubqueryId.get(topic);
           const effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
           const chunkGroupId = getLogicalChunkGroupId(normalized);
@@ -1782,6 +1958,7 @@ For example, the allResults object might look like this:
           hash_subQuery,
         );
         profileCount("rsp_query_processes_started");
+        profileCount("shared_chunk_producers_created");
         const p = rspQueryProcess
           .stream_process()
           .then(() => {
