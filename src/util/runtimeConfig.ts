@@ -153,12 +153,14 @@ export function buildSubQuerySelectClause(
   const countAlias = `?count${topicSuffix}`;
   const sumAlias = `?sum${topicSuffix}`;
   const avgAlias = `?avg${topicSuffix}`;
+  const minAlias = `?min${topicSuffix}`;
+  const maxAlias = `?max${topicSuffix}`;
 
   if (aggregation === "COUNT") {
-    return `(COUNT(?value) AS ${aggAlias}) (COUNT(?value) AS ${countAlias}) (SUM(?value) AS ${sumAlias}) (AVG(?value) AS ${avgAlias})`;
+    return `(COUNT(?value) AS ${aggAlias}) (COUNT(?value) AS ${countAlias}) (SUM(?value) AS ${sumAlias}) (AVG(?value) AS ${avgAlias}) (MIN(?value) AS ${minAlias}) (MAX(?value) AS ${maxAlias})`;
   }
 
-  return `(${aggregation}(?value) AS ${aggAlias}) (COUNT(?value) AS ${countAlias}) (SUM(?value) AS ${sumAlias}) (AVG(?value) AS ${avgAlias})`;
+  return `(${aggregation}(?value) AS ${aggAlias}) (COUNT(?value) AS ${countAlias}) (SUM(?value) AS ${sumAlias}) (AVG(?value) AS ${avgAlias}) (MIN(?value) AS ${minAlias}) (MAX(?value) AS ${maxAlias})`;
 }
 
 export function buildOutputSelectClause(

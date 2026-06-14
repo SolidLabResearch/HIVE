@@ -13,7 +13,7 @@ for pattern in "${PATTERNS[@]}"; do
     echo "================================================================================================"
     
     # Clean up previous logs
-    rm -f chunked_latency_log.csv streaming_query_hive_resource_log.csv
+    rm -f chunked_latency_log.csv streaming_query_hive_resource_log.csv chunked_debug_summary.json chunked_emission_proof.json
     
     # Run chunked approach
     DATA_PATH="pattern_comparison/$pattern" gtimeout 240 node dist/approaches/StreamingQueryChunkedApproachOrchestrator.js > /dev/null 2>&1 &
@@ -39,6 +39,12 @@ for pattern in "${PATTERNS[@]}"; do
         
         # Copy results
         cp chunked_latency_log.csv "pattern_comparison_results/chunked_${pattern}.csv"
+        if [ -f "chunked_debug_summary.json" ]; then
+            cp chunked_debug_summary.json "pattern_comparison_results/chunked_${pattern}_debug_summary.json"
+        fi
+        if [ -f "chunked_emission_proof.json" ]; then
+            cp chunked_emission_proof.json "pattern_comparison_results/chunked_${pattern}_emission_proof.json"
+        fi
         
         if [ -f "streaming_query_hive_resource_log.csv" ]; then
             cp streaming_query_hive_resource_log.csv "pattern_comparison_results/chunked_${pattern}_resources.csv"
@@ -70,7 +76,7 @@ for pattern in "${PATTERNS[@]}"; do
     fi
     
     # Clean up
-    rm -f chunked_latency_log.csv streaming_query_hive_resource_log.csv
+    rm -f chunked_latency_log.csv streaming_query_hive_resource_log.csv chunked_debug_summary.json chunked_emission_proof.json
 done
 
 echo ""

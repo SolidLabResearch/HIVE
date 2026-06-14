@@ -76,6 +76,7 @@ const APPROACHS = {
     extraFiles: [
       "streaming_query_chunk_aggregator_log.csv",
       "chunked_debug_summary.json",
+      "chunked_emission_proof.json",
       "chunked_parent_partial_latency_log.csv",
       "chunked_window_diagnostics.csv",
       "chunked_orchestrator.log",
@@ -865,6 +866,9 @@ class ScalabilityRunner {
     const chunkedDebugSummary = approach === "chunked"
       ? readJsonIfExists(path.join(iterationDir, "chunked_debug_summary.json"))
       : null;
+    const chunkedEmissionProof = approach === "chunked"
+      ? readJsonIfExists(path.join(iterationDir, "chunked_emission_proof.json"))
+      : null;
     const latencyMetrics = computeLatencyMetrics(latencyRows);
     const resourceMetrics = computeResourceMetrics(path.join(iterationDir, APPROACHS[approach].resourceFile));
     const accuracyMetrics = computeAccuracyMetrics(baselineRows, latencyRows);
@@ -898,6 +902,7 @@ class ScalabilityRunner {
         mqttTraffic: mqttMetrics,
         accuracy: accuracyMetrics,
         chunkedDebug: chunkedDebugSummary,
+        chunkedEmissionProof,
       },
       validation: validationSummary,
       artifacts: {

@@ -20,9 +20,13 @@ export type PartialChunkResult = {
   count?: number;
   sum?: number;
   avg?: number;
+  min?: number;
+  max?: number;
   state?: {
     count?: number;
     sum?: number;
+    min?: number;
+    max?: number;
   };
   rdfPayload?: string;
 };

@@ -3,7 +3,7 @@ import { BeeKeeper } from "../services/BeeKeeper";
 import { HTTPServer } from "../services/server/HTTPServer";
 import config from '../config/httpServerConfig.json';
 import { hash_string_md5 } from "../util/Util";
-import { detectCompatibleAvgChunkReuse } from "../util/chunkStateReuse";
+import { detectCompatibleChunkReuse } from "../util/chunkStateReuse";
 import { profileCount } from "../util/profiling";
 
 /**
@@ -37,7 +37,7 @@ export class Orchestrator {
         const query_hash = hash_string_md5(query);
         const compatibleReuse =
             this.operatorType === "StreamingQueryChunkAggregatorOperator"
-                ? detectCompatibleAvgChunkReuse(query)
+                ? detectCompatibleChunkReuse(query)
                 : null;
 
         if (compatibleReuse) {

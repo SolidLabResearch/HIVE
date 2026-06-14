@@ -146,37 +146,25 @@ export class FetchingAllDataClientSide {
    */
   private initializeLogging() {
     const logFilePath = "fetching_client_side_log.csv";
-    const writeHeader = !fs.existsSync(logFilePath);
-    this.logStream = fs.createWriteStream(logFilePath, { flags: "a" });
-
-    if (writeHeader) {
-      this.logStream.write("timestamp,message\n");
-    }
+    this.logStream = fs.createWriteStream(logFilePath, { flags: "w" });
+    this.logStream.write("timestamp,message\n");
 
     // Initialize latency log
     const latencyLogFilePath = "fetching_latency_log.csv";
-    const writeLatencyHeader = !fs.existsSync(latencyLogFilePath);
     this.latencyLogStream = fs.createWriteStream(latencyLogFilePath, {
-      flags: "a",
+      flags: "w",
     });
-
-    if (writeLatencyHeader) {
-      this.latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,result_value\n",
-      );
-    }
+    this.latencyLogStream.write(
+      "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,result_value\n",
+    );
 
     const diagnosticsLogFilePath = "fetching_window_diagnostics.csv";
-    const writeDiagnosticsHeader = !fs.existsSync(diagnosticsLogFilePath);
     this.diagnosticsLogStream = fs.createWriteStream(diagnosticsLogFilePath, {
-      flags: "a",
+      flags: "w",
     });
-
-    if (writeDiagnosticsHeader) {
-      this.diagnosticsLogStream.write(
-        "benchmark_event_time_anchor,window_number,window_start,window_end,event_count,expected_event_count,sum,avg,first_event_timestamp,last_event_timestamp,completeness_status,accepted_or_suppressed,reason,result_value\n",
-      );
-    }
+    this.diagnosticsLogStream.write(
+      "benchmark_event_time_anchor,window_number,window_start,window_end,event_count,expected_event_count,sum,avg,first_event_timestamp,last_event_timestamp,completeness_status,accepted_or_suppressed,reason,result_value\n",
+    );
   }
 
   private deriveExpectedEventCount(): number | null {
@@ -711,9 +699,13 @@ export class FetchingAllDataClientSide {
     eventCount: number;
     sumValue: number;
     avgValue: number;
+    minValue: number | null;
+    maxValue: number | null;
   } {
     let eventCount = 0;
     let sumValue = 0;
+    let minValue: number | null = null;
+    let maxValue: number | null = null;
 
     for (const observations of this.observationsByStream.values()) {
       for (const observation of observations) {
@@ -723,6 +715,12 @@ export class FetchingAllDataClientSide {
         ) {
           eventCount += 1;
           sumValue += observation.value;
+          if (minValue === null || observation.value < minValue) {
+            minValue = observation.value;
+          }
+          if (maxValue === null || observation.value > maxValue) {
+            maxValue = observation.value;
+          }
         }
       }
     }
@@ -731,6 +729,8 @@ export class FetchingAllDataClientSide {
       eventCount,
       sumValue,
       avgValue: eventCount > 0 ? sumValue / eventCount : 0,
+      minValue,
+      maxValue,
     };
   }
 
@@ -1010,6 +1010,27 @@ export class FetchingAllDataClientSide {
 
         this.log(`Processing valid result: ${settledAggregate.avgValue}`);
 
+        let numericValue = settledAggregate.avgValue;
+        if (this.aggregationFunction === "SUM") {
+          numericValue = settledAggregate.sumValue;
+        } else if (this.aggregationFunction === "COUNT") {
+          numericValue = settledAggregate.eventCount;
+        } else if (this.aggregationFunction === "MIN") {
+          if (settledAggregate.eventCount === 0 || settledAggregate.minValue === null) {
+            this.log(`Empty window skipped for MIN`);
+            continue;
+          }
+          numericValue = settledAggregate.minValue;
+        } else if (this.aggregationFunction === "MAX") {
+          if (settledAggregate.eventCount === 0 || settledAggregate.maxValue === null) {
+            this.log(`Empty window skipped for MAX`);
+            continue;
+          }
+          numericValue = settledAggregate.maxValue;
+        }
+
+        const valueStr = String(numericValue);
+
         // Calculate and log latency with multiple metrics
         this.windowCount++;
         this.emittedLogicalWindows.add(logicalWindow.key);
@@ -1022,7 +1043,7 @@ export class FetchingAllDataClientSide {
           expectedWindowClose,
           this.lastObservationReceivedTime,
           resultEmittedAt,
-          String(settledAggregate.avgValue),
+          valueStr,
         );
         this.writeWindowDiagnostics(
           this.windowCount,
@@ -1035,7 +1056,7 @@ export class FetchingAllDataClientSide {
           settledCompleteness.status,
           "accepted",
           "finalized_settled_window",
-          String(settledAggregate.avgValue),
+          valueStr,
         );
         this.log(
           `Accepted/finalized: ${JSON.stringify({
@@ -1058,7 +1079,6 @@ export class FetchingAllDataClientSide {
         // Debug: print the full binding object
         // console.log("DEBUG: RStream binding:", binding);
 
-        const numericValue = settledAggregate.avgValue;
         const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
         const aggregation_object_string = useBenchmarkPayload
           ? JSON.stringify(
@@ -1082,7 +1102,7 @@ export class FetchingAllDataClientSide {
                   },
                 ),
               )
-          : JSON.stringify(this.generate_aggregation_event(data));
+          : JSON.stringify(this.generate_aggregation_event(valueStr));
         console.log(
           `Aggregation event generated: ${aggregation_object_string}`,
         );

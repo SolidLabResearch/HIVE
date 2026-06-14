@@ -703,7 +703,15 @@ class PatternResultExtractor {
         if (finalizedMatches.length > 0) {
           for (const finalized of finalizedMatches) {
             const timestamp = finalized.timestamp;
-            const resultValue = parseFloat(finalized.payload.avg);
+            const resultValue = parseFloat(
+              finalized.payload.resultValue ??
+              finalized.payload.result_value ??
+              finalized.payload.avg ??
+              finalized.payload.sum ??
+              finalized.payload.count ??
+              finalized.payload.min ??
+              finalized.payload.max
+            );
             const windowNumber = parseInt(finalized.payload.window_number, 10);
 
             if (

@@ -1,8 +1,10 @@
 jest.mock('mqtt', () => ({
     connect: jest.fn().mockReturnValue({
+        connected: true,
         on: jest.fn().mockReturnThis(),
+        once: jest.fn().mockReturnThis(),
         subscribe: jest.fn(),
-        publish: jest.fn(),
+        publish: jest.fn((topic, payload, options, callback) => callback?.()),
         end: jest.fn()
     })
 }));
@@ -23,6 +25,7 @@ jest.mock('./r2r', () => ({
 jest.mock('fs', () => ({
     ...jest.requireActual('fs'),
     existsSync: jest.fn().mockReturnValue(true),
+    writeFileSync: jest.fn(),
     createWriteStream: jest.fn().mockReturnValue({ write: jest.fn(), end: jest.fn() })
 }));
 
@@ -581,6 +584,140 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
         });
     });
 
+    describe('emission proof and readiness guard', () => {
+        const window = {
+            windowName: 'https://rsp.js/w1',
+            start: 1000,
+            end: 2000,
+            range: 1000,
+            step: 1000,
+            semantics: '[start,end)' as const,
+        };
+
+        const buildPartial = (subqueryId: string, chunkId: string, value: number) => ({
+            queryId: 'q1',
+            subqueryId,
+            window,
+            chunkId,
+            value,
+            count: 1,
+            rdfPayload: `<${subqueryId}> <https://saref.etsi.org/core/hasValue> "${value}"^^<http://www.w3.org/2001/XMLSchema#double> .`,
+        });
+
+        const buildCoverageState = (chunkGroupId: string, expectedSubqueryIds: string[], duplicates: Record<string, string[]> = {}) => ({
+            chunkGroupId,
+            expectedSubqueryIds,
+            receivedChunkIdsBySubquery: Object.fromEntries(
+                expectedSubqueryIds.map((subqueryId) => [subqueryId, [] as string[]]),
+            ),
+            duplicateChunksIgnoredBySubquery: Object.fromEntries(
+                expectedSubqueryIds.map((subqueryId) => [subqueryId, [...(duplicates[subqueryId] ?? [])]]),
+            ),
+        });
+
+        const buildProcessingState = (
+            chunksByWindow: Map<string, Map<string, any>>,
+            chunkCoverageByWindow: Map<string, any>,
+            expectedSubqueryIds: string[],
+            comparableOutputCadenceOnly = false,
+        ) => ({
+            chunksByWindow,
+            chunkCoverageByWindow,
+            completedChunkGroups: new Map(),
+            orderedCompletedChunkGroups: [],
+            readyChunkGroupIds: Array.from(chunksByWindow.keys()),
+            readyChunkGroupSet: new Set(chunksByWindow.keys()),
+            nextComparableWindowStartIndex: 0,
+            expectedSubqueryIds,
+            outputAggregationFunction: 'SUM',
+            chunksPerComparableWindow: 1,
+            chunkGroupsPerOutputStep: 1,
+            comparableOutputCadenceOnly,
+        });
+
+        test('complete chunk coverage emits exactly one result on an interval tick', async () => {
+            const chunkGroupId = 'q1:1000:2000';
+            const expectedSubqueryIds = ['subA', 'subB'];
+            const chunksByWindow = new Map([
+                [
+                    chunkGroupId,
+                    new Map([
+                        ['subA', buildPartial('subA', 'chunk-a', 10)],
+                        ['subB', buildPartial('subB', 'chunk-b', 20)],
+                    ]),
+                ],
+            ]);
+            const chunkCoverageByWindow = new Map([
+                [chunkGroupId, buildCoverageState(chunkGroupId, expectedSubqueryIds)],
+            ]);
+            const state = buildProcessingState(chunksByWindow, chunkCoverageByWindow, expectedSubqueryIds);
+
+            await (operator as any).processReadyChunkGroups('Interval', state);
+
+            expect((operator as any).chunkedDebugSummary.intervalTriggersWithEmission).toBe(1);
+            expect((operator as any).chunkedEmissionProofEntries).toHaveLength(1);
+            expect((operator as any).chunkedEmissionProofEntries[0].coverageComplete).toBe(true);
+        });
+
+        test('missing chunk prevents emission and leaves the interval tick empty', async () => {
+            const chunkGroupId = 'q1:1000:2000';
+            const expectedSubqueryIds = ['subA', 'subB'];
+            const chunksByWindow = new Map([
+                [chunkGroupId, new Map([['subA', buildPartial('subA', 'chunk-a', 10)]])],
+            ]);
+            const chunkCoverageByWindow = new Map([
+                [chunkGroupId, buildCoverageState(chunkGroupId, expectedSubqueryIds)],
+            ]);
+            const state = buildProcessingState(chunksByWindow, chunkCoverageByWindow, expectedSubqueryIds);
+            state.readyChunkGroupIds = [];
+            state.readyChunkGroupSet = new Set();
+
+            await (operator as any).processReadyChunkGroups('Interval', state);
+
+            expect((operator as any).chunkedDebugSummary.intervalTriggersWithoutEmission).toBe(1);
+        });
+
+        test('duplicate chunks are ignored and recorded in the proof payload', async () => {
+            const chunkGroupId = 'q1:1000:2000';
+            const expectedSubqueryIds = ['subA', 'subB'];
+            const chunksByWindow = new Map([
+                [
+                    chunkGroupId,
+                    new Map([
+                        ['subA', buildPartial('subA', 'chunk-a', 10)],
+                        ['subB', buildPartial('subB', 'chunk-b', 20)],
+                    ]),
+                ],
+            ]);
+            const chunkCoverageByWindow = new Map([
+                [chunkGroupId, buildCoverageState(chunkGroupId, expectedSubqueryIds, { subA: ['chunk-a-dup'] })],
+            ]);
+            const state = buildProcessingState(chunksByWindow, chunkCoverageByWindow, expectedSubqueryIds);
+
+            await (operator as any).processReadyChunkGroups('Immediate', state);
+
+            const proof = (operator as any).chunkedEmissionProofEntries[0];
+            expect(proof.duplicateChunksIgnoredBySubquery.subA).toEqual(['chunk-a-dup']);
+            expect(proof.receivedChunksUsedBySubquery.subA).toEqual(['chunk-a']);
+        });
+
+        test('emission proof only includes expected chunks for the emitted window', () => {
+            const proof = (operator as any).buildChunkEmissionProofEntry(
+                [buildPartial('subA', 'chunk-a', 10), buildPartial('subB', 'chunk-b', 20)],
+                'q1:1000:2000',
+                undefined,
+                'coverage_complete',
+            );
+
+            expect(proof?.expectedSubqueryIds.sort()).toEqual(['subA', 'subB']);
+            expect(proof?.requiredChunksBySubquery.subA).toEqual(['chunk-a']);
+            expect(proof?.requiredChunksBySubquery.subB).toEqual(['chunk-b']);
+            expect(proof?.missingChunksBySubquery.subA).toEqual([]);
+            expect(proof?.missingChunksBySubquery.subB).toEqual([]);
+            expect(proof?.coverageComplete).toBe(true);
+        });
+    });
+
     describe('caching and cleanup', () => {
         test('executeR2ROperator uses structured comparable diagnostics before RDF parsing fallback', async () => {
             const mqtt = require('mqtt');
@@ -686,6 +823,291 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(latencyStream.end).toHaveBeenCalled();
             expect(diagnosticsStream.end).toHaveBeenCalled();
             expect(parentPartialStream.end).toHaveBeenCalled();
+        });
+    });
+
+    describe('Chunked latency instrumentation and validation', () => {
+        test('last_required_chunk_received_at only uses chunks required for the emitted window and later unrelated chunks do not affect it', () => {
+            const proofEntry = {
+                windowStart: 1000,
+                windowEnd: 2000,
+                emittedAt: 0,
+                emissionReason: 'coverage_complete',
+                expectedSubqueryIds: ['subA'],
+                expectedSubqueryCount: 1,
+                requiredChunksBySubquery: {
+                    subA: ['chunk-required-1']
+                },
+                receivedChunksUsedBySubquery: {
+                    subA: ['chunk-required-1']
+                },
+                missingChunksBySubquery: { subA: [] },
+                duplicateChunksIgnoredBySubquery: { subA: [] },
+                coverageComplete: true,
+                allExpectedSubqueriesPresent: true,
+                emitted: true
+            };
+
+            (operator as any).chunkArrivalTimes.set('chunk-required-1', 1781370000000);
+            (operator as any).chunkArrivalTimes.set('chunk-unrelated-later', 1781370099999);
+
+            (operator as any).chunkWindowMap.set('chunk-required-1', { start: 1000, end: 2000 });
+            (operator as any).chunkWindowMap.set('chunk-unrelated-later', { start: 2000, end: 3000 });
+
+            const writeSpy = jest.spyOn((operator as any).latencyLogStream, 'write');
+
+            (operator as any).logLatency(
+                1,
+                1781370000000,
+                1781370099999,
+                1781370005000,
+                1781370005005,
+                '42.0',
+                proofEntry,
+                'Interval'
+            );
+
+            expect(writeSpy).toHaveBeenCalled();
+            const logLine = writeSpy.mock.calls[0][0] as string;
+            const fields = logLine.trim().split(',');
+
+            expect(fields[12]).toBe('1000-2000');
+            expect(fields[13]).toBe('1781370000000');
+            expect(fields[14]).toBe('1781370000000');
+            expect(fields[17]).toBe('interval');
+        });
+
+        test('ready_to_emit_ms is near zero in immediate mode and reflects scheduling wait in interval mode', () => {
+            const proofEntry = {
+                windowStart: 1000,
+                windowEnd: 2000,
+                emittedAt: 0,
+                emissionReason: 'coverage_complete',
+                expectedSubqueryIds: ['subA'],
+                expectedSubqueryCount: 1,
+                requiredChunksBySubquery: {
+                    subA: ['chunk-1']
+                },
+                receivedChunksUsedBySubquery: {
+                    subA: ['chunk-1']
+                },
+                missingChunksBySubquery: { subA: [] },
+                duplicateChunksIgnoredBySubquery: { subA: [] },
+                coverageComplete: true,
+                allExpectedSubqueriesPresent: true,
+                emitted: true
+            };
+
+            (operator as any).chunkArrivalTimes.set('chunk-1', 1000);
+            (operator as any).chunkWindowMap.set('chunk-1', { start: 1000, end: 2000 });
+
+            const writeSpy = jest.spyOn((operator as any).latencyLogStream, 'write');
+
+            (operator as any).logLatency(
+                1,
+                1000,
+                1000,
+                1001,
+                1002,
+                '42.0',
+                proofEntry,
+                'Immediate'
+            );
+
+            let fields = (writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string).trim().split(',');
+            expect(fields[16]).toBe('2');
+            expect(fields[17]).toBe('immediate');
+
+            (operator as any).logLatency(
+                1,
+                1000,
+                1000,
+                2000,
+                2002,
+                '42.0',
+                proofEntry,
+                'Interval'
+            );
+
+            fields = (writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string).trim().split(',');
+            expect(fields[16]).toBe('1002');
+            expect(fields[17]).toBe('interval');
+        });
+
+        test('incomplete chunk coverage blocks emission', async () => {
+            const chunkGroupId = 'q1:1000:2000';
+            const expectedSubqueryIds = ['subA', 'subB'];
+            const chunksByWindow = new Map([
+                [chunkGroupId, new Map([['subA', {
+                    queryId: 'q1',
+                    subqueryId: 'subA',
+                    window: { start: 1000, end: 2000 },
+                    chunkId: 'chunk-a',
+                    value: 10
+                } as any]])]
+            ]);
+            const chunkCoverageByWindow = new Map([
+                [chunkGroupId, {
+                    chunkGroupId,
+                    expectedSubqueryIds,
+                    receivedChunkIdsBySubquery: { subA: ['chunk-a'], subB: [] },
+                    duplicateChunksIgnoredBySubquery: { subA: [], subB: [] }
+                }]
+            ]);
+
+            const state = {
+                chunksByWindow,
+                chunkCoverageByWindow,
+                completedChunkGroups: new Map(),
+                orderedCompletedChunkGroups: [],
+                readyChunkGroupIds: [chunkGroupId],
+                readyChunkGroupSet: new Set([chunkGroupId]),
+                nextComparableWindowStartIndex: 0,
+                expectedSubqueryIds,
+                outputAggregationFunction: 'SUM' as const,
+                chunksPerComparableWindow: 1,
+                chunkGroupsPerOutputStep: 1,
+                comparableOutputCadenceOnly: false
+            };
+
+            const executeSpy = jest.spyOn(operator, 'executeR2ROperator');
+
+            await (operator as any).processReadyChunkGroups('Immediate', state);
+
+            expect(executeSpy).not.toHaveBeenCalled();
+        });
+
+        test('summarizeWindowRecomposition for MIN', () => {
+            const chunkGroups: any[] = [
+                {
+                    chunkGroupId: 'g1',
+                    start: 0,
+                    end: 30000,
+                    summary: {
+                        chunkGroupId: 'g1',
+                        start: 0,
+                        end: 30000,
+                        count: 1,
+                        sum: 5,
+                        avg: 5,
+                        value: 5,
+                        min: 5,
+                        max: 5,
+                        subqueries: ['sub1'],
+                        receivedChunkIdsBySubquery: {},
+                        duplicateChunksIgnoredBySubquery: {},
+                        missingSubqueryIds: [],
+                        coverageComplete: true
+                    }
+                },
+                {
+                    chunkGroupId: 'g2',
+                    start: 30000,
+                    end: 60000,
+                    summary: {
+                        chunkGroupId: 'g2',
+                        start: 30000,
+                        end: 60000,
+                        count: 1,
+                        sum: 2,
+                        avg: 2,
+                        value: 2,
+                        min: 2,
+                        max: 2,
+                        subqueries: ['sub1'],
+                        receivedChunkIdsBySubquery: {},
+                        duplicateChunksIgnoredBySubquery: {},
+                        missingSubqueryIds: [],
+                        coverageComplete: true
+                    }
+                }
+            ];
+            const result = (operator as any).summarizeWindowRecomposition(chunkGroups, 'MIN');
+            expect(result).not.toBeNull();
+            expect(result.recomposedMin).toBe(2);
+            expect(result.resultValue).toBe(2);
+        });
+
+        test('summarizeWindowRecomposition for MAX', () => {
+            const chunkGroups: any[] = [
+                {
+                    chunkGroupId: 'g1',
+                    start: 0,
+                    end: 30000,
+                    summary: {
+                        chunkGroupId: 'g1',
+                        start: 0,
+                        end: 30000,
+                        count: 1,
+                        sum: 5,
+                        avg: 5,
+                        value: 5,
+                        min: 5,
+                        max: 5,
+                        subqueries: ['sub1'],
+                        receivedChunkIdsBySubquery: {},
+                        duplicateChunksIgnoredBySubquery: {},
+                        missingSubqueryIds: [],
+                        coverageComplete: true
+                    }
+                },
+                {
+                    chunkGroupId: 'g2',
+                    start: 30000,
+                    end: 60000,
+                    summary: {
+                        chunkGroupId: 'g2',
+                        start: 30000,
+                        end: 60000,
+                        count: 1,
+                        sum: 12,
+                        avg: 12,
+                        value: 12,
+                        min: 12,
+                        max: 12,
+                        subqueries: ['sub1'],
+                        receivedChunkIdsBySubquery: {},
+                        duplicateChunksIgnoredBySubquery: {},
+                        missingSubqueryIds: [],
+                        coverageComplete: true
+                    }
+                }
+            ];
+            const result = (operator as any).summarizeWindowRecomposition(chunkGroups, 'MAX');
+            expect(result).not.toBeNull();
+            expect(result.recomposedMax).toBe(12);
+            expect(result.resultValue).toBe(12);
+        });
+
+        test('MIN/MAX empty chunks do not produce fake values', () => {
+            const chunkGroups: any[] = [
+                {
+                    chunkGroupId: 'g1',
+                    start: 0,
+                    end: 30000,
+                    summary: {
+                        chunkGroupId: 'g1',
+                        start: 0,
+                        end: 30000,
+                        count: null,
+                        sum: null,
+                        avg: null,
+                        value: null,
+                        min: null,
+                        max: null,
+                        subqueries: ['sub1'],
+                        receivedChunkIdsBySubquery: {},
+                        duplicateChunksIgnoredBySubquery: {},
+                        missingSubqueryIds: [],
+                        coverageComplete: true
+                    }
+                }
+            ];
+            const resultMin = (operator as any).summarizeWindowRecomposition(chunkGroups, 'MIN');
+            expect(resultMin).toBeNull();
+
+            const resultMax = (operator as any).summarizeWindowRecomposition(chunkGroups, 'MAX');
+            expect(resultMax).toBeNull();
         });
     });
 });

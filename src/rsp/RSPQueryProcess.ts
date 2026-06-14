@@ -7,7 +7,7 @@ import { recordPublishedMqttMessage } from '../util/mqttTraffic';
 import { getTimestampDomainMax, getTimestampDomainMin, useCleanMqttSessionsForBenchmark } from '../util/runtimeConfig';
 import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
 import { resourceTraceSnapshot } from "../util/resourceTrace";
-import { detectCompatibleAvgChunkReuse } from '../util/chunkStateReuse';
+import { detectCompatibleChunkReuse } from '../util/chunkStateReuse';
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
 
@@ -298,15 +298,17 @@ export class RSPQueryProcess {
 
         const aggregateFunctionMatch = this.query.match(/\b(AVG|SUM|COUNT|MIN|MAX)\s*\(/i);
         const aggregateFunction = aggregateFunctionMatch?.[1]?.toUpperCase();
-        const value = this.extractNumericBinding(bindings, ["avg", "agg", "sum", "min", "max"]);
+        const value = this.extractNumericBinding(bindings, ["agg", "avg", "sum", "min", "max"]);
         const count = this.extractNumericBinding(bindings, ["count"]);
         const sum = this.extractNumericBinding(bindings, ["sum"]);
         const avg = this.extractNumericBinding(bindings, ["avg"]);
+        const min = this.extractNumericBinding(bindings, ["min"]);
+        const max = this.extractNumericBinding(bindings, ["max"]);
         const event_timestamp = new Date().getTime();
         const rdfPayload = this.generate_aggregation_event(bindings, event_timestamp);
         const chunkGroupId = `${this.queryId}:${windowBounds.start}:${windowBounds.end}`;
         const chunkId = `${chunkGroupId}:${this.subqueryId}`;
-        const compatibleReuse = detectCompatibleAvgChunkReuse(this.query);
+        const compatibleReuse = detectCompatibleChunkReuse(this.query);
 
         return {
             queryId: this.queryId,
@@ -328,10 +330,21 @@ export class RSPQueryProcess {
             count,
             sum,
             avg,
-            state: {
-                count,
-                sum,
-            },
+            min,
+            max,
+            state: compatibleReuse
+                ? {
+                    ...(compatibleReuse.aggregationStateSignature.includes("count") ? { count } : {}),
+                    ...(compatibleReuse.aggregationStateSignature.includes("sum") ? { sum } : {}),
+                    ...(compatibleReuse.aggregationStateSignature.includes("min") ? { min } : {}),
+                    ...(compatibleReuse.aggregationStateSignature.includes("max") ? { max } : {}),
+                  }
+                : {
+                    count,
+                    sum,
+                    min,
+                    max,
+                  },
             rdfPayload,
         };
     }
@@ -417,7 +430,7 @@ export class RSPQueryProcess {
         for (const [key, value] of Object.entries(bindings)) {
              console.log(`DEBUG: Generating triple for key: ${key}, value: ${value}`);
              let predicate = "";
-             if (key.startsWith("avg") || key.startsWith("agg")) {
+             if (key.startsWith("avg") || key.startsWith("agg") || key.startsWith("sum") || key.startsWith("min") || key.startsWith("max")) {
                  predicate = "<https://saref.etsi.org/core/hasValue>";
              } else if (key.startsWith("count")) {
                  predicate = "<https://saref.etsi.org/core/hasCount>";

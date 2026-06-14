@@ -124,6 +124,8 @@ class FrequencyComparisonChunkedWithCapture {
             'streaming_query_chunk_aggregator_log.csv',
             'streaming_query_hive_resource_log.csv',
             'chunked_latency_log.csv',
+            'chunked_debug_summary.json',
+            'chunked_emission_proof.json',
             'replayer-log.csv'
         ];
 
