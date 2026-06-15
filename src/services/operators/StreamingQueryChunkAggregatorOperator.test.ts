@@ -30,6 +30,7 @@ jest.mock('fs', () => ({
 }));
 
 import { StreamingQueryChunkAggregatorOperator } from './StreamingQueryChunkAggregatorOperator';
+import fs from 'fs';
 
 const QUERY_SINGLE_WINDOW = `
 PREFIX : <https://rsp.js/>
@@ -716,6 +717,168 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(proof?.missingChunksBySubquery.subB).toEqual([]);
             expect(proof?.coverageComplete).toBe(true);
         });
+
+        test('comparable-window emission proof aggregates required and duplicate chunk records across internal chunks', () => {
+            const proof = (operator as any).buildChunkEmissionProofEntry(
+                [],
+                'q1:1000:3000..q1:3000:5000',
+                {
+                    externalWindowNumber: 2,
+                    externalWindowStart: 1000,
+                    externalWindowEnd: 5000,
+                    internalChunkGroupIds: ['q1:1000:3000', 'q1:3000:5000'],
+                    internalChunks: [
+                        {
+                            chunkGroupId: 'q1:1000:3000',
+                            start: 1000,
+                            end: 3000,
+                            count: 2,
+                            sum: 30,
+                            avg: 15,
+                            value: 15,
+                            min: 10,
+                            max: 20,
+                            subqueries: ['subA', 'subB'],
+                            receivedChunkIdsBySubquery: {
+                                subA: ['chunk-a1'],
+                                subB: ['chunk-b1'],
+                            },
+                            duplicateChunksIgnoredBySubquery: {
+                                subA: ['chunk-a1-dup'],
+                                subB: [],
+                            },
+                            missingSubqueryIds: [],
+                            coverageComplete: true,
+                        },
+                        {
+                            chunkGroupId: 'q1:3000:5000',
+                            start: 3000,
+                            end: 5000,
+                            count: 2,
+                            sum: 50,
+                            avg: 25,
+                            value: 25,
+                            min: 20,
+                            max: 30,
+                            subqueries: ['subA', 'subB'],
+                            receivedChunkIdsBySubquery: {
+                                subA: ['chunk-a2'],
+                                subB: ['chunk-b2'],
+                            },
+                            duplicateChunksIgnoredBySubquery: {
+                                subA: [],
+                                subB: [],
+                            },
+                            missingSubqueryIds: [],
+                            coverageComplete: true,
+                        },
+                    ],
+                    recomposedCount: 4,
+                    recomposedSum: 80,
+                    recomposedAvg: 20,
+                    resultValue: 20,
+                },
+                'coverage_complete',
+            );
+
+            expect(proof?.windowStart).toBe(1000);
+            expect(proof?.windowEnd).toBe(5000);
+            expect(proof?.expectedSubqueryIds).toEqual(['subA', 'subB']);
+            expect(proof?.requiredChunksBySubquery).toEqual({
+                subA: ['chunk-a1', 'chunk-a2'],
+                subB: ['chunk-b1', 'chunk-b2'],
+            });
+            expect(proof?.receivedChunksUsedBySubquery).toEqual({
+                subA: ['chunk-a1', 'chunk-a2'],
+                subB: ['chunk-b1', 'chunk-b2'],
+            });
+            expect(proof?.duplicateChunksIgnoredBySubquery).toEqual({
+                subA: ['chunk-a1-dup'],
+                subB: [],
+            });
+            expect(proof?.coverageComplete).toBe(true);
+            expect(proof?.emitted).toBe(true);
+        });
+
+        test('comparable-window emission stays chronological when complete chunk groups arrive out of order', async () => {
+            const expectedSubqueryIds = ['subA', 'subB'];
+            const buildWindow = (start: number, end: number) => ({
+                windowName: 'https://rsp.js/w1',
+                start,
+                end,
+                range: end - start,
+                step: end - start,
+                semantics: '[start,end)' as const,
+            });
+            const buildCompleteGroup = (
+                chunkGroupId: string,
+                start: number,
+                groupSum: number,
+            ) => {
+                const window = buildWindow(start, start + 1000);
+                const perSubquerySum = groupSum / expectedSubqueryIds.length;
+                return [
+                    chunkGroupId,
+                    new Map([
+                        [
+                            'subA',
+                            {
+                                ...buildPartial('subA', `${chunkGroupId}:subA`, perSubquerySum),
+                                window,
+                                sum: perSubquerySum,
+                            },
+                        ],
+                        [
+                            'subB',
+                            {
+                                ...buildPartial('subB', `${chunkGroupId}:subB`, perSubquerySum),
+                                window,
+                                sum: perSubquerySum,
+                            },
+                        ],
+                    ]),
+                ] as const;
+            };
+
+            const chunksByWindow = new Map([
+                buildCompleteGroup('q1:3000:4000', 3000, 30),
+                buildCompleteGroup('q1:1000:2000', 1000, 10),
+                buildCompleteGroup('q1:2000:3000', 2000, 20),
+            ]);
+            const chunkCoverageByWindow = new Map([
+                ['q1:3000:4000', buildCoverageState('q1:3000:4000', expectedSubqueryIds)],
+                ['q1:1000:2000', buildCoverageState('q1:1000:2000', expectedSubqueryIds)],
+                ['q1:2000:3000', buildCoverageState('q1:2000:3000', expectedSubqueryIds)],
+            ]);
+            const state = buildProcessingState(
+                chunksByWindow,
+                chunkCoverageByWindow,
+                expectedSubqueryIds,
+                true,
+            );
+            state.chunksPerComparableWindow = 3;
+            state.chunkGroupsPerOutputStep = 3;
+
+            const executeSpy = jest.spyOn(operator as any, 'executeR2ROperator').mockResolvedValue(undefined);
+
+            await (operator as any).processReadyChunkGroups('Immediate', state);
+
+            expect((state as any).orderedCompletedChunkGroups.map((group: any) => group.start)).toEqual([
+                1000,
+                2000,
+                3000,
+            ]);
+            expect(executeSpy).toHaveBeenCalledTimes(1);
+
+            const comparableDiagnostics = executeSpy.mock.calls[0][2] as any;
+            expect(comparableDiagnostics?.internalChunkGroupIds).toEqual([
+                'q1:1000:2000',
+                'q1:2000:3000',
+                'q1:3000:4000',
+            ]);
+            expect(new Set(comparableDiagnostics?.internalChunkGroupIds).size).toBe(3);
+            expect(comparableDiagnostics?.resultValue).toBe(60);
+        });
     });
 
     describe('caching and cleanup', () => {
@@ -823,6 +986,69 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(latencyStream.end).toHaveBeenCalled();
             expect(diagnosticsStream.end).toHaveBeenCalled();
             expect(parentPartialStream.end).toHaveBeenCalled();
+        });
+    });
+
+    describe('publisher delayed connect', () => {
+        test('registers once(connect) and publishes only after connect for a single queued publish', async () => {
+            const connectCallbacks: Array<() => void> = [];
+            let publisherClient: any;
+            publisherClient = {
+                connected: false,
+                publish: jest.fn((topic, payload, options, callback) => callback?.()),
+                once: jest.fn((event: string, callback: () => void) => {
+                    if (event === 'connect') {
+                        connectCallbacks.push(callback);
+                    }
+                    return publisherClient;
+                }),
+                end: jest.fn(),
+            };
+
+            (operator as any).mqttPublisherClient = publisherClient;
+
+            const publishPromise = (operator as any).publishWithSharedClient('topic/a', 'payload-a', { qos: 1 });
+
+            expect(publisherClient.once).toHaveBeenCalledWith('connect', expect.any(Function));
+            expect(publisherClient.publish).not.toHaveBeenCalled();
+
+            connectCallbacks[0]();
+            await publishPromise;
+
+            expect(publisherClient.publish).toHaveBeenCalledWith('topic/a', 'payload-a', { qos: 1 }, expect.any(Function));
+        });
+
+        test('queues two publishes before connect and flushes both after connect', async () => {
+            const connectCallbacks: Array<() => void> = [];
+            let publisherClient: any;
+            publisherClient = {
+                connected: false,
+                publish: jest.fn((topic, payload, options, callback) => callback?.()),
+                once: jest.fn((event: string, callback: () => void) => {
+                    if (event === 'connect') {
+                        connectCallbacks.push(callback);
+                    }
+                    return publisherClient;
+                }),
+                end: jest.fn(),
+            };
+
+            (operator as any).mqttPublisherClient = publisherClient;
+
+            const firstPublish = (operator as any).publishWithSharedClient('topic/a', 'payload-a', { qos: 1 });
+            const secondPublish = (operator as any).publishWithSharedClient('topic/b', 'payload-b', { qos: 0 });
+
+            expect(publisherClient.once).toHaveBeenCalledTimes(2);
+            expect(publisherClient.publish).not.toHaveBeenCalled();
+
+            for (const callback of connectCallbacks) {
+                callback();
+            }
+
+            await Promise.all([firstPublish, secondPublish]);
+
+            expect(publisherClient.publish).toHaveBeenNthCalledWith(1, 'topic/a', 'payload-a', { qos: 1 }, expect.any(Function));
+            expect(publisherClient.publish).toHaveBeenNthCalledWith(2, 'topic/b', 'payload-b', { qos: 0 }, expect.any(Function));
         });
     });
 
@@ -1079,6 +1305,57 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(result.resultValue).toBe(12);
         });
 
+        test('summarizeWindowRecomposition for SUM falls back to chunk value when sum is absent', () => {
+            const chunkGroups: any[] = [
+                {
+                    chunkGroupId: 'g1',
+                    start: 0,
+                    end: 30000,
+                    summary: {
+                        chunkGroupId: 'g1',
+                        start: 0,
+                        end: 30000,
+                        count: 1,
+                        sum: null,
+                        avg: null,
+                        value: 5,
+                        min: 5,
+                        max: 5,
+                        subqueries: ['sub1'],
+                        receivedChunkIdsBySubquery: {},
+                        duplicateChunksIgnoredBySubquery: {},
+                        missingSubqueryIds: [],
+                        coverageComplete: true
+                    }
+                },
+                {
+                    chunkGroupId: 'g2',
+                    start: 30000,
+                    end: 60000,
+                    summary: {
+                        chunkGroupId: 'g2',
+                        start: 30000,
+                        end: 60000,
+                        count: 1,
+                        sum: null,
+                        avg: null,
+                        value: 12,
+                        min: 12,
+                        max: 12,
+                        subqueries: ['sub1'],
+                        receivedChunkIdsBySubquery: {},
+                        duplicateChunksIgnoredBySubquery: {},
+                        missingSubqueryIds: [],
+                        coverageComplete: true
+                    }
+                }
+            ];
+            const result = (operator as any).summarizeWindowRecomposition(chunkGroups, 'SUM');
+            expect(result).not.toBeNull();
+            expect(result.recomposedSum).toBe(17);
+            expect(result.resultValue).toBe(17);
+        });
+
         test('MIN/MAX empty chunks do not produce fake values', () => {
             const chunkGroups: any[] = [
                 {
@@ -1108,6 +1385,204 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
 
             const resultMax = (operator as any).summarizeWindowRecomposition(chunkGroups, 'MAX');
             expect(resultMax).toBeNull();
+        });
+    });
+
+    describe('structured chunk normalization and timestamp filtering', () => {
+        test('legacy or unstructured payload is ignored', () => {
+            expect((operator as any).normalizeChunkPayload('not-json')).toBeNull();
+            expect((operator as any).normalizeChunkPayload(JSON.stringify({ foo: 'bar' }))).toBeNull();
+        });
+
+        test('structured AVG payload preserves sum/count state for recomposition', () => {
+            const payload = JSON.stringify({
+                queryId: 'q1',
+                subqueryId: 'subA',
+                window: {
+                    windowName: 'https://rsp.js/w1',
+                    start: 1000,
+                    end: 2000,
+                    range: 1000,
+                    step: 1000,
+                    semantics: '[start,end)',
+                },
+                aggregateFunction: 'AVG',
+                avg: 12.5,
+                count: 4,
+                state: {
+                    count: 4,
+                    sum: 50,
+                },
+                rdfPayload: '<s> <p> "12.5" .',
+            });
+
+            expect((operator as any).normalizeChunkPayload(payload)).toEqual({
+                queryId: 'q1',
+                subqueryId: 'subA',
+                window: {
+                    windowName: 'https://rsp.js/w1',
+                    start: 1000,
+                    end: 2000,
+                    range: 1000,
+                    step: 1000,
+                    semantics: '[start,end)',
+                },
+                chunkId: 'q1:1000:2000:subA',
+                reuseClassKey: undefined,
+                sourceStreamId: undefined,
+                sourceTopic: undefined,
+                aggregateFunction: 'AVG',
+                value: undefined,
+                count: 4,
+                sum: undefined,
+                avg: 12.5,
+                state: {
+                    count: 4,
+                    sum: 50,
+                },
+                rdfPayload: '<s> <p> "12.5" .',
+            });
+        });
+
+        test('timestamp-domain filtering rejects out-of-range chunks', () => {
+            (operator as any).timestampDomainMin = 1000;
+            (operator as any).timestampDomainMax = 2000;
+
+            expect((operator as any).isContaminatedTimestamp(999, 'topic/a')).toBe(true);
+            expect((operator as any).isContaminatedTimestamp(2001, 'topic/a')).toBe(true);
+            expect((operator as any).isContaminatedTimestamp(1500, 'topic/a')).toBe(false);
+            expect((operator as any).rejectedContaminatedTimestampCount).toBe(2);
+        });
+    });
+
+    describe('chunked diagnostics writer golden lines', () => {
+        afterEach(() => {
+            (fs.existsSync as jest.Mock).mockReturnValue(true);
+            (fs.createWriteStream as jest.Mock).mockReturnValue({ write: jest.fn(), end: jest.fn() });
+        });
+
+        test('writes full comparable diagnostics CSV header and escaped body line', () => {
+            const existsSyncMock = fs.existsSync as jest.Mock;
+            const createWriteStreamMock = fs.createWriteStream as jest.Mock;
+
+            existsSyncMock.mockReturnValue(false);
+            createWriteStreamMock.mockReset();
+
+            const latencyStream = { write: jest.fn(), end: jest.fn() };
+            const diagnosticsStream = { write: jest.fn(), end: jest.fn() };
+            const parentPartialStream = { write: jest.fn(), end: jest.fn() };
+            createWriteStreamMock
+                .mockReturnValueOnce(latencyStream)
+                .mockReturnValueOnce(diagnosticsStream)
+                .mockReturnValueOnce(parentPartialStream);
+
+            const localOperator = new StreamingQueryChunkAggregatorOperator();
+
+            expect(diagnosticsStream.write.mock.calls[0][0]).toBe(
+                'benchmark_event_time_anchor,external_window_number,external_window_start,external_window_end,internal_chunk_ids,internal_chunks_json,recomposed_count,recomposed_sum,recomposed_avg,recomposed_min,recomposed_max,result_value\n',
+            );
+
+            (localOperator as any).benchmarkEventTimeAnchor = 1700000000000;
+            (localOperator as any).writeComparableDiagnostics({
+                externalWindowNumber: 7,
+                externalWindowStart: 1000,
+                externalWindowEnd: 5000,
+                internalChunkGroupIds: ['g1', 'g2'],
+                internalChunks: [
+                    {
+                        chunkGroupId: 'g1',
+                        start: 1000,
+                        end: 3000,
+                        count: 2,
+                        sum: 30,
+                        avg: 15,
+                        value: 15,
+                        min: 10,
+                        max: 20,
+                        subqueries: ['sub"A', 'subB'],
+                        receivedChunkIdsBySubquery: { subA: ['a1'], subB: ['b1'] },
+                        duplicateChunksIgnoredBySubquery: { subA: ['a1-dup'], subB: [] },
+                        missingSubqueryIds: [],
+                        coverageComplete: true,
+                    },
+                ],
+                recomposedCount: 2,
+                recomposedSum: 30,
+                recomposedAvg: 15,
+                recomposedMin: 10,
+                recomposedMax: 20,
+                resultValue: 15,
+            });
+
+            expect(diagnosticsStream.write.mock.calls[1][0]).toBe(
+                '1700000000000,7,1000,5000,"g1|g2","[{""chunkGroupId"":""g1"",""start"":1000,""end"":3000,""count"":2,""sum"":30,""avg"":15,""value"":15,""min"":10,""max"":20,""subqueries"":[""sub\\""A"",""subB""],""receivedChunkIdsBySubquery"":{""subA"":[""a1""],""subB"":[""b1""]},""duplicateChunksIgnoredBySubquery"":{""subA"":[""a1-dup""],""subB"":[]},""missingSubqueryIds"":[],""coverageComplete"":true}]",2,30,15,10,20,15\n',
+            );
+        });
+
+        test('writes full parent-partial diagnostics CSV header and escaped body line', () => {
+            const existsSyncMock = fs.existsSync as jest.Mock;
+            const createWriteStreamMock = fs.createWriteStream as jest.Mock;
+
+            existsSyncMock.mockReturnValue(false);
+            createWriteStreamMock.mockReset();
+
+            const latencyStream = { write: jest.fn(), end: jest.fn() };
+            const diagnosticsStream = { write: jest.fn(), end: jest.fn() };
+            const parentPartialStream = { write: jest.fn(), end: jest.fn() };
+            createWriteStreamMock
+                .mockReturnValueOnce(latencyStream)
+                .mockReturnValueOnce(diagnosticsStream)
+                .mockReturnValueOnce(parentPartialStream);
+
+            const localOperator = new StreamingQueryChunkAggregatorOperator();
+
+            expect(parentPartialStream.write.mock.calls[0][0]).toBe(
+                'output_type,comparable,benchmark_event_time_anchor,parent_window_number,parent_window_start,parent_window_end_or_covered_until,parent_range_ms,covered_duration_ms,chunks_used,event_count,sum,avg,min,max,result_value,emitted_at_ms,elapsed_since_registration_ms,delay_past_partial_trigger_ms,internal_chunk_ids,internal_chunks_json\n',
+            );
+
+            (localOperator as any).writeParentPartialDiagnostics({
+                outputType: 'parent_partial',
+                comparable: false,
+                benchmarkEventTimeAnchor: 1700000000000,
+                parentWindowNumber: 3,
+                parentWindowStart: 1000,
+                parentWindowEndOrCoveredUntil: 4000,
+                parentRangeMs: 6000,
+                coveredDurationMs: 3000,
+                chunksUsed: 2,
+                eventCount: 5,
+                sum: 42,
+                avg: 8.4,
+                min: 2,
+                max: 13,
+                resultValue: 8.4,
+                emittedAtMs: 1700000000500,
+                elapsedSinceRegistrationMs: 500,
+                delayPastPartialTriggerMs: 100,
+                internalChunkIds: ['g1', 'g2'],
+                internalChunks: [
+                    {
+                        chunkGroupId: 'g1',
+                        start: 1000,
+                        end: 2500,
+                        count: 2,
+                        sum: 12,
+                        avg: 6,
+                        value: 6,
+                        min: 2,
+                        max: 10,
+                        subqueries: ['sub"A', 'subB'],
+                        receivedChunkIdsBySubquery: { subA: ['a1'], subB: ['b1'] },
+                        duplicateChunksIgnoredBySubquery: { subA: [], subB: [] },
+                        missingSubqueryIds: [],
+                        coverageComplete: true,
+                    },
+                ],
+            });
+
+            expect(parentPartialStream.write.mock.calls[1][0]).toBe(
+                'parent_partial,false,1700000000000,3,1000,4000,6000,3000,2,5,42,8.4,2,13,8.4,1700000000500,500,100,"g1|g2","[{""chunkGroupId"":""g1"",""start"":1000,""end"":2500,""count"":2,""sum"":12,""avg"":6,""value"":6,""min"":2,""max"":10,""subqueries"":[""sub\\""A"",""subB""],""receivedChunkIdsBySubquery"":{""subA"":[""a1""],""subB"":[""b1""]},""duplicateChunksIgnoredBySubquery"":{""subA"":[],""subB"":[]},""missingSubqueryIds"":[],""coverageComplete"":true}]"\n',
+            );
         });
     });
 });

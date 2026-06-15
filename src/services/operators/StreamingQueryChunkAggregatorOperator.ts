@@ -30,173 +30,49 @@ import {
   deriveProjectionValues,
   detectCompatibleChunkReuse,
 } from "../../util/chunkStateReuse";
+import type {
+  ChunkCoverageState,
+  ChunkEmissionProofEntry,
+  ChunkProcessingState,
+  ChunkWindowDiagnostics,
+  ChunkedDebugSummary,
+  ComparableWindowDiagnostics,
+  CompletedChunkGroupState,
+  DerivedOriginalChunkSummary,
+  DerivedOriginalOutputConsumer,
+  ParentPartialDiagnostics,
+  SubqueryIdentity,
+  WindowRecompositionSummary,
+} from "./chunked/types";
+import {
+  getLogicalChunkGroupId,
+  hasContiguousChunkGroups,
+  insertCompletedChunkGroupOrdered,
+} from "./chunked/chunkWindow";
+import {
+  buildCoverageRecordsFromGroups as buildCoverageRecordsFromGroupsPure,
+  collectChunkByWindow as collectChunkByWindowPure,
+} from "./chunked/ChunkCoverage";
+import { buildChunkEmissionProofEntry as buildChunkEmissionProofEntryPure } from "./chunked/ChunkEmissionProof";
+import {
+  canRecomposeStructuredPartial as canRecomposeStructuredPartialPure,
+  compactStructuredPartial as compactStructuredPartialPure,
+  recomposeComparableWindow as recomposeComparableWindowPure,
+  recomputeExactResultFromPartials as recomputeExactResultFromPartialsPure,
+  summarizeChunkGroup as summarizeChunkGroupPure,
+  summarizeWindowRecomposition as summarizeWindowRecompositionPure,
+} from "./chunked/WindowRecomposer";
+import {
+  getOrCreatePublisherClient as getOrCreatePublisherClientPure,
+  publishWithSharedClient as publishWithSharedClientPure,
+} from "./chunked/ChunkedResultPublisher";
+import {
+  initializeLatencyLogging as initializeLatencyLoggingPure,
+  logLatency as logLatencyPure,
+  writeComparableDiagnostics as writeComparableDiagnosticsPure,
+  writeParentPartialDiagnostics as writeParentPartialDiagnosticsPure,
+} from "./chunked/ChunkedDiagnosticsWriter";
 const N3 = require("n3");
-
-type SubqueryIdentity = {
-  subqueryId: string;
-  topic: string;
-};
-
-type ChunkWindowDiagnostics = {
-  chunkGroupId: string;
-  start: number;
-  end: number;
-  count: number | null;
-  sum: number | null;
-  avg: number | null;
-  value: number | null;
-  min: number | null;
-  max: number | null;
-  subqueries: string[];
-  receivedChunkIdsBySubquery: Record<string, string[]>;
-  duplicateChunksIgnoredBySubquery: Record<string, string[]>;
-  missingSubqueryIds: string[];
-  coverageComplete: boolean;
-};
-
-type ComparableWindowDiagnostics = {
-  externalWindowNumber: number;
-  externalWindowStart: number;
-  externalWindowEnd: number;
-  internalChunkGroupIds: string[];
-  internalChunks: ChunkWindowDiagnostics[];
-  recomposedCount: number | null;
-  recomposedSum: number | null;
-  recomposedAvg: number | null;
-  recomposedMin?: number | null;
-  recomposedMax?: number | null;
-  resultValue: number;
-};
-
-type ChunkCoverageState = {
-  chunkGroupId: string;
-  expectedSubqueryIds: string[];
-  receivedChunkIdsBySubquery: Record<string, string[]>;
-  duplicateChunksIgnoredBySubquery: Record<string, string[]>;
-};
-
-type ChunkEmissionProofEntry = {
-  windowStart: number;
-  windowEnd: number;
-  emittedAt: number;
-  emissionReason: string;
-  expectedSubqueryIds: string[];
-  expectedSubqueryCount: number;
-  requiredChunksBySubquery: Record<string, string[]>;
-  receivedChunksUsedBySubquery: Record<string, string[]>;
-  missingChunksBySubquery: Record<string, string[]>;
-  duplicateChunksIgnoredBySubquery: Record<string, string[]>;
-  coverageComplete: boolean;
-  allExpectedSubqueriesPresent: boolean;
-  emitted: boolean;
-};
-
-type WindowRecompositionSummary = {
-  externalWindowStart: number;
-  externalWindowEnd: number;
-  internalChunkGroupIds: string[];
-  internalChunks: ChunkWindowDiagnostics[];
-  recomposedCount: number | null;
-  recomposedSum: number | null;
-  recomposedAvg: number | null;
-  recomposedMin?: number | null;
-  recomposedMax?: number | null;
-  resultValue: number;
-};
-
-type ParentPartialDiagnostics = {
-  outputType: "parent_partial";
-  comparable: false;
-  benchmarkEventTimeAnchor: number | null;
-  parentWindowNumber: number;
-  parentWindowStart: number;
-  parentWindowEndOrCoveredUntil: number;
-  parentRangeMs: number;
-  coveredDurationMs: number;
-  chunksUsed: number;
-  eventCount: number | null;
-  sum: number | null;
-  avg: number | null;
-  min?: number | null;
-  max?: number | null;
-  resultValue: number;
-  emittedAtMs: number;
-  elapsedSinceRegistrationMs: number;
-  delayPastPartialTriggerMs: number;
-  internalChunkIds: string[];
-  internalChunks: ChunkWindowDiagnostics[];
-};
-
-type CompletedChunkGroupState = {
-  chunkGroupId: string;
-  start: number;
-  end: number;
-  summary: ChunkWindowDiagnostics;
-};
-
-type DerivedOriginalChunkSummary = {
-  chunkId: string;
-  start: number;
-  end: number;
-  sum?: number;
-  count?: number;
-  min?: number;
-  max?: number;
-};
-
-type DerivedOriginalOutputConsumer = {
-  emittedWindowCount: number;
-  nextWindowStartIndex: number;
-  orderedChunks: DerivedOriginalChunkSummary[];
-  originalOutputTopic: string;
-  originalQueryHash: string;
-  projectionTerms: CompatibleChunkReuseSpec["projectionTerms"];
-  reuseSpec: CompatibleChunkReuseSpec;
-};
-
-type ChunkedDebugSummary = {
-  chunkSizeMs: number;
-  comparableOutputCadenceOnly: boolean;
-  useImmediateTrigger: boolean;
-  expectedSubqueryCount: number;
-  expectedSubqueryIds: string[];
-  subscribedTopics: string[];
-  receivedChunkMessageCount: number;
-  structuredChunkMessageCount: number;
-  duplicateChunkCount: number;
-  ignoredLegacyChunkCount: number;
-  completedChunkGroupCount: number;
-  comparableWindowEmissionCount: number;
-  reconstructedSuperqueryResultCount: number;
-  lastComparableWindowStart: number | null;
-  lastComparableWindowEnd: number | null;
-  missingChunkGroupCount: number;
-  emittedIncompleteWindowCount: number;
-  emissionProofWindowCount: number;
-  coverageCompleteEmissionCount: number;
-  coverageIncompleteBlockedCount: number;
-  intervalTriggersWithoutEmission: number;
-  intervalTriggersWithEmission: number;
-};
-
-type ChunkProcessingState = {
-  chunksByWindow: Map<string, Map<string, PartialChunkResult>>;
-  chunkCoverageByWindow: Map<string, ChunkCoverageState>;
-  completedChunkGroups: Map<string, CompletedChunkGroupState>;
-  orderedCompletedChunkGroups: CompletedChunkGroupState[];
-  readyChunkGroupIds: string[];
-  readyChunkGroupSet: Set<string>;
-  nextComparableWindowStartIndex: number;
-  expectedSubqueryIds: string[];
-  outputAggregationFunction: AggregationFunction;
-  chunksPerComparableWindow: number;
-  chunkGroupsPerOutputStep: number;
-  comparableOutputCadenceOnly: boolean;
-};
-
-function getLogicalChunkGroupId(partial: Pick<PartialChunkResult, "queryId" | "window">): string {
-  return `${partial.queryId}:${partial.window.start}:${partial.window.end}`;
-}
 
 /**
  *
@@ -379,46 +255,15 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
    * Initialize latency logging
    */
   private initializeLatencyLogging() {
-    const consumerIdx = process.env.K_SCALING_CONSUMER_INDEX ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}` : "";
-    const latencyLogFilePath = this.resolveLogFilePath(`chunked_latency_log${consumerIdx}.csv`);
-    const writeLatencyHeader = !fs.existsSync(latencyLogFilePath);
-    this.latencyLogStream = fs.createWriteStream(latencyLogFilePath, {
-      flags: "a",
-    });
-
-    if (writeLatencyHeader) {
-      this.latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,interval_wait_ms,computation_ms,result_value,required_chunk_intervals,last_required_chunk_received_at,semantic_ready_at,window_close_to_ready_ms,ready_to_emit_ms,trigger_type,emission_reason\n",
-      );
-    }
-
-    const diagnosticsLogFilePath = this.resolveLogFilePath(`chunked_window_diagnostics${consumerIdx}.csv`);
-    const writeDiagnosticsHeader = !fs.existsSync(diagnosticsLogFilePath);
-    this.diagnosticsLogStream = fs.createWriteStream(diagnosticsLogFilePath, {
-      flags: "a",
-    });
-
-    if (writeDiagnosticsHeader) {
-      this.diagnosticsLogStream.write(
-        "benchmark_event_time_anchor,external_window_number,external_window_start,external_window_end,internal_chunk_ids,internal_chunks_json,recomposed_count,recomposed_sum,recomposed_avg,recomposed_min,recomposed_max,result_value\n",
-      );
-    }
-
-    this.parentPartialDiagnosticsFilePath = this.resolveLogFilePath(
-      `chunked_parent_partial_latency_log${consumerIdx}.csv`,
+    const initialized = initializeLatencyLoggingPure(
+      this.resolveLogFilePath.bind(this),
     );
-    const writeParentPartialHeader = !fs.existsSync(
-      this.parentPartialDiagnosticsFilePath,
-    );
-    this.parentPartialDiagnosticsStream = fs.createWriteStream(
-      this.parentPartialDiagnosticsFilePath,
-      { flags: "a" },
-    );
-    if (writeParentPartialHeader) {
-      this.parentPartialDiagnosticsStream.write(
-        "output_type,comparable,benchmark_event_time_anchor,parent_window_number,parent_window_start,parent_window_end_or_covered_until,parent_range_ms,covered_duration_ms,chunks_used,event_count,sum,avg,min,max,result_value,emitted_at_ms,elapsed_since_registration_ms,delay_past_partial_trigger_ms,internal_chunk_ids,internal_chunks_json\n",
-      );
-    }
+    this.latencyLogStream = initialized.latencyLogStream;
+    this.diagnosticsLogStream = initialized.diagnosticsLogStream;
+    this.parentPartialDiagnosticsStream =
+      initialized.parentPartialDiagnosticsStream;
+    this.parentPartialDiagnosticsFilePath =
+      initialized.parentPartialDiagnosticsFilePath;
   }
 
   /**
@@ -434,79 +279,25 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     proofEntry?: ChunkEmissionProofEntry | null,
     triggerSource?: string,
   ) {
-    // Metric 1: Delay past the expected close time
-    // Expected window close = queryRegisteredTime + RANGE + (N-1) * STEP
-    const latencyFromQueryReg = resultTime - expectedWindowClose;
-
-    // Metric 2: Time from first data received to result (wall-clock)
-    // For window N: expected time = firstDataReceivedTime + RANGE + (N-1) * STEP
-    const expectedFromDataStart =
-      this.firstDataReceivedTime +
-      this.windowRange +
-      (windowNumber - 1) * this.windowSlide;
-    const latencyFromDataStart = resultTime - expectedFromDataStart;
-
-    // Metric 3: Interval wait time - time from last chunk received to when interval fires
-    const intervalWaitTime = intervalTriggerAt - lastChunkReceivedAt;
-
-    // Metric 4: Actual computation time - time from interval trigger to result emission
-    const computationTime = resultTime - intervalTriggerAt;
-
-    let requiredChunkIntervals = "";
-    let lastRequiredChunkReceivedAt = lastChunkReceivedAt;
-    let semanticReadyAt = lastChunkReceivedAt;
-    let windowCloseToReadyMs = resultTime - expectedWindowClose;
-    let readyToEmitMs = 0;
-    const triggerType = triggerSource ? triggerSource.toLowerCase() : "interval";
-    const emissionReason = proofEntry?.emissionReason ?? "unknown";
-
-    if (proofEntry && proofEntry.receivedChunksUsedBySubquery) {
-      const intervals: string[] = [];
-      let maxArrival = 0;
-      for (const chunkIds of Object.values(proofEntry.receivedChunksUsedBySubquery)) {
-        for (const chunkId of chunkIds) {
-          const win = this.chunkWindowMap.get(chunkId);
-          if (win) {
-            intervals.push(`${win.start}-${win.end}`);
-          }
-          const arrival = this.chunkArrivalTimes.get(chunkId);
-          if (arrival && arrival > maxArrival) {
-            maxArrival = arrival;
-          }
-        }
-      }
-      requiredChunkIntervals = Array.from(new Set(intervals)).sort().join("|");
-      if (maxArrival > 0) {
-        lastRequiredChunkReceivedAt = maxArrival;
-        semanticReadyAt = maxArrival;
-      }
-      windowCloseToReadyMs = semanticReadyAt - expectedWindowClose;
-      readyToEmitMs = resultTime - semanticReadyAt;
-    }
-
-    if (this.latencyLogStream) {
-      this.latencyLogStream.write(
-        `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastChunkReceivedAt},${intervalTriggerAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${intervalWaitTime},${computationTime},${value},${requiredChunkIntervals},${lastRequiredChunkReceivedAt},${semanticReadyAt},${windowCloseToReadyMs},${readyToEmitMs},${triggerType},${emissionReason}\n`,
-      );
-    }
-    console.log(`LATENCY: Window ${windowNumber}:`);
-    console.log(
-      `  - Delay past expected close: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
-    );
-    console.log(
-      `  - Delay past data start: ${latencyFromDataStart}ms (first data: ${this.firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
-    );
-    console.log(
-      `  - Interval wait time (last chunk to interval trigger): ${intervalWaitTime}ms`,
-    );
-    console.log(
-      `  - Actual computation time (interval trigger to result): ${computationTime}ms`,
-    );
-    console.log(`LATENCY CONFIGURATION & TRIGGERS:`);
-    console.log(`  - comparableOutputCadenceOnly: ${this.comparableOutputCadenceOnly}`);
-    console.log(`  - useImmediateTrigger: ${this.useImmediateTrigger}`);
-    console.log(`  - triggerSource: ${triggerType}`);
-    console.log(`  - Value: ${value}`);
+    logLatencyPure({
+      windowNumber,
+      expectedWindowClose,
+      lastChunkReceivedAt,
+      intervalTriggerAt,
+      resultTime,
+      value,
+      proofEntry,
+      triggerSource,
+      queryRegisteredTime: this.queryRegisteredTime,
+      firstDataReceivedTime: this.firstDataReceivedTime,
+      windowRange: this.windowRange,
+      windowSlide: this.windowSlide,
+      comparableOutputCadenceOnly: this.comparableOutputCadenceOnly,
+      useImmediateTrigger: this.useImmediateTrigger,
+      chunkWindowMap: this.chunkWindowMap,
+      chunkArrivalTimes: this.chunkArrivalTimes,
+      latencyLogStream: this.latencyLogStream,
+    });
   }
 
   /**
@@ -649,68 +440,14 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     partial: PartialChunkResult,
     aggregationFunction: AggregationFunction,
   ): boolean {
-    if (aggregationFunction === "COUNT") {
-      return Number.isFinite(partial.count) || Number.isFinite(partial.value);
-    }
-    if (aggregationFunction === "SUM") {
-      return Number.isFinite(partial.sum) || Number.isFinite(partial.value);
-    }
-    if (aggregationFunction === "AVG") {
-      return (
-        Number.isFinite(partial.count) &&
-        (Number.isFinite(partial.sum) ||
-          Number.isFinite(partial.avg) ||
-          Number.isFinite(partial.value))
-      );
-    }
-    if (aggregationFunction === "MIN" || aggregationFunction === "MAX") {
-      return Number.isFinite(partial.value);
-    }
-    return false;
+    return canRecomposeStructuredPartialPure(partial, aggregationFunction);
   }
 
   private compactStructuredPartial(
     partial: PartialChunkResult,
     aggregationFunction: AggregationFunction,
   ): PartialChunkResult {
-    if (!this.canRecomposeStructuredPartial(partial, aggregationFunction)) {
-      return partial;
-    }
-
-    const { rdfPayload: _rdfPayload, ...compactPartial } = partial;
-    return compactPartial;
-  }
-
-  private insertCompletedChunkGroupOrdered(
-    orderedGroups: CompletedChunkGroupState[],
-    group: CompletedChunkGroupState,
-  ): void {
-    const lastGroup = orderedGroups[orderedGroups.length - 1];
-    if (!lastGroup || lastGroup.start <= group.start) {
-      orderedGroups.push(group);
-      return;
-    }
-
-    let low = 0;
-    let high = orderedGroups.length;
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2);
-      if (orderedGroups[mid].start <= group.start) {
-        low = mid + 1;
-      } else {
-        high = mid;
-      }
-    }
-    orderedGroups.splice(low, 0, group);
-  }
-
-  private hasContiguousChunkGroups(groups: CompletedChunkGroupState[]): boolean {
-    for (let index = 1; index < groups.length; index += 1) {
-      if (groups[index - 1].end !== groups[index].start) {
-        return false;
-      }
-    }
-    return true;
+    return compactStructuredPartialPure(partial, aggregationFunction);
   }
 
   private hasContiguousDerivedChunks(groups: DerivedOriginalChunkSummary[]): boolean {
@@ -813,20 +550,11 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     partial: PartialChunkResult,
     expectedSubqueryIds: string[],
   ): { chunkGroupId: string; missingSubqueryIds: string[]; isComplete: boolean } {
-    const chunkGroupId = getLogicalChunkGroupId(partial);
-    if (!chunksByWindow.has(chunkGroupId)) {
-      chunksByWindow.set(chunkGroupId, new Map<string, PartialChunkResult>());
-    }
-    const bySubquery = chunksByWindow.get(chunkGroupId)!;
-    bySubquery.set(partial.subqueryId, partial);
-    const missingSubqueryIds = expectedSubqueryIds.filter(
-      (subqueryId) => !bySubquery.has(subqueryId),
+    return collectChunkByWindowPure(
+      chunksByWindow,
+      partial,
+      expectedSubqueryIds,
     );
-    return {
-      chunkGroupId,
-      missingSubqueryIds,
-      isComplete: missingSubqueryIds.length === 0,
-    };
   }
 
   private summarizeChunkGroup(
@@ -835,227 +563,35 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     aggregationFunction: AggregationFunction,
     coverageState: ChunkCoverageState,
   ): ChunkWindowDiagnostics {
-    const partials = Array.from(bySubquery.values());
-    const start = partials[0]?.window.start ?? 0;
-    const end = partials[0]?.window.end ?? 0;
-    let countTotal = 0;
-    let countAvailable = false;
-    let sumTotal = 0;
-    let sumAvailable = false;
-
-    for (const partial of partials) {
-      if (Number.isFinite(partial.count)) {
-        countTotal += partial.count as number;
-        countAvailable = true;
-      }
-      if (Number.isFinite(partial.sum)) {
-        sumTotal += partial.sum as number;
-        sumAvailable = true;
-      } else if (
-        Number.isFinite(partial.avg) &&
-        Number.isFinite(partial.count)
-      ) {
-        sumTotal += (partial.avg as number) * (partial.count as number);
-        sumAvailable = true;
-      } else if (
-        partial.aggregateFunction === "SUM" &&
-        Number.isFinite(partial.value)
-      ) {
-        sumTotal += partial.value as number;
-        sumAvailable = true;
-      }
-    }
-
-    const avg =
-      countAvailable && countTotal > 0 && sumAvailable
-        ? sumTotal / countTotal
-        : null;
-    let value: number | null = null;
-
-    if (aggregationFunction === "COUNT") {
-      value = countAvailable ? countTotal : null;
-    } else if (aggregationFunction === "SUM") {
-      value = sumAvailable ? sumTotal : null;
-    } else if (aggregationFunction === "AVG") {
-      value = avg;
-    } else if (aggregationFunction === "MIN") {
-      const mins = partials
-        .map((partial) => partial.value)
-        .filter((entry): entry is number => Number.isFinite(entry));
-      value = mins.length > 0 ? Math.min(...mins) : null;
-    } else if (aggregationFunction === "MAX") {
-      const maxs = partials
-        .map((partial) => partial.value)
-        .filter((entry): entry is number => Number.isFinite(entry));
-      value = maxs.length > 0 ? Math.max(...maxs) : null;
-    }
-
-    const receivedChunkIdsBySubquery: Record<string, string[]> = {};
-    const duplicateChunksIgnoredBySubquery: Record<string, string[]> = {};
-    const missingSubqueryIds = coverageState.expectedSubqueryIds.filter(
-      (subqueryId) => !bySubquery.has(subqueryId),
-    );
-
-    for (const subqueryId of coverageState.expectedSubqueryIds) {
-      receivedChunkIdsBySubquery[subqueryId] = bySubquery.has(subqueryId)
-        ? [bySubquery.get(subqueryId)!.chunkId]
-        : [];
-      duplicateChunksIgnoredBySubquery[subqueryId] = [
-        ...(coverageState.duplicateChunksIgnoredBySubquery[subqueryId] ?? []),
-      ];
-    }
-
-    const mins = partials
-      .map((p) => (p.min !== undefined && p.min !== null) ? p.min : p.value)
-      .filter((v): v is number => Number.isFinite(v));
-    const minVal = mins.length > 0 ? Math.min(...mins) : null;
-
-    const maxs = partials
-      .map((p) => (p.max !== undefined && p.max !== null) ? p.max : p.value)
-      .filter((v): v is number => Number.isFinite(v));
-    const maxVal = maxs.length > 0 ? Math.max(...maxs) : null;
-
-    return {
+    return summarizeChunkGroupPure(
       chunkGroupId,
-      start,
-      end,
-      count: countAvailable ? countTotal : null,
-      sum: sumAvailable ? sumTotal : null,
-      avg,
-      min: minVal,
-      max: maxVal,
-      value,
-      subqueries: partials.map((partial) => partial.subqueryId),
-      receivedChunkIdsBySubquery,
-      duplicateChunksIgnoredBySubquery,
-      missingSubqueryIds,
-      coverageComplete: missingSubqueryIds.length === 0,
-    };
+      bySubquery,
+      aggregationFunction,
+      coverageState,
+    );
   }
 
   private summarizeWindowRecomposition(
     windowChunkGroups: CompletedChunkGroupState[],
     aggregationFunction: AggregationFunction,
   ): WindowRecompositionSummary | null {
-    if (windowChunkGroups.length === 0) {
-      return null;
-    }
-
-    const internalChunks = windowChunkGroups.map((group) => group.summary);
-    const externalWindowStart = internalChunks[0].start;
-    const externalWindowEnd = internalChunks[internalChunks.length - 1].end;
-    let recomposedCount: number | null = null;
-    let recomposedSum: number | null = null;
-    let recomposedAvg: number | null = null;
-    let recomposedMin: number | null = null;
-    let recomposedMax: number | null = null;
-    let resultValue: number | null = null;
-
-    if (aggregationFunction === "COUNT") {
-      const totalCount = internalChunks.reduce(
-        (sum, chunk) => sum + (Number.isFinite(chunk.count) ? (chunk.count as number) : 0),
-        0,
-      );
-      recomposedCount = totalCount;
-      resultValue = totalCount;
-    } else if (aggregationFunction === "SUM") {
-      const totalSum = internalChunks.reduce((sum, chunk) => {
-        if (Number.isFinite(chunk.sum)) {
-          return sum + (chunk.sum as number);
-        }
-        if (Number.isFinite(chunk.value)) {
-          return sum + (chunk.value as number);
-        }
-        return sum;
-      }, 0);
-      recomposedSum = totalSum;
-      resultValue = totalSum;
-    } else if (aggregationFunction === "AVG") {
-      const totalCount = internalChunks.reduce(
-        (sum, chunk) => sum + (Number.isFinite(chunk.count) ? (chunk.count as number) : 0),
-        0,
-      );
-      const totalSum = internalChunks.reduce((sum, chunk) => {
-        if (Number.isFinite(chunk.sum)) {
-          return sum + (chunk.sum as number);
-        }
-        return sum;
-      }, 0);
-      recomposedCount = totalCount;
-      recomposedSum = totalSum;
-      recomposedAvg = totalCount > 0 ? totalSum / totalCount : null;
-      resultValue = recomposedAvg;
-    } else if (aggregationFunction === "MIN") {
-      const mins = internalChunks
-        .map((chunk) => {
-          // ChunkState might contain explicitly parsed min
-          const chunkData = chunk as any;
-          if (chunkData.min !== undefined && chunkData.min !== null && Number.isFinite(chunkData.min)) {
-            return chunkData.min as number;
-          }
-          return chunk.value;
-        })
-        .filter((value): value is number => Number.isFinite(value ?? NaN));
-      recomposedMin = mins.length > 0 ? Math.min(...mins) : null;
-      resultValue = recomposedMin;
-    } else if (aggregationFunction === "MAX") {
-      const maxs = internalChunks
-        .map((chunk) => {
-          // ChunkState might contain explicitly parsed max
-          const chunkData = chunk as any;
-          if (chunkData.max !== undefined && chunkData.max !== null && Number.isFinite(chunkData.max)) {
-            return chunkData.max as number;
-          }
-          return chunk.value;
-        })
-        .filter((value): value is number => Number.isFinite(value ?? NaN));
-      recomposedMax = maxs.length > 0 ? Math.max(...maxs) : null;
-      resultValue = recomposedMax;
-    }
-
-    if (resultValue === null || !Number.isFinite(resultValue)) {
-      return null;
-    }
-
-    return {
-      externalWindowStart,
-      externalWindowEnd,
-      internalChunkGroupIds: internalChunks.map((chunk) => chunk.chunkGroupId),
-      internalChunks,
-      recomposedCount,
-      recomposedSum,
-      recomposedAvg,
-      recomposedMin,
-      recomposedMax,
-      resultValue: resultValue as number,
-    };
+    return summarizeWindowRecompositionPure(
+      windowChunkGroups,
+      aggregationFunction,
+    );
   }
 
   private recomposeComparableWindow(
     windowChunkGroups: CompletedChunkGroupState[],
     aggregationFunction: AggregationFunction,
   ): ComparableWindowDiagnostics | null {
-    const summary = profileSync("structured_recomposition_time_ms", () =>
-      this.summarizeWindowRecomposition(windowChunkGroups, aggregationFunction),
+    return profileSync("structured_recomposition_time_ms", () =>
+      recomposeComparableWindowPure(
+        windowChunkGroups,
+        aggregationFunction,
+        this.windowCount + 1,
+      ),
     );
-
-    if (!summary) {
-      return null;
-    }
-
-    return {
-      externalWindowNumber: this.windowCount + 1,
-      externalWindowStart: summary.externalWindowStart,
-      externalWindowEnd: summary.externalWindowEnd,
-      internalChunkGroupIds: summary.internalChunkGroupIds,
-      internalChunks: summary.internalChunks,
-      recomposedCount: summary.recomposedCount,
-      recomposedSum: summary.recomposedSum,
-      recomposedAvg: summary.recomposedAvg,
-      recomposedMin: summary.recomposedMin,
-      recomposedMax: summary.recomposedMax,
-      resultValue: summary.resultValue,
-    };
   }
 
   private buildCoverageRecordsFromGroups(
@@ -1069,50 +605,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     coverageComplete: boolean;
     allExpectedSubqueriesPresent: boolean;
   } {
-    const requiredChunksBySubquery: Record<string, string[]> = {};
-    const receivedChunksUsedBySubquery: Record<string, string[]> = {};
-    const missingChunksBySubquery: Record<string, string[]> = {};
-    const duplicateChunksIgnoredBySubquery: Record<string, string[]> = {};
-
-    for (const subqueryId of expectedSubqueryIds) {
-      requiredChunksBySubquery[subqueryId] = [];
-      receivedChunksUsedBySubquery[subqueryId] = [];
-      missingChunksBySubquery[subqueryId] = [];
-      duplicateChunksIgnoredBySubquery[subqueryId] = [];
-    }
-
-    for (const group of windowChunkGroups) {
-      for (const subqueryId of expectedSubqueryIds) {
-        const receivedChunkIds =
-          group.summary.receivedChunkIdsBySubquery[subqueryId] ?? [];
-        requiredChunksBySubquery[subqueryId].push(...receivedChunkIds);
-        receivedChunksUsedBySubquery[subqueryId].push(...receivedChunkIds);
-        const duplicates =
-          group.summary.duplicateChunksIgnoredBySubquery[subqueryId] ?? [];
-        duplicateChunksIgnoredBySubquery[subqueryId].push(...duplicates);
-        if ((group.summary.missingSubqueryIds ?? []).includes(subqueryId)) {
-          missingChunksBySubquery[subqueryId].push(group.chunkGroupId);
-        }
-      }
-    }
-
-    const allExpectedSubqueriesPresent = expectedSubqueryIds.every(
-      (subqueryId) => receivedChunksUsedBySubquery[subqueryId].length > 0,
+    return buildCoverageRecordsFromGroupsPure(
+      windowChunkGroups,
+      expectedSubqueryIds,
     );
-    const coverageComplete =
-      allExpectedSubqueriesPresent &&
-      expectedSubqueryIds.every(
-        (subqueryId) => missingChunksBySubquery[subqueryId].length === 0,
-      );
-
-    return {
-      requiredChunksBySubquery,
-      receivedChunksUsedBySubquery,
-      missingChunksBySubquery,
-      duplicateChunksIgnoredBySubquery,
-      coverageComplete,
-      allExpectedSubqueriesPresent,
-    };
   }
 
   private recordChunkEmissionProof(entry: ChunkEmissionProofEntry): void {
@@ -1135,87 +631,14 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     emissionReason: string,
     coverageState?: ChunkCoverageState,
   ): ChunkEmissionProofEntry | null {
-    if (comparableDiagnostics) {
-      const windowChunkGroups = comparableDiagnostics.internalChunks.map((chunk) => ({
-        chunkGroupId: chunk.chunkGroupId,
-        start: chunk.start,
-        end: chunk.end,
-        summary: chunk,
-      }));
-      const coverage = this.buildCoverageRecordsFromGroups(
-        windowChunkGroups,
-        comparableDiagnostics.internalChunks[0]?.subqueries ?? [],
-      );
-      return {
-        windowStart: comparableDiagnostics.externalWindowStart,
-        windowEnd: comparableDiagnostics.externalWindowEnd,
-        emittedAt: Date.now(),
-        emissionReason,
-        expectedSubqueryIds:
-          comparableDiagnostics.internalChunks[0]?.subqueries ?? [],
-        expectedSubqueryCount:
-          comparableDiagnostics.internalChunks[0]?.subqueries.length ?? 0,
-        requiredChunksBySubquery: coverage.requiredChunksBySubquery,
-        receivedChunksUsedBySubquery: coverage.receivedChunksUsedBySubquery,
-        missingChunksBySubquery: coverage.missingChunksBySubquery,
-        duplicateChunksIgnoredBySubquery:
-          coverage.duplicateChunksIgnoredBySubquery,
-        coverageComplete: coverage.coverageComplete,
-        allExpectedSubqueriesPresent: coverage.allExpectedSubqueriesPresent,
-        emitted: true,
-      };
-    }
-
-    if (partials.length === 0) {
-      return null;
-    }
-
-    const expectedSubqueryIds = coverageState?.expectedSubqueryIds ?? partials.map((partial) => partial.subqueryId);
-    const partialBySubquery = new Map(partials.map((partial) => [partial.subqueryId, partial]));
-    const requiredChunksBySubquery: Record<string, string[]> = {};
-    const receivedChunksUsedBySubquery: Record<string, string[]> = {};
-    const missingChunksBySubquery: Record<string, string[]> = {};
-    const duplicateChunksIgnoredBySubquery: Record<string, string[]> = {};
-
-    for (const subqueryId of expectedSubqueryIds) {
-      const partial = partialBySubquery.get(subqueryId);
-      const receivedChunkIds = partial ? [partial.chunkId] : [];
-      requiredChunksBySubquery[subqueryId] = [...receivedChunkIds];
-      receivedChunksUsedBySubquery[subqueryId] = [...receivedChunkIds];
-      missingChunksBySubquery[subqueryId] = partial ? [] : [`missing:${subqueryId}`];
-      duplicateChunksIgnoredBySubquery[subqueryId] = [
-        ...(coverageState?.duplicateChunksIgnoredBySubquery[subqueryId] ?? []),
-      ];
-    }
-
-    return {
-      windowStart: partials[0].window.start,
-      windowEnd: partials[0].window.end,
-      emittedAt: Date.now(),
+    const _chunkGroupId = chunkGroupId;
+    return buildChunkEmissionProofEntryPure(
+      partials,
+      comparableDiagnostics,
       emissionReason,
-      expectedSubqueryIds,
-      expectedSubqueryCount: expectedSubqueryIds.length,
-      requiredChunksBySubquery,
-      receivedChunksUsedBySubquery,
-      missingChunksBySubquery,
-      duplicateChunksIgnoredBySubquery,
-      coverageComplete:
-        coverageState !== undefined
-          ? coverageState.expectedSubqueryIds.every(
-              (subqueryId) => receivedChunksUsedBySubquery[subqueryId]?.length > 0,
-            ) &&
-            coverageState.expectedSubqueryIds.every(
-              (subqueryId) => missingChunksBySubquery[subqueryId]?.length === 0,
-            )
-          : true,
-      allExpectedSubqueriesPresent:
-        coverageState !== undefined
-          ? coverageState.expectedSubqueryIds.every(
-              (subqueryId) => receivedChunksUsedBySubquery[subqueryId]?.length > 0,
-            )
-          : true,
-      emitted: true,
-    };
+      Date.now(),
+      coverageState,
+    );
   }
 
   private async processReadyChunkGroups(
@@ -1285,7 +708,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
               summary,
             };
             state.completedChunkGroups.set(chunkGroupId, completedGroup);
-            this.insertCompletedChunkGroupOrdered(
+            insertCompletedChunkGroupOrdered(
               state.orderedCompletedChunkGroups,
               completedGroup,
             );
@@ -1326,7 +749,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             state.nextComparableWindowStartIndex,
             state.nextComparableWindowStartIndex + state.chunksPerComparableWindow,
           );
-          if (!this.hasContiguousChunkGroups(windowChunkGroups)) {
+          if (!hasContiguousChunkGroups(windowChunkGroups)) {
             profileCount("missingChunkGroups");
             break;
           }
@@ -1482,92 +905,24 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   }
 
   private writeComparableDiagnostics(diagnostics: ComparableWindowDiagnostics): void {
-    profileSync("diagnostics_write_time_ms", () => {
-      if (this.diagnosticsLogStream) {
-        this.diagnosticsLogStream.write(
-          `${this.benchmarkEventTimeAnchor ?? ""},${diagnostics.externalWindowNumber},${diagnostics.externalWindowStart},${diagnostics.externalWindowEnd},"${diagnostics.internalChunkGroupIds.join("|")}","${JSON.stringify(diagnostics.internalChunks).replace(/"/g, '""')}",${diagnostics.recomposedCount ?? ""},${diagnostics.recomposedSum ?? ""},${diagnostics.recomposedAvg ?? ""},${diagnostics.recomposedMin ?? ""},${diagnostics.recomposedMax ?? ""},${diagnostics.resultValue}\n`,
-        );
-      }
+    writeComparableDiagnosticsPure({
+      diagnostics,
+      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+      diagnosticsLogStream: this.diagnosticsLogStream,
+      debugChunksEnabled: this.debugChunksEnabled,
+      logger: this.logger,
     });
-    if (this.debugChunksEnabled) {
-      this.logger.log(
-        `Chunked window diagnostics: ${JSON.stringify({
-          benchmark_event_time_anchor: this.benchmarkEventTimeAnchor,
-          external_window_number: diagnostics.externalWindowNumber,
-          external_window_start: diagnostics.externalWindowStart,
-          external_window_end: diagnostics.externalWindowEnd,
-          internal_chunks_used: diagnostics.internalChunkGroupIds,
-          internal_chunks: diagnostics.internalChunks,
-          recomposed_count: diagnostics.recomposedCount,
-          recomposed_sum: diagnostics.recomposedSum,
-          recomposed_avg: diagnostics.recomposedAvg,
-          recomposed_min: diagnostics.recomposedMin,
-          recomposed_max: diagnostics.recomposedMax,
-          result_value: diagnostics.resultValue,
-        })}`,
-      );
-    }
   }
 
   private writeParentPartialDiagnostics(
     diagnostics: ParentPartialDiagnostics,
   ): void {
-    profileSync("diagnostics_write_time_ms", () => {
-      if (this.parentPartialDiagnosticsStream) {
-        const internalChunksJson = JSON.stringify(diagnostics.internalChunks).replace(
-          /"/g,
-          '""',
-        );
-        const line = [
-          diagnostics.outputType,
-          String(diagnostics.comparable),
-          diagnostics.benchmarkEventTimeAnchor ?? "",
-          diagnostics.parentWindowNumber,
-          diagnostics.parentWindowStart,
-          diagnostics.parentWindowEndOrCoveredUntil,
-          diagnostics.parentRangeMs,
-          diagnostics.coveredDurationMs,
-          diagnostics.chunksUsed,
-          diagnostics.eventCount ?? "",
-          diagnostics.sum ?? "",
-          diagnostics.avg ?? "",
-          diagnostics.min ?? "",
-          diagnostics.max ?? "",
-          diagnostics.resultValue,
-          diagnostics.emittedAtMs,
-          diagnostics.elapsedSinceRegistrationMs,
-          diagnostics.delayPastPartialTriggerMs,
-          `"${diagnostics.internalChunkIds.join("|")}"`,
-          `"${internalChunksJson}"`,
-        ].join(",");
-        this.parentPartialDiagnosticsStream.write(`${line}\n`);
-      }
+    writeParentPartialDiagnosticsPure({
+      diagnostics,
+      parentPartialDiagnosticsStream: this.parentPartialDiagnosticsStream,
+      debugChunksEnabled: this.debugChunksEnabled,
+      logger: this.logger,
     });
-
-    if (this.debugChunksEnabled) {
-      this.logger.log(
-        `Chunked parent partial diagnostics: ${JSON.stringify({
-          output_type: diagnostics.outputType,
-          comparable: diagnostics.comparable,
-          benchmark_event_time_anchor: diagnostics.benchmarkEventTimeAnchor,
-          parent_window_number: diagnostics.parentWindowNumber,
-          parent_window_start: diagnostics.parentWindowStart,
-          parent_window_end_or_covered_until: diagnostics.parentWindowEndOrCoveredUntil,
-          parent_range_ms: diagnostics.parentRangeMs,
-          covered_duration_ms: diagnostics.coveredDurationMs,
-          chunks_used: diagnostics.chunksUsed,
-          event_count: diagnostics.eventCount,
-          sum: diagnostics.sum,
-          avg: diagnostics.avg,
-          result_value: diagnostics.resultValue,
-          emitted_at_ms: diagnostics.emittedAtMs,
-          elapsed_since_registration_ms: diagnostics.elapsedSinceRegistrationMs,
-          delay_past_partial_trigger_ms: diagnostics.delayPastPartialTriggerMs,
-          internal_chunk_ids: diagnostics.internalChunkIds,
-          internal_chunks: diagnostics.internalChunks,
-        })}`,
-      );
-    }
   }
 
   /**
@@ -2074,15 +1429,11 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   }
 
   private getOrCreatePublisherClient(): any {
-    if (this.mqttPublisherClient) {
-      return this.mqttPublisherClient;
-    }
-
-    this.mqttPublisherClient = mqtt.connect(this.mqttBroker, {
-      clean: useCleanMqttSessionsForBenchmark(),
-    });
-    this.activeMqttClients.push(this.mqttPublisherClient);
-    profileCount("mqtt_clients_created");
+    this.mqttPublisherClient = getOrCreatePublisherClientPure(
+      this.mqttBroker,
+      this.mqttPublisherClient,
+      this.activeMqttClients,
+    );
     return this.mqttPublisherClient;
   }
 
@@ -2092,94 +1443,14 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     options: { qos?: number } = {},
   ): Promise<void> {
     const client = this.getOrCreatePublisherClient();
-    return new Promise((resolve) => {
-      const publish = () => {
-        client.publish(topic, payload, options, (err: any) => {
-          if (err) {
-            console.error(`Error publishing to topic ${topic}:`, err);
-          }
-          profileCount("mqtt_messages_published");
-          resolve();
-        });
-      };
-
-      if (client.connected) {
-        publish();
-      } else {
-        client.once("connect", publish);
-      }
-    });
+    return publishWithSharedClientPure(client, topic, payload, options);
   }
 
   private recomputeExactResultFromPartials(
     partials: PartialChunkResult[],
     aggregationFunction: AggregationFunction,
   ): number | null {
-    if (partials.length === 0) {
-      return null;
-    }
-
-    if (aggregationFunction === "COUNT") {
-      const totalCount = partials.reduce((sum, partial) => {
-        if (Number.isFinite(partial.count)) {
-          return sum + (partial.count as number);
-        }
-        if (Number.isFinite(partial.value)) {
-          return sum + (partial.value as number);
-        }
-        return sum;
-      }, 0);
-      return totalCount;
-    }
-
-    if (aggregationFunction === "SUM") {
-      const totalSum = partials.reduce((sum, partial) => {
-        if (Number.isFinite(partial.sum)) {
-          return sum + (partial.sum as number);
-        }
-        if (Number.isFinite(partial.value)) {
-          return sum + (partial.value as number);
-        }
-        return sum;
-      }, 0);
-      return totalSum;
-    }
-
-    if (aggregationFunction === "AVG") {
-      let totalCount = 0;
-      let totalSum = 0;
-
-      for (const partial of partials) {
-        if (Number.isFinite(partial.count)) {
-          totalCount += partial.count as number;
-        }
-        if (Number.isFinite(partial.sum)) {
-          totalSum += partial.sum as number;
-        } else if (Number.isFinite(partial.avg) && Number.isFinite(partial.count)) {
-          totalSum += (partial.avg as number) * (partial.count as number);
-        } else if (Number.isFinite(partial.value) && Number.isFinite(partial.count)) {
-          totalSum += (partial.value as number) * (partial.count as number);
-        }
-      }
-
-      return totalCount > 0 ? totalSum / totalCount : null;
-    }
-
-    if (aggregationFunction === "MIN") {
-      const values = partials
-        .map((partial) => partial.value)
-        .filter((value): value is number => Number.isFinite(value));
-      return values.length > 0 ? Math.min(...values) : null;
-    }
-
-    if (aggregationFunction === "MAX") {
-      const values = partials
-        .map((partial) => partial.value)
-        .filter((value): value is number => Number.isFinite(value));
-      return values.length > 0 ? Math.max(...values) : null;
-    }
-
-    return null;
+    return recomputeExactResultFromPartialsPure(partials, aggregationFunction);
   }
 
   /**
