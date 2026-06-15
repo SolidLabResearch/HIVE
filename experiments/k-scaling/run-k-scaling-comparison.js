@@ -76,6 +76,15 @@ async function terminateProcessTree(child, label, graceMs = 5000) {
   return { sigtermSent, sigkillSent, sigkillRequired };
 }
 
+function getSelfExcludingPattern(pattern) {
+  const parts = pattern.split("/");
+  const lastPart = parts[parts.length - 1];
+  if (lastPart.length > 0) {
+    parts[parts.length - 1] = "[" + lastPart[0] + "]" + lastPart.slice(1);
+  }
+  return parts.join("/");
+}
+
 function checkStaleProcesses() {
   const patterns = [
     "StreamingQueryFetchingKScalingOrchestrator",
@@ -87,7 +96,8 @@ function checkStaleProcesses() {
   const foundProcesses = [];
   for (const pattern of patterns) {
     try {
-      const output = execSync(`pgrep -f "${pattern}"`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      const selfExcluding = getSelfExcludingPattern(pattern);
+      const output = execSync(`pgrep -f "${selfExcluding}"`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
       const pids = output.trim().split("\n").map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p) && p !== process.pid);
       if (pids.length > 0) {
         foundStale = true;
@@ -676,10 +686,20 @@ class KScalingBenchmarkRunner {
         staleProcessesFoundAfterCleanup = true;
         
         console.log("[cleanup] executing fallback pkill for stale processes...");
-        execSync(`pkill -f "StreamingQueryFetchingKScalingOrchestrator" || true`);
-        execSync(`pkill -f "StreamingQueryChunkedKScalingOrchestrator" || true`);
-        execSync(`pkill -f "dist/services/BeeWorker.js" || true`);
-        execSync(`pkill -f "dist/streamer/src/publish" || true`);
+        const pkillPatterns = [
+          "StreamingQueryFetchingKScalingOrchestrator",
+          "StreamingQueryChunkedKScalingOrchestrator",
+          "dist/services/BeeWorker.js",
+          "dist/streamer/src/publish"
+        ];
+        for (const pattern of pkillPatterns) {
+          try {
+            const selfExcluding = getSelfExcludingPattern(pattern);
+            execSync(`pkill -f "${selfExcluding}" || true`, { stdio: "ignore" });
+          } catch (e) {
+            console.error(`[cleanup] fallback pkill failed for pattern=${pattern}`, e);
+          }
+        }
         
         await sleep(1000);
         
