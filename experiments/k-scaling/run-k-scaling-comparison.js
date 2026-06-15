@@ -124,6 +124,25 @@ function verifyExpectedOutputFiles(approach, K, logDir) {
   return { valid: true, emittedCount: totalEmittedResults };
 }
 
+function openLogFds(stdoutPath, stderrPath) {
+  fs.mkdirSync(path.dirname(stdoutPath), { recursive: true });
+  fs.mkdirSync(path.dirname(stderrPath), { recursive: true });
+
+  return {
+    stdoutFd: fs.openSync(stdoutPath, "a"),
+    stderrFd: fs.openSync(stderrPath, "a"),
+  };
+}
+
+function closeLogFds(fds) {
+  if (!fds) return;
+  for (const fd of [fds.stdoutFd, fds.stderrFd]) {
+    try {
+      if (typeof fd === "number") fs.closeSync(fd);
+    } catch {}
+  }
+}
+
 const DEFAULT_K_VALUES = [1, 2, 4, 8];
 const OPTIONAL_STRESS_K = 16;
 const DEFAULT_APPROACHES = ["fetching", "chunked"];
@@ -558,8 +577,8 @@ class KScalingBenchmarkRunner {
     let publisherExitCode = null;
     let publisherExitSignal = null;
     let intentionalShutdown = false;
-    let orchestratorLogStream = null;
-    let publisherLogStream = null;
+    let orchestratorLogFds = null;
+    let publisherLogFds = null;
 
     let cleanupSigtermSent = false;
     let cleanupSigkillSent = false;
@@ -633,12 +652,14 @@ class KScalingBenchmarkRunner {
         if (res.sigkillRequired) forcedCleanupRequired = true;
       }
 
-      // Close log streams
-      if (orchestratorLogStream) {
-        try { orchestratorLogStream.end(); } catch (_) {}
+      // Close log file descriptors
+      if (orchestratorLogFds) {
+        closeLogFds(orchestratorLogFds);
+        orchestratorLogFds = null;
       }
-      if (publisherLogStream) {
-        try { publisherLogStream.end(); } catch (_) {}
+      if (publisherLogFds) {
+        closeLogFds(publisherLogFds);
+        publisherLogFds = null;
       }
 
       // 3. If SIGKILL was required to terminate processes, fail the run
@@ -729,7 +750,7 @@ class KScalingBenchmarkRunner {
       }
 
       const orchestratorLogPath = path.join(logDir, `${approach}_orchestrator.log`);
-      orchestratorLogStream = fs.createWriteStream(orchestratorLogPath);
+      orchestratorLogFds = openLogFds(orchestratorLogPath, orchestratorLogPath);
 
       // Start orchestrator process
       console.log(`Spawning orchestrator: node ${approachScript}`);
@@ -738,7 +759,7 @@ class KScalingBenchmarkRunner {
           ...testEnv,
           HIVE_PROCESS_ROLE: `${approach}_orchestrator`,
         },
-        stdio: ["ignore", orchestratorLogStream, orchestratorLogStream],
+        stdio: ["ignore", orchestratorLogFds.stdoutFd, orchestratorLogFds.stderrFd],
         detached: true,
       });
 
@@ -765,7 +786,7 @@ class KScalingBenchmarkRunner {
         console.log("Spawning data publisher...");
         const dataPath = `custom_patterns/${patternName}`;
         const publisherLogPath = path.join(logDir, "publisher.log");
-        publisherLogStream = fs.createWriteStream(publisherLogPath);
+        publisherLogFds = openLogFds(publisherLogPath, publisherLogPath);
 
         publisherProc = spawn("node", ["dist/streamer/src/publish.js"], {
           env: {
@@ -773,7 +794,7 @@ class KScalingBenchmarkRunner {
             DATA_PATH: dataPath,
             HIVE_PROCESS_ROLE: "benchmark_publisher",
           },
-          stdio: ["ignore", publisherLogStream, publisherLogStream],
+          stdio: ["ignore", publisherLogFds.stdoutFd, publisherLogFds.stderrFd],
           detached: true,
         });
 

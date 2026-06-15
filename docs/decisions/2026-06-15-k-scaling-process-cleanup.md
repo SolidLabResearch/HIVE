@@ -12,6 +12,7 @@ During K-scaling benchmark runs, process execution must not leave orphan process
 4. Update orchestrator entrypoints ([StreamingQueryFetchingKScalingOrchestrator.ts](file:///Users/kushbisen/Code/streaming-query-hive/src/approaches/StreamingQueryFetchingKScalingOrchestrator.ts) and [StreamingQueryChunkedKScalingOrchestrator.ts](file:///Users/kushbisen/Code/streaming-query-hive/src/approaches/StreamingQueryChunkedKScalingOrchestrator.ts)) to catch SIGINT, SIGTERM, uncaughtException, and unhandledRejection to run the async shutdown sequence before calling `process.exit()`.
 5. Incorporate stale process checks (using `pgrep`) and fallback pkill commands, failing the run if stale processes cannot be cleared.
 6. Write run status and error info into `resource_summary.json` for validation and post-extraction.
+7. Use synchronous file descriptors via `fs.openSync` and `fs.closeSync` for stdio redirection in `spawn` to avoid standard input/output crashes from unopened `WriteStream` handles.
 
 ## Alternatives Considered
 
