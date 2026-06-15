@@ -258,22 +258,45 @@ export class BeeWorker {
     /**
      *
      */
-    stop() {
-
+    async stop() {
+        if (this.operator && typeof this.operator.cleanup === "function") {
+            try {
+                await this.operator.cleanup();
+            } catch (err) {
+                console.error("Error cleaning up operator in BeeWorker:", err);
+            }
+        }
     }
 }
 
 if (require.main === module) {
     const beeWorker = new BeeWorker();
 
-    process.on("SIGINT", () => {
-        beeWorker.stop();
-        process.exit(0);
-    });
+    let shuttingDown = false;
+    const shutdown = async (signal: string, exitCode: number) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log(`[BeeWorker] Received ${signal}, starting cleanup...`);
+        try {
+            await beeWorker.stop();
+        } catch (err) {
+            console.error("[BeeWorker] stop failed", err);
+        }
+        process.exit(exitCode);
+    };
 
-    process.on("SIGTERM", () => {
-        beeWorker.stop();
-        process.exit(0);
+    process.on("SIGINT", () => void shutdown("SIGINT", 130));
+    process.on("SIGTERM", () => void shutdown("SIGTERM", 143));
+    process.on("uncaughtException", (err) => {
+        console.error("[BeeWorker fatal] uncaughtException", err);
+        void shutdown("uncaughtException", 1);
+    });
+    process.on("unhandledRejection", (err) => {
+        console.error("[BeeWorker fatal] unhandledRejection", err);
+        void shutdown("unhandledRejection", 1);
+    });
+    process.on("exit", (code) => {
+        console.log(`[BeeWorker exit] code=${code}`);
     });
 }
 

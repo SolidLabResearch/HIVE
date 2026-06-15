@@ -159,6 +159,33 @@ WHERE {
   }
 
   logger.log(`Initialized K=${K} Chunked queries.`);
+
+  let shuttingDown = false;
+  async function shutdown(reason: string, exitCode = 0) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[shutdown] reason=${reason}`);
+    try {
+      await orchestrator.stop?.();
+    } catch (err) {
+      console.error("[shutdown] orchestrator.stop failed", err);
+    }
+    process.exit(exitCode);
+  }
+
+  process.on("SIGINT", () => void shutdown("SIGINT", 130));
+  process.on("SIGTERM", () => void shutdown("SIGTERM", 143));
+  process.on("uncaughtException", (err) => {
+    console.error("[fatal] uncaughtException", err);
+    void shutdown("uncaughtException", 1);
+  });
+  process.on("unhandledRejection", (err) => {
+    console.error("[fatal] unhandledRejection", err);
+    void shutdown("unhandledRejection", 1);
+  });
+  process.on("exit", (code) => {
+    console.log(`[exit] code=${code}`);
+  });
 }
 
 startResourceUsageLogging();

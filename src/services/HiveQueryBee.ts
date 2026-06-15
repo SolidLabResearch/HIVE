@@ -50,7 +50,14 @@ export class HiveQueryBee {
     /**
      *
      */
+    kill(signal?: NodeJS.Signals) {
+        this.process.kill(signal || "SIGTERM");
+    }
+
+    /**
+     *
+     */
     stop() {
-        this.process.kill();
+        this.process.kill("SIGTERM");
     }
 }

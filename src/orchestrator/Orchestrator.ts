@@ -150,4 +150,9 @@ export class Orchestrator {
         console.log(`Running registered query: ${this.registeredQuery}`);
 
     }
+
+    public async stop(): Promise<void> {
+        await this.beeKeeper.stop();
+        this.http_server.close();
+    }
 }

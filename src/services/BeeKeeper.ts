@@ -55,4 +55,26 @@ export class BeeKeeper {
 
         }
     }
+
+    public kill(signal?: NodeJS.Signals): void {
+        for (const worker of this.bees.values()) {
+            try {
+                worker.kill(signal);
+            } catch (e) {
+                console.error("Error killing worker:", e);
+            }
+        }
+        this.bees.clear();
+    }
+
+    public async stop(): Promise<void> {
+        for (const worker of this.bees.values()) {
+            try {
+                worker.stop();
+            } catch (e) {
+                console.error("Error stopping worker:", e);
+            }
+        }
+        this.bees.clear();
+    }
 }

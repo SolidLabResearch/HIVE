@@ -67,25 +67,33 @@ WHERE {
   }
 
   // Setup process wide cleanup
-  const cleanup = () => {
-    console.log("Cleaning up all Fetching consumers...");
-    clients.forEach((client) => {
+  let shuttingDown = false;
+  async function shutdown(reason: string, exitCode = 0) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[shutdown] reason=${reason}`);
+    for (const client of clients) {
       try {
-        client.cleanup();
+        await client.cleanup();
       } catch (err) {
-        console.error("Error cleaning up Fetching consumer:", err);
+        console.error(`[shutdown] Failed to clean up fetching consumer:`, err);
       }
-    });
-  };
+    }
+    process.exit(exitCode);
+  }
 
-  process.on("exit", cleanup);
-  process.on("SIGINT", () => {
-    cleanup();
-    process.exit(0);
+  process.on("SIGINT", () => void shutdown("SIGINT", 130));
+  process.on("SIGTERM", () => void shutdown("SIGTERM", 143));
+  process.on("uncaughtException", (err) => {
+    console.error("[fatal] uncaughtException", err);
+    void shutdown("uncaughtException", 1);
   });
-  process.on("SIGTERM", () => {
-    cleanup();
-    process.exit(0);
+  process.on("unhandledRejection", (err) => {
+    console.error("[fatal] unhandledRejection", err);
+    void shutdown("unhandledRejection", 1);
+  });
+  process.on("exit", (code) => {
+    console.log(`[exit] code=${code}`);
   });
 
   // Start all consumers

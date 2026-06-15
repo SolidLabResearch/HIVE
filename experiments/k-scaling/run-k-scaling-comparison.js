@@ -12,15 +12,117 @@
  *   node run-k-scaling-comparison.js --iterations 3 --timeout 300000
  */
 
-const { execFileSync, spawn } = require("child_process");
+const { execFileSync, spawn, execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 const {
   cleanupStaleBenchmarkProcesses,
   delay,
-  terminateChildProcessTree,
 } = require("../utils/processCleanup");
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function terminateProcessTree(child, label, graceMs = 5000) {
+  if (!child || !child.pid) {
+    return { sigtermSent: false, sigkillSent: false, sigkillRequired: false };
+  }
+
+  console.log(`[cleanup] terminating process group label=${label} pid=${child.pid}`);
+  let sigtermSent = false;
+  let sigkillSent = false;
+  let sigkillRequired = false;
+
+  try {
+    process.kill(-child.pid, "SIGTERM");
+    console.log(`[cleanup] SIGTERM sent to process group label=${label}`);
+    sigtermSent = true;
+  } catch (e) {
+    try {
+      process.kill(child.pid, "SIGTERM");
+      console.log(`[cleanup] SIGTERM sent to pid label=${label}`);
+      sigtermSent = true;
+    } catch {}
+  }
+
+  await sleep(graceMs);
+
+  let alive = false;
+  try {
+    process.kill(child.pid, 0);
+    alive = true;
+  } catch (e) {
+    // ESRCH means dead
+  }
+
+  if (alive) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      console.log(`[cleanup] SIGKILL sent to process group label=${label}`);
+      sigkillSent = true;
+      sigkillRequired = true;
+    } catch (e) {
+      try {
+        process.kill(child.pid, "SIGKILL");
+        console.log(`[cleanup] SIGKILL sent to pid label=${label}`);
+        sigkillSent = true;
+        sigkillRequired = true;
+      } catch {}
+    }
+  }
+
+  return { sigtermSent, sigkillSent, sigkillRequired };
+}
+
+function checkStaleProcesses() {
+  const patterns = [
+    "StreamingQueryFetchingKScalingOrchestrator",
+    "StreamingQueryChunkedKScalingOrchestrator",
+    "dist/services/BeeWorker.js",
+    "dist/streamer/src/publish"
+  ];
+  let foundStale = false;
+  const foundProcesses = [];
+  for (const pattern of patterns) {
+    try {
+      const output = execSync(`pgrep -f "${pattern}"`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      const pids = output.trim().split("\n").map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p) && p !== process.pid);
+      if (pids.length > 0) {
+        foundStale = true;
+        foundProcesses.push({ pattern, pids });
+      }
+    } catch (e) {
+      // pgrep exits with 1 if no process matches, which is expected
+    }
+  }
+  return { foundStale, foundProcesses };
+}
+
+function verifyExpectedOutputFiles(approach, K, logDir) {
+  let totalEmittedResults = 0;
+  for (let i = 1; i <= K; i++) {
+    const fileName = approach === "fetching"
+      ? `fetching_latency_log_consumer_${i}.csv`
+      : `chunked_latency_log_consumer_${i}.csv`;
+    const filePath = path.join(logDir, fileName);
+    if (!fs.existsSync(filePath)) {
+      return { valid: false, reason: `Expected result file missing: ${fileName}`, emittedCount: 0 };
+    }
+    try {
+      const content = fs.readFileSync(filePath, "utf8").trim();
+      const lines = content.split("\n").filter(line => line.trim().length > 0);
+      if (lines.length <= 1) {
+        return { valid: false, reason: `Result file has no data rows: ${fileName}`, emittedCount: 0 };
+      }
+      totalEmittedResults += (lines.length - 1);
+    } catch (e) {
+      return { valid: false, reason: `Error reading result file ${fileName}: ${e.message}`, emittedCount: 0 };
+    }
+  }
+  return { valid: true, emittedCount: totalEmittedResults };
+}
 
 const DEFAULT_K_VALUES = [1, 2, 4, 8];
 const OPTIONAL_STRESS_K = 16;
@@ -451,6 +553,19 @@ class KScalingBenchmarkRunner {
     let timeoutTimer = null;
     let finalized = false;
 
+    let orchestratorExitCode = null;
+    let orchestratorExitSignal = null;
+    let publisherExitCode = null;
+    let publisherExitSignal = null;
+    let intentionalShutdown = false;
+    let orchestratorLogStream = null;
+    let publisherLogStream = null;
+
+    let cleanupSigtermSent = false;
+    let cleanupSigkillSent = false;
+    let forcedCleanupRequired = false;
+    let staleProcessesFoundAfterCleanup = false;
+
     const resourceMonitor = new AttemptResourceSampler(logDir, {
       sampleIntervalMs: 500,
       getRootPids: () => {
@@ -469,10 +584,108 @@ class KScalingBenchmarkRunner {
       if (finalized) return;
       finalized = true;
 
-      console.log(`Finalizing test run (Reason: ${reason})...`);
+      intentionalShutdown = true;
+
+      console.log(`[cleanup] Finalizing test run. Reason: ${reason}`);
       clearTimeout(publisherTimer);
       clearTimeout(timeoutTimer);
 
+      let isSuccess = true;
+      let failureReason = "";
+
+      // 1. Check exit status prior to termination
+      if (publisherExitCode !== null && publisherExitCode !== 0) {
+        isSuccess = false;
+        failureReason = `Publisher exited with non-zero code ${publisherExitCode}`;
+      } else if (publisherExitSignal !== null) {
+        isSuccess = false;
+        failureReason = `Publisher exited with signal ${publisherExitSignal}`;
+      } else if (orchestratorExitSignal === "SIGKILL" || orchestratorExitSignal === "SIGABRT") {
+        isSuccess = false;
+        failureReason = `Orchestrator exited with signal ${orchestratorExitSignal}`;
+      } else if (orchestratorExitCode !== null && orchestratorExitCode !== 0) {
+        isSuccess = false;
+        failureReason = `Orchestrator exited with non-zero code ${orchestratorExitCode}`;
+      } else if (reason === "timeout") {
+        isSuccess = false;
+        failureReason = "Test run timed out";
+      } else if (reason === "process_error" && err) {
+        isSuccess = false;
+        failureReason = `Process error: ${err.message}`;
+      } else if (reason === "orchestrator_unexpected_exit") {
+        isSuccess = false;
+        failureReason = "Orchestrator exited unexpectedly before publisher completion";
+      }
+
+      // 2. Kill child processes using process group tree termination
+      if (publisherProc) {
+        console.log("Terminating publisher process tree...");
+        const res = await terminateProcessTree(publisherProc, "publisher", 2000);
+        if (res.sigtermSent) cleanupSigtermSent = true;
+        if (res.sigkillSent) cleanupSigkillSent = true;
+        if (res.sigkillRequired) forcedCleanupRequired = true;
+      }
+      if (orchestratorProc) {
+        console.log("Terminating orchestrator process tree...");
+        const res = await terminateProcessTree(orchestratorProc, "orchestrator", 2000);
+        if (res.sigtermSent) cleanupSigtermSent = true;
+        if (res.sigkillSent) cleanupSigkillSent = true;
+        if (res.sigkillRequired) forcedCleanupRequired = true;
+      }
+
+      // Close log streams
+      if (orchestratorLogStream) {
+        try { orchestratorLogStream.end(); } catch (_) {}
+      }
+      if (publisherLogStream) {
+        try { publisherLogStream.end(); } catch (_) {}
+      }
+
+      // 3. If SIGKILL was required to terminate processes, fail the run
+      if (forcedCleanupRequired) {
+        isSuccess = false;
+        failureReason = (failureReason ? failureReason + "; " : "") + "Forced SIGKILL cleanup was required";
+      }
+
+      // 4. Stale process check and fallback cleanup
+      console.log("[cleanup] checking for stale benchmark processes...");
+      const staleBefore = checkStaleProcesses();
+      if (staleBefore.foundStale) {
+        console.log(`[cleanup] stale process check failed: found processes: ${JSON.stringify(staleBefore.foundProcesses)}`);
+        staleProcessesFoundAfterCleanup = true;
+        
+        console.log("[cleanup] executing fallback pkill for stale processes...");
+        execSync(`pkill -f "StreamingQueryFetchingKScalingOrchestrator" || true`);
+        execSync(`pkill -f "StreamingQueryChunkedKScalingOrchestrator" || true`);
+        execSync(`pkill -f "dist/services/BeeWorker.js" || true`);
+        execSync(`pkill -f "dist/streamer/src/publish" || true`);
+        
+        await sleep(1000);
+        
+        const staleAfter = checkStaleProcesses();
+        if (staleAfter.foundStale) {
+          isSuccess = false;
+          failureReason = (failureReason ? failureReason + "; " : "") + `Stale processes remain after fallback cleanup: ${JSON.stringify(staleAfter.foundProcesses)}`;
+        }
+      } else {
+        console.log("[cleanup] stale process check passed.");
+      }
+
+      // 5. Verify expected output files exist and are not empty
+      let totalEmittedResults = 0;
+      if (isSuccess) {
+        const fileCheck = verifyExpectedOutputFiles(approach, K, logDir);
+        if (!fileCheck.valid) {
+          isSuccess = false;
+          failureReason = fileCheck.reason;
+        } else {
+          totalEmittedResults = fileCheck.emittedCount;
+        }
+      }
+
+      console.log(`[cleanup] Finalizing test run summary. Success status: ${isSuccess ? "SUCCESS" : "FAILED"}`);
+
+      // Write resource summary
       const summary = resourceMonitor.summarize();
       await resourceMonitor.stop({
         approach,
@@ -480,22 +693,28 @@ class KScalingBenchmarkRunner {
         pattern: patternName,
         iteration: iterationNum,
         terminationReason: reason,
-        exitStatus: err ? "error" : "completed",
-        error: err ? err.message : null,
+        exitStatus: isSuccess ? "completed" : "error",
+        error: isSuccess ? null : failureReason,
+        orchestrator_exit_code: orchestratorExitCode,
+        orchestrator_exit_signal: orchestratorExitSignal,
+        publisher_exit_code: publisherExitCode,
+        publisher_exit_signal: publisherExitSignal,
+        cleanup_sigterm_sent: cleanupSigtermSent,
+        cleanup_sigkill_sent: cleanupSigkillSent,
+        cleanup_forced_sigkill_required: forcedCleanupRequired,
+        stale_processes_found_after_cleanup: staleProcessesFoundAfterCleanup,
+        run_status: isSuccess ? "SUCCESS" : "FAILED",
+        failure_reason: failureReason || null,
+        emitted_result_count: totalEmittedResults,
       });
 
-      // Kill processes
-      if (publisherProc) {
-        console.log("Terminating publisher...");
-        await terminateChildProcessTree(publisherProc.pid, { logger: () => {} });
-      }
-      if (orchestratorProc) {
-        console.log("Terminating orchestrator...");
-        await terminateChildProcessTree(orchestratorProc.pid, { logger: () => {} });
-      }
-
-      await cleanupStaleBenchmarkProcesses({ logger: () => {} });
       this.activeAttemptCleanup = null;
+
+      if (isSuccess) {
+        resolve();
+      } else {
+        reject(new Error(failureReason || "Test run failed"));
+      }
     };
 
     this.activeAttemptCleanup = () => {
@@ -509,6 +728,9 @@ class KScalingBenchmarkRunner {
         return;
       }
 
+      const orchestratorLogPath = path.join(logDir, `${approach}_orchestrator.log`);
+      orchestratorLogStream = fs.createWriteStream(orchestratorLogPath);
+
       // Start orchestrator process
       console.log(`Spawning orchestrator: node ${approachScript}`);
       orchestratorProc = spawn("node", [approachScript], {
@@ -516,17 +738,11 @@ class KScalingBenchmarkRunner {
           ...testEnv,
           HIVE_PROCESS_ROLE: `${approach}_orchestrator`,
         },
-        stdio: "pipe",
+        stdio: ["ignore", orchestratorLogStream, orchestratorLogStream],
         detached: true,
       });
 
       resourceMonitor.start();
-
-      // Write orchestrator logs
-      const orchestratorLogPath = path.join(logDir, `${approach}_orchestrator.log`);
-      const orchestratorLogStream = fs.createWriteStream(orchestratorLogPath);
-      orchestratorProc.stdout.on("data", (chunk) => orchestratorLogStream.write(chunk));
-      orchestratorProc.stderr.on("data", (chunk) => orchestratorLogStream.write(chunk));
 
       orchestratorProc.on("error", (err) => {
         console.error(`Orchestrator error: ${err.message}`);
@@ -534,9 +750,11 @@ class KScalingBenchmarkRunner {
       });
 
       orchestratorProc.on("close", (code, signal) => {
+        orchestratorExitCode = code;
+        orchestratorExitSignal = signal;
         console.log(`Orchestrator exited: code=${code} signal=${signal}`);
-        if (!finalized) {
-          void finalize("orchestrator_exited").then(resolve);
+        if (!intentionalShutdown && !finalized) {
+          void finalize("orchestrator_unexpected_exit").then(resolve);
         }
       });
 
@@ -546,32 +764,39 @@ class KScalingBenchmarkRunner {
 
         console.log("Spawning data publisher...");
         const dataPath = `custom_patterns/${patternName}`;
+        const publisherLogPath = path.join(logDir, "publisher.log");
+        publisherLogStream = fs.createWriteStream(publisherLogPath);
+
         publisherProc = spawn("node", ["dist/streamer/src/publish.js"], {
           env: {
             ...testEnv,
             DATA_PATH: dataPath,
             HIVE_PROCESS_ROLE: "benchmark_publisher",
           },
-          stdio: "pipe",
+          stdio: ["ignore", publisherLogStream, publisherLogStream],
           detached: true,
         });
-
-        const publisherLogPath = path.join(logDir, "publisher.log");
-        const publisherLogStream = fs.createWriteStream(publisherLogPath);
-        publisherProc.stdout.on("data", (chunk) => publisherLogStream.write(chunk));
-        publisherProc.stderr.on("data", (chunk) => publisherLogStream.write(chunk));
 
         publisherProc.on("error", (err) => {
           console.error(`Publisher error: ${err.message}`);
           void finalize("publisher_error", err).then(resolve);
         });
 
-        publisherProc.on("close", (code) => {
-          console.log(`Publisher completed: code=${code}`);
-          // Give 3 seconds for trailing messages to recompose/propagate
-          setTimeout(() => {
-            void finalize("completed").then(resolve);
-          }, 3000);
+        publisherProc.on("close", (code, signal) => {
+          publisherExitCode = code;
+          publisherExitSignal = signal;
+          console.log(`Publisher completed: code=${code} signal=${signal}`);
+          
+          if (!finalized) {
+            if (code !== 0) {
+              void finalize("publisher_failed").then(resolve);
+            } else {
+              // Give 5 seconds for trailing messages to recompose/propagate and flush logs
+              setTimeout(() => {
+                void finalize("completed").then(resolve);
+              }, 5000);
+            }
+          }
         });
       }, 5000);
 

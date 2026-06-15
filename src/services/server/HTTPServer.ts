@@ -84,4 +84,9 @@ export class HTTPServer {
             }
         }
     }
+
+    public close(): void {
+        this.http_server.close();
+        this.logger.info("HTTP Server stopped");
+    }
 }
