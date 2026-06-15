@@ -199,9 +199,10 @@ function resolveArtifactPath(): string | null {
     return null;
   }
   const processRoleGroup = getProcessRoleGroup(getProcessRole());
+  const consumerIdx = process.env.K_SCALING_CONSUMER_INDEX ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}` : "";
   return path.resolve(
     outputDir,
-    `hive_profile_summary.${sanitize(processRoleGroup)}.json`,
+    `hive_profile_summary.${sanitize(processRoleGroup)}${consumerIdx}.json`,
   );
 }
 

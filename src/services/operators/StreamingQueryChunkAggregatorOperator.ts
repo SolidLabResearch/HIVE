@@ -265,13 +265,14 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.chunkGCD = 0;
     this.comparableOutputCadenceOnly = useChunkedComparableOutputCadence();
     this.useImmediateTrigger = getChunkedUseImmediateTrigger();
-    this.logger = new CSVLogger("streaming_query_chunk_aggregator_log.csv");
+    const consumerIdx = process.env.K_SCALING_CONSUMER_INDEX ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}` : "";
+    this.logger = new CSVLogger(this.resolveLogFilePath(`streaming_query_chunk_aggregator_log${consumerIdx}.csv`));
     this.sessionId = getSessionId();
     this.benchmarkEventTimeAnchor = getBenchmarkEventTimeAnchor();
     this.timestampDomainMin = getTimestampDomainMin();
     this.timestampDomainMax = getTimestampDomainMax();
-    this.chunkedDebugSummaryPath = this.resolveLogFilePath("chunked_debug_summary.json");
-    this.chunkedEmissionProofPath = this.resolveLogFilePath("chunked_emission_proof.json");
+    this.chunkedDebugSummaryPath = this.resolveLogFilePath(`chunked_debug_summary${consumerIdx}.json`);
+    this.chunkedEmissionProofPath = this.resolveLogFilePath(`chunked_emission_proof${consumerIdx}.json`);
     this.chunkedDebugSummary = {
       chunkSizeMs: 0,
       comparableOutputCadenceOnly: this.comparableOutputCadenceOnly,
@@ -378,7 +379,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
    * Initialize latency logging
    */
   private initializeLatencyLogging() {
-    const latencyLogFilePath = this.resolveLogFilePath("chunked_latency_log.csv");
+    const consumerIdx = process.env.K_SCALING_CONSUMER_INDEX ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}` : "";
+    const latencyLogFilePath = this.resolveLogFilePath(`chunked_latency_log${consumerIdx}.csv`);
     const writeLatencyHeader = !fs.existsSync(latencyLogFilePath);
     this.latencyLogStream = fs.createWriteStream(latencyLogFilePath, {
       flags: "a",
@@ -390,7 +392,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       );
     }
 
-    const diagnosticsLogFilePath = this.resolveLogFilePath("chunked_window_diagnostics.csv");
+    const diagnosticsLogFilePath = this.resolveLogFilePath(`chunked_window_diagnostics${consumerIdx}.csv`);
     const writeDiagnosticsHeader = !fs.existsSync(diagnosticsLogFilePath);
     this.diagnosticsLogStream = fs.createWriteStream(diagnosticsLogFilePath, {
       flags: "a",
@@ -403,7 +405,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     }
 
     this.parentPartialDiagnosticsFilePath = this.resolveLogFilePath(
-      "chunked_parent_partial_latency_log.csv",
+      `chunked_parent_partial_latency_log${consumerIdx}.csv`,
     );
     const writeParentPartialHeader = !fs.existsSync(
       this.parentPartialDiagnosticsFilePath,
@@ -2462,6 +2464,7 @@ For example, the allResults object might look like this:
     if (chunkPlan.chunkSize > 0) {
       const allPromises: Promise<void>[] = [];
       const uniqueRewrittenQueries = Array.from(new Set(chunkPlan.rewrittenQueries));
+      const skipSpawning = process.env.HIVE_SKIP_CHUNK_PRODUCER_SPAWNING === "true";
 
       for (let i = 0; i < uniqueRewrittenQueries.length; i++) {
         const rewrittenQuery = uniqueRewrittenQueries[i];
@@ -2469,28 +2472,35 @@ For example, the allResults object might look like this:
         const hash_subQuery = hash_string_md5(rewrittenQuery);
         const topicName = `chunked/${this.sessionId}/${hash_subQuery}`;
         this.subQueryMQTTTopicMap.set(hash_subQuery, topicName);
-        const rspQueryProcess = new RSPQueryProcess(
-          rewrittenQuery,
-          topicName,
-          this.sessionId,
-          hash_subQuery,
-        );
-        profileCount("rsp_query_processes_started");
-        profileCount("shared_chunk_producers_created");
-        const p = rspQueryProcess
-          .stream_process()
-          .then(() => {
-            this.logger.log(
-              `RSP Query Process started for rewritten subquery ${i}: ${rewrittenQuery}`,
-            );
-          })
-          .catch((error) => {
-            console.error(
-              `Error starting RSP Query Process for rewritten subquery ${i}: ${rewrittenQuery}`,
-              error,
-            );
-          });
-        allPromises.push(p);
+        console.log(`EXPECTED_CHUNK_TOPIC: hash=${hash_subQuery} topic=${topicName} skipSpawning=${skipSpawning}`);
+        this.logger.log(`Expected chunk topic: hash=${hash_subQuery} topic=${topicName} skipSpawning=${skipSpawning}`);
+        
+        if (!skipSpawning) {
+          const rspQueryProcess = new RSPQueryProcess(
+            rewrittenQuery,
+            topicName,
+            this.sessionId,
+            hash_subQuery,
+          );
+          profileCount("rsp_query_processes_started");
+          profileCount("shared_chunk_producers_created");
+          const p = rspQueryProcess
+            .stream_process()
+            .then(() => {
+              this.logger.log(
+                `RSP Query Process started for rewritten subquery ${i}: ${rewrittenQuery}`,
+              );
+            })
+            .catch((error) => {
+              console.error(
+                `Error starting RSP Query Process for rewritten subquery ${i}: ${rewrittenQuery}`,
+                error,
+              );
+            });
+          allPromises.push(p);
+        } else {
+          this.logger.log(`Skipping RSP Query Process instantiation for rewritten subquery ${i} (secondary consumer)`);
+        }
       }
 
       await Promise.all(allPromises);

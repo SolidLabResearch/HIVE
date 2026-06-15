@@ -1,5 +1,6 @@
 import { EventEmitter } from "events";
 import fs from "fs";
+import path from "path";
 import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
 import { v4 as uuidv4 } from "uuid";
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
@@ -98,6 +99,7 @@ export class FetchingAllDataClientSide {
   private mqttClients: any[] = [];
   private resourceUsageInterval: NodeJS.Timeout | null = null;
   private cleanupRegistered: boolean = false;
+  private consumerIdx: string;
 
   /**
    *
@@ -108,9 +110,11 @@ export class FetchingAllDataClientSide {
     query: string,
     r2s_topic: string,
     aggregationFunction: AggregationFunction,
+    consumerIndex?: string | number,
   ) {
     process.env.HIVE_PROCESS_ROLE =
       process.env.HIVE_PROCESS_ROLE || "fetching_orchestrator";
+    this.consumerIdx = consumerIndex ? `_consumer_${consumerIndex}` : (process.env.K_SCALING_CONSUMER_INDEX ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}` : "");
     this.query = query;
     this.r2s_topic = r2s_topic;
     this.aggregationFunction = aggregationFunction;
@@ -145,12 +149,16 @@ export class FetchingAllDataClientSide {
    * Initialize CSV logging for this approach
    */
   private initializeLogging() {
-    const logFilePath = "fetching_client_side_log.csv";
+    const logRoot = process.env.LOG_PATH || ".";
+    fs.mkdirSync(logRoot, { recursive: true });
+    const consumerIdx = this.consumerIdx;
+
+    const logFilePath = path.join(logRoot, `fetching_client_side_log${consumerIdx}.csv`);
     this.logStream = fs.createWriteStream(logFilePath, { flags: "w" });
     this.logStream.write("timestamp,message\n");
 
     // Initialize latency log
-    const latencyLogFilePath = "fetching_latency_log.csv";
+    const latencyLogFilePath = path.join(logRoot, `fetching_latency_log${consumerIdx}.csv`);
     this.latencyLogStream = fs.createWriteStream(latencyLogFilePath, {
       flags: "w",
     });
@@ -158,7 +166,7 @@ export class FetchingAllDataClientSide {
       "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,result_value\n",
     );
 
-    const diagnosticsLogFilePath = "fetching_window_diagnostics.csv";
+    const diagnosticsLogFilePath = path.join(logRoot, `fetching_window_diagnostics${consumerIdx}.csv`);
     this.diagnosticsLogStream = fs.createWriteStream(diagnosticsLogFilePath, {
       flags: "w",
     });
@@ -1205,8 +1213,13 @@ export class FetchingAllDataClientSide {
     filePath = "fetching_client_side_resource_usage.csv",
     intervalMs = 100,
   ) {
-    const writeHeader = !fs.existsSync(filePath);
-    const logStream = fs.createWriteStream(filePath, { flags: "a" });
+    const logRoot = process.env.LOG_PATH || ".";
+    fs.mkdirSync(logRoot, { recursive: true });
+    const consumerIdx = this.consumerIdx;
+    const targetPath = path.join(logRoot, filePath.replace(".csv", `${consumerIdx}.csv`));
+
+    const writeHeader = !fs.existsSync(targetPath);
+    const logStream = fs.createWriteStream(targetPath, { flags: "a" });
     if (writeHeader) {
       logStream.write(
         "timestamp,cpu_user,cpu_system,rss,heapTotal,heapUsed,heapUsedMB,external\n",
