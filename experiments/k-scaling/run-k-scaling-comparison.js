@@ -581,6 +581,8 @@ class KScalingBenchmarkRunner {
     let publisherTimer = null;
     let timeoutTimer = null;
     let finalized = false;
+    let resolveFn = null;
+    let rejectFn = null;
 
     let orchestratorExitCode = null;
     let orchestratorExitSignal = null;
@@ -752,9 +754,9 @@ class KScalingBenchmarkRunner {
       this.activeAttemptCleanup = null;
 
       if (isSuccess) {
-        resolve();
+        if (resolveFn) resolveFn();
       } else {
-        reject(new Error(failureReason || "Test run failed"));
+        if (rejectFn) rejectFn(new Error(failureReason || "Test run failed"));
       }
     };
 
@@ -763,6 +765,9 @@ class KScalingBenchmarkRunner {
     };
 
     return new Promise(async (resolve, reject) => {
+      resolveFn = resolve;
+      rejectFn = reject;
+
       const approachScript = this.getApproachScript(approach);
       if (!fs.existsSync(approachScript)) {
         reject(new Error(`Approach script not found: ${approachScript}`));
@@ -787,7 +792,7 @@ class KScalingBenchmarkRunner {
 
       orchestratorProc.on("error", (err) => {
         console.error(`Orchestrator error: ${err.message}`);
-        void finalize("process_error", err).then(resolve);
+        void finalize("process_error", err);
       });
 
       orchestratorProc.on("close", (code, signal) => {
@@ -795,7 +800,7 @@ class KScalingBenchmarkRunner {
         orchestratorExitSignal = signal;
         console.log(`Orchestrator exited: code=${code} signal=${signal}`);
         if (!intentionalShutdown && !finalized) {
-          void finalize("orchestrator_unexpected_exit").then(resolve);
+          void finalize("orchestrator_unexpected_exit");
         }
       });
 
@@ -820,7 +825,7 @@ class KScalingBenchmarkRunner {
 
         publisherProc.on("error", (err) => {
           console.error(`Publisher error: ${err.message}`);
-          void finalize("publisher_error", err).then(resolve);
+          void finalize("publisher_error", err);
         });
 
         publisherProc.on("close", (code, signal) => {
@@ -830,11 +835,11 @@ class KScalingBenchmarkRunner {
           
           if (!finalized) {
             if (code !== 0) {
-              void finalize("publisher_failed").then(resolve);
+              void finalize("publisher_failed");
             } else {
               // Give 5 seconds for trailing messages to recompose/propagate and flush logs
               setTimeout(() => {
-                void finalize("completed").then(resolve);
+                void finalize("completed");
               }, 5000);
             }
           }
@@ -845,7 +850,7 @@ class KScalingBenchmarkRunner {
       timeoutTimer = setTimeout(() => {
         if (!finalized) {
           console.log(`Test timed out after ${timeout}ms.`);
-          void finalize("timeout").then(resolve);
+          void finalize("timeout");
         }
       }, timeout);
     });

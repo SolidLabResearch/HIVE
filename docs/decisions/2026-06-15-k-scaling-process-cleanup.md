@@ -14,6 +14,7 @@ During K-scaling benchmark runs, process execution must not leave orphan process
 6. Write run status and error info into `resource_summary.json` for validation and post-extraction.
 7. Use synchronous file descriptors via `fs.openSync` and `fs.closeSync` for stdio redirection in `spawn` to avoid standard input/output crashes from unopened `WriteStream` handles.
 8. Transform stale process matching patterns using a bracketed first letter (e.g. `[S]treamingQueryFetchingKScalingOrchestrator`) for `pgrep` and `pkill` to prevent self-matching and runner SIGTERM terminations.
+9. Capture Promise resolver/rejecter closures into `resolveFn`/`rejectFn` variables in the runner to allow safe execution of callbacks from outside the executor block.
 
 ## Alternatives Considered
 
