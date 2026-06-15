@@ -13,6 +13,9 @@ const DEFAULT_OUTPUT_WINDOW_STEP = 60000;
 const DEFAULT_SUB_WINDOW_RANGE = 60000;
 const DEFAULT_SUB_WINDOW_STEP = 30000;
 const DEFAULT_CHUNKED_USE_IMMEDIATE_TRIGGER = true;
+const DEFAULT_K_SCALING_REUSE_MODE = "chunk-state";
+
+export type KScalingReuseMode = "chunk-state" | "exact-final";
 
 function parseBooleanFlag(
   value: string | undefined,
@@ -97,6 +100,21 @@ export function getChunkedUseImmediateTrigger(): boolean {
 
 export function getResultTopic(defaultTopic: string): string {
   return process.env.RESULT_TOPIC || defaultTopic;
+}
+
+export function isExactFinalResultReuseEnabled(): boolean {
+  return parseBooleanFlag(
+    process.env.HIVE_ENABLE_EXACT_FINAL_RESULT_REUSE,
+    false,
+  );
+}
+
+export function getKScalingReuseMode(): KScalingReuseMode {
+  const raw = (process.env.K_SCALING_REUSE_MODE || DEFAULT_K_SCALING_REUSE_MODE)
+    .trim()
+    .toLowerCase();
+
+  return raw === "exact-final" ? "exact-final" : "chunk-state";
 }
 
 export function getSessionId(): string {

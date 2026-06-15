@@ -30,6 +30,16 @@ type ProfileSummary = {
   shared_chunk_producers_created: number;
   chunk_state_messages_published: number;
   chunk_consumers_registered: number;
+  exact_final_result_reuse_hits: number;
+  final_result_topics_created: number;
+  final_result_topics_reused: number;
+  final_result_subscribers_registered: number;
+  chunk_reuse_paths_created: number;
+  chunk_reuse_paths_skipped_due_to_exact_hit: number;
+  reconstruction_paths_created: number;
+  reconstruction_paths_skipped: number;
+  fresh_executions_started: number;
+  canonical_query_hashes_seen: number;
   rsp_engines_created: number;
   emitted_results: number;
   query_rewrites: number;
@@ -139,6 +149,28 @@ function buildSummary(
       "chunk_state_messages_published",
     ),
     chunk_consumers_registered: flattenCounter("chunk_consumers_registered"),
+    exact_final_result_reuse_hits: flattenCounter(
+      "exact_final_result_reuse_hits",
+    ),
+    final_result_topics_created: flattenCounter(
+      "final_result_topics_created",
+    ),
+    final_result_topics_reused: flattenCounter("final_result_topics_reused"),
+    final_result_subscribers_registered: flattenCounter(
+      "final_result_subscribers_registered",
+    ),
+    chunk_reuse_paths_created: flattenCounter("chunk_reuse_paths_created"),
+    chunk_reuse_paths_skipped_due_to_exact_hit: flattenCounter(
+      "chunk_reuse_paths_skipped_due_to_exact_hit",
+    ),
+    reconstruction_paths_created: flattenCounter(
+      "reconstruction_paths_created",
+    ),
+    reconstruction_paths_skipped: flattenCounter(
+      "reconstruction_paths_skipped",
+    ),
+    fresh_executions_started: flattenCounter("fresh_executions_started"),
+    canonical_query_hashes_seen: flattenCounter("canonical_query_hashes_seen"),
     rsp_engines_created: flattenCounter("rsp_engines_created"),
     emitted_results: emittedResults,
     query_rewrites: flattenCounter("query_rewrites"),
