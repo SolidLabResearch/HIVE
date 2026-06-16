@@ -4,7 +4,6 @@ import { RSPQLParser } from "rsp-js";
 import { ExtractedQuery, QueryMap } from "../../util/Types";
 import { CSVLogger } from "../../util/logger/CSVLogger";
 import mqtt from "mqtt";
-import fs from "fs";
 import {
   AggregationFunction,
   buildBenchmarkResultPayload,
@@ -15,6 +14,15 @@ import { hash_string_md5 } from "../../util/Util";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 import { getCachedParsedQuery } from "../../util/queryCache";
 import { profileCount, profileSync, writeProfileArtifact } from "../../util/profiling";
+import { ApproximationDiagnosticsWriter } from "./approximation/ApproximationDiagnosticsWriter";
+import { ApproximationResultPublisher } from "./approximation/ApproximationResultPublisher";
+import {
+  appendTopicResult,
+  cleanupOldWindows,
+  computeTopicLevelApproximationResult,
+  getLatestTopicValue,
+  TopicWindowBuffers,
+} from "./approximation/ApproximationWindowBuffer";
 
 /**
  * Configuration interface for inactivity detection
@@ -42,7 +50,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private extractedQueries: ExtractedQuery[] = [];
   private parser: RSPQLParser = new RSPQLParser();
   private inactivityConfig: InactivityConfig;
-  private latencyLogStream!: fs.WriteStream;
+  private diagnosticsWriter: ApproximationDiagnosticsWriter;
   private windowCount: number = 0;
   private queryRegisteredTime: number = 0;
   private windowRange: number = 120000; // 120 seconds based on RANGE 120000
@@ -50,7 +58,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private firstDataReceivedTime: number = 0; // Track when first data arrives (wall-clock)
   private lastDataReceivedTime: number = 0; // Track when last data was received
   private sessionId: string = getSessionId();
-  private mqttPublisherClient: any = null;
+  private resultPublisher: ApproximationResultPublisher;
   private activeMqttClients: any[] = [];
   private cleanupRegistered: boolean = false;
   private cachedOutputQuery: string = "";
@@ -69,8 +77,20 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       maxTimeoutMs: 15000, // Reduced from 3min to 15s - much more aggressive
       ...inactivityConfig,
     };
-    this.initializeLatencyLogging();
     this.queryRegisteredTime = Date.now(); // Record when query is registered
+    this.diagnosticsWriter = new ApproximationDiagnosticsWriter(
+      this.queryRegisteredTime,
+      this.windowRange,
+      this.windowSlide,
+    );
+    this.resultPublisher = new ApproximationResultPublisher(
+      CONFIG.mqttBroker,
+      this.activeMqttClients,
+      (error) => {
+        console.error("Failed to publish aggregated results:", error);
+        this.logger.log(`Failed to publish aggregated results: ${error}`);
+      },
+    );
     this.registerCleanupHook();
   }
 
@@ -87,15 +107,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
   public cleanup(): void {
     profileSync("cleanup_time_ms", () => {
-      if (this.mqttPublisherClient) {
-        try {
-          this.mqttPublisherClient.end(true);
-        } catch (error) {
-          console.error("Failed to close approximation publisher client:", error);
-        }
-        this.mqttPublisherClient = null;
-      }
-
+      this.resultPublisher.cleanup();
       for (const client of this.activeMqttClients.splice(0)) {
         try {
           client.end(true);
@@ -103,122 +115,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
           console.error("Failed to close approximation MQTT client:", error);
         }
       }
-
-      if (this.latencyLogStream) {
-        this.latencyLogStream.end();
-      }
+      this.diagnosticsWriter.cleanup();
     });
     writeProfileArtifact();
-  }
-
-  private getOrCreatePublisherClient(): any {
-    if (this.mqttPublisherClient) {
-      return this.mqttPublisherClient;
-    }
-
-    this.mqttPublisherClient = mqtt.connect(CONFIG.mqttBroker, {
-      clientId: "approximation-operator-" + Math.random().toString(16).substr(2, 8),
-      clean: true,
-      keepalive: 60,
-      reconnectPeriod: 1000,
-    });
-    this.activeMqttClients.push(this.mqttPublisherClient);
-    profileCount("mqtt_clients_created");
-    return this.mqttPublisherClient;
-  }
-
-  private publishWithSharedClient(topic: string, payload: string, qos = 1): Promise<void> {
-    const client = this.getOrCreatePublisherClient();
-    return new Promise((resolve) => {
-      const publish = () => {
-        client.publish(topic, payload, { qos }, (error: any) => {
-          if (error) {
-            console.error("Failed to publish aggregated results:", error);
-            this.logger.log(`Failed to publish aggregated results: ${error}`);
-          } else {
-            profileCount("mqtt_messages_published");
-          }
-          resolve();
-        });
-      };
-
-      if (client.connected) {
-        publish();
-      } else {
-        client.once("connect", publish);
-      }
-    });
-  }
-
-  /**
-   * Initialize latency logging
-   */
-  private initializeLatencyLogging() {
-    const latencyLogFilePath = "approximation_latency_log.csv";
-    const writeLatencyHeader = !fs.existsSync(latencyLogFilePath);
-    this.latencyLogStream = fs.createWriteStream(latencyLogFilePath, {
-      flags: "a",
-    });
-
-    if (writeLatencyHeader) {
-      this.latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_data_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_data_ms,result_value\n",
-      );
-    }
-  }
-
-  /**
-   * Log latency measurement with multiple metrics
-   */
-  private logLatency(
-    windowNumber: number,
-    expectedWindowClose: number,
-    lastDataReceivedAt: number,
-    resultTime: number,
-    value: string,
-  ) {
-    // Metric 1: Latency from query registration (original calculation)
-    const latencyFromQueryReg = resultTime - expectedWindowClose;
-
-    // Metric 2: Time from first data received to result (wall-clock)
-    // For window N: expected time = firstDataReceivedTime + RANGE + (N-1) * STEP
-    const expectedFromDataStart =
-      this.firstDataReceivedTime +
-      this.windowRange +
-      (windowNumber - 1) * this.windowSlide;
-    const latencyFromDataStart = resultTime - expectedFromDataStart;
-
-    // Metric 3: Time from last data received to result emitted (processing latency)
-    const latencyFromLastData = resultTime - lastDataReceivedAt;
-
-    if (this.latencyLogStream) {
-      this.latencyLogStream.write(
-        `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastDataReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastData},${value}\n`,
-      );
-    }
-    console.log(`LATENCY: Window ${windowNumber}:`);
-    console.log(
-      `  - From query registration: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
-    );
-    console.log(
-      `  - From data start: ${latencyFromDataStart}ms (first data: ${this.firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
-    );
-    console.log(
-      `  - Processing time (last data to result): ${latencyFromLastData}ms`,
-    );
-    console.log(`  - Value: ${value}`);
-  }
-
-  /**
-   * Calculate expected window close time for a given window number
-   * Window N closes at: queryRegisteredTime + RANGE + (N-1) * STEP
-   */
-  private getExpectedWindowCloseTime(windowNumber: number): number {
-    return (
-      this.queryRegisteredTime +
-      this.windowRange +
-      (windowNumber - 1) * this.windowSlide
-    );
   }
 
   /**
@@ -406,6 +305,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     const resultTopic = getResultTopic("approximation/output");
     this.windowRange = outputQueryWidth;
     this.windowSlide = outputQuerySlide;
+    this.diagnosticsWriter.updateWindowConfig(
+      this.windowRange,
+      this.windowSlide,
+    );
 
     // Extract aggregation type from output query
     const outputAggregationMatch =
@@ -504,15 +407,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       }
 
       // Use separate buffers for each topic/variable
-      const windowBuffers: Map<
-        string,
-        Array<{
-          start: number;
-          end: number;
-          value: number;
-          agg: "SUM" | "AVG" | "COUNT" | "MIN" | "MAX";
-        }>
-      > = new Map();
+      const windowBuffers: TopicWindowBuffers = new Map();
 
       // Global tracking of latest values from all topics - this persists across windows
       const globalLatestValues: Map<
@@ -619,19 +514,12 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
               `Received null or undefined value for topic ${topic}. Skipping.`,
             );
             // Still add to buffer for this topic
-            if (!windowBuffers.has(topic)) {
-              windowBuffers.set(topic, []);
-            }
-            windowBuffers.get(topic)!.push(result);
+            appendTopicResult(windowBuffers, topic, result);
             profileCount("buffered_subwindow_results");
             return;
           }
 
-          // Get or create buffer for this specific topic
-          if (!windowBuffers.has(topic)) {
-            windowBuffers.set(topic, []);
-          }
-          windowBuffers.get(topic)!.push(result);
+          appendTopicResult(windowBuffers, topic, result);
           profileCount("buffered_subwindow_results");
 
           // ALWAYS update global latest values for ALL topics receiving data
@@ -736,10 +624,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             let totalValidBuffers = 0;
 
             windowBuffers.forEach((buffer, topicKey) => {
-              // Clean up old entries for this topic
-              while (buffer.length && buffer[0].end < windowStartGlobal) {
-                buffer.shift();
-              }
+              cleanupOldWindows(buffer, windowStartGlobal);
 
               this.logger.log(
                 `Topic ${topicKey} buffer size after cleanup: ${buffer.length}`,
@@ -750,14 +635,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
               if (buffer.length > 0) {
                 totalValidBuffers++;
-                // Calculate aggregation for this specific topic
                 const target = { start: windowStartGlobal, end: now };
-                const aggregation = buffer[buffer.length - 1].agg;
-
-                const topicResult = mergeMultipleSlidingWindowResults(
+                const topicResult = computeTopicLevelApproximationResult(
                   buffer,
                   target,
-                  aggregation,
                 );
                 aggregationResults[topicKey] = topicResult;
 
@@ -770,13 +651,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   `Aggregation result for topic ${topicKey}: ${topicResult}`,
                 );
               } else {
-                // If no current window data, try to use the most recent value from this topic
-                // Look through all buffered data for this topic to find the most recent value
                 const allTopicData = windowBuffers.get(topicKey);
-                if (allTopicData && allTopicData.length > 0) {
-                  // Get the most recent value regardless of window
-                  const mostRecentValue =
-                    allTopicData[allTopicData.length - 1].value;
+                const mostRecentValue = getLatestTopicValue(allTopicData);
+                if (mostRecentValue !== undefined) {
                   latestValues[topicKey] = mostRecentValue;
                   this.logger.log(
                     `Using most recent value for topic ${topicKey}: ${mostRecentValue} (outside current window)`,
@@ -791,9 +668,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                 !latestValues[expectedTopic] &&
                 windowBuffers.has(expectedTopic)
               ) {
-                const buffer = windowBuffers.get(expectedTopic)!;
-                if (buffer.length > 0) {
-                  const mostRecentValue = buffer[buffer.length - 1].value;
+                const mostRecentValue = getLatestTopicValue(
+                  windowBuffers.get(expectedTopic),
+                );
+                if (mostRecentValue !== undefined) {
                   latestValues[expectedTopic] = mostRecentValue;
                   this.logger.log(
                     `Added latest value for expected topic ${expectedTopic}: ${mostRecentValue}`,
@@ -917,11 +795,13 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                 // Calculate and log latency with multiple metrics
                 this.windowCount++;
                 const resultEmittedAt = Date.now();
-                const expectedWindowClose = this.getExpectedWindowCloseTime(
+                const expectedWindowClose =
+                  this.diagnosticsWriter.getExpectedWindowCloseTime(
+                    this.windowCount,
+                  );
+                this.diagnosticsWriter.logLatency(
                   this.windowCount,
-                );
-                this.logLatency(
-                  this.windowCount,
+                  this.firstDataReceivedTime,
                   expectedWindowClose,
                   this.lastDataReceivedTime,
                   resultEmittedAt,
@@ -993,166 +873,4 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       });
     });
   }
-}
-
-/**
- * Merges two window results with overlap subtraction for sliding windows.
- * @param win1 - First window result {start, end, value}.
- * @param win2 - Second window result {start, end, value}.
- * @param overlap - Overlap window result {start, end, value}.
- * @param target - Target window {start, end}.
- * @param win1.start
- * @param win1.end
- * @param win1.value
- * @param agg - Aggregation function: 'SUM' | 'AVG' | 'COUNT' | 'MIN' | 'MAX'.
- * @param win2.start
- * @param win2.end
- * @param win2.value
- * @param overlap.start
- * @param overlap.end
- * @param overlap.value
- * @param target.start
- * @param target.end
- * @returns The approximate aggregation for the target window.
- */
-export function mergeSlidingWindowResults(
-  win1: { start: number; end: number; value: number },
-  win2: { start: number; end: number; value: number },
-  overlap: { start: number; end: number; value: number },
-  target: { start: number; end: number },
-  agg: "SUM" | "AVG" | "COUNT" | "MIN" | "MAX",
-): number | string {
-  const dur1 = win1.end - win1.start;
-  const dur2 = win2.end - win2.start;
-  const dur3 = target.end - target.start;
-  const overlap_dur = Math.max(
-    0,
-    Math.min(win1.end, win2.end) - Math.max(win1.start, win2.start),
-  );
-
-  if (agg === "SUM" || agg === "AVG") {
-    const combined_sum =
-      win1.value * dur1 + win2.value * dur2 - overlap.value * overlap_dur;
-    return agg === "AVG" ? combined_sum / dur3 : combined_sum;
-  } else if (agg === "COUNT") {
-    const combined = win1.value + win2.value - overlap.value;
-    return combined;
-  } else if (agg === "MIN") {
-    return Math.min(win1.value, win2.value, overlap.value);
-  } else if (agg === "MAX") {
-    return Math.max(win1.value, win2.value, overlap.value);
-  } else {
-    return "Not Supported";
-  }
-}
-
-export function mergeMultipleSlidingWindowResults(
-  windows: Array<{ start: number; end: number; value: number }>,
-  target: { start: number; end: number },
-  agg: "SUM" | "AVG" | "COUNT" | "MIN" | "MAX",
-): number | string {
-  console.log(`DEBUG: mergeMultipleSlidingWindowResults called with:`);
-  console.log(`  - windows:`, JSON.stringify(windows));
-  console.log(`  - target:`, JSON.stringify(target));
-  console.log(`  - aggregation:`, agg);
-
-  // Filter windows that overlap target
-  const overlapping = windows.filter(
-    (w) => w.end > target.start && w.start < target.end,
-  );
-  console.log(
-    `DEBUG: Found ${overlapping.length} overlapping windows:`,
-    JSON.stringify(overlapping),
-  );
-
-  if (overlapping.length === 0) return 0;
-
-  // MIN/MAX aggregation - straightforward from overlapping window values
-  if (agg === "MIN") {
-    const result = Math.min(...overlapping.map((w) => w.value));
-    console.log(`DEBUG: MIN result:`, result);
-    return result;
-  }
-  if (agg === "MAX") {
-    const result = Math.max(...overlapping.map((w) => w.value));
-    console.log(`DEBUG: MAX result:`, result);
-    return result;
-  }
-
-  // For AVG: Calculate weighted average based on overlap duration with target window
-  if (agg === "AVG") {
-    let weightedSum = 0;
-    let totalWeight = 0;
-
-    console.log(`DEBUG: Calculating weighted average:`);
-    overlapping.forEach((w, idx) => {
-      // Calculate overlap duration between window and target
-      const overlapStart = Math.max(w.start, target.start);
-      const overlapEnd = Math.min(w.end, target.end);
-      const overlapDuration = overlapEnd - overlapStart;
-
-      console.log(
-        `DEBUG: Window ${idx}: value=${w.value}, overlapDuration=${overlapDuration}`,
-      );
-
-      if (overlapDuration > 0) {
-        // For averages, weight by overlap duration
-        const contribution = w.value * overlapDuration;
-        weightedSum += contribution;
-        totalWeight += overlapDuration;
-        console.log(
-          `DEBUG: Added contribution=${contribution}, totalWeight=${totalWeight}, weightedSum=${weightedSum}`,
-        );
-      }
-    });
-
-    const result = totalWeight > 0 ? weightedSum / totalWeight : 0;
-    console.log(
-      `DEBUG: Final AVG calculation: weightedSum=${weightedSum} / totalWeight=${totalWeight} = ${result}`,
-    );
-    return result;
-  }
-
-  // For SUM and COUNT: partition target window by all unique boundaries from overlapping windows
-  const boundaries = new Set<number>();
-  boundaries.add(target.start);
-  boundaries.add(target.end);
-  overlapping.forEach((w) => {
-    if (w.start > target.start && w.start < target.end) boundaries.add(w.start);
-    if (w.end > target.start && w.end < target.end) boundaries.add(w.end);
-  });
-
-  const sortedBoundaries = Array.from(boundaries).sort((a, b) => a - b);
-
-  let totalSum = 0;
-
-  for (let i = 0; i < sortedBoundaries.length - 1; i++) {
-    const subStart = sortedBoundaries[i];
-    const subEnd = sortedBoundaries[i + 1];
-    const subDuration = subEnd - subStart;
-    if (subDuration <= 0) continue;
-
-    // Identify windows covering this subinterval
-    const coveringWindows = overlapping.filter(
-      (w) => w.start <= subStart && w.end >= subEnd,
-    );
-    if (coveringWindows.length === 0) continue;
-
-    if (agg === "SUM") {
-      // For SUM: treat values as rates and integrate over time
-      const subValueRateSum = coveringWindows.reduce((acc, w) => {
-        const windowDuration = w.end - w.start;
-        if (windowDuration <= 0) return acc;
-        const rate = w.value / windowDuration;
-        return acc + rate;
-      }, 0);
-      totalSum += subValueRateSum * subDuration;
-    } else if (agg === "COUNT") {
-      // For COUNT: sum the values directly
-      const subValueSum = coveringWindows.reduce((acc, w) => acc + w.value, 0);
-      totalSum += subValueSum;
-    }
-  }
-
-  return totalSum;
 }

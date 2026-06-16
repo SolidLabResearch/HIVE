@@ -19,7 +19,10 @@ jest.mock('fs', () => ({
   createWriteStream: jest.fn().mockReturnValue({ write: jest.fn(), end: jest.fn() }),
 }));
 
-import { ApproximationApproachOperator } from './RateBasedApproximationApproachOperator';
+import {
+  ApproximationApproachOperator,
+} from './RateBasedApproximationApproachOperator';
+import { mergeMultipleSlidingWindowResults } from './approximation/RateBasedApproximationMath';
 
 describe('ApproximationApproachOperator', () => {
   let operator: ApproximationApproachOperator;
@@ -60,5 +63,71 @@ WHERE { WINDOW :w2 { ?sensor :value ?v } }
 
     expect(second).toEqual(first);
     expect(parseSpy.mock.calls.length).toBe(callsAfterFirst);
+  });
+
+  describe('mergeMultipleSlidingWindowResults characterization', () => {
+    test('calculates AVG weighted by overlap duration', () => {
+      const result = mergeMultipleSlidingWindowResults(
+        [
+          { start: 0, end: 10, value: 10 },
+          { start: 8, end: 20, value: 40 },
+        ],
+        { start: 5, end: 15 },
+        'AVG',
+      );
+
+      expect(result).toBe(27.5);
+    });
+
+    test('calculates SUM using rate-based integration over target subintervals', () => {
+      const result = mergeMultipleSlidingWindowResults(
+        [
+          { start: 0, end: 10, value: 100 },
+          { start: 5, end: 15, value: 50 },
+        ],
+        { start: 0, end: 15 },
+        'SUM',
+      );
+
+      expect(result).toBe(150);
+    });
+
+    test('preserves COUNT behavior across subintervals', () => {
+      const result = mergeMultipleSlidingWindowResults(
+        [
+          { start: 0, end: 10, value: 2 },
+          { start: 5, end: 15, value: 3 },
+        ],
+        { start: 0, end: 15 },
+        'COUNT',
+      );
+
+      expect(result).toBe(10);
+    });
+
+    test('preserves MIN/MAX behavior over overlapping windows', () => {
+      const windows = [
+        { start: 0, end: 10, value: 7 },
+        { start: 5, end: 15, value: 3 },
+        { start: 8, end: 12, value: 9 },
+      ];
+      const target = { start: 6, end: 11 };
+
+      expect(mergeMultipleSlidingWindowResults(windows, target, 'MIN')).toBe(3);
+      expect(mergeMultipleSlidingWindowResults(windows, target, 'MAX')).toBe(9);
+    });
+
+    test('returns 0 when no windows overlap the target interval', () => {
+      const result = mergeMultipleSlidingWindowResults(
+        [
+          { start: 0, end: 10, value: 1 },
+          { start: 20, end: 30, value: 2 },
+        ],
+        { start: 10, end: 20 },
+        'SUM',
+      );
+
+      expect(result).toBe(0);
+    });
   });
 });
