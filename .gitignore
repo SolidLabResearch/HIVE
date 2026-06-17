@@ -132,3 +132,9 @@ node scripts/benchmark/run-all-paper-benchmarks.js \
   --patterns high_freq_oscillation \
   --approaches fetching,approximation,chunked \
   --output-dir results/paper-benchmarks/target-highfreq-accuracy
+
+# K-scaling generated artifacts
+analysis/k-scaling/raw/
+analysis/k-scaling/plots/
+analysis/k-scaling/k_scaling_plot_summary.csv
+analysis/k-scaling/k_scaling_interpretation.md

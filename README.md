@@ -137,6 +137,7 @@ The most important directories for reviewers and benchmark users are:
 | `experiments/real-data-comparison/` | Four-approach benchmark over real accelerometer streams. |
 | `experiments/pattern-analysis/` | Custom-pattern experiments used for controlled evaluation of behavior under different signal shapes. |
 | `experiments/k-scaling/` | Reuse-density / scalability benchmark for increasing numbers of compatible consumers. |
+| `experiments/window-parameter-sensitivity/` | Controlled chunk-state reconstruction benchmarks for superquery range scaling and chunk granularity sensitivity. |
 | `scripts/benchmark/` | Top-level paper benchmark runners and extraction scripts. |
 | `analysis/` | Post-processing and visualization scripts. |
 | `docs/` | Design notes, experiment reports, and branch-specific decisions. |
@@ -146,6 +147,15 @@ Useful branch-specific design notes:
 
 - `docs/chunk-state-primary-reuse-design.md`
 - `docs/decisions/`
+
+## Additional Reconstruction Benchmarks
+
+The repository also includes two focused chunk-state reconstruction experiments under `experiments/window-parameter-sensitivity/`:
+
+1. `superquery-range-scaling`: keep the two reusable subqueries fixed and increase only the downstream superquery range.
+2. `chunk-granularity-sensitivity`: keep the superquery fixed and vary the reusable chunk size.
+
+These runs reuse the current `fetching` and `chunked` orchestrators, keep exact-final reuse disabled, and emit per-run, aggregate, and profile-counter CSVs through the companion extractor in the same folder.
 
 ## Installation
 
