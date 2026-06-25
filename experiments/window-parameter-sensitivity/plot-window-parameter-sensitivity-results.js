@@ -32,6 +32,20 @@ const EXPERIMENTS = [
       "chunk_state_messages_per_emitted_result_mean",
     ],
   },
+  {
+    name: "query-target-scaling",
+    prefix: "query_target_scaling",
+    xField: "target_count",
+    xLabel: "Target count",
+    subtitle:
+      "Window parameters stay fixed while the queried target set changes. Fetching remains the baseline.",
+    metrics: [
+      "cpu_seconds_per_emitted_result_mean",
+      "mean_window_adjusted_latency_ms_mean",
+      "peak_rss_mb_per_emitted_result_mean",
+      "chunk_state_messages_per_emitted_result_mean",
+    ],
+  },
 ];
 
 const SERIES_STYLES = {
@@ -54,9 +68,36 @@ function readCsv(filePath) {
   if (lines.length < 2) {
     return [];
   }
-  const headers = lines[0].split(",");
+  const splitCsvLine = (line) => {
+    const values = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index];
+      const next = line[index + 1];
+      if (char === '"') {
+        if (inQuotes && next === '"') {
+          current += '"';
+          index += 1;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (char === "," && !inQuotes) {
+        values.push(current);
+        current = "";
+      } else {
+        current += char;
+      }
+    }
+
+    values.push(current);
+    return values;
+  };
+
+  const headers = splitCsvLine(lines[0]);
   return lines.slice(1).map((line) => {
-    const values = line.split(",");
+    const values = splitCsvLine(line);
     const row = {};
     headers.forEach((header, index) => {
       row[header] = values[index] ?? "";
@@ -299,28 +340,45 @@ function main() {
     }
 
     const rows = readCsv(aggregatePath);
-    for (const metric of experiment.metrics) {
-      const seriesList = buildSeries(rows, experiment.xField, metric);
-      if (seriesList.length === 0) {
-        throw new Error(`No plottable rows found for ${experiment.name} ${metric}`);
-      }
+    const rowGroups =
+      experiment.name === "query-target-scaling"
+        ? ["real", "synthetic"].map((targetSource) => ({
+            suffix: targetSource,
+            subtitle: `${experiment.subtitle} Target source: ${targetSource}.`,
+            rows: rows.filter((row) => String(row.target_source || "").trim() === targetSource),
+          }))
+        : [{ suffix: "", subtitle: experiment.subtitle, rows }];
 
-      const prettyMetric = metric
-        .replace(/_mean$/, "")
-        .replace(/_/g, " ")
-        .replace(/\b(ms|rss|cpu|mape|rmse|mae)\b/g, (token) => token.toUpperCase());
-      const title = `${experiment.name}: ${prettyMetric}`;
-      const outputPath = path.join(PLOTS_DIR, `${experiment.prefix}_${metric}.svg`);
-      renderChart({
-        title,
-        subtitle: experiment.subtitle,
-        xLabel: experiment.xLabel,
-        yLabel: metric,
-        seriesList,
-        metric,
-        outputPath,
-      });
-      outputs.push(outputPath);
+    for (const group of rowGroups) {
+      if (group.rows.length === 0) {
+        continue;
+      }
+      for (const metric of experiment.metrics) {
+        const seriesList = buildSeries(group.rows, experiment.xField, metric);
+        if (seriesList.length === 0) {
+          throw new Error(`No plottable rows found for ${experiment.name} ${metric}`);
+        }
+
+        const prettyMetric = metric
+          .replace(/_mean$/, "")
+          .replace(/_/g, " ")
+          .replace(/\b(ms|rss|cpu|mape|rmse|mae)\b/g, (token) => token.toUpperCase());
+        const title = `${experiment.name}: ${prettyMetric}`;
+        const outputPath = path.join(
+          PLOTS_DIR,
+          `${experiment.prefix}${group.suffix ? `_${group.suffix}` : ""}_${metric}.svg`,
+        );
+        renderChart({
+          title,
+          subtitle: group.subtitle,
+          xLabel: experiment.xLabel,
+          yLabel: metric,
+          seriesList,
+          metric,
+          outputPath,
+        });
+        outputs.push(outputPath);
+      }
     }
   }
 

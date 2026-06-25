@@ -70,6 +70,10 @@ describe("window-parameter-sensitivity extractor", () => {
         chunk_size_seconds: 30,
         replay_duration_seconds: 240,
         exact_final_reuse_enabled: false,
+        expected_window_count: null,
+        actual_window_count: 0,
+        missing_window_count: null,
+        extra_window_count: null,
         chunk_size_applies_to_approach: false,
         cpu_seconds: 10,
         cpu_seconds_per_emitted_result: null,
@@ -109,6 +113,11 @@ describe("window-parameter-sensitivity extractor", () => {
         superquery_result_count: 0,
         emitted_window_count: 0,
         matched_window_count: 0,
+        trimmed_expected_window_count: null,
+        trimmed_matched_window_count: null,
+        trimmed_missing_window_count: null,
+        trimmed_extra_window_count: null,
+        trimmed_actual_window_count: 0,
         chunk_states_consumed_per_result_mean: null,
         chunk_states_consumed_per_emitted_result: null,
         expected_chunk_states_per_result: 8,
@@ -136,6 +145,14 @@ describe("window-parameter-sensitivity extractor", () => {
         superquery_range_seconds: 120,
         superquery_step_seconds: 60,
         chunk_size_seconds: 30,
+        target_source: "real",
+        unique_target_count: 2,
+        real_target_count: 2,
+        synthetic_target_count: 0,
+        target_count: 2,
+        target_set: "wearableX|smartphoneX",
+        target_names: "wearableX,smartphoneX",
+        is_synthetic_target_scaling: false,
         replay_duration_seconds: 240,
         exact_final_reuse_enabled: false,
         chunk_size_applies_to_approach: false,
@@ -150,6 +167,14 @@ describe("window-parameter-sensitivity extractor", () => {
         superquery_range_seconds: 120,
         superquery_step_seconds: 60,
         chunk_size_seconds: 30,
+        target_source: "real",
+        unique_target_count: 2,
+        real_target_count: 2,
+        synthetic_target_count: 0,
+        target_count: 2,
+        target_set: "wearableX|smartphoneX",
+        target_names: "wearableX,smartphoneX",
+        is_synthetic_target_scaling: false,
         replay_duration_seconds: 240,
         exact_final_reuse_enabled: false,
         chunk_size_applies_to_approach: true,
@@ -170,15 +195,26 @@ describe("window-parameter-sensitivity extractor", () => {
 
     try {
       const baseRun = {
-        experiment_name: "superquery-range-scaling",
+        experiment_name: "query-target-scaling",
         pattern: "low_variability",
         iteration: 1,
         aggregation_function: "AVG",
         superquery_range_seconds: 120,
         superquery_step_seconds: 60,
         chunk_size_seconds: 30,
+        target_source: "real",
+        unique_target_count: 2,
+        real_target_count: 2,
+        synthetic_target_count: 0,
+        target_count: 2,
+        target_set: "wearableX|smartphoneX",
+        target_names: "wearableX,smartphoneX",
+        is_synthetic_target_scaling: false,
         replay_duration_seconds: 240,
         exact_final_reuse_enabled: false,
+        target_window_count: 35,
+        trimmed_window_start: 4,
+        trimmed_window_end: 33,
         process_cleanup_ok: true,
         success: true,
       };
@@ -216,7 +252,7 @@ describe("window-parameter-sensitivity extractor", () => {
           tempRoot,
           approach,
           "low_variability",
-          "range-120s",
+          "real-targets-k2",
           "iteration1",
         );
         fs.mkdirSync(runDir, { recursive: true });
@@ -265,13 +301,14 @@ describe("window-parameter-sensitivity extractor", () => {
       );
 
       const records = loadRunRecords({
-        experimentName: "superquery-range-scaling",
+        experimentName: "query-target-scaling",
         inputRoot: tempRoot,
         outputDir: path.join(tempRoot, "out"),
         patterns: ["low_variability"],
         approaches: ["fetching", "chunked"],
         ranges: [],
         chunkSizes: [],
+        targetCounts: [],
       });
 
       const fetching = records.find((record) => record.approach === "fetching");
@@ -279,10 +316,86 @@ describe("window-parameter-sensitivity extractor", () => {
 
       expect(fetching.expected_chunk_states_per_result).toBe(8);
       expect(fetching.chunk_states_consumed_per_emitted_result).toBeNull();
+      expect(fetching.target_source).toBe("real");
+      expect(fetching.real_target_count).toBe(2);
+      expect(fetching.synthetic_target_count).toBe(0);
+      expect(fetching.target_count).toBe(2);
+      expect(fetching.target_set).toBe("wearableX|smartphoneX");
+      expect(fetching.target_names).toBe("wearableX,smartphoneX");
+      expect(fetching.expected_window_count).toBe(35);
+      expect(fetching.actual_window_count).toBe(1);
+      expect(fetching.missing_window_count).toBe(34);
+      expect(fetching.extra_window_count).toBe(0);
+      expect(fetching.trimmed_expected_window_count).toBe(30);
+      expect(fetching.trimmed_matched_window_count).toBe(0);
+      expect(fetching.trimmed_missing_window_count).toBe(30);
+      expect(fetching.trimmed_extra_window_count).toBe(1);
+      expect(fetching.trimmed_actual_window_count).toBe(1);
       expect(chunked.expected_chunk_states_per_result).toBe(8);
       expect(chunked.chunk_states_consumed_per_emitted_result).toBe(8);
+      expect(chunked.expected_window_count).toBe(35);
+      expect(chunked.missing_window_count).toBe(34);
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  test("query-target-scaling aggregate rows group by target metadata", () => {
+    const rows = buildAggregateRows([
+      {
+        experiment_name: "query-target-scaling",
+        approach: "fetching",
+        pattern: "low_variability",
+        aggregation_function: "AVG",
+        superquery_range_seconds: 120,
+        superquery_step_seconds: 60,
+        chunk_size_seconds: 30,
+        target_source: "real",
+        unique_target_count: 2,
+        real_target_count: 2,
+        synthetic_target_count: 0,
+        replay_duration_seconds: 240,
+        exact_final_reuse_enabled: false,
+        target_count: 2,
+        target_set: "wearableX|smartphoneX",
+        target_names: "wearableX,smartphoneX",
+        is_synthetic_target_scaling: false,
+        chunk_size_applies_to_approach: false,
+        expected_chunk_states_per_result: 8,
+        success: true,
+        is_valid: true,
+      },
+      {
+        experiment_name: "query-target-scaling",
+        approach: "fetching",
+        pattern: "low_variability",
+        aggregation_function: "AVG",
+        superquery_range_seconds: 120,
+        superquery_step_seconds: 60,
+        chunk_size_seconds: 30,
+        target_source: "synthetic",
+        unique_target_count: 4,
+        real_target_count: 0,
+        synthetic_target_count: 4,
+        replay_duration_seconds: 240,
+        exact_final_reuse_enabled: false,
+        target_count: 4,
+        target_set: "syntheticTarget1|syntheticTarget2|syntheticTarget3|syntheticTarget4",
+        target_names: "syntheticTarget1,syntheticTarget2,syntheticTarget3,syntheticTarget4",
+        is_synthetic_target_scaling: true,
+        chunk_size_applies_to_approach: false,
+        expected_chunk_states_per_result: 16,
+        success: true,
+        is_valid: true,
+      },
+    ]);
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0].target_count).toBe(2);
+    expect(rows[1].target_count).toBe(4);
+    expect(rows[0].target_source).toBe("real");
+    expect(rows[1].target_source).toBe("synthetic");
+    expect(rows[0].expected_chunk_states_per_result).toBe(8);
+    expect(rows[1].expected_chunk_states_per_result).toBe(16);
   });
 });

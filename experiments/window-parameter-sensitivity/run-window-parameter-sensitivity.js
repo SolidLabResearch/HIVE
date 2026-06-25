@@ -7,18 +7,30 @@ const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 const { getReplayMetadata } = require("../utils/benchmarkResultMetadata");
 const { cleanupStaleBenchmarkProcesses } = require("../utils/processCleanup");
 const {
+  ProcessTreeTracker,
+  collectTreeMetrics,
+  summarizeResourceSamples,
+} = require("../utils/processTreeMetrics");
+const {
   DEFAULT_AGGREGATION_FUNCTION,
   DEFAULT_APPROACHES,
   DEFAULT_PATTERNS,
+  DEFAULT_QUERY_TARGET_SCALING_CHUNK_SIZE_SECONDS,
+  DEFAULT_QUERY_TARGET_SCALING_SUPERQUERY_RANGE_SECONDS,
+  DEFAULT_QUERY_TARGET_SCALING_SUPERQUERY_STEP_SECONDS,
   DEFAULT_RANGE_SCALING_SUB_WINDOW_RANGE_SECONDS,
   DEFAULT_RANGE_SCALING_SUB_WINDOW_STEP_SECONDS,
   DEFAULT_REPLAY_DURATION_SECONDS,
   DEFAULT_SUPERQUERY_STEP_SECONDS,
   EXPERIMENTS,
+  buildQueryTargetScalingScenarioConfig,
   buildScenarioConfig,
+  getRealQueryTargetDefinitions,
   normalizeExperimentName,
+  normalizeTargetSource,
   parseCsvList,
   parsePositiveIntList,
+  resolveQueryTargetScalingScenarioDefinitions,
 } = require("./common");
 
 function sleep(ms) {
@@ -153,121 +165,6 @@ function checkStaleProcesses() {
   };
 }
 
-function parsePsSnapshot(psOutput) {
-  return psOutput
-    .trim()
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const parts = line.split(/\s+/, 5);
-      if (parts.length < 4) {
-        return null;
-      }
-
-      const pid = Number.parseInt(parts[0], 10);
-      const ppid = Number.parseInt(parts[1], 10);
-      const cpu = Number.parseFloat(parts[2]);
-      const rssKb = Number.parseFloat(parts[3]);
-      const command = parts[4] || "";
-
-      if (!Number.isFinite(pid) || !Number.isFinite(ppid)) {
-        return null;
-      }
-
-      return {
-        pid,
-        ppid,
-        cpu: Number.isFinite(cpu) ? cpu : 0,
-        rssKb: Number.isFinite(rssKb) ? rssKb : 0,
-        command,
-      };
-    })
-    .filter(Boolean);
-}
-
-function collectTreeStatsFromPs(rootPids) {
-  const liveRootPids = rootPids.filter((pid) => {
-    if (!Number.isFinite(pid)) {
-      return false;
-    }
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-
-  if (liveRootPids.length === 0) {
-    return null;
-  }
-
-  let snapshot;
-  try {
-    snapshot = parsePsSnapshot(
-      execSync("ps -axo pid=,ppid=,%cpu=,rss=,command=", {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      }),
-    );
-  } catch {
-    return null;
-  }
-
-  const childrenByParent = new Map();
-  for (const proc of snapshot) {
-    const children = childrenByParent.get(proc.ppid) || [];
-    children.push(proc.pid);
-    childrenByParent.set(proc.ppid, children);
-  }
-
-  const pidMap = new Map(snapshot.map((proc) => [proc.pid, proc]));
-  const seen = new Set();
-  const queue = [...liveRootPids];
-  const tree = [];
-
-  while (queue.length > 0) {
-    const pid = queue.shift();
-    if (seen.has(pid)) {
-      continue;
-    }
-    seen.add(pid);
-
-    const proc = pidMap.get(pid);
-    if (!proc) {
-      continue;
-    }
-
-    tree.push(proc);
-    const children = childrenByParent.get(pid) || [];
-    for (const childPid of children) {
-      if (!seen.has(childPid)) {
-        queue.push(childPid);
-      }
-    }
-  }
-
-  if (tree.length === 0) {
-    return null;
-  }
-
-  const totalCpuPct = tree.reduce((sum, proc) => sum + proc.cpu, 0);
-  const totalRssKb = tree.reduce((sum, proc) => sum + proc.rssKb, 0);
-
-  return {
-    rootPids: liveRootPids,
-    tree,
-    processCount: tree.length,
-    totalCpuPct,
-    meanCpuPct: totalCpuPct,
-    peakCpuPct: totalCpuPct,
-    totalRssMb: totalRssKb / 1024,
-    meanRssMb: totalRssKb / 1024,
-    peakRssMb: tree.reduce((max, proc) => Math.max(max, proc.rssKb / 1024), 0),
-  };
-}
-
 class AttemptResourceSampler {
   constructor(logDir, options = {}) {
     this.logDir = logDir;
@@ -279,6 +176,7 @@ class AttemptResourceSampler {
     this.stopped = false;
     this.running = false;
     this.pidSamples = new Map();
+    this.tracker = new ProcessTreeTracker();
   }
 
   start() {
@@ -301,13 +199,13 @@ class AttemptResourceSampler {
 
     this.running = true;
     try {
-      const stats = collectTreeStatsFromPs(this.getRootPids());
+      const timestamp = Date.now();
+      const elapsedMs = this.startedAt ? timestamp - this.startedAt : 0;
+      const stats = collectTreeMetrics(this.getRootPids(), this.tracker, timestamp, elapsedMs);
       if (!stats) {
         return;
       }
 
-      const timestamp = Date.now();
-      const elapsedMs = this.startedAt ? timestamp - this.startedAt : 0;
       this.samples.push({
         timestamp,
         elapsedMs,
@@ -321,7 +219,7 @@ class AttemptResourceSampler {
           elapsedMs,
           pid: proc.pid,
           ppid: proc.ppid,
-          cpuPct: proc.cpu,
+          cpuPct: proc.cpuPct,
           rssMb: proc.rssKb / 1024,
           command: proc.command,
         });
@@ -333,35 +231,21 @@ class AttemptResourceSampler {
   }
 
   summarize() {
-    const sampleCount = this.samples.length;
     const wallTimeMs = this.startedAt ? Date.now() - this.startedAt : 0;
-    const meanCpuPct =
-      sampleCount > 0
-        ? this.samples.reduce((sum, sample) => sum + sample.totalCpuPct, 0) / sampleCount
-        : 0;
-    const peakCpuPct =
-      sampleCount > 0 ? Math.max(...this.samples.map((sample) => sample.totalCpuPct)) : 0;
-    const meanRssMb =
-      sampleCount > 0
-        ? this.samples.reduce((sum, sample) => sum + sample.totalRssMb, 0) / sampleCount
-        : 0;
-    const peakRssMb =
-      sampleCount > 0 ? Math.max(...this.samples.map((sample) => sample.totalRssMb)) : 0;
-    const peakProcessCount =
-      sampleCount > 0 ? Math.max(...this.samples.map((sample) => sample.processCount)) : 0;
-    const cpuSeconds = (meanCpuPct / 100) * (wallTimeMs / 1000);
+    const resource = summarizeResourceSamples(this.samples);
 
     return {
       sampleIntervalMs: this.sampleIntervalMs,
-      sampleCount,
+      sampleCount: resource.sampleCount,
       wallTimeMs,
       wallTimeSec: wallTimeMs / 1000,
-      meanCpuPct,
-      peakCpuPct,
-      cpuSeconds,
-      meanRssMb,
-      peakRssMb,
-      peakProcessCount,
+      meanCpuPct: resource.meanCpuPct,
+      peakCpuPct: resource.peakCpuPct,
+      cpuSeconds: resource.cpuSeconds,
+      meanRssMb: resource.meanRssMb,
+      peakRssMb: resource.peakRssMb,
+      peakProcessCount: resource.peakProcessCount,
+      cpuAccountingNegativeDeltaCount: this.tracker.negativeDeltaEvents.length,
     };
   }
 
@@ -372,7 +256,7 @@ class AttemptResourceSampler {
     const summaryPath = path.join(this.logDir, "resource_summary.json");
     const perPidPath = path.join(this.logDir, "resource_per_pid_summary.json");
     const lines = [
-      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,total_rss_mb,peak_rss_mb",
+      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,total_rss_mb,peak_rss_mb,tree_cpu_seconds,tree_cpu_seconds_delta,tree_cpu_seconds_raw_snapshot",
       ...this.samples.map((sample) =>
         [
           sample.timestamp,
@@ -382,12 +266,18 @@ class AttemptResourceSampler {
           sample.totalCpuPct.toFixed(4),
           sample.totalRssMb.toFixed(3),
           sample.peakRssMb.toFixed(3),
+          sample.treeCpuSeconds.toFixed(6),
+          sample.treeCpuSecondsDelta.toFixed(6),
+          sample.treeCpuSecondsRawSnapshot.toFixed(6),
         ].join(","),
       ),
     ];
 
     fs.writeFileSync(csvPath, `${lines.join("\n")}\n`);
 
+    const perPidCpuSeconds = new Map(
+      this.tracker.getPerPidSummary().map((entry) => [entry.pid, entry.cpuSeconds]),
+    );
     const perPidSummary = Array.from(this.pidSamples.entries())
       .map(([pid, samples]) => {
         const sampleCount = samples.length;
@@ -413,7 +303,7 @@ class AttemptResourceSampler {
           command: samples[0]?.command || "",
           sampleCount,
           wallTimeSec,
-          cpuSeconds: (meanCpuPct / 100) * wallTimeSec,
+          cpuSeconds: perPidCpuSeconds.get(pid) ?? 0,
           meanCpuPct,
           peakCpuPct,
           meanRssMb,
@@ -607,6 +497,84 @@ function verifyExpectedOutputFiles(approach, logDir) {
   };
 }
 
+function readBenchmarkWindowCapSummary(logDir) {
+  const filePath = path.join(logDir, "benchmark_window_cap_summary.json");
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function classifyBoundedSuccess({
+  approach,
+  logDir,
+  orchestratorExitCode,
+  orchestratorExitSignal,
+  publisherExitCode,
+  publisherExitSignal,
+  failureReason,
+}) {
+  if (failureReason !== "Orchestrator exited unexpectedly before publisher completion") {
+    return { boundedSuccess: false, reason: null, fileCheck: null, capSummary: null };
+  }
+  if (publisherExitSignal && publisherExitSignal !== "SIGTERM") {
+    return { boundedSuccess: false, reason: null, fileCheck: null, capSummary: null };
+  }
+  if (Number.isFinite(publisherExitCode) && publisherExitCode !== 0) {
+    return { boundedSuccess: false, reason: null, fileCheck: null, capSummary: null };
+  }
+
+  const fileCheck = verifyExpectedOutputFiles(approach, logDir);
+  if (!fileCheck.valid || fileCheck.emittedCount <= 0) {
+    return { boundedSuccess: false, reason: null, fileCheck, capSummary: null };
+  }
+
+  const capSummary = readBenchmarkWindowCapSummary(logDir);
+  const orchestratorTerminatedAfterCap = (
+    orchestratorExitSignal === "SIGTERM" ||
+    orchestratorExitCode === 143
+  );
+
+  if (capSummary?.stoppedAfterTargetWindows === true) {
+    return {
+      boundedSuccess: true,
+      reason: "target_window_cap_reached",
+      fileCheck,
+      capSummary,
+    };
+  }
+
+  if (
+    orchestratorExitSignal &&
+    !orchestratorTerminatedAfterCap
+  ) {
+    return { boundedSuccess: false, reason: null, fileCheck, capSummary };
+  }
+  if (
+    Number.isFinite(orchestratorExitCode) &&
+    orchestratorExitCode !== 0 &&
+    !orchestratorTerminatedAfterCap
+  ) {
+    return { boundedSuccess: false, reason: null, fileCheck, capSummary };
+  }
+
+  if (Number(fileCheck.emittedCount) > 0) {
+    return {
+      boundedSuccess: true,
+      reason: "bounded_smoke_windows_emitted",
+      fileCheck,
+      capSummary,
+    };
+  }
+
+  return { boundedSuccess: false, reason: null, fileCheck, capSummary };
+}
+
 function resolveScenarioList(options) {
   const experimentDefinition = EXPERIMENTS[options.experimentName];
   if (!experimentDefinition) {
@@ -615,6 +583,14 @@ function resolveScenarioList(options) {
 
   if (options.experimentName === "superquery-range-scaling") {
     return options.ranges.length > 0 ? options.ranges : experimentDefinition.defaultScenarios;
+  }
+  if (options.experimentName === "query-target-scaling") {
+    return resolveQueryTargetScalingScenarioDefinitions({
+      targetSource: options.targetSource,
+      targetCounts: options.targetCounts,
+      requestedTargetNames: options.targets,
+      availableTargets: getRealQueryTargetDefinitions(),
+    });
   }
   return options.chunkSizes.length > 0
     ? options.chunkSizes
@@ -631,12 +607,21 @@ function parseArgs(argv) {
     patterns: [...DEFAULT_PATTERNS],
     ranges: [],
     chunkSizes: [],
+    targetSource: "real",
+    targetCounts: [],
+    targets: [],
     aggregationFunction: DEFAULT_AGGREGATION_FUNCTION,
     superqueryStepSeconds: DEFAULT_SUPERQUERY_STEP_SECONDS,
     rangeScalingSubWindowRangeSeconds:
       DEFAULT_RANGE_SCALING_SUB_WINDOW_RANGE_SECONDS,
     rangeScalingSubWindowStepSeconds:
       DEFAULT_RANGE_SCALING_SUB_WINDOW_STEP_SECONDS,
+    queryTargetScalingRangeSeconds:
+      DEFAULT_QUERY_TARGET_SCALING_SUPERQUERY_RANGE_SECONDS,
+    queryTargetScalingStepSeconds:
+      DEFAULT_QUERY_TARGET_SCALING_SUPERQUERY_STEP_SECONDS,
+    queryTargetScalingChunkSizeSeconds:
+      DEFAULT_QUERY_TARGET_SCALING_CHUNK_SIZE_SECONDS,
     extractAfterRun: true,
     skipBuild: false,
     logRoot: path.resolve(process.cwd(), "logs/window-parameter-sensitivity"),
@@ -690,6 +675,21 @@ function parseArgs(argv) {
         parsed.chunkSizes = parsePositiveIntList(next);
         index += 1;
         break;
+      case "--target-counts":
+        if (!next) throw new Error("--target-counts requires a value");
+        parsed.targetCounts = parsePositiveIntList(next);
+        index += 1;
+        break;
+      case "--target-source":
+        if (!next) throw new Error("--target-source requires a value");
+        parsed.targetSource = normalizeTargetSource(next);
+        index += 1;
+        break;
+      case "--targets":
+        if (!next) throw new Error("--targets requires a value");
+        parsed.targets = parseCsvList(next);
+        index += 1;
+        break;
       case "--aggregation":
         if (!next) throw new Error("--aggregation requires a value");
         parsed.aggregationFunction = String(next).trim().toUpperCase();
@@ -712,6 +712,21 @@ function parseArgs(argv) {
           throw new Error("--range-scaling-sub-window-step-seconds requires a value");
         }
         parsed.rangeScalingSubWindowStepSeconds = Number.parseInt(next, 10);
+        index += 1;
+        break;
+      case "--range":
+        if (!next) throw new Error("--range requires a value");
+        parsed.queryTargetScalingRangeSeconds = Number.parseInt(next, 10);
+        index += 1;
+        break;
+      case "--step":
+        if (!next) throw new Error("--step requires a value");
+        parsed.queryTargetScalingStepSeconds = Number.parseInt(next, 10);
+        index += 1;
+        break;
+      case "--chunk-size":
+        if (!next) throw new Error("--chunk-size requires a value");
+        parsed.queryTargetScalingChunkSizeSeconds = Number.parseInt(next, 10);
         index += 1;
         break;
       case "--log-root":
@@ -767,7 +782,7 @@ function printHelp() {
   console.log(`Usage: node experiments/window-parameter-sensitivity/run-window-parameter-sensitivity.js [options]
 
 Required:
-  --experiment <name>                         superquery-range-scaling | chunk-granularity-sensitivity
+  --experiment <name>                         superquery-range-scaling | chunk-granularity-sensitivity | query-target-scaling
 
 Common options:
   --iterations <n>                           Default: 1
@@ -789,6 +804,14 @@ Experiment 2 options:
 
 Experiment 3 options:
   --chunk-sizes <list>                       Example: 1,5,15,30,60
+
+Experiment 4 options:
+  --target-source <real|synthetic>          Default: real
+  --target-counts <list>                     Example: 2,4
+  --targets <list>                           Optional real target names, example: wearableX,smartphoneX
+  --range <seconds>                          Default: 120
+  --step <seconds>                           Default: 60
+  --chunk-size <seconds>                     Default: 30
 `);
 }
 
@@ -830,10 +853,25 @@ class WindowParameterSensitivityRunner {
     );
   }
 
-  async runSingleTest({ approach, patternName, scenarioSeconds, iterationNum }) {
-    const scenarioConfig = buildScenarioConfig({
+  buildRunScenarioConfig({ patternName, iterationNum, scenario }) {
+    if (this.options.experimentName === "query-target-scaling") {
+      return buildQueryTargetScalingScenarioConfig({
+        targetDefinitions: scenario.targetDefinitions,
+        targetSource: this.options.targetSource,
+        aggregationFunction: this.options.aggregationFunction,
+        pattern: patternName,
+        iteration: iterationNum,
+        replayDurationSeconds: this.options.replayDurationSeconds,
+        superqueryRangeSeconds: this.options.queryTargetScalingRangeSeconds,
+        superqueryStepSeconds: this.options.queryTargetScalingStepSeconds,
+        chunkSizeSeconds: this.options.queryTargetScalingChunkSizeSeconds,
+        exactFinalReuseEnabled: false,
+      });
+    }
+
+    return buildScenarioConfig({
       experimentName: this.options.experimentName,
-      scenarioSeconds,
+      scenarioSeconds: scenario,
       aggregationFunction: this.options.aggregationFunction,
       pattern: patternName,
       iteration: iterationNum,
@@ -844,6 +882,14 @@ class WindowParameterSensitivityRunner {
       rangeScalingSubWindowStepSeconds:
         this.options.rangeScalingSubWindowStepSeconds,
       exactFinalReuseEnabled: false,
+    });
+  }
+
+  async runSingleTest({ approach, patternName, scenario, iterationNum }) {
+    const scenarioConfig = this.buildRunScenarioConfig({
+      patternName,
+      iterationNum,
+      scenario,
     });
 
     const minimumReplayDurationSeconds =
@@ -925,6 +971,9 @@ class WindowParameterSensitivityRunner {
       BENCHMARK_REPLAY_DURATION_SECONDS: String(
         scenarioConfig.metadata.replay_duration_seconds,
       ),
+      BENCHMARK_TARGET_COUNT: String(scenarioConfig.metadata.target_count || ""),
+      BENCHMARK_TARGET_SET: scenarioConfig.metadata.target_set || "",
+      BENCHMARK_TARGET_NAMES: scenarioConfig.metadata.target_names || "",
     });
 
     const replayMetadata = getReplayMetadata(testEnv);
@@ -1003,6 +1052,31 @@ class WindowParameterSensitivityRunner {
           "Orchestrator exited unexpectedly before publisher completion";
       }
 
+      let totalEmittedResults = 0;
+      let requiredFiles = [];
+      let boundedSuccessReason = null;
+      let capSummary = null;
+
+      if (!isSuccess) {
+        const boundedSuccess = classifyBoundedSuccess({
+          approach,
+          logDir,
+          orchestratorExitCode,
+          orchestratorExitSignal,
+          publisherExitCode,
+          publisherExitSignal,
+          failureReason,
+        });
+        if (boundedSuccess.boundedSuccess) {
+          isSuccess = true;
+          failureReason = "";
+          totalEmittedResults = boundedSuccess.fileCheck?.emittedCount ?? 0;
+          requiredFiles = boundedSuccess.fileCheck?.requiredFiles ?? [];
+          boundedSuccessReason = boundedSuccess.reason;
+          capSummary = boundedSuccess.capSummary ?? null;
+        }
+      }
+
       if (publisherProc) {
         const termination = await terminateProcessTree(publisherProc, "publisher", 2000);
         cleanupSigtermSent = cleanupSigtermSent || termination.sigtermSent;
@@ -1060,10 +1134,10 @@ class WindowParameterSensitivityRunner {
         }
       }
 
-      let totalEmittedResults = 0;
-      let requiredFiles = [];
       if (isSuccess) {
-        const fileCheck = verifyExpectedOutputFiles(approach, logDir);
+        const fileCheck = totalEmittedResults > 0 && requiredFiles.length > 0
+          ? { valid: true, emittedCount: totalEmittedResults, requiredFiles }
+          : verifyExpectedOutputFiles(approach, logDir);
         if (!fileCheck.valid) {
           isSuccess = false;
           failureReason = fileCheck.reason;
@@ -1097,6 +1171,8 @@ class WindowParameterSensitivityRunner {
         emitted_result_count: totalEmittedResults,
         required_result_files: requiredFiles,
         profile_aggregate_path: profileAggregate?.aggregatePath || null,
+        bounded_success_reason: boundedSuccessReason,
+        benchmark_window_cap_summary: capSummary,
       };
 
       await resourceMonitor.stop(resourceSummaryMetadata);
@@ -1122,6 +1198,8 @@ class WindowParameterSensitivityRunner {
             publisher_exit_code: publisherExitCode,
             publisher_exit_signal: publisherExitSignal,
             profile_aggregate_path: profileAggregate?.aggregatePath || null,
+            bounded_success_reason: boundedSuccessReason,
+            benchmark_window_cap_summary: capSummary,
           },
           null,
           2,
@@ -1231,19 +1309,23 @@ class WindowParameterSensitivityRunner {
       );
 
       for (const approach of this.options.approaches) {
-        for (const scenarioSeconds of scenarios) {
+        for (const scenario of scenarios) {
           for (const patternName of this.options.patterns) {
             try {
               await this.runSingleTest({
                 approach,
                 patternName,
-                scenarioSeconds,
+                scenario,
                 iterationNum,
               });
               await sleep(2000);
             } catch (error) {
+              const scenarioLabel =
+                this.options.experimentName === "query-target-scaling"
+                  ? scenario.scenarioLabel
+                  : `${scenario}s`;
               console.error(
-                `Failed run: experiment=${this.options.experimentName} approach=${approach} pattern=${patternName} scenario=${scenarioSeconds}s iteration=${iterationNum}`,
+                `Failed run: experiment=${this.options.experimentName} approach=${approach} pattern=${patternName} scenario=${scenarioLabel} iteration=${iterationNum}`,
                 error,
               );
             }
@@ -1284,6 +1366,9 @@ function runExtractor(options) {
   ) {
     args.push("--chunk-sizes", options.chunkSizes.join(","));
   }
+  if (options.experimentName === "query-target-scaling" && options.targetCounts.length > 0) {
+    args.push("--target-counts", options.targetCounts.join(","));
+  }
 
   execFileSync("node", args, { stdio: "inherit" });
 }
@@ -1310,9 +1395,10 @@ module.exports = {
   WindowParameterSensitivityRunner,
   buildProfileAggregate,
   checkStaleProcesses,
-  collectTreeStatsFromPs,
+  classifyBoundedSuccess,
   getApproachScript,
   getRequiredResultFiles,
   parseArgs,
+  readBenchmarkWindowCapSummary,
   verifyExpectedOutputFiles,
 };

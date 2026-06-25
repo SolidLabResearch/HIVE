@@ -13,20 +13,24 @@ const {
 } = require("./common");
 
 const EXACT_RECONSTRUCTION_ERROR_TOLERANCE = 1e-3;
+const DEFAULT_TRIMMED_WINDOW_START = 4;
+const DEFAULT_TRIMMED_WINDOW_END = 33;
 
 function printHelp() {
   console.log(`Usage: node experiments/window-parameter-sensitivity/extract-window-parameter-sensitivity-results.js [options]
 
 Required:
-  --experiment <name>      superquery-range-scaling | chunk-granularity-sensitivity
+  --experiment <name>      superquery-range-scaling | chunk-granularity-sensitivity | query-target-scaling
   --input-root <path>      Input log root for the selected experiment
   --output-dir <path>      Directory for CSV outputs
 
 Optional:
   --patterns <list>        Default: low_variability
   --approaches <list>      Default: fetching,chunked
+  --target-source <name>   Optional filter for query-target-scaling
   --ranges <list>          Filter for experiment 2
   --chunk-sizes <list>     Filter for experiment 3
+  --target-counts <list>   Filter for experiment 4
 `);
 }
 
@@ -37,8 +41,10 @@ function parseArgs(argv) {
     outputDir: null,
     patterns: [...DEFAULT_PATTERNS],
     approaches: [...DEFAULT_APPROACHES],
+    targetSource: null,
     ranges: [],
     chunkSizes: [],
+    targetCounts: [],
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -71,6 +77,11 @@ function parseArgs(argv) {
         args.approaches = parseCsvList(next).map((value) => value.toLowerCase());
         index += 1;
         break;
+      case "--target-source":
+        if (!next) throw new Error("--target-source requires a value");
+        args.targetSource = String(next).trim().toLowerCase();
+        index += 1;
+        break;
       case "--ranges":
         if (!next) throw new Error("--ranges requires a value");
         args.ranges = parsePositiveIntList(next);
@@ -79,6 +90,11 @@ function parseArgs(argv) {
       case "--chunk-sizes":
         if (!next) throw new Error("--chunk-sizes requires a value");
         args.chunkSizes = parsePositiveIntList(next);
+        index += 1;
+        break;
+      case "--target-counts":
+        if (!next) throw new Error("--target-counts requires a value");
+        args.targetCounts = parsePositiveIntList(next);
         index += 1;
         break;
       case "--help":
@@ -394,6 +410,71 @@ function buildLatencySummary(approach, runDir) {
   };
 }
 
+function normalizeWindowBounds(start, end) {
+  const normalizedStart = Number(start);
+  const normalizedEnd = Number(end);
+  if (!Number.isFinite(normalizedStart) || !Number.isFinite(normalizedEnd)) {
+    return null;
+  }
+  if (normalizedStart > normalizedEnd) {
+    return null;
+  }
+  return {
+    start: normalizedStart,
+    end: normalizedEnd,
+  };
+}
+
+function buildWindowSet(start, end) {
+  const bounds = normalizeWindowBounds(start, end);
+  if (!bounds) {
+    return null;
+  }
+
+  const windows = new Set();
+  for (let windowNumber = bounds.start; windowNumber <= bounds.end; windowNumber += 1) {
+    windows.add(windowNumber);
+  }
+  return windows;
+}
+
+function computeWindowCompleteness(windowNumbers, expectedWindows) {
+  const actualWindows = new Set(
+    windowNumbers.filter((value) => Number.isFinite(value)).map((value) => Number(value)),
+  );
+  const sortedActual = [...actualWindows].sort((left, right) => left - right);
+
+  if (!expectedWindows) {
+    return {
+      expectedWindowCount: null,
+      matchedWindowCount: sortedActual.length,
+      missingWindowCount: null,
+      extraWindowCount: null,
+      actualWindowCount: sortedActual.length,
+      actualWindows: sortedActual,
+      expectedWindows: null,
+      missingWindows: [],
+      extraWindows: [],
+    };
+  }
+
+  const sortedExpected = [...expectedWindows].sort((left, right) => left - right);
+  const missingWindows = sortedExpected.filter((windowNumber) => !actualWindows.has(windowNumber));
+  const extraWindows = sortedActual.filter((windowNumber) => !expectedWindows.has(windowNumber));
+
+  return {
+    expectedWindowCount: sortedExpected.length,
+    matchedWindowCount: sortedExpected.length - missingWindows.length,
+    missingWindowCount: missingWindows.length,
+    extraWindowCount: extraWindows.length,
+    actualWindowCount: sortedActual.length,
+    actualWindows: sortedActual,
+    expectedWindows: sortedExpected,
+    missingWindows,
+    extraWindows,
+  };
+}
+
 function computeErrorStats(run, baselineRun) {
   if (run.approach === "fetching") {
     return {
@@ -469,6 +550,11 @@ function getScenarioFilter(args) {
       ? new Set(args.ranges.map((value) => String(value)))
       : null;
   }
+  if (args.experimentName === "query-target-scaling") {
+    return args.targetCounts.length > 0
+      ? new Set(args.targetCounts.map((value) => String(value)))
+      : null;
+  }
   return args.chunkSizes.length > 0
     ? new Set(args.chunkSizes.map((value) => String(value)))
     : null;
@@ -491,14 +577,6 @@ function loadRunRecords(args) {
           continue;
         }
 
-        const scenarioSecondsMatch = scenarioEntry.match(/(\d+)s$/);
-        const scenarioSeconds = scenarioSecondsMatch
-          ? Number.parseInt(scenarioSecondsMatch[1], 10)
-          : null;
-        if (scenarioFilter && !scenarioFilter.has(String(scenarioSeconds))) {
-          continue;
-        }
-
         for (const iterationEntry of fs.readdirSync(scenarioRoot)) {
           if (!/^iteration\d+$/.test(iterationEntry)) {
             continue;
@@ -507,6 +585,28 @@ function loadRunRecords(args) {
           const runMetadata = readJson(path.join(runDir, "run_metadata.json"));
           const resourceSummary = readJson(path.join(runDir, "resource_summary.json"));
           if (!runMetadata || !resourceSummary) {
+            continue;
+          }
+          if (
+            args.targetSource &&
+            String(runMetadata.target_source || "").trim().toLowerCase() !== args.targetSource
+          ) {
+            continue;
+          }
+          const scenarioSecondsMatch = scenarioEntry.match(/(\d+)s$/);
+          const scenarioTargetCountMatch = scenarioEntry.match(/k(\d+)$/i);
+          const scenarioValue =
+            args.experimentName === "query-target-scaling"
+              ? Number(
+                  runMetadata.target_count ??
+                    (scenarioTargetCountMatch
+                      ? Number.parseInt(scenarioTargetCountMatch[1], 10)
+                      : NaN),
+                )
+              : (scenarioSecondsMatch
+                ? Number.parseInt(scenarioSecondsMatch[1], 10)
+                : null);
+          if (scenarioFilter && !scenarioFilter.has(String(scenarioValue))) {
             continue;
           }
 
@@ -537,12 +637,43 @@ function loadRunRecords(args) {
             computeExpectedChunkStatesPerResult({
               superqueryRangeSeconds: Number(runMetadata.superquery_range_seconds),
               chunkSizeSeconds: Number(runMetadata.chunk_size_seconds),
+              streamCount: Number(runMetadata.target_count) || 2,
             });
           const chunkStatesConsumedPerEmittedResult =
             approach === "chunked"
               ? chunkStatesConsumed.chunkStatesConsumedPerResultMean ??
                 expectedChunkStatesPerResult
               : null;
+          const targetWindowCount = parseNumber(
+            runMetadata.target_window_count ?? runMetadata.targetWindowCount,
+          );
+          const trimmedWindowStart = parseNumber(
+            runMetadata.trimmed_window_start ?? runMetadata.trimmedWindowStart,
+          );
+          const trimmedWindowEnd = parseNumber(
+            runMetadata.trimmed_window_end ?? runMetadata.trimmedWindowEnd,
+          );
+          const windowNumbers = [...latencySummary.resultValuesByWindow.keys()];
+          const expectedWindows = Number.isFinite(targetWindowCount)
+            ? buildWindowSet(1, targetWindowCount)
+            : null;
+          const trimmedExpectedWindows =
+            Number.isFinite(trimmedWindowStart) && Number.isFinite(trimmedWindowEnd)
+              ? buildWindowSet(trimmedWindowStart, trimmedWindowEnd)
+              : (
+                  Number.isFinite(targetWindowCount) &&
+                  targetWindowCount >= DEFAULT_TRIMMED_WINDOW_START
+                    ? buildWindowSet(
+                        DEFAULT_TRIMMED_WINDOW_START,
+                        Math.min(DEFAULT_TRIMMED_WINDOW_END, targetWindowCount),
+                      )
+                    : null
+                );
+          const windowCompleteness = computeWindowCompleteness(windowNumbers, expectedWindows);
+          const trimmedWindowCompleteness = computeWindowCompleteness(
+            windowNumbers,
+            trimmedExpectedWindows,
+          );
 
           records.push({
             ...runMetadata,
@@ -553,6 +684,15 @@ function loadRunRecords(args) {
             peak_cpu_percent: parseNumber(resourceSummary.peakCpuPct),
             peak_process_count: parseNumber(resourceSummary.peakProcessCount),
             emitted_window_count: latencySummary.emittedWindowCount,
+            expected_window_count: windowCompleteness.expectedWindowCount,
+            actual_window_count: windowCompleteness.actualWindowCount,
+            missing_window_count: windowCompleteness.missingWindowCount,
+            extra_window_count: windowCompleteness.extraWindowCount,
+            trimmed_expected_window_count: trimmedWindowCompleteness.expectedWindowCount,
+            trimmed_matched_window_count: trimmedWindowCompleteness.matchedWindowCount,
+            trimmed_missing_window_count: trimmedWindowCompleteness.missingWindowCount,
+            trimmed_extra_window_count: trimmedWindowCompleteness.extraWindowCount,
+            trimmed_actual_window_count: trimmedWindowCompleteness.actualWindowCount,
             emitted_result_count: emittedResultCount,
             reconstructed_result_count: reconstructedResultCount,
             superquery_result_count: superqueryResultCount,
@@ -650,9 +790,12 @@ function applyValidation(records) {
       record.experiment_name,
       record.pattern,
       record.iteration,
+      record.target_source || "",
       record.superquery_range_seconds,
       record.superquery_step_seconds,
       record.chunk_size_seconds,
+      record.target_count || "",
+      record.target_set || "",
     ].join("::");
     fetchingByScenario.set(key, record);
   }
@@ -662,9 +805,12 @@ function applyValidation(records) {
       record.experiment_name,
       record.pattern,
       record.iteration,
+      record.target_source || "",
       record.superquery_range_seconds,
       record.superquery_step_seconds,
       record.chunk_size_seconds,
+      record.target_count || "",
+      record.target_set || "",
     ].join("::");
     const baseline = fetchingByScenario.get(baselineKey);
     const errorStats = computeErrorStats(record, baseline);
@@ -727,8 +873,14 @@ function buildPerRunRows(records) {
       if (left.approach !== right.approach) {
         return left.approach.localeCompare(right.approach);
       }
+      if ((left.target_source || "") !== (right.target_source || "")) {
+        return String(left.target_source || "").localeCompare(String(right.target_source || ""));
+      }
       if (left.superquery_range_seconds !== right.superquery_range_seconds) {
         return left.superquery_range_seconds - right.superquery_range_seconds;
+      }
+      if ((left.target_count || 0) !== (right.target_count || 0)) {
+        return (left.target_count || 0) - (right.target_count || 0);
       }
       if (left.chunk_size_seconds !== right.chunk_size_seconds) {
         return left.chunk_size_seconds - right.chunk_size_seconds;
@@ -746,6 +898,14 @@ function buildPerRunRows(records) {
       chunk_size_seconds: record.chunk_size_seconds,
       replay_duration_seconds: record.replay_duration_seconds,
       exact_final_reuse_enabled: record.exact_final_reuse_enabled,
+      target_source: record.target_source ?? "",
+      unique_target_count: record.unique_target_count ?? record.target_count ?? null,
+      real_target_count: record.real_target_count ?? null,
+      synthetic_target_count: record.synthetic_target_count ?? null,
+      target_count: record.target_count ?? null,
+      target_set: record.target_set ?? "",
+      target_names: record.target_names ?? "",
+      is_synthetic_target_scaling: record.is_synthetic_target_scaling ?? false,
       chunk_size_applies_to_approach: record.chunk_size_applies_to_approach,
       cpu_seconds: record.cpu_seconds,
       cpu_seconds_per_emitted_result: record.cpu_seconds_per_emitted_result,
@@ -787,7 +947,16 @@ function buildPerRunRows(records) {
       reconstructed_result_count: record.reconstructed_result_count,
       superquery_result_count: record.superquery_result_count,
       emitted_window_count: record.emitted_window_count,
+      expected_window_count: record.expected_window_count,
+      actual_window_count: record.actual_window_count,
+      missing_window_count: record.missing_window_count,
+      extra_window_count: record.extra_window_count,
       matched_window_count: record.matched_window_count,
+      trimmed_expected_window_count: record.trimmed_expected_window_count,
+      trimmed_matched_window_count: record.trimmed_matched_window_count,
+      trimmed_missing_window_count: record.trimmed_missing_window_count,
+      trimmed_extra_window_count: record.trimmed_extra_window_count,
+      trimmed_actual_window_count: record.trimmed_actual_window_count,
       chunk_states_consumed_per_result_mean:
         record.chunk_states_consumed_per_result_mean,
       chunk_states_consumed_per_emitted_result:
@@ -809,10 +978,14 @@ function buildAggregateRows(records) {
       record.experiment_name,
       record.approach,
       record.pattern,
+      record.target_source || "",
       record.aggregation_function,
       record.superquery_range_seconds,
       record.superquery_step_seconds,
       record.chunk_size_seconds,
+      record.target_count || "",
+      record.target_set || "",
+      record.target_names || "",
       record.replay_duration_seconds,
       record.exact_final_reuse_enabled,
     ].join("::");
@@ -852,6 +1025,16 @@ function buildAggregateRows(records) {
     "emitted_result_count",
     "reconstructed_result_count",
     "superquery_result_count",
+    "expected_window_count",
+    "actual_window_count",
+    "missing_window_count",
+    "extra_window_count",
+    "matched_window_count",
+    "trimmed_expected_window_count",
+    "trimmed_matched_window_count",
+    "trimmed_missing_window_count",
+    "trimmed_extra_window_count",
+    "trimmed_actual_window_count",
     "chunk_states_consumed_per_result_mean",
     "chunk_states_consumed_per_emitted_result",
     "expected_chunk_states_total",
@@ -868,6 +1051,14 @@ function buildAggregateRows(records) {
       superquery_range_seconds: first.superquery_range_seconds,
       superquery_step_seconds: first.superquery_step_seconds,
       chunk_size_seconds: first.chunk_size_seconds,
+      target_count: first.target_count ?? null,
+      target_source: first.target_source ?? "",
+      unique_target_count: first.unique_target_count ?? first.target_count ?? null,
+      real_target_count: first.real_target_count ?? null,
+      synthetic_target_count: first.synthetic_target_count ?? null,
+      target_set: first.target_set ?? "",
+      target_names: first.target_names ?? "",
+      is_synthetic_target_scaling: first.is_synthetic_target_scaling ?? false,
       replay_duration_seconds: first.replay_duration_seconds,
       exact_final_reuse_enabled: first.exact_final_reuse_enabled,
       iterations: groupRecords.length,
@@ -893,8 +1084,14 @@ function buildAggregateRows(records) {
     if (left.approach !== right.approach) {
       return left.approach.localeCompare(right.approach);
     }
+    if ((left.target_source || "") !== (right.target_source || "")) {
+      return String(left.target_source || "").localeCompare(String(right.target_source || ""));
+    }
     if (left.superquery_range_seconds !== right.superquery_range_seconds) {
       return left.superquery_range_seconds - right.superquery_range_seconds;
+    }
+    if ((left.target_count || 0) !== (right.target_count || 0)) {
+      return (left.target_count || 0) - (right.target_count || 0);
     }
     return left.chunk_size_seconds - right.chunk_size_seconds;
   });
@@ -912,6 +1109,14 @@ function buildProfileRows(records) {
     chunk_size_seconds: record.chunk_size_seconds,
     replay_duration_seconds: record.replay_duration_seconds,
     exact_final_reuse_enabled: record.exact_final_reuse_enabled,
+    target_source: record.target_source ?? "",
+    unique_target_count: record.unique_target_count ?? record.target_count ?? null,
+    real_target_count: record.real_target_count ?? null,
+    synthetic_target_count: record.synthetic_target_count ?? null,
+    target_count: record.target_count ?? null,
+    target_set: record.target_set ?? "",
+    target_names: record.target_names ?? "",
+    is_synthetic_target_scaling: record.is_synthetic_target_scaling ?? false,
     chunk_size_applies_to_approach: record.chunk_size_applies_to_approach,
     shared_chunk_producers_created: record.shared_chunk_producers_created,
     chunk_state_messages_published: record.chunk_state_messages_published,
@@ -946,7 +1151,9 @@ function main(argv = process.argv.slice(2)) {
   const filePrefix =
     args.experimentName === "superquery-range-scaling"
       ? "superquery_range_scaling"
-      : "chunk_granularity_sensitivity";
+      : args.experimentName === "chunk-granularity-sensitivity"
+        ? "chunk_granularity_sensitivity"
+        : "query_target_scaling";
 
   const perRunRows = buildPerRunRows(records);
   const aggregateRows = buildAggregateRows(records);
@@ -965,6 +1172,14 @@ function main(argv = process.argv.slice(2)) {
       "chunk_size_seconds",
       "replay_duration_seconds",
       "exact_final_reuse_enabled",
+      "target_source",
+      "unique_target_count",
+      "real_target_count",
+      "synthetic_target_count",
+      "target_count",
+      "target_set",
+      "target_names",
+      "is_synthetic_target_scaling",
       "chunk_size_applies_to_approach",
       "cpu_seconds",
       "cpu_seconds_per_emitted_result",
@@ -1003,7 +1218,16 @@ function main(argv = process.argv.slice(2)) {
       "reconstructed_result_count",
       "superquery_result_count",
       "emitted_window_count",
+      "expected_window_count",
+      "actual_window_count",
+      "missing_window_count",
+      "extra_window_count",
       "matched_window_count",
+      "trimmed_expected_window_count",
+      "trimmed_matched_window_count",
+      "trimmed_missing_window_count",
+      "trimmed_extra_window_count",
+      "trimmed_actual_window_count",
       "chunk_states_consumed_per_result_mean",
       "chunk_states_consumed_per_emitted_result",
       "expected_chunk_states_per_result",
@@ -1023,10 +1247,18 @@ function main(argv = process.argv.slice(2)) {
       "experiment_name",
       "approach",
       "pattern",
+      "target_source",
       "aggregation_function",
       "superquery_range_seconds",
       "superquery_step_seconds",
       "chunk_size_seconds",
+      "unique_target_count",
+      "real_target_count",
+      "synthetic_target_count",
+      "target_count",
+      "target_set",
+      "target_names",
+      "is_synthetic_target_scaling",
       "replay_duration_seconds",
       "exact_final_reuse_enabled",
       "iterations",
@@ -1092,6 +1324,26 @@ function main(argv = process.argv.slice(2)) {
       "reconstructed_result_count_std",
       "superquery_result_count_mean",
       "superquery_result_count_std",
+      "expected_window_count_mean",
+      "expected_window_count_std",
+      "actual_window_count_mean",
+      "actual_window_count_std",
+      "missing_window_count_mean",
+      "missing_window_count_std",
+      "extra_window_count_mean",
+      "extra_window_count_std",
+      "matched_window_count_mean",
+      "matched_window_count_std",
+      "trimmed_expected_window_count_mean",
+      "trimmed_expected_window_count_std",
+      "trimmed_matched_window_count_mean",
+      "trimmed_matched_window_count_std",
+      "trimmed_missing_window_count_mean",
+      "trimmed_missing_window_count_std",
+      "trimmed_extra_window_count_mean",
+      "trimmed_extra_window_count_std",
+      "trimmed_actual_window_count_mean",
+      "trimmed_actual_window_count_std",
       "chunk_states_consumed_per_result_mean_mean",
       "chunk_states_consumed_per_result_mean_std",
       "chunk_states_consumed_per_emitted_result_mean",
@@ -1115,6 +1367,14 @@ function main(argv = process.argv.slice(2)) {
       "chunk_size_seconds",
       "replay_duration_seconds",
       "exact_final_reuse_enabled",
+      "target_source",
+      "unique_target_count",
+      "real_target_count",
+      "synthetic_target_count",
+      "target_count",
+      "target_set",
+      "target_names",
+      "is_synthetic_target_scaling",
       "chunk_size_applies_to_approach",
       "shared_chunk_producers_created",
       "chunk_state_messages_published",

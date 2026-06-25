@@ -1,6 +1,6 @@
 # Window-Parameter Sensitivity Benchmarks
 
-This folder adds two controlled chunk-state reconstruction benchmarks on top of the existing HIVE runner/orchestrator pattern. Both experiments reuse the current `fetching` and `chunked` approach implementations, the shared finite-replay publisher, the shared process-cleanup flow, and the existing profiling counters.
+This folder adds controlled chunk-state reconstruction benchmarks on top of the existing HIVE runner/orchestrator pattern. These experiments reuse the current `fetching` and `chunked` approach implementations, the shared finite-replay publisher, the shared process-cleanup flow, and the existing profiling counters.
 
 ## Experiment 2: Superquery Range Scaling
 
@@ -70,6 +70,78 @@ node experiments/window-parameter-sensitivity/run-window-parameter-sensitivity.j
   --replay-duration-seconds 900
 ```
 
+## Experiment 4: Query Target Scaling
+
+Purpose: evaluate "different things with the same window size" by keeping the window fixed and varying the queried target/property/stream set.
+
+- Superquery window: `RANGE 120s STEP 60s`
+- Chunk size: `30s`
+- Aggregation: `AVG`
+- Exact-final reuse: disabled explicitly with `HIVE_ENABLE_EXACT_FINAL_RESULT_REUSE=false`
+- Real target-scaling:
+  - `target_source=real`
+  - `K=2` uses the currently supported real targets: `wearableX` and `smartphoneX`
+  - In the current repository state, only two real targets are wired into the benchmarked query path, so real `K=4` remains unavailable and is not faked or mixed into the results
+- Synthetic target-scaling:
+  - `target_source=synthetic`
+  - controlled internal stress test only
+  - `K=2,4,6,8`
+  - deterministic synthetic targets named `syntheticTarget1` through `syntheticTarget8`
+  - synthetic targets reuse the same timestamp grid and RDF shape as the real replay input, but with distinct property IRIs and deterministic value offsets
+  - this is not the same as real-world target diversity and should not be conflated with the real-target benchmark
+
+Real smoke run:
+
+```bash
+node experiments/window-parameter-sensitivity/run-window-parameter-sensitivity.js \
+  --experiment query-target-scaling \
+  --target-source real \
+  --iterations 1 \
+  --patterns low_variability \
+  --approaches fetching,chunked \
+  --target-counts 2 \
+  --replay-duration-seconds 240
+```
+
+Synthetic smoke run:
+
+```bash
+node experiments/window-parameter-sensitivity/run-window-parameter-sensitivity.js \
+  --experiment query-target-scaling \
+  --target-source synthetic \
+  --iterations 1 \
+  --patterns low_variability \
+  --approaches fetching,chunked \
+  --target-counts 2,4 \
+  --replay-duration-seconds 240
+```
+
+Synthetic full run:
+
+```bash
+node experiments/window-parameter-sensitivity/run-window-parameter-sensitivity.js \
+  --experiment query-target-scaling \
+  --target-source synthetic \
+  --iterations 5 \
+  --patterns low_variability \
+  --approaches fetching,chunked \
+  --target-counts 2,4,6,8 \
+  --replay-duration-seconds 900
+```
+
+If four real targets are added later, a separate real-target run can be expanded explicitly:
+
+```bash
+node experiments/window-parameter-sensitivity/run-window-parameter-sensitivity.js \
+  --experiment query-target-scaling \
+  --target-source real \
+  --iterations 5 \
+  --patterns low_variability \
+  --approaches fetching,chunked \
+  --target-counts 2,4 \
+  --replay-duration-seconds 900
+```
+
 ## Outputs
 
 Runner logs:
@@ -106,6 +178,7 @@ When plotting chunk size on the x-axis, fetching should be shown as a repeated b
 Each per-run row includes:
 
 - experiment metadata (`experiment_name`, `approach`, `pattern`, `iteration`, aggregation, superquery range/step, chunk size, replay duration, exact-final reuse flag)
+- target metadata (`target_source`, `unique_target_count`, `real_target_count`, `synthetic_target_count`, `target_count`, `target_set`, `target_names`, `is_synthetic_target_scaling`)
 - emitted-result metadata (`emitted_result_count`, `reconstructed_result_count`, `superquery_result_count`, `expected_chunk_states_per_result`, `expected_chunk_states_total`)
 - resource metrics (`cpu_seconds`, `peak_rss_mb`, plus per-emitted-result normalized variants)
 - latency metrics (`mean/std/median/p95` for adjusted latency and, where available, `ready_to_emit_ms` and `computation_ms`)
