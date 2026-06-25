@@ -76,11 +76,33 @@ class PatternResultExtractor {
   }
 
   parseCsvLine(line) {
-    return line.match(/("([^"]|"")*"|[^,]+)/g)?.map((entry) =>
-      entry.startsWith("\"") && entry.endsWith("\"")
-        ? entry.slice(1, -1).replace(/""/g, "\"")
-        : entry,
-    ) || [];
+    const values = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index];
+      if (char === "\"") {
+        if (inQuotes && line[index + 1] === "\"") {
+          current += "\"";
+          index += 1;
+          continue;
+        }
+        inQuotes = !inQuotes;
+        continue;
+      }
+
+      if (char === "," && !inQuotes) {
+        values.push(current);
+        current = "";
+        continue;
+      }
+
+      current += char;
+    }
+
+    values.push(current);
+    return values;
   }
 
   getHeaderIndex(headerIndex, candidates) {
@@ -90,6 +112,102 @@ class PatternResultExtractor {
       }
     }
     return undefined;
+  }
+
+  buildApproximationResultsFromLatency(latencyContent, diagnosticsByWindow, queryRegisteredTimeRef) {
+    const latencyLines = latencyContent.trim().split("\n");
+    const headers = latencyLines[0]?.split(",").map((header) => header.trim()) || [];
+    const headerIndex = new Map(headers.map((header, index) => [header, index]));
+    const windowNumberIndex = this.getHeaderIndex(headerIndex, ["window_number"]);
+    const registeredAtIndex = this.getHeaderIndex(headerIndex, ["query_registered_at"]);
+    const timestampIndex = this.getHeaderIndex(headerIndex, ["result_emitted_at"]);
+    const resultValueIndex = this.getHeaderIndex(headerIndex, ["result_value"]);
+    const approximationStatusIndex = this.getHeaderIndex(headerIndex, ["approximation_status"]);
+
+    if (
+      windowNumberIndex === undefined ||
+      timestampIndex === undefined ||
+      resultValueIndex === undefined
+    ) {
+      return {
+        parsed: false,
+        queryRegisteredTime: queryRegisteredTimeRef ?? null,
+        firstResultTime: null,
+        results: [],
+      };
+    }
+
+    let queryRegisteredTime = queryRegisteredTimeRef ?? null;
+    let firstResultTime = null;
+    const results = [];
+
+    for (const line of latencyLines.slice(1)) {
+      if (!line.trim()) continue;
+      const parts = this.parseCsvLine(line);
+      const requiredColumnCount = Math.max(
+        windowNumberIndex,
+        timestampIndex,
+        resultValueIndex,
+      );
+      if (parts.length <= requiredColumnCount) {
+        continue;
+      }
+
+      const approximationStatus = approximationStatusIndex !== undefined &&
+        parts.length > approximationStatusIndex
+        ? String(parts[approximationStatusIndex] || "").trim()
+        : "";
+      if (
+        approximationStatus &&
+        approximationStatus !== "completed_window_approximation"
+      ) {
+        continue;
+      }
+
+      const windowNumber = parseInt(parts[windowNumberIndex], 10);
+      const timestamp = parseInt(parts[timestampIndex], 10);
+      const rawResultValue = parts[resultValueIndex];
+      const resultValue = parseFloat(rawResultValue);
+
+      if (!Number.isFinite(windowNumber) || !Number.isFinite(resultValue)) {
+        continue;
+      }
+
+      if (
+        !Number.isFinite(queryRegisteredTime) &&
+        registeredAtIndex !== undefined &&
+        parts.length > registeredAtIndex
+      ) {
+        const registeredAt = parseInt(parts[registeredAtIndex], 10);
+        if (Number.isFinite(registeredAt)) {
+          queryRegisteredTime = registeredAt;
+          console.log(`Found query registration time from latency log: ${queryRegisteredTime}`);
+        }
+      }
+
+      if (!Number.isFinite(firstResultTime) && Number.isFinite(timestamp)) {
+        firstResultTime = timestamp;
+        console.log(`Found first result time from latency log: ${firstResultTime}`);
+      }
+
+      results.push({
+        timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
+        resultValue,
+        windowNumber,
+        ...diagnosticsByWindow.get(windowNumber),
+      });
+
+      console.log(
+        `  Window ${windowNumber}: ${resultValue.toFixed(6)} at ${Number.isFinite(timestamp) ? timestamp : "N/A"}`,
+      );
+    }
+
+    return {
+      parsed: results.length > 0,
+      queryRegisteredTime,
+      firstResultTime,
+      results,
+    };
   }
 
   buildFetchingLatencySummary(logContent, queryRegisteredTime, finalizedTimestamps) {
@@ -753,78 +871,24 @@ class PatternResultExtractor {
     }
     // Approximation approach
     else if (this.approach === "approximation") {
-      const parseApproximationLatencyRows = (latencyContent) => {
-        const latencyLines = latencyContent.trim().split("\n");
-        const headers = latencyLines[0]?.split(",").map((header) => header.trim()) || [];
-        const headerIndex = new Map(headers.map((header, index) => [header, index]));
-        const windowNumberIndex = this.getHeaderIndex(headerIndex, ["window_number"]);
-        const registeredAtIndex = this.getHeaderIndex(headerIndex, ["query_registered_at"]);
-        const timestampIndex = this.getHeaderIndex(headerIndex, ["result_emitted_at"]);
-        const resultValueIndex = this.getHeaderIndex(headerIndex, ["result_value"]);
-
-        if (
-          windowNumberIndex === undefined ||
-          timestampIndex === undefined ||
-          resultValueIndex === undefined
-        ) {
-          return false;
-        }
-
-        for (const line of latencyLines.slice(1)) {
-          if (!line.trim()) continue;
-          const parts = this.parseCsvLine(line);
-          const requiredColumnCount = Math.max(
-            windowNumberIndex,
-            timestampIndex,
-            resultValueIndex,
-          );
-          if (parts.length <= requiredColumnCount) {
-            continue;
-          }
-
-          const windowNumber = parseInt(parts[windowNumberIndex], 10);
-          const timestamp = parseInt(parts[timestampIndex], 10);
-          const rawResultValue = parts[resultValueIndex];
-          const resultValue = parseFloat(rawResultValue);
-
-          if (!Number.isFinite(windowNumber) || !Number.isFinite(resultValue)) {
-            continue;
-          }
-
-          if (!Number.isFinite(queryRegisteredTime) && registeredAtIndex !== undefined && parts.length > registeredAtIndex) {
-            const registeredAt = parseInt(parts[registeredAtIndex], 10);
-            if (Number.isFinite(registeredAt)) {
-              queryRegisteredTime = registeredAt;
-              console.log(`Found query registration time from latency log: ${queryRegisteredTime}`);
-            }
-          }
-
-          if (!Number.isFinite(firstResultTime) && Number.isFinite(timestamp)) {
-            firstResultTime = timestamp;
-            console.log(`Found first result time from latency log: ${firstResultTime}`);
-          }
-
-          results.push({
-            timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
-            resultValue,
-            windowNumber,
-            ...deriveApproximationWindowBounds(windowNumber),
-            ...diagnosticsByWindow.get(windowNumber),
-          });
-
-          console.log(
-            `  Window ${windowNumber}: ${resultValue.toFixed(6)} at ${Number.isFinite(timestamp) ? timestamp : "N/A"}`,
-          );
-        }
-
-        return results.length > 0;
-      };
-
       let parsedFromLatency = false;
       if (fs.existsSync(this.latencyFile)) {
         try {
           const latencyContent = fs.readFileSync(this.latencyFile, "utf8");
-          parsedFromLatency = parseApproximationLatencyRows(latencyContent);
+          const parsedLatency = this.buildApproximationResultsFromLatency(
+            latencyContent,
+            diagnosticsByWindow,
+            queryRegisteredTime,
+          );
+          parsedFromLatency = parsedLatency.parsed;
+          queryRegisteredTime = parsedLatency.queryRegisteredTime ?? queryRegisteredTime;
+          firstResultTime = parsedLatency.firstResultTime ?? firstResultTime;
+          for (const result of parsedLatency.results) {
+            results.push({
+              ...result,
+              ...deriveApproximationWindowBounds(result.windowNumber),
+            });
+          }
         } catch (error) {
           console.warn(`Failed to parse approximation latency log: ${error.message}`);
         }
@@ -1235,33 +1299,38 @@ class PatternResultExtractor {
   }
 }
 
-// Main execution
-const args = process.argv.slice(2);
+if (require.main === module) {
+  const args = process.argv.slice(2);
 
-if (args.length < 3) {
-  console.error(
-    "Usage: node extract-pattern-results.js <approach> <pattern_name> <log_dir>",
-  );
-  console.error(
-    "Example: node extract-pattern-results.js fetching exponential_growth_rate_1 ./logs/...",
-  );
-  process.exit(1);
+  if (args.length < 3) {
+    console.error(
+      "Usage: node extract-pattern-results.js <approach> <pattern_name> <log_dir>",
+    );
+    console.error(
+      "Example: node extract-pattern-results.js fetching exponential_growth_rate_1 ./logs/...",
+    );
+    process.exit(1);
+  }
+
+  const [approach, patternName, logDir] = args;
+
+  if (
+    approach !== "fetching" &&
+    approach !== "approximation" &&
+    approach !== "chunked"
+  ) {
+    console.error(
+      'Error: Approach must be "fetching", "approximation", or "chunked"',
+    );
+    process.exit(1);
+  }
+
+  const extractor = new PatternResultExtractor(approach, patternName, logDir);
+  const success = extractor.run();
+
+  process.exit(success ? 0 : 1);
 }
 
-const [approach, patternName, logDir] = args;
-
-if (
-  approach !== "fetching" &&
-  approach !== "approximation" &&
-  approach !== "chunked"
-) {
-  console.error(
-    'Error: Approach must be "fetching", "approximation", or "chunked"',
-  );
-  process.exit(1);
-}
-
-const extractor = new PatternResultExtractor(approach, patternName, logDir);
-const success = extractor.run();
-
-process.exit(success ? 0 : 1);
+module.exports = {
+  PatternResultExtractor,
+};

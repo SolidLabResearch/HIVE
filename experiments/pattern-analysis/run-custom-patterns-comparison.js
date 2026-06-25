@@ -33,6 +33,11 @@ const {
   delay,
   terminateChildProcessTree,
 } = require("../utils/processCleanup");
+const {
+  ProcessTreeTracker,
+  collectTreeMetrics,
+  summarizeResourceSamples,
+} = require("../utils/processTreeMetrics");
 
 const SMOKE_PATTERN_TYPE = "low_variability";
 const SMOKE_APPROACHES = ["fetching", "approximation"];
@@ -117,119 +122,6 @@ function parseSelectionList(value, allowedValues) {
 
   const filtered = entries.filter((entry) => allowedValues.includes(entry));
   return [...new Set(filtered)];
-}
-
-function parsePsSnapshot(psOutput) {
-  const rows = [];
-  const lines = psOutput
-    .trim()
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  for (const line of lines) {
-    const parts = line.split(/\s+/, 5);
-    if (parts.length < 4) {
-      continue;
-    }
-
-    const pid = Number.parseInt(parts[0], 10);
-    const ppid = Number.parseInt(parts[1], 10);
-    const cpu = Number.parseFloat(parts[2]);
-    const rssKb = Number.parseFloat(parts[3]);
-    const command = parts[4] || "";
-
-    if (!Number.isFinite(pid) || !Number.isFinite(ppid)) {
-      continue;
-    }
-
-    rows.push({
-      pid,
-      ppid,
-      cpu: Number.isFinite(cpu) ? cpu : 0,
-      rssKb: Number.isFinite(rssKb) ? rssKb : 0,
-      command,
-    });
-  }
-
-  return rows;
-}
-
-function collectTreeStatsFromPs(rootPids) {
-  const liveRootPids = [...new Set((rootPids || []).filter((pid) => Number.isFinite(pid)))];
-  if (liveRootPids.length === 0) {
-    return null;
-  }
-
-  let snapshot;
-  try {
-    snapshot = parsePsSnapshot(
-      execFileSync("ps", ["-A", "-o", "pid=,ppid=,pcpu=,rss=,comm="], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        maxBuffer: 1024 * 1024 * 8,
-      }),
-    );
-  } catch (err) {
-    return null;
-  }
-
-  if (snapshot.length === 0) {
-    return null;
-  }
-
-  const childrenByParent = new Map();
-  for (const proc of snapshot) {
-    const children = childrenByParent.get(proc.ppid) || [];
-    children.push(proc.pid);
-    childrenByParent.set(proc.ppid, children);
-  }
-
-  const pidMap = new Map(snapshot.map((proc) => [proc.pid, proc]));
-  const seen = new Set();
-  const queue = [...liveRootPids];
-  const tree = [];
-
-  while (queue.length > 0) {
-    const pid = queue.shift();
-    if (seen.has(pid)) {
-      continue;
-    }
-    seen.add(pid);
-
-    const proc = pidMap.get(pid);
-    if (!proc) {
-      continue;
-    }
-
-    tree.push(proc);
-
-    const children = childrenByParent.get(pid) || [];
-    for (const childPid of children) {
-      if (!seen.has(childPid)) {
-        queue.push(childPid);
-      }
-    }
-  }
-
-  if (tree.length === 0) {
-    return null;
-  }
-
-  const totalCpuPct = tree.reduce((sum, proc) => sum + proc.cpu, 0);
-  const totalRssKb = tree.reduce((sum, proc) => sum + proc.rssKb, 0);
-
-  return {
-    rootPids: liveRootPids,
-    tree,
-    processCount: tree.length,
-    totalCpuPct,
-    meanCpuPct: totalCpuPct,
-    peakCpuPct: totalCpuPct,
-    totalRssMb: totalRssKb / 1024,
-    meanRssMb: totalRssKb / 1024,
-    peakRssMb: tree.reduce((max, proc) => Math.max(max, proc.rssKb / 1024), 0),
-  };
 }
 
 function sumNumericFields(records, fieldNames) {
@@ -380,6 +272,7 @@ class AttemptResourceSampler {
     this.stopped = false;
     this.running = false;
     this.pidSamples = new Map();
+    this.tracker = new ProcessTreeTracker();
   }
 
   start() {
@@ -402,24 +295,26 @@ class AttemptResourceSampler {
 
     this.running = true;
     try {
-      const stats = collectTreeStatsFromPs(this.getRootPids());
+      const timestamp = Date.now();
+      const elapsedMs = this.startedAt ? timestamp - this.startedAt : 0;
+      const stats = collectTreeMetrics(this.getRootPids(), this.tracker, timestamp, elapsedMs);
       if (!stats) {
         return;
       }
 
       this.samples.push({
-        timestamp: Date.now(),
-        elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
+        timestamp,
+        elapsedMs,
         ...stats,
       });
       for (const proc of stats.tree || []) {
         const bucket = this.pidSamples.get(proc.pid) || [];
         bucket.push({
-          timestamp: Date.now(),
-          elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
+          timestamp,
+          elapsedMs,
           pid: proc.pid,
           ppid: proc.ppid,
-          cpuPct: proc.cpu,
+          cpuPct: proc.cpuPct,
           rssMb: proc.rssKb / 1024,
           command: proc.command,
         });
@@ -431,36 +326,21 @@ class AttemptResourceSampler {
   }
 
   summarize() {
-    const sampleCount = this.samples.length;
     const wallTimeMs = this.startedAt ? Date.now() - this.startedAt : 0;
-    const meanCpuPct = sampleCount > 0
-      ? this.samples.reduce((sum, sample) => sum + sample.totalCpuPct, 0) / sampleCount
-      : 0;
-    const peakCpuPct = sampleCount > 0
-      ? Math.max(...this.samples.map((sample) => sample.totalCpuPct))
-      : 0;
-    const meanRssMb = sampleCount > 0
-      ? this.samples.reduce((sum, sample) => sum + sample.totalRssMb, 0) / sampleCount
-      : 0;
-    const peakRssMb = sampleCount > 0
-      ? Math.max(...this.samples.map((sample) => sample.totalRssMb))
-      : 0;
-    const peakProcessCount = sampleCount > 0
-      ? Math.max(...this.samples.map((sample) => sample.processCount))
-      : 0;
-    const cpuSeconds = (meanCpuPct / 100) * (wallTimeMs / 1000);
+    const resource = summarizeResourceSamples(this.samples);
 
     return {
       sampleIntervalMs: this.sampleIntervalMs,
-      sampleCount,
+      sampleCount: resource.sampleCount,
       wallTimeMs,
       wallTimeSec: wallTimeMs / 1000,
-      meanCpuPct,
-      peakCpuPct,
-      cpuSeconds,
-      meanRssMb,
-      peakRssMb,
-      peakProcessCount,
+      meanCpuPct: resource.meanCpuPct,
+      peakCpuPct: resource.peakCpuPct,
+      cpuSeconds: resource.cpuSeconds,
+      meanRssMb: resource.meanRssMb,
+      peakRssMb: resource.peakRssMb,
+      peakProcessCount: resource.peakProcessCount,
+      cpuAccountingNegativeDeltaCount: this.tracker.negativeDeltaEvents.length,
     };
   }
 
@@ -473,7 +353,7 @@ class AttemptResourceSampler {
     const summaryPath = path.join(this.logDir, "resource_summary.json");
     const perPidPath = path.join(this.logDir, "resource_per_pid_summary.json");
     const lines = [
-      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,mean_cpu_pct,peak_cpu_pct,total_rss_mb,mean_rss_mb,peak_rss_mb",
+      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,total_rss_mb,peak_rss_mb,tree_cpu_seconds,tree_cpu_seconds_delta,tree_cpu_seconds_raw_snapshot",
       ...this.samples.map((sample) =>
         [
           sample.timestamp,
@@ -481,17 +361,20 @@ class AttemptResourceSampler {
           sample.rootPids.length,
           sample.processCount,
           sample.totalCpuPct.toFixed(4),
-          sample.meanCpuPct.toFixed(4),
-          sample.peakCpuPct.toFixed(4),
           sample.totalRssMb.toFixed(3),
-          sample.meanRssMb.toFixed(3),
           sample.peakRssMb.toFixed(3),
+          sample.treeCpuSeconds.toFixed(6),
+          sample.treeCpuSecondsDelta.toFixed(6),
+          sample.treeCpuSecondsRawSnapshot.toFixed(6),
         ].join(",")
       ),
     ];
 
     fs.writeFileSync(csvPath, `${lines.join("\n")}\n`);
     const pidMetadata = this.readPidMetadata();
+    const perPidCpuSeconds = new Map(
+      this.tracker.getPerPidSummary().map((entry) => [entry.pid, entry.cpuSeconds]),
+    );
     const perPidSummary = Array.from(this.pidSamples.entries())
       .map(([pid, samples]) => {
         const sampleCount = samples.length;
@@ -510,7 +393,6 @@ class AttemptResourceSampler {
         const wallTimeSec = sampleCount > 1
           ? (samples[samples.length - 1].elapsedMs - samples[0].elapsedMs) / 1000
           : 0;
-        const cpuSeconds = (meanCpuPct / 100) * wallTimeSec;
         const meta = pidMetadata.get(pid) || null;
         return {
           pid,
@@ -519,7 +401,7 @@ class AttemptResourceSampler {
           command: meta?.command || samples[0]?.command || "",
           sampleCount,
           wallTimeSec,
-          cpuSeconds,
+          cpuSeconds: perPidCpuSeconds.get(pid) ?? 0,
           meanCpuPct,
           peakCpuPct,
           meanRssMb,
@@ -908,9 +790,29 @@ class CustomPatternComparisonRunner {
     const topicPrefix = `bench/${attemptId}`;
     const timestampBounds = extractDatasetTimestampBoundsMs(smartphoneDataPath);
     const timestampDomainMin = benchmarkEventTimeAnchor;
+
+    const targetWindowsStr = process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "35";
+    const targetWindows = parseInt(targetWindowsStr, 10);
+    const outputWindowRangeMs = parseInt(process.env.OUTPUT_WINDOW_RANGE || "120000", 10);
+    const outputWindowStepMs = parseInt(process.env.OUTPUT_WINDOW_STEP || "60000", 10);
+    const derivedReplayDurationSeconds = Math.ceil(
+      (outputWindowRangeMs + ((targetWindows + 2) * outputWindowStepMs)) / 1000
+    );
+
+    const finiteReplayDurationSeconds =
+      process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS ||
+      String(derivedReplayDurationSeconds);
+    const finiteReplayExplicitlySet =
+      process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY !== undefined;
+    const finiteReplay = finiteReplayExplicitlySet
+      ? process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY
+      : "1";
+
+    const finalTestTimeoutMs = Math.max((derivedReplayDurationSeconds * 1000) + 120000, this.timeout);
+
     const timestampDomainMax =
       benchmarkEventTimeAnchor +
-      this.timeout +
+      finalTestTimeoutMs +
       120000 +
       Math.max(0, timestampBounds.durationMs || 0);
 
@@ -920,8 +822,8 @@ class CustomPatternComparisonRunner {
       benchmark_event_time_anchor: benchmarkEventTimeAnchor,
       timestamp_domain_min: timestampDomainMin,
       timestamp_domain_max: timestampDomainMax,
-      output_window_range: process.env.OUTPUT_WINDOW_RANGE || "120000",
-      output_window_step: process.env.OUTPUT_WINDOW_STEP || "60000",
+      output_window_range: String(outputWindowRangeMs),
+      output_window_step: String(outputWindowStepMs),
       sub_window_range: process.env.SUB_WINDOW_RANGE || "60000",
       sub_window_step: process.env.SUB_WINDOW_STEP || "30000",
       data_path: dataPath,
@@ -956,6 +858,21 @@ class CustomPatternComparisonRunner {
       ),
       STREAMING_QUERY_HIVE_TIMESTAMP_DOMAIN_MIN: String(timestampDomainMin),
       STREAMING_QUERY_HIVE_TIMESTAMP_DOMAIN_MAX: String(timestampDomainMax),
+      STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: targetWindowsStr,
+      STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD:
+        process.env.STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD || "1",
+      STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE:
+        process.env.STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE || "1",
+      STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE:
+        process.env.STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_USE_IMMEDIATE_TRIGGER:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_USE_IMMEDIATE_TRIGGER || "1",
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: finiteReplay,
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: finiteReplayDurationSeconds,
     });
 
     console.log(
@@ -1142,7 +1059,7 @@ class CustomPatternComparisonRunner {
             exitCode: null,
             duration: Date.now() - startTime,
             durationMs: Date.now() - startTime,
-            configuredTimeoutMs: this.timeout,
+            configuredTimeoutMs: finalTestTimeoutMs,
             logDir,
             iterationRootDir,
             benchmarkEventTimeAnchor,
@@ -1159,6 +1076,91 @@ class CustomPatternComparisonRunner {
           durationMs: Date.now() - startTime,
           lastChildActivityAt,
         });
+
+        if (finalized) {
+          return;
+        }
+
+        // Verify if the orchestrator completed cleanly and emitted the target windows
+        let hasValidOutput = false;
+        let invalidReason = "";
+
+        if (code !== 0 || signal !== null) {
+          invalidReason = `exit code: ${code}, signal: ${signal}`;
+        } else {
+          const summaryPath = path.join(logDir, "benchmark_window_cap_summary.json");
+          if (!fs.existsSync(summaryPath)) {
+            invalidReason = "missing benchmark_window_cap_summary.json";
+          } else {
+            try {
+              const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+              if (summary.stoppedAfterTargetWindows !== true) {
+                invalidReason = "stoppedAfterTargetWindows is not true in summary";
+              } else if (typeof summary.emittedFinalWindowCount !== "number" || summary.emittedFinalWindowCount < targetWindows) {
+                invalidReason = `emittedFinalWindowCount ${summary.emittedFinalWindowCount} is less than target windows ${targetWindows}`;
+              } else {
+                hasValidOutput = true;
+              }
+            } catch (err) {
+              invalidReason = `failed to parse benchmark_window_cap_summary.json: ${err.message}`;
+            }
+          }
+        }
+
+        if (hasValidOutput) {
+          console.log(`✓ Approach process exited cleanly after reaching target windows`);
+          void (async () => {
+            const durationMs = Date.now() - startTime;
+            await finalizeAttempt({
+              approach,
+              pattern: patternName,
+              patternDisplayName: pattern.name,
+              patternParams: pattern.params,
+              iteration: iterationNum,
+              attempt: attemptNumber,
+              benchmarkStatus: "completed",
+              terminationReason: "process_exit",
+              timedOut: false,
+              reachedDurationLimit: false,
+              exitCode: code,
+              duration: durationMs,
+              durationMs,
+              configuredTimeoutMs: finalTestTimeoutMs,
+              logDir,
+              iterationRootDir,
+              benchmarkEventTimeAnchor,
+              topicPrefix,
+            });
+          })();
+        } else {
+          // Early exit failure
+          console.log(`✗ Approach process exited early and invalidly: ${invalidReason}`);
+          void (async () => {
+            const durationMs = Date.now() - startTime;
+            const errorMsg = `Approach process exited early and invalidly: exit code ${code}, signal ${signal} (${invalidReason})`;
+            await finalizeAttempt({
+              approach,
+              pattern: patternName,
+              patternDisplayName: pattern.name,
+              patternParams: pattern.params,
+              iteration: iterationNum,
+              attempt: attemptNumber,
+              benchmarkStatus: "failed",
+              terminationReason: "process_error",
+              timedOut: false,
+              reachedDurationLimit,
+              exitCode: code,
+              duration: durationMs,
+              durationMs,
+              configuredTimeoutMs: finalTestTimeoutMs,
+              logDir,
+              iterationRootDir,
+              benchmarkEventTimeAnchor,
+              topicPrefix,
+              error: errorMsg,
+            });
+          })();
+        }
       });
 
       publisherStartTimer = setTimeout(() => {
@@ -1219,7 +1221,7 @@ class CustomPatternComparisonRunner {
         timeoutId = setTimeout(() => {
           lifecycleLog("timeout.watchdog.fired", {
             attemptId,
-            timeoutMs: this.timeout,
+            timeoutMs: finalTestTimeoutMs,
             timestamp: lifecycleTs(),
             lastPublisherActivityAt,
             lastChildActivityAt,
@@ -1228,10 +1230,10 @@ class CustomPatternComparisonRunner {
           console.log("⏰ Benchmark duration limit reached");
           reachedDurationLimit = true;
           void cleanupAttempt();
-        }, this.timeout);
+        }, finalTestTimeoutMs);
         lifecycleLog("timeout.watchdog.armed", {
           attemptId,
-          timeoutMs: this.timeout,
+          timeoutMs: finalTestTimeoutMs,
           armedAt: lifecycleTs(),
           waitState: currentWaitState,
         });
@@ -1252,7 +1254,7 @@ class CustomPatternComparisonRunner {
             exitCode: null,
             duration: Date.now() - startTime,
             durationMs: Date.now() - startTime,
-            configuredTimeoutMs: this.timeout,
+            configuredTimeoutMs: finalTestTimeoutMs,
             logDir,
             iterationRootDir,
             benchmarkEventTimeAnchor,
@@ -1293,7 +1295,7 @@ class CustomPatternComparisonRunner {
               exitCode: code,
               duration: durationMs,
               durationMs,
-              configuredTimeoutMs: this.timeout,
+              configuredTimeoutMs: finalTestTimeoutMs,
               logDir,
               iterationRootDir,
               benchmarkEventTimeAnchor,
@@ -1786,21 +1788,28 @@ class CustomPatternComparisonRunner {
     console.log("RUNNING COMPREHENSIVE ANALYSIS");
     console.log("=".repeat(80));
 
-    // Note: You'll need to create a custom analysis script for these patterns
-    // For now, just print instructions
-    console.log("\n⚠️  Custom analysis script needed");
-    console.log(
-      "Create: analysis/accuracy/custom-pattern-accuracy-comparison.js",
-    );
-    console.log("This script should:");
-    console.log("  1. Read all iteration data for each pattern-approach");
-    console.log("  2. Compute mean ± std for MAPE, MAE, RMSE");
-    console.log("  3. Compute mean ± std for latency and memory");
-    console.log("  4. Generate aggregated CSV and JSON outputs");
-    console.log("\nFor now, results are in individual iteration directories.");
-    console.log("=".repeat(80));
+    return new Promise((resolve) => {
+      const proc = spawn(
+        "node",
+        ["analysis/accuracy/accuracy-comparison-custom-patterns.js"],
+        { stdio: "inherit" },
+      );
 
-    return true;
+      proc.on("close", (code) => {
+        if (code === 0) {
+          console.log("✓ Analysis completed");
+          resolve(true);
+        } else {
+          console.log("⚠️  Analysis completed with warnings/errors");
+          resolve(false);
+        }
+      });
+
+      proc.on("error", (err) => {
+        console.error(`✗ Failed to run analysis: ${err.message}`);
+        resolve(false);
+      });
+    });
   }
 }
 

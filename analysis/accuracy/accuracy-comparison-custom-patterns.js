@@ -604,21 +604,42 @@ function calculateStats(values) {
   };
 }
 
-function compareResults(baselineResults, approachResults) {
+function compareResults(baselineResults, approachResults, options = {}) {
+  const trimStart = options.trimWindowStart;
+  const trimEnd = options.trimWindowEnd;
+  const methodologyLabel = options.methodologyLabel || "raw";
+
+  let filteredBaseline = baselineResults;
+  let filteredApproach = approachResults;
+
+  if (Number.isFinite(trimStart)) {
+    filteredBaseline = filteredBaseline.filter((r) => r.windowNumber >= trimStart);
+    filteredApproach = filteredApproach.filter((r) => r.windowNumber >= trimStart);
+  }
+  if (Number.isFinite(trimEnd)) {
+    filteredBaseline = filteredBaseline.filter((r) => r.windowNumber <= trimEnd);
+    filteredApproach = filteredApproach.filter((r) => r.windowNumber <= trimEnd);
+  }
+
   const baselineByWindow = new Map();
   const approachByWindow = new Map();
+  const bothSidesHaveWindowNumbers =
+    filteredBaseline.every((result) => Number.isFinite(result.windowNumber)) &&
+    filteredApproach.every((result) => Number.isFinite(result.windowNumber));
   const hasWindowBounds = (result) =>
     Number.isFinite(result.windowStart) && Number.isFinite(result.windowEnd);
   const getWindowKey = (result) =>
-    hasWindowBounds(result)
+    bothSidesHaveWindowNumbers
+      ? `window-number:${result.windowNumber}`
+      : hasWindowBounds(result)
       ? `${result.windowStart}:${result.windowEnd}`
       : `window-number:${result.windowNumber}`;
 
-  for (const result of baselineResults) {
+  for (const result of filteredBaseline) {
     baselineByWindow.set(getWindowKey(result), result);
   }
 
-  for (const result of approachResults) {
+  for (const result of filteredApproach) {
     approachByWindow.set(getWindowKey(result), result);
   }
 
@@ -646,8 +667,8 @@ function compareResults(baselineResults, approachResults) {
   }
 
   const matchedWindowCount = matchedWindowKeys.length;
-  const baselineOnlyCount = baselineResults.length - matchedWindowCount;
-  const approachOnlyCount = approachResults.length - matchedWindowCount;
+  const baselineOnlyCount = filteredBaseline.length - matchedWindowCount;
+  const approachOnlyCount = filteredApproach.length - matchedWindowCount;
 
   return {
     matchedWindowCount,
@@ -660,6 +681,9 @@ function compareResults(baselineResults, approachResults) {
       mapeApplicableWindowCount > 0
         ? sumPercentageError / mapeApplicableWindowCount
         : null,
+    methodologyLabel,
+    baselineResultCount: filteredBaseline.length,
+    approachResultCount: filteredApproach.length,
   };
 }
 
@@ -718,6 +742,7 @@ function buildPatternSummary(
   executionContext,
   configuredIterationCountOverride,
   explicitIterations,
+  options = {},
 ) {
   const fetchingRoot = getApproachRoot(inputRoot, "fetching", pattern.type);
   const configuredIterationCount = configuredIterationCountOverride;
@@ -878,7 +903,7 @@ function buildPatternSummary(
         continue;
       }
 
-      const comparison = compareResults(baselineResults, approachResults);
+      const comparison = compareResults(baselineResults, approachResults, options);
 
       matchedWindowsTotals.push(comparison.matchedWindowCount);
       baselineOnlyTotals.push(comparison.baselineOnlyCount);
@@ -895,8 +920,8 @@ function buildPatternSummary(
 
       comparableIterationDetails.push({
         iteration: iterationNumber,
-        baselineResultCount: baselineResults.length,
-        approachResultCount: approachResults.length,
+        baselineResultCount: comparison.baselineResultCount,
+        approachResultCount: comparison.approachResultCount,
         matchedWindowCount: comparison.matchedWindowCount,
         baselineOnlyCount: comparison.baselineOnlyCount,
         approachOnlyCount: comparison.approachOnlyCount,
@@ -1041,6 +1066,7 @@ function summarizePatterns(
   executionContext,
   configuredIterationCount,
   explicitIterations,
+  options = {},
 ) {
   return patterns.map((pattern) =>
     buildPatternSummary(
@@ -1051,6 +1077,7 @@ function summarizePatterns(
       executionContext,
       configuredIterationCount,
       explicitIterations,
+      options,
     ),
   );
 }
@@ -1342,7 +1369,7 @@ function main() {
     effectiveOptionalApproaches = optionalApproaches.filter((approach) => metadataSelectedApproaches.includes(approach));
   }
 
-  const patternSummaries = summarizePatterns(
+  const rawPatternSummaries = summarizePatterns(
     resolvedInputRoot,
     effectivePatterns,
     effectiveRequiredApproaches,
@@ -1350,60 +1377,110 @@ function main() {
     executionContext,
     configuredIterationCount,
     args.selectedIterations,
+    {}
   );
-  const csvRows = buildCsvRows(patternSummaries);
+  const rawCsvRows = buildCsvRows(rawPatternSummaries);
 
   ensureDir(args.outputDir);
-  const jsonPath = path.join(args.outputDir, "summary.json");
-  const csvPath = path.join(args.outputDir, "summary.csv");
+  const rawJsonPath = path.join(args.outputDir, "summary.raw.json");
+  const rawCsvPath = path.join(args.outputDir, "summary.raw.csv");
 
-  const summary = buildSummary(
-    patternSummaries,
+  const rawSummary = buildSummary(
+    rawPatternSummaries,
     resolvedInputRoot,
     args.outputDir,
-    csvPath,
+    rawCsvPath,
     effectivePatterns,
     effectiveRequiredApproaches,
     effectiveOptionalApproaches,
     smokeMode,
     executionContext,
   );
-  summary.selectedPatterns = effectivePatterns.map((pattern) => pattern.type);
-  summary.selectedApproaches = selectedApproachTypes || summary.selectedApproaches;
-  summary.selectedIterations = buildExpectedIterationNumbers(
+  rawSummary.selectedPatterns = effectivePatterns.map((pattern) => pattern.type);
+  rawSummary.selectedApproaches = selectedApproachTypes || rawSummary.selectedApproaches;
+  rawSummary.selectedIterations = buildExpectedIterationNumbers(
     configuredIterationCount,
     [],
     args.selectedIterations,
   );
 
-  fs.writeFileSync(jsonPath, `${JSON.stringify(summary, null, 2)}\n`);
-  writeCsv(csvPath, csvRows);
+  const trimmedPatternSummaries = summarizePatterns(
+    resolvedInputRoot,
+    effectivePatterns,
+    effectiveRequiredApproaches,
+    effectiveOptionalApproaches,
+    executionContext,
+    configuredIterationCount,
+    args.selectedIterations,
+    {
+      trimWindowStart: 4,
+      trimWindowEnd: 33,
+      methodologyLabel: "trimmed-4-33",
+    }
+  );
+  const trimmedCsvRows = buildCsvRows(trimmedPatternSummaries);
+  const trimmedJsonPath = path.join(args.outputDir, "summary.trimmed-4-33.json");
+  const trimmedCsvPath = path.join(args.outputDir, "summary.trimmed-4-33.csv");
+
+  const trimmedSummary = buildSummary(
+    trimmedPatternSummaries,
+    resolvedInputRoot,
+    args.outputDir,
+    trimmedCsvPath,
+    effectivePatterns,
+    effectiveRequiredApproaches,
+    effectiveOptionalApproaches,
+    smokeMode,
+    executionContext,
+  );
+  trimmedSummary.selectedPatterns = effectivePatterns.map((pattern) => pattern.type);
+  trimmedSummary.selectedApproaches = selectedApproachTypes || trimmedSummary.selectedApproaches;
+  trimmedSummary.selectedIterations = buildExpectedIterationNumbers(
+    configuredIterationCount,
+    [],
+    args.selectedIterations,
+  );
+
+  const compatJsonPath = path.join(args.outputDir, "summary.json");
+  const compatCsvPath = path.join(args.outputDir, "summary.csv");
+
+  const compatSummary = {
+    ...trimmedSummary,
+    csvPath: compatCsvPath,
+  };
+
+  fs.writeFileSync(rawJsonPath, `${JSON.stringify(rawSummary, null, 2)}\n`);
+  writeCsv(rawCsvPath, rawCsvRows);
+  fs.writeFileSync(trimmedJsonPath, `${JSON.stringify(trimmedSummary, null, 2)}\n`);
+  writeCsv(trimmedCsvPath, trimmedCsvRows);
+  fs.writeFileSync(compatJsonPath, `${JSON.stringify(compatSummary, null, 2)}\n`);
+  writeCsv(compatCsvPath, trimmedCsvRows);
 
   console.log("Custom pattern accuracy summary generated.");
   console.log(`Input root: ${resolvedInputRoot}`);
-  console.log(`JSON summary: ${jsonPath}`);
-  console.log(`CSV summary: ${csvPath}`);
+  console.log(`JSON summary: ${compatJsonPath}`);
+  console.log(`CSV summary: ${compatCsvPath}`);
 
-  if (summary.ignoredObservedIterations.length > 0) {
-    const ignoredList = summary.ignoredObservedIterations
+  if (compatSummary.ignoredObservedIterations.length > 0) {
+    const ignoredList = compatSummary.ignoredObservedIterations
       .map((entry) => `${entry.patternType}/${entry.approach}: [${entry.ignoredObservedIterations.join(", ")}]`)
       .join("; ");
     console.warn(`Ignoring stale iteration directories outside configured range: ${ignoredList}`);
   }
 
-  if (summary.failedExecutionCases.length > 0) {
+  if (compatSummary.failedExecutionCases.length > 0) {
     console.warn("Execution failures were recorded for benchmark cases:");
-    for (const entry of summary.failedExecutionCases) {
+    for (const entry of compatSummary.failedExecutionCases) {
       console.warn(
         `- ${entry.approach} / ${entry.pattern} / iteration${entry.iteration}: ${entry.failureReason || entry.failureStage || "failed"}`,
       );
     }
     console.warn(
-      `Data completeness and execution cleanliness are reported separately. validationClean=${summary.summary.validationClean}`,
+      `Data completeness and execution cleanliness are reported separately. validationClean=${compatSummary.summary.validationClean}`,
     );
   }
 
-  const missingRequired = summary.missingRequiredComparisons;
+  const missingRequired = compatSummary.missingRequiredComparisons;
   if (missingRequired.length > 0) {
     if (smokeMode) {
       console.warn("Smoke mode: partial comparison coverage is expected for pipeline validation.");
@@ -1427,4 +1504,8 @@ if (require.main === module) {
     console.error(error.stack || error.message);
     process.exit(1);
   }
+} else {
+  module.exports = {
+    compareResults,
+  };
 }
