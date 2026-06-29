@@ -80,7 +80,9 @@ const APPROACHES = [
 function parseCliArgs(argv) {
   const args = {
     analyzeOnly: false,
+    approachNames: null,
     iterations: 3,
+    targetWindowCount: null,
   };
 
   const positional = [];
@@ -96,6 +98,35 @@ function parseCliArgs(argv) {
         throw new Error(`${arg} requires a positive integer`);
       }
       args.iterations = value;
+      index += 1;
+      continue;
+    }
+    if (arg === "--approach" || arg === "--approaches") {
+      const rawValue = String(argv[index + 1] || "").trim();
+      if (!rawValue) {
+        throw new Error(`${arg} requires a value`);
+      }
+      const selectedNames = rawValue
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      if (selectedNames.length === 0) {
+        throw new Error(`${arg} requires a value`);
+      }
+      const invalidNames = selectedNames.filter((name) => !getApproachByName(name));
+      if (invalidNames.length > 0) {
+        throw new Error(`Unknown approach name(s): ${invalidNames.join(", ")}`);
+      }
+      args.approachNames = [...new Set(selectedNames)];
+      index += 1;
+      continue;
+    }
+    if (arg === "--target-windows") {
+      const value = Number.parseInt(argv[index + 1] || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error("--target-windows requires a positive integer");
+      }
+      args.targetWindowCount = value;
       index += 1;
       continue;
     }
@@ -336,7 +367,7 @@ function selectWindows(rows, startWindow, endWindow) {
   return rows.filter((row) => row.windowNumber >= startWindow && row.windowNumber <= endWindow);
 }
 
-function buildPaperConfig(iterationCount) {
+function buildPaperConfig(iterationCount, options = {}) {
   const effectiveIterations = Math.max(iterationCount, PAPER_TARGET_WINDOWS);
   const trimmed = buildTrimmedIterationSelection({
     iterations: effectiveIterations,
@@ -344,10 +375,14 @@ function buildPaperConfig(iterationCount) {
     dropCooldown: DEFAULT_DROP_COOLDOWN,
   });
 
+  const configuredTargetWindows = Number.parseInt(options.targetWindowCount || "", 10);
   return {
-    targetWindows:
-      Number.parseInt(process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "", 10) ||
-      PAPER_TARGET_WINDOWS,
+    targetWindows: configuredTargetWindows > 0
+      ? configuredTargetWindows
+      : (
+        Number.parseInt(process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "", 10) ||
+        PAPER_TARGET_WINDOWS
+      ),
     analysisWindowStart: trimmed.startIteration || DEFAULT_ANALYSIS_WINDOW_START,
     analysisWindowEnd: trimmed.endIteration || DEFAULT_ANALYSIS_WINDOW_END,
     trimmedIterations: trimmed.iterations,
@@ -397,9 +432,14 @@ function resolveFiniteReplayDurationSeconds(env, paperConfig) {
 class RealDataComparisonRunner {
   constructor(options = {}) {
     this.iterations = options.iterations || 3;
+    this.selectedApproaches = options.approachNames
+      ? APPROACHES.filter((approach) => options.approachNames.includes(approach.name))
+      : APPROACHES;
     this.results = [];
     this.replayEnv = createBenchmarkReplayRunEnv(process.env);
-    this.paperConfig = buildPaperConfig(this.iterations);
+    this.paperConfig = buildPaperConfig(this.iterations, {
+      targetWindowCount: options.targetWindowCount,
+    });
     ensureDir(LOGS_DIR);
   }
 
@@ -636,16 +676,16 @@ class RealDataComparisonRunner {
 
   async runAllTests() {
     console.log("Starting real-data 4-approach comparison");
-    console.log(`Approaches: ${APPROACHES.map((approach) => approach.label).join(", ")}`);
+    console.log(`Approaches: ${this.selectedApproaches.map((approach) => approach.label).join(", ")}`);
     console.log(`Iterations per approach: ${this.iterations}`);
     console.log(`Target windows per run: ${this.paperConfig.targetWindows}`);
     console.log(`Trimmed analysis windows: ${this.paperConfig.analysisWindowStart}..${this.paperConfig.analysisWindowEnd}`);
     console.log(`Default replay frequency: ${this.paperConfig.defaultReplayFrequencyHz} Hz\n`);
 
-    const totalTests = APPROACHES.length * this.iterations;
+    const totalTests = this.selectedApproaches.length * this.iterations;
     let completedTests = 0;
 
-    for (const approach of APPROACHES) {
+    for (const approach of this.selectedApproaches) {
       for (let iteration = 1; iteration <= this.iterations; iteration += 1) {
         try {
           const result = await this.runSingleTest(approach, iteration);
@@ -1050,7 +1090,11 @@ class RealDataComparisonRunner {
 
 async function main() {
   const args = parseCliArgs(process.argv.slice(2));
-  const runner = new RealDataComparisonRunner({ iterations: args.iterations });
+  const runner = new RealDataComparisonRunner({
+    iterations: args.iterations,
+    approachNames: args.approachNames,
+    targetWindowCount: args.targetWindowCount,
+  });
 
   if (args.analyzeOnly) {
     runner.discoverExistingResults();
@@ -1074,6 +1118,7 @@ if (require.main === module) {
     buildPaperConfig,
     computeReplayDurationSeconds,
     computeRunTimeoutMs,
+    getApproachByName,
     resolveFiniteReplayDurationSeconds,
     normalizeLatencyRows,
     parseCliArgs,

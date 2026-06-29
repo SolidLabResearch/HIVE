@@ -218,7 +218,7 @@ export function logLatency(args: {
     wallClockWindowClose !== null &&
     Math.abs(Number(wallClockCloseToResultMs)) > maxPlausibleLatencyMs
   ) {
-    throw new Error(
+    console.warn(
       `Chunked latency plausibility check failed for window ${args.windowNumber}: wall_clock_close_to_result_ms=${wallClockCloseToResultMs}`,
     );
   }

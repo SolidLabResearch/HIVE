@@ -212,6 +212,41 @@ type WindowPartialAggregate = {
     latencyFromWindowCloseMs: number | null;
 };
 
+export function maybeFinalizeNaiveBenchmarkTargetWindowCount(params: {
+    finalizedWindowNumbers: Set<number>;
+    benchmarkTargetWindowCount: number | null;
+    benchmarkWindowSummaryPath: string;
+    scheduleShutdown: () => void;
+}): boolean {
+    const {
+        finalizedWindowNumbers,
+        benchmarkTargetWindowCount,
+        benchmarkWindowSummaryPath,
+        scheduleShutdown,
+    } = params;
+
+    if (
+        !Number.isFinite(benchmarkTargetWindowCount) ||
+        finalizedWindowNumbers.size < (benchmarkTargetWindowCount as number)
+    ) {
+        return false;
+    }
+
+    fs.writeFileSync(
+        benchmarkWindowSummaryPath,
+        `${JSON.stringify({
+            targetWindowCount: benchmarkTargetWindowCount,
+            emittedFinalWindowCount: finalizedWindowNumbers.size,
+            finalWindowNumbers: [...finalizedWindowNumbers].sort((left, right) => left - right),
+            stoppedAfterTargetWindows: true,
+            stopReason: "target_window_count_reached",
+            approach: "naive_distributed",
+        }, null, 2)}\n`,
+    );
+    scheduleShutdown();
+    return true;
+}
+
 function parseBindingFields(binding: any): ParsedBindingFields {
     const entry = (key: string) => {
         if (binding instanceof Map) {
@@ -355,6 +390,16 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
     const resultTopic = getResultTopic("naive_distributed/output");
     const benchmarkTargetWindowCount = getBenchmarkTargetWindowCount();
     const benchmarkWindowSummaryPath = `${process.env.LOG_PATH || "."}/benchmark_window_cap_summary.json`;
+    let benchmarkShutdownInitiated = false;
+    const scheduleBenchmarkShutdown = () => {
+        if (benchmarkShutdownInitiated) {
+            return;
+        }
+        benchmarkShutdownInitiated = true;
+        setTimeout(() => {
+            process.exit(0);
+        }, 50);
+    };
     const subQuery1 = buildSubQuery1(
         aggregationFunction,
         subWindowRange,
@@ -421,6 +466,9 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
             : [object.bindings];
 
         for (const binding of bindings) {
+            if (benchmarkShutdownInitiated) {
+                continue;
+            }
             const parsed = parseBindingFields(binding);
             const emittedWindowNumber = Number(object?.window_number);
             const logicalTriggerTime = Number(object?.logical_trigger_time);
@@ -581,22 +629,12 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
                 );
             });
 
-            if (
-                Number.isFinite(benchmarkTargetWindowCount) &&
-                finalizedWindowNumbers.size >= (benchmarkTargetWindowCount as number)
-            ) {
-                fs.writeFileSync(
-                    benchmarkWindowSummaryPath,
-                    `${JSON.stringify({
-                        targetWindowCount: benchmarkTargetWindowCount,
-                        emittedFinalWindowCount: finalizedWindowNumbers.size,
-                        finalWindowNumbers: [...finalizedWindowNumbers].sort((left, right) => left - right),
-                        stoppedAfterTargetWindows: true,
-                        stopReason: "target_window_count_reached",
-                        approach: "naive_distributed",
-                    }, null, 2)}\n`,
-                );
-            }
+            maybeFinalizeNaiveBenchmarkTargetWindowCount({
+                finalizedWindowNumbers,
+                benchmarkTargetWindowCount,
+                benchmarkWindowSummaryPath,
+                scheduleShutdown: scheduleBenchmarkShutdown,
+            });
         }
     });
 
@@ -649,7 +687,9 @@ function startResourceUsageLogging(
     timer.unref?.();
 }
 
-startResourceUsageLogging();
-NaiveDistributedApproachOrchestrator().catch((error) => {
-    console.error("Error in Naive Distributed orchestrator:", error);
-});
+if (require.main === module) {
+    startResourceUsageLogging();
+    NaiveDistributedApproachOrchestrator().catch((error) => {
+        console.error("Error in Naive Distributed orchestrator:", error);
+    });
+}

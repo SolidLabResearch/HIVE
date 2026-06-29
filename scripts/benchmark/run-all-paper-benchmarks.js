@@ -70,6 +70,7 @@ function parseArgs(argv) {
     smoke: false,
     refreshSummaryOnly: null,
     skipBrokerPreflight: false,
+    targetWindows: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -149,6 +150,10 @@ function parseArgs(argv) {
         ]);
         index += 1;
         break;
+      case "--target-windows":
+        args.targetWindows = parseIntegerFlag("--target-windows", next);
+        index += 1;
+        break;
       case "--output-dir":
         args.outputDir = requireValue("--output-dir", next);
         args.outputDirProvided = true;
@@ -211,7 +216,8 @@ Options:
   --pattern-test-timeout <ms> Default: 300000
   --retries <n>               Retry failed custom-pattern cases N additional times
   --patterns <list>           Comma-separated custom-pattern types
-  --approaches <list>         Comma-separated custom-pattern approaches
+  --approaches <list>         Comma-separated approaches
+  --target-windows <n>        Override real-data target window count
   --output-dir <path>         Default: results/paper-benchmarks/<timestamp>
                               or results/paper-benchmarks/smoke-<timestamp> with --smoke
   --dry-run                   Print commands without executing them
@@ -846,9 +852,24 @@ function createJobDefinitions(config) {
       suites: ["real-data", "latency", "resources", "naive-distributed"],
       command: [
         "node",
-        ["experiments/real-data-comparison/run-real-data-4-approaches.js", "--iterations", String(config.iterations)],
+        [
+          "experiments/real-data-comparison/run-real-data-4-approaches.js",
+          "--iterations",
+          String(config.iterations),
+          ...(config.approaches && config.approaches.length > 0
+            ? ["--approaches", config.approaches.join(",")]
+            : []),
+          ...(Number.isFinite(config.targetWindows) && config.targetWindows > 0
+            ? ["--target-windows", String(config.targetWindows)]
+            : []),
+        ],
       ],
-      env: sharedEnv,
+      env: {
+        ...sharedEnv,
+        ...(Number.isFinite(config.targetWindows) && config.targetWindows > 0
+          ? { STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: String(config.targetWindows) }
+          : {}),
+      },
       sourceLogs: path.join(REPO_ROOT, "experiments/real-data-comparison/logs"),
       snapshot(outputDir) {
         return snapshotRealDataArtifacts(this.sourceLogs, outputDir);

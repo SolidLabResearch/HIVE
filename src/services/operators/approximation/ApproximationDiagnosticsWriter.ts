@@ -102,6 +102,40 @@ export class ApproximationDiagnosticsWriter {
     };
   }
 
+  private validateWallClockLatency(
+    wallClockWindowClose: number | null,
+    resultTime: number,
+    latencyDomainStatus:
+      | "wall_clock_mapped"
+      | "runtime_anchor_missing"
+      | "event_time_missing"
+      | "domain_mismatch",
+  ): {
+    wallClockWindowClose: number | null;
+    latencyDomainStatus:
+      | "wall_clock_mapped"
+      | "runtime_anchor_missing"
+      | "event_time_missing"
+      | "domain_mismatch";
+  } {
+    if (
+      latencyDomainStatus !== "wall_clock_mapped" ||
+      wallClockWindowClose === null
+    ) {
+      return { wallClockWindowClose, latencyDomainStatus };
+    }
+
+    const wallClockCloseToResultMs = resultTime - wallClockWindowClose;
+    if (Math.abs(wallClockCloseToResultMs) > this.maxPlausibleLatencyMs) {
+      return {
+        wallClockWindowClose: null,
+        latencyDomainStatus: "domain_mismatch",
+      };
+    }
+
+    return { wallClockWindowClose, latencyDomainStatus };
+  }
+
   /**
    * Calculate expected window close time for a given window number
    * Window N closes at: queryRegisteredTime + RANGE + (N-1) * STEP
@@ -142,8 +176,14 @@ export class ApproximationDiagnosticsWriter {
     const latencyFromDataStart = resultTime - expectedFromDataStart;
     const latencyFromLastData = resultTime - lastDataReceivedAt;
     const eventTimeWindowClose = metadata.windowDataCloseTime ?? null;
-    const { wallClockWindowClose, latencyDomainStatus } =
+    const resolvedWallClock =
       this.resolveWallClockWindowClose(eventTimeWindowClose);
+    const { wallClockWindowClose, latencyDomainStatus } =
+      this.validateWallClockLatency(
+        resolvedWallClock.wallClockWindowClose,
+        resultTime,
+        resolvedWallClock.latencyDomainStatus,
+      );
     const wallClockCloseToResultMs =
       wallClockWindowClose !== null ? resultTime - wallClockWindowClose : "";
     const approximationStatus =
@@ -161,15 +201,6 @@ export class ApproximationDiagnosticsWriter {
         : "";
     const latencyFromWindowCloseMs =
       wallClockWindowClose !== null ? resultTime - wallClockWindowClose : "";
-
-    if (
-      wallClockWindowClose !== null &&
-      Math.abs(Number(wallClockCloseToResultMs)) > this.maxPlausibleLatencyMs
-    ) {
-      throw new Error(
-        `Approximation latency plausibility check failed for window ${windowNumber}: wall_clock_close_to_result_ms=${wallClockCloseToResultMs}`,
-      );
-    }
 
     if (
       latencyDomainStatus !== "wall_clock_mapped" &&

@@ -8,6 +8,8 @@ const {
   buildPaperConfig,
   computeReplayDurationSeconds,
   computeRunTimeoutMs,
+  getApproachByName,
+  parseCliArgs,
   resolveFiniteReplayDurationSeconds,
 } = require("./run-real-data-4-approaches.js");
 
@@ -147,6 +149,97 @@ describe("real-data paper-ready analysis", () => {
     expect(resolveFiniteReplayDurationSeconds({
       STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: "2500",
     }, paperConfig)).toBe(2500);
+  });
+
+  test("parseCliArgs accepts the plural approach filter for the three paper-ready approaches", () => {
+    expect(parseCliArgs([
+      "--iterations",
+      "3",
+      "--approaches",
+      "fetching,approximation,chunked",
+    ])).toEqual({
+      analyzeOnly: false,
+      approachNames: ["fetching", "approximation", "chunked"],
+      iterations: 3,
+      targetWindowCount: null,
+    });
+
+    const runner = new RealDataComparisonRunner({
+      iterations: 3,
+      approachNames: ["fetching", "approximation", "chunked"],
+    });
+    expect(runner.selectedApproaches.map((approach) => approach.name)).toEqual([
+      "fetching",
+      "approximation",
+      "chunked",
+    ]);
+    expect(runner.selectedApproaches.some((approach) => approach.name === "naive_distributed")).toBe(false);
+    expect(getApproachByName("approximation")?.label).toBe("Approximation");
+  });
+
+  test("parseCliArgs keeps the singular approach flag as a compatibility alias", () => {
+    expect(parseCliArgs(["--iterations", "1", "--approach", "approximation"])).toEqual({
+      analyzeOnly: false,
+      approachNames: ["approximation"],
+      iterations: 1,
+      targetWindowCount: null,
+    });
+  });
+
+  test("parseCliArgs accepts target-window counts of 1 and 35", () => {
+    expect(parseCliArgs(["--iterations", "2", "--target-windows", "1"])).toEqual({
+      analyzeOnly: false,
+      approachNames: null,
+      iterations: 2,
+      targetWindowCount: 1,
+    });
+
+    expect(parseCliArgs(["--iterations", "1", "--target-windows", "35"])).toEqual({
+      analyzeOnly: false,
+      approachNames: null,
+      iterations: 1,
+      targetWindowCount: 35,
+    });
+  });
+
+  test("buildPaperConfig prefers an explicit target-window override and keeps the env fallback", () => {
+    expect(buildPaperConfig(1, { targetWindowCount: 1 }).targetWindows).toBe(1);
+    expect(buildPaperConfig(1, { targetWindowCount: 35 }).targetWindows).toBe(35);
+
+    const original = process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS;
+    process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS = "7";
+    try {
+      expect(buildPaperConfig(1).targetWindows).toBe(7);
+    } finally {
+      if (original === undefined) {
+        delete process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS;
+      } else {
+        process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS = original;
+      }
+    }
+  });
+
+  test("direct runner preserves selected approaches and target-window counts in run env", () => {
+    const startupRunner = new RealDataComparisonRunner({
+      iterations: 2,
+      approachNames: ["fetching", "approximation", "chunked"],
+      targetWindowCount: 1,
+    });
+    const startupEnv = startupRunner.buildRunEnv(APPROACHES[0], "/tmp/log", 1);
+    expect(startupRunner.selectedApproaches.map((approach) => approach.name)).toEqual([
+      "fetching",
+      "approximation",
+      "chunked",
+    ]);
+    expect(startupEnv.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS).toBe("1");
+
+    const steadyRunner = new RealDataComparisonRunner({
+      iterations: 1,
+      approachNames: ["fetching", "approximation", "chunked"],
+      targetWindowCount: 35,
+    });
+    const steadyEnv = steadyRunner.buildRunEnv(APPROACHES[1], "/tmp/log", 1);
+    expect(steadyEnv.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS).toBe("35");
   });
 
   test("real-data runner uses the base smartphone and wearable datasets", () => {
