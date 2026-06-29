@@ -1,10 +1,20 @@
 
 import { CSVLogger } from '../../util/logger/CSVLogger';
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import * as mqtt from "mqtt";
 import { StreamToMQTT } from './publishing/StreamToMQTT';
 import { buildBenchmarkTopicName, useCleanMqttSessionsForBenchmark } from "../../util/runtimeConfig";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 import { profileCount, writeProfileArtifact } from "../../util/profiling";
+import {
+    buildSyntheticBenchmarkTargets,
+    getConfiguredBenchmarkTargetNames,
+    getConfiguredBenchmarkTargetSource,
+    getConfiguredBenchmarkTargets,
+    getRealBenchmarkTargets,
+} from "../../util/queryTargets";
 
 /**
  *
@@ -102,64 +112,177 @@ function getReplayFrequency(): number {
     return Number.isFinite(configured) && configured > 0 ? configured : 4;
 }
 
+function getConfiguredBasePath(): string {
+    return process.env.DATA_PATH || 'noisy_datasets/noise_0.5';
+}
+
+function getRealStreamDataPath(topicName: string): string {
+    const basePath = getConfiguredBasePath();
+    if (topicName === "smartphoneX") {
+        return `src/streamer/data/${basePath}/smartphone.acceleration.x/data.nt`;
+    }
+    if (topicName === "wearableX") {
+        return `src/streamer/data/${basePath}/wearable.acceleration.x/data.nt`;
+    }
+    throw new Error(`No real replay dataset path configured for target ${topicName}`);
+}
+
+function formatSyntheticValue(baseValue: string, syntheticIndex: number): string {
+    const parsed = Number.parseFloat(baseValue);
+    if (!Number.isFinite(parsed)) {
+        return baseValue;
+    }
+    return (parsed + syntheticIndex).toFixed(6);
+}
+
+function createSyntheticReplayFile(params: {
+    syntheticTargetName: string;
+    syntheticIndex: number;
+    baseFilePath: string;
+    outputDir: string;
+}): string {
+    const { syntheticTargetName, syntheticIndex, baseFilePath, outputDir } = params;
+    const input = fs.readFileSync(baseFilePath, "utf8");
+    const transformed = input
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line, lineIndex) => {
+            const subjectSuffix = `${syntheticTargetName}_obs${lineIndex}`;
+            const datasetSuffix = `${syntheticTargetName}_dataset`;
+            const withSubject = line
+                .replace(/<https:\/\/dahcc\.idlab\.ugent\.be\/Protego\/_participant1\/obs\d+>/g, `<https://dahcc.idlab.ugent.be/Protego/_participant1/${subjectSuffix}>`)
+                .replace(/<https:\/\/dahcc\.idlab\.ugent\.be\/Protego\/_participant1>/g, `<https://dahcc.idlab.ugent.be/Protego/_participant1/${datasetSuffix}>`);
+            const withProperty = withSubject.replace(
+                /<https:\/\/dahcc\.idlab\.ugent\.be\/Homelab\/SensorsAndActuators\/(?:wearableX|smartphoneX)>/g,
+                `<https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/${syntheticTargetName}>`,
+            );
+            return withProperty.replace(
+                /"([+-]?\d+(?:\.\d+)?)"\^\^<http:\/\/www\.w3\.org\/2001\/XMLSchema#float>/,
+                (_match, baseValue) =>
+                    `"${formatSyntheticValue(baseValue, syntheticIndex)}"^^<http://www.w3.org/2001/XMLSchema#float>`,
+            );
+        })
+        .join("\n");
+
+    const outputPath = path.join(outputDir, `${syntheticTargetName}.data.nt`);
+    fs.writeFileSync(outputPath, `${transformed}\n`);
+    return outputPath;
+}
+
+async function replayTargetStream(
+    streamName: string,
+    dataPath: string,
+): Promise<void> {
+    const clientId = 'pub-' + Math.random().toString(16).substr(2, 8);
+    const mqttOptions = { clean: useCleanMqttSessionsForBenchmark(), clientId };
+    const topic = buildBenchmarkTopicName(streamName);
+    const publisher = new StreamToMQTT(
+        'mqtt://localhost:1883',
+        getReplayFrequency(),
+        dataPath,
+        topic,
+        mqttOptions,
+    );
+    lifecycleLog("replay.stream.start", { stream: streamName, dataPath, topic });
+    logger.log(`Starting replay for ${streamName} stream`);
+    await publisher.replay_streams();
+    lifecycleLog("replay.stream.complete", { stream: streamName, dataPath, topic });
+    lifecycleLog("replay.stream.end", { stream: streamName, dataPath, topic });
+    logger.log(`Replay completed for ${streamName} stream`);
+}
+
 /**
  *
  */
 
 async function replaySmartphoneXStream() {
-    // Pass a unique clientId for persistent MQTT session
-    const clientId = 'pub-' + Math.random().toString(16).substr(2, 8);
-    const mqttOptions = { clean: useCleanMqttSessionsForBenchmark(), clientId };
-    
-    // Use DATA_PATH environment variable or default to noisy datasets
-    const basePath = process.env.DATA_PATH || 'noisy_datasets/noise_0.5';
-    const dataPath = `src/streamer/data/${basePath}/smartphone.acceleration.x/data.nt`;
-    
-    const publisher = new StreamToMQTT('mqtt://localhost:1883', getReplayFrequency(), dataPath, buildBenchmarkTopicName("smartphoneX"), mqttOptions);
-    lifecycleLog("replay.stream.start", { stream: "smartphoneX", dataPath, topic: buildBenchmarkTopicName("smartphoneX") });
-    logger.log("Starting replay for SmartphoneX stream");
-    await publisher.replay_streams();
-    lifecycleLog("replay.stream.complete", { stream: "smartphoneX", dataPath, topic: buildBenchmarkTopicName("smartphoneX") });
-    lifecycleLog("replay.stream.end", { stream: "smartphoneX", dataPath, topic: buildBenchmarkTopicName("smartphoneX") });
-    logger.log("Replay completed for SmartphoneX stream");
-
+    await replayTargetStream("smartphoneX", getRealStreamDataPath("smartphoneX"));
 }
 
 /**
  *
  */
 async function replayWearableXStream() {
-    // Pass a unique clientId for persistent MQTT session
-    const clientId = 'pub-' + Math.random().toString(16).substr(2, 8);
-    const mqttOptions = { clean: useCleanMqttSessionsForBenchmark(), clientId };
-    
-    // Use DATA_PATH environment variable or default to noisy datasets
-    const basePath = process.env.DATA_PATH || 'noisy_datasets/noise_0.5';
-    const dataPath = `src/streamer/data/${basePath}/wearable.acceleration.x/data.nt`;
-    
-    const publisher = new StreamToMQTT('mqtt://localhost:1883', getReplayFrequency(), dataPath, buildBenchmarkTopicName("wearableX"), mqttOptions);
-    lifecycleLog("replay.stream.start", { stream: "wearableX", dataPath, topic: buildBenchmarkTopicName("wearableX") });
-    logger.log("Starting replay for WearableX stream");
-    await publisher.replay_streams();
-    lifecycleLog("replay.stream.complete", { stream: "wearableX", dataPath, topic: buildBenchmarkTopicName("wearableX") });
-    lifecycleLog("replay.stream.end", { stream: "wearableX", dataPath, topic: buildBenchmarkTopicName("wearableX") });
-    logger.log("Replay completed for WearableX stream");
+    await replayTargetStream("wearableX", getRealStreamDataPath("wearableX"));
+}
+
+async function replayConfiguredRealTargetStreams(): Promise<void> {
+    const configuredNames = getConfiguredBenchmarkTargetNames();
+    const targets = configuredNames.length > 0
+        ? getConfiguredBenchmarkTargets()
+        : getRealBenchmarkTargets();
+    await Promise.all(
+        targets.map((target) => replayTargetStream(target.topicName, getRealStreamDataPath(target.topicName))),
+    );
+}
+
+async function replaySyntheticTargetStreams(): Promise<void> {
+    const configuredTargets = getConfiguredBenchmarkTargets();
+    const targets = configuredTargets.length > 0
+        ? configuredTargets
+        : buildSyntheticBenchmarkTargets(
+            Number.parseInt(process.env.BENCHMARK_TARGET_COUNT || "2", 10) || 2,
+        );
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "streaming-query-hive-synth-"));
+    const cleanup = () => {
+        try {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {
+            // ignore cleanup errors
+        }
+    };
+
+    try {
+        const baseSourcePaths = [
+            getRealStreamDataPath("wearableX"),
+            getRealStreamDataPath("smartphoneX"),
+        ];
+        const syntheticFiles = targets.map((target, index) => ({
+            targetName: target.topicName,
+            filePath: createSyntheticReplayFile({
+                syntheticTargetName: target.name,
+                syntheticIndex: index + 1,
+                baseFilePath: baseSourcePaths[index % baseSourcePaths.length],
+                outputDir: tempDir,
+            }),
+        }));
+
+        lifecycleLog("replay.synthetic.prepared", {
+            targetCount: targets.length,
+            targetNames: targets.map((target) => target.name).join(","),
+            tempDir,
+        });
+
+        await Promise.all(
+            syntheticFiles.map((entry) => replayTargetStream(entry.targetName, entry.filePath)),
+        );
+    } finally {
+        cleanup();
+    }
 }
 
 /**
  *
  */
 async function replayStreams() {
+    const targetSource = getConfiguredBenchmarkTargetSource();
     lifecycleLog("replay.start", {
-        dataPath: process.env.DATA_PATH || 'noisy_datasets/noise_0.5',
+        dataPath: getConfiguredBasePath(),
         replayFrequency: getReplayFrequency(),
         smokeMode: process.env.PAPER_BENCHMARK_SMOKE || "0",
         finiteReplayMode: isBenchmarkFiniteReplayMode(),
+        targetSource,
     });
-    await Promise.all([
-        replaySmartphoneXStream(),
-        replayWearableXStream()
-    ]);
+    if (targetSource === "synthetic") {
+        await replaySyntheticTargetStreams();
+    } else if (process.env.BENCHMARK_QUERY_TARGET_NAMES || process.env.BENCHMARK_TARGET_NAMES) {
+        await replayConfiguredRealTargetStreams();
+    } else {
+        await Promise.all([
+            replaySmartphoneXStream(),
+            replayWearableXStream()
+        ]);
+    }
     if (isBenchmarkFiniteReplayMode()) {
         lifecycleLog("benchmark.finite_replay_complete.signal.requested", {
             topicPrefix: process.env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX || "",
@@ -170,7 +293,8 @@ async function replayStreams() {
         });
     }
     lifecycleLog("replay.all_streams_complete", {
-        dataPath: process.env.DATA_PATH || 'noisy_datasets/noise_0.5',
+        dataPath: getConfiguredBasePath(),
+        targetSource,
     });
     logger.log("All streams replayed successfully");
 }

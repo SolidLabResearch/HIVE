@@ -53,6 +53,7 @@ export function summarizeChunkGroup(
   const partials = Array.from(bySubquery.values());
   const start = partials[0]?.window.start ?? 0;
   const end = partials[0]?.window.end ?? 0;
+  const windowMetadata = partials[0]?.window;
   let countTotal = 0;
   let countAvailable = false;
   let sumTotal = 0;
@@ -142,6 +143,13 @@ export function summarizeChunkGroup(
     duplicateChunksIgnoredBySubquery,
     missingSubqueryIds,
     coverageComplete: missingSubqueryIds.length === 0,
+    windowSemantics: windowMetadata?.windowSemantics,
+    logicalTriggerTime: windowMetadata?.logicalTriggerTime ?? null,
+    windowDataCloseTime: windowMetadata?.windowDataCloseTime ?? null,
+    resultEmittedAt: windowMetadata?.resultEmittedAt ?? null,
+    latencyFromLogicalTriggerMs: windowMetadata?.latencyFromLogicalTriggerMs ?? null,
+    latencyFromWindowCloseMs: windowMetadata?.latencyFromWindowCloseMs ?? null,
+    metadataSource: windowMetadata?.metadataSource ?? "reconstructed",
   };
 }
 

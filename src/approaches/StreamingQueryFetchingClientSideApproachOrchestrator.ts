@@ -6,20 +6,25 @@ import { v4 as uuidv4 } from "uuid";
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import {
   AggregationFunction,
-  buildBenchmarkStreamIri,
   buildBenchmarkTopicName,
   buildBenchmarkResultPayload,
-  buildOutputSelectClause,
+  buildBenchmarkWindowMetadata,
+  getConfiguredWindowSemantics,
   getBenchmarkEventTimeAnchor,
   getConfiguredAggregation,
   getOutputWindowRange,
   getOutputWindowStep,
   getResultTopic,
   getSessionId,
+  getBenchmarkTargetWindowCount,
   getTimestampDomainMax,
   getTimestampDomainMin,
   useCleanMqttSessionsForBenchmark,
 } from "../util/runtimeConfig";
+import {
+  buildQueryTargetScalingSuperQuery,
+  getConfiguredBenchmarkTargets,
+} from "../util/queryTargets";
 import { recordPublishedMqttMessage } from "../util/mqttTraffic";
 import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
 import { resourceTraceSnapshot } from "../util/resourceTrace";
@@ -94,8 +99,31 @@ export class FetchingAllDataClientSide {
   private benchmarkFiniteReplayMode: boolean = ["1", "true", "yes", "on"].includes(
     (process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY || "").trim().toLowerCase(),
   );
+  private deterministicEventTimeMode: boolean = ["1", "true", "yes", "on"].includes(
+    (process.env.STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME || "").trim().toLowerCase(),
+  );
+  private disableCadenceFilterMode: boolean = ["1", "true", "yes", "on"].includes(
+    (process.env.STREAMING_QUERY_HIVE_FETCHING_DISABLE_CADENCE_FILTER || "").trim().toLowerCase(),
+  );
+  private timingFilterEnabled: boolean = true;
+  private timingFilterBypassedReason: string | null = null;
+  private filteredDueToTimingCount: number = 0;
+  private acceptedCompleteWindowCount: number = 0;
   private benchmarkReplayComplete: boolean = false;
+  private benchmarkShutdownInitiated: boolean = false;
+  private benchmarkTargetWindowCount: number | null =
+    getBenchmarkTargetWindowCount();
+  private finalizedWindowNumbers: number[] = [];
+  private benchmarkTargetWindowReached: boolean = false;
+  private benchmarkStopReason:
+    | "target_window_count_reached"
+    | "finite_replay_duration_reached"
+    | "other" = "other";
   private benchmarkControlTopic: string = buildBenchmarkTopicName("__benchmark_control__");
+  private benchmarkWindowSummaryPath: string = path.join(
+    process.env.LOG_PATH || ".",
+    "benchmark_window_cap_summary.json",
+  );
   private mqttClients: any[] = [];
   private resourceUsageInterval: NodeJS.Timeout | null = null;
   private cleanupRegistered: boolean = false;
@@ -134,10 +162,15 @@ export class FetchingAllDataClientSide {
     this.expectedEventCountTolerance = this.deriveExpectedEventCountTolerance(
       this.expectedEventCount,
     );
+    this.timingFilterBypassedReason = this.deriveTimingFilterBypassedReason();
+    this.timingFilterEnabled = this.timingFilterBypassedReason === null;
 
     // Initialize CSV logging for this approach
     this.initializeLogging();
     this.log("fetching_query_registered");
+    this.log(
+      `Benchmark target window cap ${this.benchmarkTargetWindowCount !== null ? `enabled target=${this.benchmarkTargetWindowCount}` : "disabled"}`,
+    );
 
     this.registerCleanupHook();
     this.subscribeRStream();
@@ -163,7 +196,7 @@ export class FetchingAllDataClientSide {
       flags: "w",
     });
     this.latencyLogStream.write(
-      "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,result_value\n",
+      "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,window_semantics,logical_trigger_time,window_start,window_end,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,metadata_source,result_value\n",
     );
 
     const diagnosticsLogFilePath = path.join(logRoot, `fetching_window_diagnostics${consumerIdx}.csv`);
@@ -171,7 +204,7 @@ export class FetchingAllDataClientSide {
       flags: "w",
     });
     this.diagnosticsLogStream.write(
-      "benchmark_event_time_anchor,window_number,window_start,window_end,event_count,expected_event_count,sum,avg,first_event_timestamp,last_event_timestamp,completeness_status,accepted_or_suppressed,reason,result_value\n",
+      "benchmark_event_time_anchor,window_number,window_start,window_end,event_count,expected_event_count,sum,avg,first_event_timestamp,last_event_timestamp,completeness_status,accepted_or_suppressed,reason,result_value,timing_filter_enabled,timing_filter_bypassed_reason,filtered_due_to_timing_count,accepted_complete_window_count\n",
     );
   }
 
@@ -195,6 +228,18 @@ export class FetchingAllDataClientSide {
     }
 
     return Math.max(2, Math.ceil((expectedEventCount as number) * 0.01));
+  }
+
+  private deriveTimingFilterBypassedReason(): string | null {
+    if (this.disableCadenceFilterMode) {
+      return "STREAMING_QUERY_HIVE_FETCHING_DISABLE_CADENCE_FILTER=1";
+    }
+
+    if (this.deterministicEventTimeMode) {
+      return "STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME=1";
+    }
+
+    return null;
   }
 
   private extractBindingValue(binding: any, candidateKeys: string[]): string | null {
@@ -258,6 +303,49 @@ export class FetchingAllDataClientSide {
     return null;
   }
 
+  private buildWindowMetadata(
+    rstreamObject: any,
+    logicalWindow: DerivedLogicalWindow,
+    resultEmittedAt: number,
+    expectedWindowClose: number,
+  ) {
+    const directLogicalTriggerTime = Number(rstreamObject?.logical_trigger_time);
+    const directWindowDataCloseTime = Number(rstreamObject?.window_data_close_time);
+    const directResultEmittedAt = Number(rstreamObject?.result_emitted_at);
+    const directLatencyFromLogicalTriggerMs = Number(rstreamObject?.latency_from_logical_trigger_ms);
+    const directLatencyFromWindowCloseMs = Number(rstreamObject?.latency_from_window_close_ms);
+    const windowSemantics = String(
+      rstreamObject?.window_semantics || getConfiguredWindowSemantics(),
+    ).toLowerCase();
+    const metadataSource = Number.isFinite(directLogicalTriggerTime) &&
+      Number.isFinite(directWindowDataCloseTime) &&
+      Number.isFinite(directResultEmittedAt)
+      ? "direct"
+      : "reconstructed";
+
+    return buildBenchmarkWindowMetadata({
+      windowSemantics,
+      logicalTriggerTime: Number.isFinite(directLogicalTriggerTime)
+        ? directLogicalTriggerTime
+        : expectedWindowClose - (this.windowRange / 2),
+      windowStart: logicalWindow.start,
+      windowEnd: logicalWindow.end,
+      windowDataCloseTime: Number.isFinite(directWindowDataCloseTime)
+        ? directWindowDataCloseTime
+        : expectedWindowClose,
+      resultEmittedAt: Number.isFinite(directResultEmittedAt)
+        ? directResultEmittedAt
+        : resultEmittedAt,
+      latencyFromLogicalTriggerMs: Number.isFinite(directLatencyFromLogicalTriggerMs)
+        ? directLatencyFromLogicalTriggerMs
+        : undefined,
+      latencyFromWindowCloseMs: Number.isFinite(directLatencyFromWindowCloseMs)
+        ? directLatencyFromWindowCloseMs
+        : undefined,
+      metadataSource,
+    });
+  }
+
   /**
    * Log latency measurement with multiple metrics
    */
@@ -267,6 +355,7 @@ export class FetchingAllDataClientSide {
     lastObsReceivedAt: number,
     resultTime: number,
     value: string,
+    metadata: ReturnType<typeof buildBenchmarkWindowMetadata>,
   ) {
     // Metric 1: Delay past the expected close time
     const latencyFromQueryReg = resultTime - expectedWindowClose;
@@ -284,7 +373,7 @@ export class FetchingAllDataClientSide {
 
     if (this.latencyLogStream) {
       this.latencyLogStream.write(
-        `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastObsReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastObs},${value}\n`,
+        `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastObsReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastObs},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${metadata.windowDataCloseTime ?? ""},${metadata.latencyFromLogicalTriggerMs ?? ""},${metadata.latencyFromWindowCloseMs ?? ""},${metadata.metadataSource},${value}\n`,
       );
     }
     console.log(`LATENCY: Window ${windowNumber}:`);
@@ -371,6 +460,13 @@ export class FetchingAllDataClientSide {
             const parsed = JSON.parse(message.toString());
             if (parsed?.type === "finite_replay_complete") {
               this.benchmarkReplayComplete = true;
+              if (
+                this.benchmarkTargetWindowCount !== null &&
+                !this.benchmarkTargetWindowReached
+              ) {
+                this.benchmarkStopReason = "finite_replay_duration_reached";
+                this.writeBenchmarkWindowSummary();
+              }
               this.log(
                 `Finite replay complete signal received: ${JSON.stringify({
                   topic: this.benchmarkControlTopic,
@@ -378,6 +474,7 @@ export class FetchingAllDataClientSide {
                 })}`,
               );
               this.flushPendingFinalizedWindows();
+              this.scheduleBenchmarkShutdown();
             }
           } catch (error) {
             console.error("Error parsing benchmark control message:", error);
@@ -703,6 +800,70 @@ export class FetchingAllDataClientSide {
     }
   }
 
+  private scheduleBenchmarkShutdown(): void {
+    if (this.benchmarkShutdownInitiated) {
+      return;
+    }
+
+    this.benchmarkShutdownInitiated = true;
+    setTimeout(() => {
+      try {
+        this.cleanup();
+      } finally {
+        process.exit(0);
+      }
+    }, 50);
+  }
+
+  private recordFinalizedWindow(windowNumber: number): void {
+    if (!this.finalizedWindowNumbers.includes(windowNumber)) {
+      this.finalizedWindowNumbers.push(windowNumber);
+      this.finalizedWindowNumbers.sort((left, right) => left - right);
+    }
+
+    if (
+      this.benchmarkTargetWindowCount !== null &&
+      this.finalizedWindowNumbers.length >= this.benchmarkTargetWindowCount
+    ) {
+      this.benchmarkTargetWindowReached = true;
+      this.benchmarkStopReason = "target_window_count_reached";
+      this.log(
+        `Benchmark target window reached: target=${this.benchmarkTargetWindowCount} finalWindows=${this.finalizedWindowNumbers.join(",")}`,
+      );
+      this.writeBenchmarkWindowSummary();
+      this.scheduleBenchmarkShutdown();
+    }
+  }
+
+  private writeBenchmarkWindowSummary(): void {
+    if (this.benchmarkTargetWindowCount === null) {
+      return;
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(this.benchmarkWindowSummaryPath), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        this.benchmarkWindowSummaryPath,
+        JSON.stringify(
+          {
+            targetWindowCount: this.benchmarkTargetWindowCount,
+            emittedFinalWindowCount: this.finalizedWindowNumbers.length,
+            finalWindowNumbers: this.finalizedWindowNumbers,
+            stoppedAfterTargetWindows: this.benchmarkTargetWindowReached,
+            stopReason: this.benchmarkStopReason,
+            approach: "fetching",
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      console.error("Error writing benchmark window summary:", error);
+    }
+  }
+
   private computeSettledWindowAggregate(logicalWindow: DerivedLogicalWindow): {
     eventCount: number;
     sumValue: number;
@@ -760,7 +921,7 @@ export class FetchingAllDataClientSide {
     }
 
     this.diagnosticsLogStream.write(
-      `${this.benchmarkEventTimeAnchor ?? ""},${windowNumber ?? ""},${logicalWindow.start},${logicalWindow.end},${Number.isFinite(eventCount) ? eventCount : ""},${Number.isFinite(this.expectedEventCount ?? NaN) ? this.expectedEventCount : ""},${Number.isFinite(sumValue) ? sumValue : ""},${Number.isFinite(avgValue) ? avgValue : ""},${firstEventTimestamp},${lastEventTimestamp},${completenessStatus},${acceptedOrSuppressed},${reason},${resultValue}\n`,
+      `${this.benchmarkEventTimeAnchor ?? ""},${windowNumber ?? ""},${logicalWindow.start},${logicalWindow.end},${Number.isFinite(eventCount) ? eventCount : ""},${Number.isFinite(this.expectedEventCount ?? NaN) ? this.expectedEventCount : ""},${Number.isFinite(sumValue) ? sumValue : ""},${Number.isFinite(avgValue) ? avgValue : ""},${firstEventTimestamp},${lastEventTimestamp},${completenessStatus},${acceptedOrSuppressed},${reason},${resultValue},${this.timingFilterEnabled},${this.timingFilterBypassedReason ?? ""},${this.filteredDueToTimingCount},${this.acceptedCompleteWindowCount}\n`,
     );
   }
 
@@ -1009,8 +1170,54 @@ export class FetchingAllDataClientSide {
           continue;
         }
 
-        // Apply timing filter to ignore extra dynamic windows
-        if (!this.isWithinExpectedWindowTiming(currentTimestamp)) {
+        if (
+          this.benchmarkTargetWindowCount !== null &&
+          this.acceptedCompleteWindowCount >= this.benchmarkTargetWindowCount
+        ) {
+          this.writeWindowDiagnostics(
+            "",
+            logicalWindow,
+            settledAggregate.eventCount,
+            settledAggregate.sumValue,
+            settledAggregate.avgValue,
+            firstEventTimestamp,
+            lastEventTimestamp,
+            settledCompleteness.status,
+            "suppressed",
+            "target_window_count_reached",
+            data,
+          );
+          this.log(
+            `Suppressed complete window after benchmark target reached: ${JSON.stringify({
+              logicalWindowKey: logicalWindow.key,
+              targetWindowCount: this.benchmarkTargetWindowCount,
+              acceptedCompleteWindowCount: this.acceptedCompleteWindowCount,
+            })}`,
+          );
+          this.benchmarkTargetWindowReached = true;
+          this.benchmarkStopReason = "target_window_count_reached";
+          this.writeBenchmarkWindowSummary();
+          this.scheduleBenchmarkShutdown();
+          continue;
+        }
+
+        // Apply timing filter only in legacy/live mode. Deterministic benchmark
+        // mode finalizes based on window completeness and logical window keys.
+        if (this.timingFilterEnabled && !this.isWithinExpectedWindowTiming(currentTimestamp)) {
+          this.filteredDueToTimingCount += 1;
+          this.writeWindowDiagnostics(
+            "",
+            logicalWindow,
+            settledAggregate.eventCount,
+            settledAggregate.sumValue,
+            settledAggregate.avgValue,
+            firstEventTimestamp,
+            lastEventTimestamp,
+            settledCompleteness.status,
+            "suppressed",
+            "filtered_due_to_timing",
+            data,
+          );
           // Skip this result - it's from an extra dynamic window
           this.log(`Filtered out result due to timing: ${data}`);
           continue;
@@ -1041,10 +1248,18 @@ export class FetchingAllDataClientSide {
 
         // Calculate and log latency with multiple metrics
         this.windowCount++;
+        this.acceptedCompleteWindowCount++;
         this.emittedLogicalWindows.add(logicalWindow.key);
+        this.recordFinalizedWindow(this.windowCount);
         const resultEmittedAt = Date.now();
         const expectedWindowClose = this.getExpectedWindowCloseTime(
           this.windowCount,
+        );
+        const centeredWindowMetadata = this.buildWindowMetadata(
+          object,
+          logicalWindow,
+          resultEmittedAt,
+          expectedWindowClose,
         );
         this.logLatency(
           this.windowCount,
@@ -1052,6 +1267,7 @@ export class FetchingAllDataClientSide {
           this.lastObservationReceivedTime,
           resultEmittedAt,
           valueStr,
+          centeredWindowMetadata,
         );
         this.writeWindowDiagnostics(
           this.windowCount,
@@ -1081,6 +1297,10 @@ export class FetchingAllDataClientSide {
             first_event_timestamp: firstEventTimestamp || null,
             last_event_timestamp: lastEventTimestamp || null,
             completeness_status: settledCompleteness.status,
+            timing_filter_enabled: this.timingFilterEnabled,
+            timing_filter_bypassed_reason: this.timingFilterBypassedReason,
+            filtered_due_to_timing_count: this.filteredDueToTimingCount,
+            accepted_complete_window_count: this.acceptedCompleteWindowCount,
           })}`,
         );
 
@@ -1098,8 +1318,8 @@ export class FetchingAllDataClientSide {
                   this.windowCount,
                   {
                     benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                    windowStart: logicalWindow.start,
-                    windowEnd: logicalWindow.end,
+                    benchmarkWindowStart: logicalWindow.start,
+                    benchmarkWindowEnd: logicalWindow.end,
                     rspWindowStart: windowBounds?.start ?? null,
                     rspWindowEnd: windowBounds?.end ?? null,
                     eventCount: settledAggregate.eventCount,
@@ -1107,6 +1327,15 @@ export class FetchingAllDataClientSide {
                     avgValue: settledAggregate.avgValue,
                     firstEventTimestamp: firstEventTimestamp || null,
                     lastEventTimestamp: lastEventTimestamp || null,
+                    windowSemantics: centeredWindowMetadata.windowSemantics,
+                    logicalTriggerTime: centeredWindowMetadata.logicalTriggerTime,
+                    windowStart: centeredWindowMetadata.windowStart,
+                    windowEnd: centeredWindowMetadata.windowEnd,
+                    windowDataCloseTime: centeredWindowMetadata.windowDataCloseTime,
+                    resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
+                    latencyFromLogicalTriggerMs: centeredWindowMetadata.latencyFromLogicalTriggerMs,
+                    latencyFromWindowCloseMs: centeredWindowMetadata.latencyFromWindowCloseMs,
+                    metadataSource: centeredWindowMetadata.metadataSource,
                   },
                 ),
               )
@@ -1180,6 +1409,7 @@ export class FetchingAllDataClientSide {
    */
   public cleanup() {
     profileSync("cleanup_time_ms", () => {
+      this.writeBenchmarkWindowSummary();
       if (this.resourceUsageInterval) {
         clearInterval(this.resourceUsageInterval);
         this.resourceUsageInterval = null;
@@ -1238,10 +1468,11 @@ export class FetchingAllDataClientSide {
           mem.heapTotal,
           mem.heapUsed,
           (mem.heapUsed / 1024 / 1024).toFixed(2),
-          mem.external,
+        mem.external,
       ].join(",") + "\n";
       logStream.write(line);
     }, intervalMs);
+    this.resourceUsageInterval.unref?.();
   }
 
   private registerCleanupHook() {
@@ -1263,36 +1494,13 @@ async function clientSideProcessing() {
   const aggregationFunction = getConfiguredAggregation();
   const outputWindowRange = getOutputWindowRange();
   const outputWindowStep = getOutputWindowStep();
-  const wearableTopicName = buildBenchmarkTopicName("wearableX");
-  const smartphoneTopicName = buildBenchmarkTopicName("smartphoneX");
-  const wearableStreamIri = buildBenchmarkStreamIri("wearableX");
-  const smartphoneStreamIri = buildBenchmarkStreamIri("smartphoneX");
-  const query = `
-PREFIX mqtt_broker: <mqtt://localhost:1883/>
-PREFIX saref: <https://saref.etsi.org/core/>
-PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
-PREFIX : <https://rsp.js>
-
-REGISTER RStream <sensor_averages> AS
-SELECT ${buildOutputSelectClause(aggregationFunction)}
-FROM NAMED WINDOW <${wearableStreamIri}> ON STREAM mqtt_broker:${wearableTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
-FROM NAMED WINDOW <${smartphoneStreamIri}> ON STREAM mqtt_broker:${smartphoneTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
-WHERE {
-    {
-        WINDOW <${wearableStreamIri}> {
-            ?s1 saref:hasValue ?value .
-            ?s1 saref:hasTimestamp ?ts .
-            ?s1 saref:relatesToProperty dahccsensors:wearableX .
-        }
-    } UNION {
-        WINDOW <${smartphoneStreamIri}> {
-            ?s2 saref:hasValue ?value .
-            ?s2 saref:hasTimestamp ?ts .
-            ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
-        }
-    }
-}
-  `;
+  const targets = getConfiguredBenchmarkTargets();
+  const query = buildQueryTargetScalingSuperQuery(
+    targets,
+    aggregationFunction,
+    outputWindowRange,
+    outputWindowStep,
+  );
 
   console.log(new RSPQLParser().parse(query).sparql);
 

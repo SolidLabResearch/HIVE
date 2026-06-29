@@ -60,30 +60,44 @@ export function mergeMultipleSlidingWindowResults(
   windows: ApproximationWindowResult[],
   target: ApproximationTargetWindow,
   agg: ApproximationAggregation,
+  startIndex = 0,
 ): number | string {
-  console.log(`DEBUG: mergeMultipleSlidingWindowResults called with:`);
-  console.log(`  - windows:`, JSON.stringify(windows));
-  console.log(`  - target:`, JSON.stringify(target));
-  console.log(`  - aggregation:`, agg);
+  const debugEnabled =
+    process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1";
+  const debugLog = (...args: unknown[]) => {
+    if (debugEnabled) {
+      console.log(...args);
+    }
+  };
 
-  const overlapping = windows.filter(
-    (w) => w.end > target.start && w.start < target.end,
-  );
-  console.log(
+  debugLog(`DEBUG: mergeMultipleSlidingWindowResults called with:`);
+  debugLog(`  - windows:`, debugEnabled ? JSON.stringify(windows) : "[redacted]");
+  debugLog(`  - target:`, debugEnabled ? JSON.stringify(target) : "[redacted]");
+  debugLog(`  - aggregation:`, agg);
+
+  const activeStart = Math.max(0, startIndex);
+  const overlapping: ApproximationWindowResult[] = [];
+  for (let index = activeStart; index < windows.length; index += 1) {
+    const window = windows[index];
+    if (window.end > target.start && window.start < target.end) {
+      overlapping.push(window);
+    }
+  }
+  debugLog(
     `DEBUG: Found ${overlapping.length} overlapping windows:`,
-    JSON.stringify(overlapping),
+    debugEnabled ? JSON.stringify(overlapping) : "[redacted]",
   );
 
   if (overlapping.length === 0) return 0;
 
   if (agg === "MIN") {
     const result = Math.min(...overlapping.map((w) => w.value));
-    console.log(`DEBUG: MIN result:`, result);
+    debugLog(`DEBUG: MIN result:`, result);
     return result;
   }
   if (agg === "MAX") {
     const result = Math.max(...overlapping.map((w) => w.value));
-    console.log(`DEBUG: MAX result:`, result);
+    debugLog(`DEBUG: MAX result:`, result);
     return result;
   }
 
@@ -91,13 +105,13 @@ export function mergeMultipleSlidingWindowResults(
     let weightedSum = 0;
     let totalWeight = 0;
 
-    console.log(`DEBUG: Calculating weighted average:`);
+    debugLog(`DEBUG: Calculating weighted average:`);
     overlapping.forEach((w, idx) => {
       const overlapStart = Math.max(w.start, target.start);
       const overlapEnd = Math.min(w.end, target.end);
       const overlapDuration = overlapEnd - overlapStart;
 
-      console.log(
+      debugLog(
         `DEBUG: Window ${idx}: value=${w.value}, overlapDuration=${overlapDuration}`,
       );
 
@@ -105,14 +119,14 @@ export function mergeMultipleSlidingWindowResults(
         const contribution = w.value * overlapDuration;
         weightedSum += contribution;
         totalWeight += overlapDuration;
-        console.log(
+        debugLog(
           `DEBUG: Added contribution=${contribution}, totalWeight=${totalWeight}, weightedSum=${weightedSum}`,
         );
       }
     });
 
     const result = totalWeight > 0 ? weightedSum / totalWeight : 0;
-    console.log(
+    debugLog(
       `DEBUG: Final AVG calculation: weightedSum=${weightedSum} / totalWeight=${totalWeight} = ${result}`,
     );
     return result;

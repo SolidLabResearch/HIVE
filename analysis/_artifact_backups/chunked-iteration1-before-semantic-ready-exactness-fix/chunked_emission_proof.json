@@ -1,0 +1,1332 @@
+[
+  {
+    "windowStart": 1782341499957,
+    "windowEnd": 1782341529957,
+    "emittedAt": 1782341533820,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341499957:1782341529957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341499957:1782341529957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341499957:1782341529957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341499957:1782341529957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341529957,
+    "windowEnd": 1782341559957,
+    "emittedAt": 1782341563790,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341529957:1782341559957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341529957:1782341559957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341529957:1782341559957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341529957:1782341559957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341559957,
+    "windowEnd": 1782341589957,
+    "emittedAt": 1782341593793,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341559957:1782341589957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341559957:1782341589957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341559957:1782341589957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341559957:1782341589957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341589957,
+    "windowEnd": 1782341619957,
+    "emittedAt": 1782341623789,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341589957:1782341619957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341589957:1782341619957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341589957:1782341619957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341589957:1782341619957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341619957,
+    "windowEnd": 1782341649957,
+    "emittedAt": 1782341653794,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341619957:1782341649957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341619957:1782341649957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341619957:1782341649957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341619957:1782341649957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341649957,
+    "windowEnd": 1782341679957,
+    "emittedAt": 1782341683805,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341649957:1782341679957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341649957:1782341679957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341649957:1782341679957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341649957:1782341679957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341679957,
+    "windowEnd": 1782341709957,
+    "emittedAt": 1782341713797,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341679957:1782341709957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341679957:1782341709957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341679957:1782341709957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341679957:1782341709957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341709957,
+    "windowEnd": 1782341739957,
+    "emittedAt": 1782341743795,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341709957:1782341739957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341709957:1782341739957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341709957:1782341739957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341709957:1782341739957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341739957,
+    "windowEnd": 1782341769957,
+    "emittedAt": 1782341773802,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341739957:1782341769957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341739957:1782341769957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341739957:1782341769957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341739957:1782341769957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341769957,
+    "windowEnd": 1782341799957,
+    "emittedAt": 1782341803799,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341769957:1782341799957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341769957:1782341799957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341769957:1782341799957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341769957:1782341799957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341799957,
+    "windowEnd": 1782341829957,
+    "emittedAt": 1782341833801,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341799957:1782341829957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341799957:1782341829957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341799957:1782341829957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341799957:1782341829957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341829957,
+    "windowEnd": 1782341859957,
+    "emittedAt": 1782341863808,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341829957:1782341859957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341829957:1782341859957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341829957:1782341859957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341829957:1782341859957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341859957,
+    "windowEnd": 1782341889957,
+    "emittedAt": 1782341893808,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341859957:1782341889957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341859957:1782341889957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341859957:1782341889957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341859957:1782341889957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341889957,
+    "windowEnd": 1782341919957,
+    "emittedAt": 1782341923805,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341889957:1782341919957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341889957:1782341919957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341889957:1782341919957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341889957:1782341919957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341919957,
+    "windowEnd": 1782341949957,
+    "emittedAt": 1782341953813,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341919957:1782341949957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341919957:1782341949957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341919957:1782341949957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341919957:1782341949957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341949957,
+    "windowEnd": 1782341979957,
+    "emittedAt": 1782341983814,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341949957:1782341979957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341949957:1782341979957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341949957:1782341979957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341949957:1782341979957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782341979957,
+    "windowEnd": 1782342009957,
+    "emittedAt": 1782342013814,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341979957:1782342009957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341979957:1782342009957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782341979957:1782342009957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782341979957:1782342009957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342009957,
+    "windowEnd": 1782342039957,
+    "emittedAt": 1782342043819,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342009957:1782342039957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342009957:1782342039957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342009957:1782342039957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342009957:1782342039957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342039957,
+    "windowEnd": 1782342069957,
+    "emittedAt": 1782342073821,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342039957:1782342069957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342039957:1782342069957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342039957:1782342069957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342039957:1782342069957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342069957,
+    "windowEnd": 1782342099957,
+    "emittedAt": 1782342103819,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342069957:1782342099957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342069957:1782342099957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342069957:1782342099957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342069957:1782342099957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342099957,
+    "windowEnd": 1782342129957,
+    "emittedAt": 1782342133823,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342099957:1782342129957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342099957:1782342129957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342099957:1782342129957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342099957:1782342129957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342129957,
+    "windowEnd": 1782342159957,
+    "emittedAt": 1782342163830,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342129957:1782342159957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342129957:1782342159957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342129957:1782342159957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342129957:1782342159957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342159957,
+    "windowEnd": 1782342189957,
+    "emittedAt": 1782342193832,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342159957:1782342189957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342159957:1782342189957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342159957:1782342189957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342159957:1782342189957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342189957,
+    "windowEnd": 1782342219957,
+    "emittedAt": 1782342223826,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342189957:1782342219957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342189957:1782342219957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342189957:1782342219957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342189957:1782342219957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342219957,
+    "windowEnd": 1782342249957,
+    "emittedAt": 1782342253832,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342219957:1782342249957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342219957:1782342249957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342219957:1782342249957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342219957:1782342249957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342249957,
+    "windowEnd": 1782342279957,
+    "emittedAt": 1782342283835,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342249957:1782342279957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342249957:1782342279957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342249957:1782342279957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342249957:1782342279957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342279957,
+    "windowEnd": 1782342309957,
+    "emittedAt": 1782342313837,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342279957:1782342309957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342279957:1782342309957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342279957:1782342309957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342279957:1782342309957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342309957,
+    "windowEnd": 1782342339957,
+    "emittedAt": 1782342343840,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342309957:1782342339957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342309957:1782342339957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342309957:1782342339957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342309957:1782342339957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342339957,
+    "windowEnd": 1782342369957,
+    "emittedAt": 1782342373844,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342339957:1782342369957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342339957:1782342369957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342339957:1782342369957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342339957:1782342369957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342369957,
+    "windowEnd": 1782342399957,
+    "emittedAt": 1782342403846,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342369957:1782342399957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342369957:1782342399957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342369957:1782342399957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342369957:1782342399957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342399957,
+    "windowEnd": 1782342429957,
+    "emittedAt": 1782342433852,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342399957:1782342429957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342399957:1782342429957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342399957:1782342429957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342399957:1782342429957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342429957,
+    "windowEnd": 1782342459957,
+    "emittedAt": 1782342463843,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342429957:1782342459957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342429957:1782342459957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342429957:1782342459957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342429957:1782342459957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342459957,
+    "windowEnd": 1782342489957,
+    "emittedAt": 1782342493847,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342459957:1782342489957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342459957:1782342489957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342459957:1782342489957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342459957:1782342489957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342489957,
+    "windowEnd": 1782342519957,
+    "emittedAt": 1782342523848,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342489957:1782342519957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342489957:1782342519957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342489957:1782342519957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342489957:1782342519957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  },
+  {
+    "windowStart": 1782342519957,
+    "windowEnd": 1782342549957,
+    "emittedAt": 1782342553857,
+    "emissionReason": "immediate_ready_check",
+    "expectedSubqueryIds": [
+      "6f4f16fbfea9517e0f4c603ed2293d6f",
+      "20d676b6cecb5e843875594a7898f3ef"
+    ],
+    "expectedSubqueryCount": 2,
+    "requiredChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342519957:1782342549957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342519957:1782342549957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "receivedChunksUsedBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [
+        "mqso411m:1782342519957:1782342549957:6f4f16fbfea9517e0f4c603ed2293d6f"
+      ],
+      "20d676b6cecb5e843875594a7898f3ef": [
+        "mqso411m:1782342519957:1782342549957:20d676b6cecb5e843875594a7898f3ef"
+      ]
+    },
+    "missingChunksBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "duplicateChunksIgnoredBySubquery": {
+      "6f4f16fbfea9517e0f4c603ed2293d6f": [],
+      "20d676b6cecb5e843875594a7898f3ef": []
+    },
+    "coverageComplete": true,
+    "allExpectedSubqueriesPresent": true,
+    "emitted": true
+  }
+]

@@ -20,6 +20,11 @@ const {
   cleanupStaleBenchmarkProcesses,
   delay,
 } = require("../utils/processCleanup");
+const {
+  ProcessTreeTracker,
+  collectTreeMetrics,
+  summarizeResourceSamples,
+} = require("../utils/processTreeMetrics");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -201,119 +206,6 @@ console.log(`  Timeout: ${timeout}ms`);
 console.log(`  Aggregation: ${aggregationFunc}`);
 console.log(`  Immediate Trigger: ${immediateTrigger}`);
 
-function parsePsSnapshot(psOutput) {
-  const rows = [];
-  const lines = psOutput
-    .trim()
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  for (const line of lines) {
-    const parts = line.split(/\s+/, 5);
-    if (parts.length < 4) {
-      continue;
-    }
-
-    const pid = parseInt(parts[0], 10);
-    const ppid = parseInt(parts[1], 10);
-    const cpu = parseFloat(parts[2]);
-    const rssKb = parseFloat(parts[3]);
-    const command = parts[4] || "";
-
-    if (!Number.isFinite(pid) || !Number.isFinite(ppid)) {
-      continue;
-    }
-
-    rows.push({
-      pid,
-      ppid,
-      cpu: Number.isFinite(cpu) ? cpu : 0,
-      rssKb: Number.isFinite(rssKb) ? rssKb : 0,
-      command,
-    });
-  }
-
-  return rows;
-}
-
-function collectTreeStatsFromPs(rootPids) {
-  const liveRootPids = [...new Set((rootPids || []).filter((pid) => Number.isFinite(pid)))];
-  if (liveRootPids.length === 0) {
-    return null;
-  }
-
-  let snapshot;
-  try {
-    snapshot = parsePsSnapshot(
-      execFileSync("ps", ["-A", "-o", "pid=,ppid=,pcpu=,rss=,comm="], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        maxBuffer: 1024 * 1024 * 8,
-      }),
-    );
-  } catch (err) {
-    return null;
-  }
-
-  if (snapshot.length === 0) {
-    return null;
-  }
-
-  const childrenByParent = new Map();
-  for (const proc of snapshot) {
-    const children = childrenByParent.get(proc.ppid) || [];
-    children.push(proc.pid);
-    childrenByParent.set(proc.ppid, children);
-  }
-
-  const pidMap = new Map(snapshot.map((proc) => [proc.pid, proc]));
-  const seen = new Set();
-  const queue = [...liveRootPids];
-  const tree = [];
-
-  while (queue.length > 0) {
-    const pid = queue.shift();
-    if (seen.has(pid)) {
-      continue;
-    }
-    seen.add(pid);
-
-    const proc = pidMap.get(pid);
-    if (!proc) {
-      continue;
-    }
-
-    tree.push(proc);
-
-    const children = childrenByParent.get(pid) || [];
-    for (const childPid of children) {
-      if (!seen.has(childPid)) {
-        queue.push(childPid);
-      }
-    }
-  }
-
-  if (tree.length === 0) {
-    return null;
-  }
-
-  const totalCpuPct = tree.reduce((sum, proc) => sum + proc.cpu, 0);
-  const totalRssKb = tree.reduce((sum, proc) => sum + proc.rssKb, 0);
-
-  return {
-    rootPids: liveRootPids,
-    tree,
-    processCount: tree.length,
-    totalCpuPct,
-    meanCpuPct: totalCpuPct,
-    peakCpuPct: totalCpuPct,
-    totalRssMb: totalRssKb / 1024,
-    meanRssMb: totalRssKb / 1024,
-    peakRssMb: tree.reduce((max, proc) => Math.max(max, proc.rssKb / 1024), 0),
-  };
-}
-
 class AttemptResourceSampler {
   constructor(logDir, options = {}) {
     this.logDir = logDir;
@@ -325,6 +217,7 @@ class AttemptResourceSampler {
     this.stopped = false;
     this.running = false;
     this.pidSamples = new Map();
+    this.tracker = new ProcessTreeTracker();
   }
 
   start() {
@@ -347,24 +240,26 @@ class AttemptResourceSampler {
 
     this.running = true;
     try {
-      const stats = collectTreeStatsFromPs(this.getRootPids());
+      const timestamp = Date.now();
+      const elapsedMs = this.startedAt ? timestamp - this.startedAt : 0;
+      const stats = collectTreeMetrics(this.getRootPids(), this.tracker, timestamp, elapsedMs);
       if (!stats) {
         return;
       }
 
       this.samples.push({
-        timestamp: Date.now(),
-        elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
+        timestamp,
+        elapsedMs,
         ...stats,
       });
       for (const proc of stats.tree || []) {
         const bucket = this.pidSamples.get(proc.pid) || [];
         bucket.push({
-          timestamp: Date.now(),
-          elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
+          timestamp,
+          elapsedMs,
           pid: proc.pid,
           ppid: proc.ppid,
-          cpuPct: proc.cpu,
+          cpuPct: proc.cpuPct,
           rssMb: proc.rssKb / 1024,
           command: proc.command,
         });
@@ -376,36 +271,21 @@ class AttemptResourceSampler {
   }
 
   summarize() {
-    const sampleCount = this.samples.length;
     const wallTimeMs = this.startedAt ? Date.now() - this.startedAt : 0;
-    const meanCpuPct = sampleCount > 0
-      ? this.samples.reduce((sum, sample) => sum + sample.totalCpuPct, 0) / sampleCount
-      : 0;
-    const peakCpuPct = sampleCount > 0
-      ? Math.max(...this.samples.map((sample) => sample.totalCpuPct))
-      : 0;
-    const meanRssMb = sampleCount > 0
-      ? this.samples.reduce((sum, sample) => sum + sample.totalRssMb, 0) / sampleCount
-      : 0;
-    const peakRssMb = sampleCount > 0
-      ? Math.max(...this.samples.map((sample) => sample.totalRssMb))
-      : 0;
-    const peakProcessCount = sampleCount > 0
-      ? Math.max(...this.samples.map((sample) => sample.processCount))
-      : 0;
-    const cpuSeconds = (meanCpuPct / 100) * (wallTimeMs / 1000);
+    const resource = summarizeResourceSamples(this.samples);
 
     return {
       sampleIntervalMs: this.sampleIntervalMs,
-      sampleCount,
+      sampleCount: resource.sampleCount,
       wallTimeMs,
       wallTimeSec: wallTimeMs / 1000,
-      meanCpuPct,
-      peakCpuPct,
-      cpuSeconds,
-      meanRssMb,
-      peakRssMb,
-      peakProcessCount,
+      meanCpuPct: resource.meanCpuPct,
+      peakCpuPct: resource.peakCpuPct,
+      cpuSeconds: resource.cpuSeconds,
+      meanRssMb: resource.meanRssMb,
+      peakRssMb: resource.peakRssMb,
+      peakProcessCount: resource.peakProcessCount,
+      cpuAccountingNegativeDeltaCount: this.tracker.negativeDeltaEvents.length,
     };
   }
 
@@ -418,7 +298,7 @@ class AttemptResourceSampler {
     const summaryPath = path.join(this.logDir, "resource_summary.json");
     const perPidPath = path.join(this.logDir, "resource_per_pid_summary.json");
     const lines = [
-      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,mean_cpu_pct,peak_cpu_pct,total_rss_mb,mean_rss_mb,peak_rss_mb",
+      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,mean_cpu_pct,peak_cpu_pct,total_rss_mb,mean_rss_mb,peak_rss_mb,tree_cpu_seconds,tree_cpu_seconds_delta,tree_cpu_seconds_raw_snapshot",
       ...this.samples.map((sample) =>
         [
           sample.timestamp,
@@ -431,11 +311,17 @@ class AttemptResourceSampler {
           sample.totalRssMb.toFixed(3),
           sample.meanRssMb.toFixed(3),
           sample.peakRssMb.toFixed(3),
+          sample.treeCpuSeconds.toFixed(6),
+          sample.treeCpuSecondsDelta.toFixed(6),
+          sample.treeCpuSecondsRawSnapshot.toFixed(6),
         ].join(",")
       ),
     ];
 
     fs.writeFileSync(csvPath, `${lines.join("\n")}\n`);
+    const perPidCpuSeconds = new Map(
+      this.tracker.getPerPidSummary().map((entry) => [entry.pid, entry.cpuSeconds]),
+    );
     const perPidSummary = Array.from(this.pidSamples.entries())
       .map(([pid, samples]) => {
         const sampleCount = samples.length;
@@ -454,14 +340,13 @@ class AttemptResourceSampler {
         const wallTimeSec = sampleCount > 1
           ? (samples[samples.length - 1].elapsedMs - samples[0].elapsedMs) / 1000
           : 0;
-        const cpuSeconds = (meanCpuPct / 100) * wallTimeSec;
         return {
           pid,
           ppid: samples[0]?.ppid ?? null,
           command: samples[0]?.command || "",
           sampleCount,
           wallTimeSec,
-          cpuSeconds,
+          cpuSeconds: perPidCpuSeconds.get(pid) ?? 0,
           meanCpuPct,
           peakCpuPct,
           meanRssMb,

@@ -1,7 +1,15 @@
 import fs from "fs";
+import { buildBenchmarkWindowMetadata } from "../../../util/runtimeConfig";
+import { profileStageSync } from "../../../util/profiling";
 
 export class ApproximationDiagnosticsWriter {
   private latencyLogStream!: fs.WriteStream;
+  private runtimeReplayStartWallClockTime: number | null = null;
+  private benchmarkEventTimeAnchor: number | null = null;
+  private warnedAboutMissingWallClockAnchor: boolean = false;
+  private readonly maxPlausibleLatencyMs = 120000;
+  private readonly verboseConsoleLogging: boolean =
+    process.env.STREAMING_QUERY_HIVE_VERBOSE_LATENCY_LOGS === "1";
 
   constructor(
     private readonly queryRegisteredTime: number,
@@ -15,6 +23,19 @@ export class ApproximationDiagnosticsWriter {
   updateWindowConfig(windowRange: number, windowSlide: number): void {
     this.windowRange = windowRange;
     this.windowSlide = windowSlide;
+  }
+
+  updateTimeAnchors(args: {
+    runtimeReplayStartWallClockTime: number | null;
+    benchmarkEventTimeAnchor: number | null;
+  }): void {
+    this.runtimeReplayStartWallClockTime =
+      Number.isFinite(args.runtimeReplayStartWallClockTime)
+        ? Number(args.runtimeReplayStartWallClockTime)
+        : null;
+    this.benchmarkEventTimeAnchor = Number.isFinite(args.benchmarkEventTimeAnchor)
+      ? Number(args.benchmarkEventTimeAnchor)
+      : null;
   }
 
   cleanup(): void {
@@ -34,9 +55,51 @@ export class ApproximationDiagnosticsWriter {
 
     if (writeLatencyHeader) {
       this.latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,last_data_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_data_ms,result_value\n",
+        "window_number,query_registered_at,first_data_received_at,expected_window_close,registration_anchored_expected_close,event_time_window_close,wall_clock_window_close,last_data_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_data_ms,wall_clock_close_to_result_ms,latency_domain_status,approximation_status,window_semantics,logical_trigger_time,window_start,window_end,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,metadata_source,result_value\n",
       );
     }
+  }
+
+  private resolveWallClockWindowClose(eventTimeWindowClose: number | null): {
+    wallClockWindowClose: number | null;
+    latencyDomainStatus:
+      | "wall_clock_mapped"
+      | "runtime_anchor_missing"
+      | "event_time_missing"
+      | "domain_mismatch";
+  } {
+    if (!Number.isFinite(eventTimeWindowClose)) {
+      return {
+        wallClockWindowClose: null,
+        latencyDomainStatus: "event_time_missing",
+      };
+    }
+
+    if (
+      !Number.isFinite(this.runtimeReplayStartWallClockTime) ||
+      !Number.isFinite(this.benchmarkEventTimeAnchor)
+    ) {
+      return {
+        wallClockWindowClose: null,
+        latencyDomainStatus: "runtime_anchor_missing",
+      };
+    }
+
+    const wallClockWindowClose =
+      Number(this.runtimeReplayStartWallClockTime) +
+      (Number(eventTimeWindowClose) - Number(this.benchmarkEventTimeAnchor));
+
+    if (Math.abs(wallClockWindowClose - this.queryRegisteredTime) > 86400000) {
+      return {
+        wallClockWindowClose: null,
+        latencyDomainStatus: "domain_mismatch",
+      };
+    }
+
+    return {
+      wallClockWindowClose,
+      latencyDomainStatus: "wall_clock_mapped",
+    };
   }
 
   /**
@@ -61,6 +124,15 @@ export class ApproximationDiagnosticsWriter {
     lastDataReceivedAt: number,
     resultTime: number,
     value: string,
+    metadata = buildBenchmarkWindowMetadata({
+      windowSemantics: process.env.RSP_WINDOW_SEMANTICS || "trailing",
+      logicalTriggerTime: expectedWindowClose - (this.windowRange / 2),
+      windowStart: expectedWindowClose - this.windowRange,
+      windowEnd: expectedWindowClose,
+      windowDataCloseTime: expectedWindowClose,
+      resultEmittedAt: resultTime,
+      metadataSource: "reconstructed",
+    }),
   ): void {
     const latencyFromQueryReg = resultTime - expectedWindowClose;
     const expectedFromDataStart =
@@ -69,22 +141,65 @@ export class ApproximationDiagnosticsWriter {
       (windowNumber - 1) * this.windowSlide;
     const latencyFromDataStart = resultTime - expectedFromDataStart;
     const latencyFromLastData = resultTime - lastDataReceivedAt;
+    const eventTimeWindowClose = metadata.windowDataCloseTime ?? null;
+    const { wallClockWindowClose, latencyDomainStatus } =
+      this.resolveWallClockWindowClose(eventTimeWindowClose);
+    const wallClockCloseToResultMs =
+      wallClockWindowClose !== null ? resultTime - wallClockWindowClose : "";
+    const approximationStatus =
+      (metadata as Record<string, unknown>).approximationStatus ??
+      "completed_window_approximation";
+    const latencyFromLogicalTriggerMs =
+      wallClockWindowClose !== null &&
+      Number.isFinite(metadata.logicalTriggerTime) &&
+      Number.isFinite(this.benchmarkEventTimeAnchor) &&
+      Number.isFinite(this.runtimeReplayStartWallClockTime)
+        ? resultTime -
+          (Number(this.runtimeReplayStartWallClockTime) +
+            (Number(metadata.logicalTriggerTime) -
+              Number(this.benchmarkEventTimeAnchor)))
+        : "";
+    const latencyFromWindowCloseMs =
+      wallClockWindowClose !== null ? resultTime - wallClockWindowClose : "";
 
-    if (this.latencyLogStream) {
-      this.latencyLogStream.write(
-        `${windowNumber},${this.queryRegisteredTime},${firstDataReceivedTime},${expectedWindowClose},${lastDataReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastData},${value}\n`,
+    if (
+      wallClockWindowClose !== null &&
+      Math.abs(Number(wallClockCloseToResultMs)) > this.maxPlausibleLatencyMs
+    ) {
+      throw new Error(
+        `Approximation latency plausibility check failed for window ${windowNumber}: wall_clock_close_to_result_ms=${wallClockCloseToResultMs}`,
       );
     }
-    console.log(`LATENCY: Window ${windowNumber}:`);
-    console.log(
-      `  - From query registration: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
-    );
-    console.log(
-      `  - From data start: ${latencyFromDataStart}ms (first data: ${firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
-    );
-    console.log(
-      `  - Processing time (last data to result): ${latencyFromLastData}ms`,
-    );
-    console.log(`  - Value: ${value}`);
+
+    if (
+      latencyDomainStatus !== "wall_clock_mapped" &&
+      !this.warnedAboutMissingWallClockAnchor
+    ) {
+      this.warnedAboutMissingWallClockAnchor = true;
+      console.error(
+        `Approximation latency wall-clock anchor unavailable; runtime close-to-result latency omitted (status=${latencyDomainStatus}).`,
+      );
+    }
+
+    profileStageSync("approximation.diagnostics_write_ms", () => {
+      if (this.latencyLogStream) {
+        this.latencyLogStream.write(
+          `${windowNumber},${this.queryRegisteredTime},${firstDataReceivedTime},${expectedWindowClose},${expectedWindowClose},${eventTimeWindowClose ?? ""},${wallClockWindowClose ?? ""},${lastDataReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastData},${wallClockCloseToResultMs},${latencyDomainStatus},${approximationStatus},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${metadata.windowDataCloseTime ?? ""},${latencyFromLogicalTriggerMs},${latencyFromWindowCloseMs},${metadata.metadataSource},${value}\n`,
+        );
+      }
+    });
+    if (this.verboseConsoleLogging) {
+      console.log(`LATENCY: Window ${windowNumber}:`);
+      console.log(
+        `  - From query registration: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
+      );
+      console.log(
+        `  - From data start: ${latencyFromDataStart}ms (first data: ${firstDataReceivedTime}, expected: ${expectedFromDataStart}, result: ${resultTime})`,
+      );
+      console.log(
+        `  - Processing time (last data to result): ${latencyFromLastData}ms`,
+      );
+      console.log(`  - Value: ${value}`);
+    }
   }
 }

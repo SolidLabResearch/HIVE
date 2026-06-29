@@ -17,7 +17,7 @@ export class StreamToMQTT {
     private store: any;
     private mqtt_client: mqtt.MqttClient;
     private file_location: string;
-    private initialize_promise: Promise<void>;
+    private initialize_promise: Promise<void> | null = null;
     private sorted_observation_subjects!: string[];
     private observation_pointer: number = 0;
     private number_of_publish: number = 0;
@@ -32,6 +32,7 @@ export class StreamToMQTT {
     private benchmarkStartTime: number = Number(process.env.STREAMING_QUERY_HIVE_BENCHMARK_START_TIME || Date.now());
     private datasetStartTime: number | null = null;
     private datasetDuration: number = 0;
+    private loopDurationMs: number = 0;
     private replayLoopIndex: number = 0;
     private originalObservationTimestamps: Map<string, string> = new Map();
     private originalObservationOffsets: Map<string, number> = new Map();
@@ -43,6 +44,10 @@ export class StreamToMQTT {
     );
     private pendingPublishCount: number = 0;
     private mqttConnectWaitPromise: Promise<void> | null = null;
+    private targetReplayIntervalMs: number;
+    private selectedObservationCount: number = 0;
+    private sourceObservationIntervalMs: number | null = null;
+    private replayStartWallClockTime: number | null = null;
 
     private lifecycleLog(event: string, details: Record<string, unknown> = {}): void {
         const parts = Object.entries(details)
@@ -64,6 +69,7 @@ export class StreamToMQTT {
         this.stream_consumer = new StreamConsumer(this.store);
         this.file_location = file_location;
         this.frequency = frequency;
+        this.targetReplayIntervalMs = 1000 / this.frequency;
         this.topic_to_publish = topic_to_publish;
         const brokerHostname = new URL(mqtt_broker).hostname;
         const resolvedBrokerUrl = brokerHostname === "localhost"
@@ -119,7 +125,6 @@ export class StreamToMQTT {
                 error: error.message,
             });
         });
-        this.initialize_promise = this.initialize();
     }
 
     /**
@@ -131,9 +136,14 @@ export class StreamToMQTT {
             const store: typeof N3.Store = await this.load_dataset(this.file_location);
             this.sorted_observation_subjects = await this.sort_observations(store);
             this.captureOriginalObservationTiming();
+            this.applyFrequencySampling();
             this.lifecycleLog("initialize.completed", {
                 topic: this.topic_to_publish,
                 subjects: this.sorted_observation_subjects.length,
+                selectedObservationCount: this.selectedObservationCount,
+                sourceObservationIntervalMs: this.sourceObservationIntervalMs ?? "",
+                targetReplayIntervalMs: this.targetReplayIntervalMs,
+                loopDurationMs: this.loopDurationMs,
             });
         } catch (error) {
             console.error('Error initializing StreamToMQTT:', error);
@@ -229,7 +239,10 @@ export class StreamToMQTT {
             frequency: this.frequency,
             finiteReplayMode: this.finiteReplayMode,
         });
-        await this.initialize();
+        if (!this.initialize_promise) {
+            this.initialize_promise = this.initialize();
+        }
+        await this.initialize_promise;
         await this.waitForMqttConnected();
 
         if (!this.store || this.sorted_observation_subjects.length === 0) {
@@ -238,11 +251,11 @@ export class StreamToMQTT {
             return;
         }
 
-        const delay = 1000 / this.frequency;
         const durationSeconds = this.finiteReplayMode
             ? Number(process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS || Math.ceil((getOutputWindowRange() + (2 * getOutputWindowStep())) / 1000))
             : (process.env.PAPER_BENCHMARK_SMOKE === "1" ? 120 : 300); // Smoke mode uses a shorter replay window.
         const startTime = Date.now();
+        this.replayStartWallClockTime = startTime;
 
         if (this.finiteReplayMode) {
             while ((Date.now() - startTime) < durationSeconds * 1000) {
@@ -257,10 +270,8 @@ export class StreamToMQTT {
                         loopIndex: this.replayLoopIndex,
                     });
                 }
+                await this.waitForScheduledPublishTime();
                 await this.publish_one_observation();
-                if (this.observation_pointer < this.sorted_observation_subjects.length) {
-                    await this.sleep(delay);
-                }
             }
             this.lifecycleLog("replay.duration.complete", {
                 topic: this.topic_to_publish,
@@ -283,8 +294,8 @@ export class StreamToMQTT {
                     });
                 }
 
+                await this.waitForScheduledPublishTime();
                 await this.publish_one_observation();
-                await this.sleep(delay);
             }
             this.lifecycleLog("replay.duration.complete", {
                 topic: this.topic_to_publish,
@@ -302,7 +313,14 @@ export class StreamToMQTT {
         });
         await this.closeMqttClient();
         this.lifecycleLog("mqtt.client.end.called", { topic: this.topic_to_publish });
-        const completionStatus = this.successfulPublishes >= this.sort_subject_length ? "completed" : "incomplete";
+        const completedAllSourceObservations =
+            this.successfulPublishes >= this.sort_subject_length;
+        const completionStatus = completedAllSourceObservations ? "completed" : "incomplete";
+        const publisherExitReason = this.finiteReplayMode
+            ? "finite_replay_duration_reached"
+            : (completedAllSourceObservations
+                ? "source_dataset_exhausted"
+                : "insufficient_publishes");
         console.log(
             `[STREAM SUMMARY] topic=${this.topic_to_publish} expectedRecords=${this.sort_subject_length} publishAttempts=${this.publishAttempts} publishSuccesses=${this.successfulPublishes} publishFailures=${this.failedPublishes} firstTimestamp=${this.firstPublishedTimestamp || "none"} lastTimestamp=${this.lastPublishedTimestamp || "none"} completionStatus=${completionStatus}`,
         );
@@ -321,10 +339,50 @@ export class StreamToMQTT {
             console.error('Error writing summary to replayer-log.csv:', err);
         }
 
-        if (this.successfulPublishes < this.sort_subject_length) {
+        try {
+            const summaryDir = process.env.LOG_PATH || process.cwd();
+            const runSummaryPath = path.join(summaryDir, "run_summary.json");
+            fs.mkdirSync(path.dirname(runSummaryPath), { recursive: true });
+            fs.writeFileSync(
+                runSummaryPath,
+                JSON.stringify(
+                    {
+                        publisherExitReason,
+                        completionStatus,
+                        publishedObservations: this.successfulPublishes,
+                        totalSourceObservations: this.sort_subject_length,
+                        publishAttempts: this.publishAttempts,
+                        failedPublishes: this.failedPublishes,
+                        finiteReplayMode: this.finiteReplayMode,
+                        finiteReplayDurationSeconds: this.finiteReplayMode
+                            ? Number(process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS || Math.ceil((getOutputWindowRange() + (2 * getOutputWindowStep())) / 1000))
+                            : null,
+                        replayLoopCount: this.replayLoopIndex,
+                        topic: this.topic_to_publish,
+                        firstPublishedTimestamp: this.firstPublishedTimestamp || null,
+                        lastPublishedTimestamp: this.lastPublishedTimestamp || null,
+                    },
+                    null,
+                    2,
+                ),
+            );
+        } catch (error) {
+            console.error('Error writing run_summary.json:', error);
+        }
+
+        if (!this.finiteReplayMode && this.successfulPublishes < this.sort_subject_length) {
             throw new Error(
                 `Replay completed with insufficient publishes for ${this.topic_to_publish}: expected at least ${this.sort_subject_length}, got ${this.successfulPublishes}`,
             );
+        }
+        if (this.finiteReplayMode && !completedAllSourceObservations) {
+            this.lifecycleLog("replay.finite_duration.reached", {
+                topic: this.topic_to_publish,
+                publisherExitReason,
+                publishedObservations: this.successfulPublishes,
+                totalSourceObservations: this.sort_subject_length,
+                finiteReplayDurationSeconds: Number(process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS || Math.ceil((getOutputWindowRange() + (2 * getOutputWindowStep())) / 1000)),
+            });
         }
         this.lifecycleLog("replay.completed", {
             topic: this.topic_to_publish,
@@ -415,6 +473,107 @@ export class StreamToMQTT {
      */
     private sleep(ms: number): Promise<void> {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    private applyFrequencySampling(): void {
+        const offsets = this.sorted_observation_subjects
+            .map((id) => ({
+                id,
+                offset: this.originalObservationOffsets.get(id),
+            }))
+            .filter((entry): entry is { id: string; offset: number } => entry.offset !== undefined)
+            .sort((left, right) => left.offset - right.offset);
+
+        if (offsets.length < 2 || !(this.targetReplayIntervalMs > 0)) {
+            this.selectedObservationCount = this.sorted_observation_subjects.length;
+            return;
+        }
+
+        const deltas: number[] = [];
+        for (let index = 1; index < offsets.length; index += 1) {
+            const delta = offsets[index].offset - offsets[index - 1].offset;
+            if (delta > 0) {
+                deltas.push(delta);
+            }
+        }
+
+        if (deltas.length === 0) {
+            this.selectedObservationCount = this.sorted_observation_subjects.length;
+            return;
+        }
+
+        this.sourceObservationIntervalMs = Math.min(...deltas);
+        if (this.sourceObservationIntervalMs >= this.targetReplayIntervalMs) {
+            this.selectedObservationCount = this.sorted_observation_subjects.length;
+            return;
+        }
+
+        const sampledSubjects: string[] = [];
+        let lastBucket: number | null = null;
+        for (const entry of offsets) {
+            const bucket = Math.floor(entry.offset / this.targetReplayIntervalMs);
+            if (bucket === lastBucket) {
+                continue;
+            }
+            sampledSubjects.push(entry.id);
+            lastBucket = bucket;
+        }
+
+        this.sorted_observation_subjects = sampledSubjects;
+        this.sort_subject_length = sampledSubjects.length;
+        this.selectedObservationCount = sampledSubjects.length;
+        const lastSampledOffset = sampledSubjects.length > 0
+            ? this.originalObservationOffsets.get(sampledSubjects[sampledSubjects.length - 1]) ?? 0
+            : 0;
+        this.loopDurationMs = Math.max(
+            this.datasetDuration,
+            lastSampledOffset + this.targetReplayIntervalMs,
+        );
+        this.lifecycleLog("replay.frequency_sampling.applied", {
+            topic: this.topic_to_publish,
+            sourceObservationCount: offsets.length,
+            selectedObservationCount: sampledSubjects.length,
+            sourceObservationIntervalMs: this.sourceObservationIntervalMs,
+            targetReplayIntervalMs: this.targetReplayIntervalMs,
+            loopDurationMs: this.loopDurationMs,
+        });
+    }
+
+    private getCurrentObservationSchedulingContext(): {
+        id: string;
+        eventOffsetMs: number;
+        targetPublishTime: number;
+    } | null {
+        if (this.observation_pointer >= this.sorted_observation_subjects.length) {
+            return null;
+        }
+
+        const id = this.sorted_observation_subjects[this.observation_pointer];
+        const eventOffsetMs = this.originalObservationOffsets.get(id);
+        if (eventOffsetMs === undefined || this.replayStartWallClockTime === null) {
+            return null;
+        }
+
+        return {
+            id,
+            eventOffsetMs,
+            targetPublishTime:
+                this.replayStartWallClockTime +
+                (this.replayLoopIndex * this.loopDurationMs) +
+                eventOffsetMs,
+        };
+    }
+
+    private async waitForScheduledPublishTime(): Promise<void> {
+        const schedulingContext = this.getCurrentObservationSchedulingContext();
+        if (!schedulingContext) {
+            return;
+        }
+
+        const delayMs = schedulingContext.targetPublishTime - Date.now();
+        if (delayMs > 0) {
+            await this.sleep(delayMs);
+        }
     }
 
     /**
@@ -562,16 +721,44 @@ export class StreamToMQTT {
                 }
 
                 this.successfulPublishes++;
+                const actualPublishTime = Date.now();
+                const targetPublishTime =
+                    this.getCurrentObservationSchedulingContext()?.targetPublishTime;
+                const publishLagMs =
+                    targetPublishTime !== undefined
+                        ? actualPublishTime - targetPublishTime
+                        : undefined;
+                const eventTimeSpanMs = originalOffset ?? undefined;
+                const wallClockPublishSpanMs =
+                    this.replayStartWallClockTime !== null
+                        ? actualPublishTime - this.replayStartWallClockTime
+                        : undefined;
+                const effectiveReplaySpeed =
+                    eventTimeSpanMs !== undefined &&
+                    wallClockPublishSpanMs !== undefined &&
+                    wallClockPublishSpanMs > 0
+                        ? eventTimeSpanMs / wallClockPublishSpanMs
+                        : undefined;
                 recordPublishedMqttMessage({
                     topic: this.topic_to_publish,
                     payload: data,
                     messageType: "raw_input_stream",
+                    targetPublishTime,
+                    actualPublishTime,
+                    publishLagMs,
+                    effectiveReplaySpeed,
+                    eventTimeSpanMs,
+                    wallClockPublishSpanMs,
                 });
                 this.lifecycleLog("mqtt.publish.acks_complete", {
                     topic: this.topic_to_publish,
                     publishAttempts: this.publishAttempts,
                     successfulPublishes: this.successfulPublishes,
                     failedPublishes: this.failedPublishes,
+                    targetPublishTime: targetPublishTime ?? "",
+                    actualPublishTime,
+                    publishLagMs: publishLagMs ?? "",
+                    effectiveReplaySpeed: effectiveReplaySpeed ?? "",
                 });
                 if (this.firstPublishedTimestamp === null) {
                     this.firstPublishedTimestamp = emittedTimestamp;
@@ -658,6 +845,7 @@ export class StreamToMQTT {
         if (observationsWithEpochs.length === 0) {
             this.datasetStartTime = null;
             this.datasetDuration = 0;
+            this.loopDurationMs = 0;
             this.originalObservationOffsets.clear();
             return;
         }
@@ -665,6 +853,7 @@ export class StreamToMQTT {
         const epochs = observationsWithEpochs.map(({ epoch }) => epoch);
         this.datasetStartTime = Math.min(...epochs);
         this.datasetDuration = Math.max(...epochs) - this.datasetStartTime;
+        this.loopDurationMs = this.datasetDuration;
         this.originalObservationOffsets.clear();
 
         for (const { id, epoch } of observationsWithEpochs) {
@@ -692,7 +881,7 @@ export class StreamToMQTT {
             return new Date().toISOString();
         }
 
-        const loopBaseTime = this.benchmarkStartTime + (this.replayLoopIndex * this.datasetDuration);
+        const loopBaseTime = this.benchmarkStartTime + (this.replayLoopIndex * this.loopDurationMs);
         return new Date(loopBaseTime + resolvedOffset).toISOString();
     }
 }

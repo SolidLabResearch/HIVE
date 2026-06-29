@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { getReplayMetadata } = require('../../experiments/utils/benchmarkResultMetadata');
 const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
+const { startProcessTreeResourceLogging } = require('./process-tree-resource-sampler');
 
 const RUNS = 1;
 const LOGS_DIR = 'logs/streaming-query-hive';
@@ -12,6 +13,7 @@ const PUBLISH_CMD = ['node', ['dist/streamer/src/publish.js']];
 const LOG_FILES = [
   'streaming_query_chunk_aggregator_log.csv',
   'streaming_query_hive_resource_log.csv',
+  'streaming_query_hive_process_tree_resource_log.csv',
   'replayer-log.csv',
   'streaming_query_hive_stdout.log',
   'streaming_query_hive_stderr.log',
@@ -21,6 +23,16 @@ const TIMEOUT_MS = Number.parseInt(
   process.env.STREAMING_QUERY_HIVE_BENCHMARK_TIMEOUT_MS || String(DEFAULT_TIMEOUT_MS),
   10,
 ) || DEFAULT_TIMEOUT_MS;
+const TARGET_WINDOW_COUNT = Number.parseInt(
+  process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "",
+  10,
+);
+const USE_TARGET_WINDOW_CAP = Number.isFinite(TARGET_WINDOW_COUNT) && TARGET_WINDOW_COUNT > 0;
+const SKIP_LINGERING_CLEANUP = process.env.STREAMING_QUERY_HIVE_SKIP_LINGERING_PROCESS_CLEANUP === '1';
+
+function resolveIterationDir(iter) {
+  return process.env.LOG_PATH ? path.resolve(process.env.LOG_PATH) : path.join(LOGS_DIR, `iteration${iter}`);
+}
 
 if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
 
@@ -36,6 +48,9 @@ function quoteArg(value) {
 }
 
 function killLingeringProcesses() {
+  if (SKIP_LINGERING_CLEANUP) {
+    return;
+  }
   try {
     execSync('pkill -f StreamingQueryHiveApproachOrchestrator.js');
   } catch (e) { }
@@ -46,6 +61,45 @@ function killLingeringProcesses() {
   // try { execSync('pkill -f node'); } catch (e) {}
   // Optionally, kill MQTT broker (uncomment if needed)
   // try { execSync('pkill -f mosquitto'); } catch (e) { }
+}
+
+function readJsonIfExists(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8').trim();
+  return content ? JSON.parse(content) : null;
+}
+
+function finalizeRunSummary(iterDir) {
+  const runSummaryPath = path.join(iterDir, 'run_summary.json');
+  const capSummaryPath = path.join(iterDir, 'benchmark_window_cap_summary.json');
+  const runSummary = readJsonIfExists(runSummaryPath) || {};
+  const capSummary = readJsonIfExists(capSummaryPath) || {};
+  const finalSummary = {
+    ...runSummary,
+    ...capSummary,
+    targetWindowCount: Number.isFinite(TARGET_WINDOW_COUNT) ? TARGET_WINDOW_COUNT : runSummary.targetWindowCount ?? null,
+    emittedFinalWindowCount: capSummary.emittedFinalWindowCount ?? runSummary.emittedFinalWindowCount ?? null,
+    finalWindowNumbers: capSummary.finalWindowNumbers ?? runSummary.finalWindowNumbers ?? [],
+    stoppedAfterTargetWindows: capSummary.stoppedAfterTargetWindows ?? runSummary.stoppedAfterTargetWindows ?? false,
+    stopReason: capSummary.stopReason ?? runSummary.stopReason ?? runSummary.publisherExitReason ?? 'other',
+  };
+  fs.writeFileSync(runSummaryPath, `${JSON.stringify(finalSummary, null, 2)}\n`);
+}
+
+function waitForTargetWindowSummary(iterDir) {
+  const capSummaryPath = path.join(iterDir, 'benchmark_window_cap_summary.json');
+  return new Promise((resolve) => {
+    const interval = setInterval(() => {
+      const summary = readJsonIfExists(capSummaryPath);
+      if (summary?.stoppedAfterTargetWindows) {
+        clearInterval(interval);
+        resolve(summary);
+      }
+    }, 250);
+  });
 }
 
 function parseFrequency(dataPath) {
@@ -126,6 +180,9 @@ async function runOnce(iter) {
   const deterministicEnv = replayEnv.withBenchmarkReplayEnv(process.env);
   const dataPath = process.env.DATA_PATH || 'noisy_datasets/noise_0.5';
   const approach = spawn(APPROACH_CMD[0], APPROACH_CMD[1], { stdio: ['ignore', 'pipe', 'pipe'], env: deterministicEnv });
+  const iterDir = resolveIterationDir(iter);
+  const processTreeLogPath = path.join(iterDir, 'streaming_query_hive_process_tree_resource_log.csv');
+  const treeSampler = startProcessTreeResourceLogging(processTreeLogPath, approach.pid, 100);
   let approachStdout = '';
   let approachStderr = '';
   approach.stdout.on('data', (data) => {
@@ -161,14 +218,28 @@ async function runOnce(iter) {
     killLingeringProcesses(); // Extra cleanup on timeout
   }, TIMEOUT_MS);
 
-  await new Promise((resolve) => { publisher.on('exit', () => resolve()); });
-  await new Promise((resolve) => { approach.on('exit', () => resolve()); });
+  if (USE_TARGET_WINDOW_CAP) {
+    await Promise.race([
+      new Promise((resolve) => { approach.on('exit', () => resolve('approach_exit')); }),
+      waitForTargetWindowSummary(iterDir),
+    ]);
+    if (approach.exitCode === null && approach.signalCode === null) {
+      approach.kill();
+    }
+    if (publisher.exitCode === null && publisher.signalCode === null) {
+      publisher.kill();
+    }
+    await new Promise((resolve) => { publisher.on('exit', () => resolve()); });
+  } else {
+    await new Promise((resolve) => { publisher.on('exit', () => resolve()); });
+    await new Promise((resolve) => { approach.on('exit', () => resolve()); });
+  }
 
   clearTimeout(timeout);
+  treeSampler.stop();
 
   killLingeringProcesses(); // Ensure no lingering processes after run
 
-  const iterDir = path.join(LOGS_DIR, `iteration${iter}`);
   if (!fs.existsSync(iterDir)) fs.mkdirSync(iterDir, { recursive: true });
 
   for (const file of LOG_FILES) {
@@ -176,6 +247,10 @@ async function runOnce(iter) {
       const newName = path.join(iterDir, file);
       fs.renameSync(file, newName);
     }
+  }
+
+  if (USE_TARGET_WINDOW_CAP) {
+    finalizeRunSummary(iterDir);
   }
 
   fs.writeFileSync(path.join(iterDir, 'streaming_query_hive_stdout.log'), `${approachStdout}${publisherStdout}`);

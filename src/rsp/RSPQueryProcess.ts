@@ -309,6 +309,36 @@ export class RSPQueryProcess {
         const chunkGroupId = `${this.queryId}:${windowBounds.start}:${windowBounds.end}`;
         const chunkId = `${chunkGroupId}:${this.subqueryId}`;
         const compatibleReuse = detectCompatibleChunkReuse(this.query);
+        const directLogicalTriggerTime = Number(rstreamObject?.logical_trigger_time);
+        const directWindowDataCloseTime = Number(rstreamObject?.window_data_close_time);
+        const directResultEmittedAt = Number(rstreamObject?.result_emitted_at);
+        const directLatencyFromLogicalTriggerMs = Number(rstreamObject?.latency_from_logical_trigger_ms);
+        const directLatencyFromWindowCloseMs = Number(rstreamObject?.latency_from_window_close_ms);
+        const windowSemantics = String(
+            rstreamObject?.window_semantics ||
+            process.env.RSP_WINDOW_SEMANTICS ||
+            "trailing",
+        ).toLowerCase();
+        const metadataSource = Number.isFinite(directLogicalTriggerTime) &&
+            Number.isFinite(directWindowDataCloseTime) &&
+            Number.isFinite(directResultEmittedAt)
+            ? "direct"
+            : "reconstructed";
+        const logicalTriggerTime = Number.isFinite(directLogicalTriggerTime)
+            ? directLogicalTriggerTime
+            : (windowBounds.end - (range / 2));
+        const windowDataCloseTime = Number.isFinite(directWindowDataCloseTime)
+            ? directWindowDataCloseTime
+            : windowBounds.end;
+        const resultEmittedAt = Number.isFinite(directResultEmittedAt)
+            ? directResultEmittedAt
+            : windowDataCloseTime;
+        const latencyFromLogicalTriggerMs = Number.isFinite(directLatencyFromLogicalTriggerMs)
+            ? directLatencyFromLogicalTriggerMs
+            : resultEmittedAt - logicalTriggerTime;
+        const latencyFromWindowCloseMs = Number.isFinite(directLatencyFromWindowCloseMs)
+            ? directLatencyFromWindowCloseMs
+            : resultEmittedAt - windowDataCloseTime;
 
         return {
             queryId: this.queryId,
@@ -320,6 +350,13 @@ export class RSPQueryProcess {
                 range,
                 step,
                 semantics: "[start,end)",
+                windowSemantics,
+                logicalTriggerTime,
+                windowDataCloseTime,
+                resultEmittedAt,
+                latencyFromLogicalTriggerMs,
+                latencyFromWindowCloseMs,
+                metadataSource,
             },
             chunkId,
             reuseClassKey: compatibleReuse?.reuseClassKey,

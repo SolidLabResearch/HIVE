@@ -5,6 +5,13 @@ export type WindowDescriptor = {
   range?: number;
   step?: number;
   semantics: "[start,end)";
+  windowSemantics?: string;
+  logicalTriggerTime?: number | null;
+  windowDataCloseTime?: number | null;
+  resultEmittedAt?: number | null;
+  latencyFromLogicalTriggerMs?: number | null;
+  latencyFromWindowCloseMs?: number | null;
+  metadataSource?: "direct" | "reconstructed";
 };
 
 export type PartialChunkResult = {

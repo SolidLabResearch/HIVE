@@ -1,0 +1,18 @@
+{
+  "targetWindowCount": 35,
+  "emittedFinalWindowCount": 9,
+  "finalWindowNumbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "stoppedAfterTargetWindows": false,
+  "stopReason": "other",
+  "approach": "fetching"
+}

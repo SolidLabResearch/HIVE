@@ -6,7 +6,7 @@
  * the three Phase 1 tables:
  *   1. Accuracy table  (avg result value per dataset per approach, % error vs fetching)
  *   2. Latency table   (avg, std dev, min, max, success rate)
- *   3. Resource table  (avg CPU%, avg memory MB ± std)
+ *   3. Resource table  (CPU-seconds, avg memory MB ± std)
  *
  * Usage:
  *   node experiments/generate-phase1-report.js
@@ -15,6 +15,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { computeCpuSecondsFromLegacyTreeRows } = require('./utils/processTreeMetrics');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -49,6 +50,13 @@ const RESOURCE_LOG = {
   naive_distributed: 'naive_distributed_approach_resource_usage.csv',
   approximation:     'approximation_approach_resource_usage.csv',
   chunked:           'streaming_query_hive_resource_log.csv',
+};
+
+const TREE_RESOURCE_LOG = {
+  fetching:          'fetching_client_side_process_tree_resource_usage.csv',
+  naive_distributed: null,
+  approximation:     'approximation_approach_process_tree_resource_usage.csv',
+  chunked:           'streaming_query_hive_process_tree_resource_log.csv',
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -123,19 +131,19 @@ function extractLatencyFromDir(dir, approachKey) {
 // ─── Resource extraction ──────────────────────────────────────────────────────
 
 function extractResourcesFromDir(dir, approachKey) {
+  const treeLogFile = TREE_RESOURCE_LOG[approachKey]
+    ? path.join(dir, TREE_RESOURCE_LOG[approachKey])
+    : null;
+  const treeRows = treeLogFile ? parseCSV(treeLogFile) : null;
+  const cpuStats =
+    treeRows && treeRows.length >= 2
+      ? computeCpuSecondsFromLegacyTreeRows(treeRows, { cpuKey: 'tree_cpu_seconds' })
+      : null;
+
   const logFile = path.join(dir, RESOURCE_LOG[approachKey]);
   const rows = parseCSV(logFile);
-  if (!rows || rows.length < 2) return null;
-
-  // cpu_user/cpu_system are cumulative ms from process.cpuUsage().
-  // CPU% = (delta_cpu_ms) / (delta_wall_ms) * 100
-  const first = rows[0], last = rows[rows.length - 1];
-  const wallMs = parseFloat(last.timestamp) - parseFloat(first.timestamp);
-  let avgCpu = null;
-  if (wallMs > 0) {
-    const deltaCpu = (parseFloat(last.cpu_user || '0') - parseFloat(first.cpu_user || '0'))
-                   + (parseFloat(last.cpu_system || '0') - parseFloat(first.cpu_system || '0'));
-    avgCpu = (deltaCpu / wallMs) * 100;
+  if (!rows || rows.length < 2) {
+    return cpuStats ? { cpuSeconds: cpuStats.cumulativeCpuSeconds, avgMemMB: null, stdMemMB: null } : null;
   }
 
   // heapUsedMB column is already in MB
@@ -143,12 +151,12 @@ function extractResourcesFromDir(dir, approachKey) {
     .map(r => parseFloat(r.heapUsedMB || '0'))
     .filter(v => !isNaN(v) && v > 0);
 
-  if (memVals.length === 0) return null;
+  if (memVals.length === 0 && !cpuStats) return null;
 
   return {
-    avgCpu:   avgCpu,
-    avgMemMB: memVals.reduce((a, b) => a + b, 0) / memVals.length,
-    stdMemMB: stdDev(memVals),
+    cpuSeconds: cpuStats ? cpuStats.cumulativeCpuSeconds : null,
+    avgMemMB: memVals.length ? memVals.reduce((a, b) => a + b, 0) / memVals.length : null,
+    stdMemMB: memVals.length ? stdDev(memVals) : null,
   };
 }
 
@@ -175,8 +183,8 @@ function aggregateApproachDataset(approachKey, dataset) {
 
     const res = extractResourcesFromDir(dir, approachKey);
     if (res) {
-      cpuArr.push(res.avgCpu);
-      memArr.push(res.avgMemMB);
+      if (res.cpuSeconds !== null) cpuArr.push(res.cpuSeconds);
+      if (res.avgMemMB !== null) memArr.push(res.avgMemMB);
     }
   }
 
@@ -196,7 +204,7 @@ function aggregateApproachDataset(approachKey, dataset) {
     minLatency:   allLatencies.length ? Math.min(...allLatencies) : null,
     maxLatency:   allLatencies.length ? Math.max(...allLatencies) : null,
     windowCount:  allLatencies.length,
-    avgCpu:       cpuArr.length ? cpuArr.reduce((a, b) => a + b, 0) / cpuArr.length : null,
+    cpuSeconds:   cpuArr.length ? cpuArr.reduce((a, b) => a + b, 0) / cpuArr.length : null,
     avgMemMB:     memArr.length ? memArr.reduce((a, b) => a + b, 0) / memArr.length : null,
     stdMemMB:     stdDev(memArr),
   };
@@ -277,7 +285,7 @@ function printLatencyTable(data) {
 
 function printResourceTable(data) {
   console.log('\n### Resource Usage per Approach (across all datasets and iterations)\n');
-  console.log('| Approach | Avg CPU% | Avg Memory (MB) |');
+  console.log('| Approach | CPU-seconds | Avg Memory (MB) |');
   console.log('|---|---|---|');
 
   for (const ap of APPROACHES) {
@@ -285,8 +293,8 @@ function printResourceTable(data) {
 
     for (const ds of DATASETS) {
       const d = data[ap.key]?.[ds.key];
-      if (!d || d.avgCpu === null) continue;
-      cpus.push(d.avgCpu);
+      if (!d || d.cpuSeconds === null) continue;
+      cpus.push(d.cpuSeconds);
       if (d.avgMemMB !== null) mems.push(d.avgMemMB);
       if (d.stdMemMB !== null) memStds.push(d.stdMemMB);
     }
@@ -304,7 +312,7 @@ function printResourceTable(data) {
       ? `${avgMem.toFixed(2)}MB${avgStd ? ` ±${avgStd.toFixed(2)}MB` : ''}`
       : 'N/A';
 
-    console.log(`| ${ap.label} | ${avgCpu.toFixed(1)}% | ${memStr} |`);
+    console.log(`| ${ap.label} | ${avgCpu.toFixed(2)} s | ${memStr} |`);
   }
 }
 

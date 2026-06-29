@@ -22,6 +22,13 @@ export type ChunkWindowDiagnostics = {
   duplicateChunksIgnoredBySubquery: Record<string, string[]>;
   missingSubqueryIds: string[];
   coverageComplete: boolean;
+  windowSemantics?: string;
+  logicalTriggerTime?: number | null;
+  windowDataCloseTime?: number | null;
+  resultEmittedAt?: number | null;
+  latencyFromLogicalTriggerMs?: number | null;
+  latencyFromWindowCloseMs?: number | null;
+  metadataSource?: "direct" | "reconstructed";
 };
 
 export type ComparableWindowDiagnostics = {

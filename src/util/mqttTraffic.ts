@@ -24,6 +24,12 @@ export type MqttTrafficRecord = {
   subscriberCount: number;
   estimatedDeliveryBytes: number;
   warmup?: boolean;
+  targetPublishTime?: number;
+  actualPublishTime?: number;
+  publishLagMs?: number;
+  effectiveReplaySpeed?: number;
+  eventTimeSpanMs?: number;
+  wallClockPublishSpanMs?: number;
 };
 
 type RecordMqttTrafficInput = Omit<Partial<MqttTrafficRecord>, "iteration"> & {
@@ -45,6 +51,12 @@ type RecordPublishedMqttMessageInput = {
   scale?: string;
   iteration?: string | number;
   logDir?: string;
+  targetPublishTime?: number;
+  actualPublishTime?: number;
+  publishLagMs?: number;
+  effectiveReplaySpeed?: number;
+  eventTimeSpanMs?: number;
+  wallClockPublishSpanMs?: number;
 };
 
 type FinalizeMqttTrafficArtifactsInput = {
@@ -70,6 +82,12 @@ const CSV_COLUMNS = [
   "subscriberCount",
   "estimatedDeliveryBytes",
   "warmup",
+  "targetPublishTime",
+  "actualPublishTime",
+  "publishLagMs",
+  "effectiveReplaySpeed",
+  "eventTimeSpanMs",
+  "wallClockPublishSpanMs",
 ] as const;
 
 function resolveLogDir(logDir?: string): string {
@@ -296,6 +314,30 @@ export function recordMqttTraffic(
     subscriberCount: normalizeInteger(subscriberCount),
     estimatedDeliveryBytes: normalizeInteger(estimatedDeliveryBytes),
     warmup: typeof input.warmup === "boolean" ? input.warmup : undefined,
+    targetPublishTime:
+      input.targetPublishTime !== undefined
+        ? normalizeInteger(input.targetPublishTime)
+        : undefined,
+    actualPublishTime:
+      input.actualPublishTime !== undefined
+        ? normalizeInteger(input.actualPublishTime)
+        : undefined,
+    publishLagMs:
+      input.publishLagMs !== undefined
+        ? Number(input.publishLagMs)
+        : undefined,
+    effectiveReplaySpeed:
+      input.effectiveReplaySpeed !== undefined
+        ? Number(input.effectiveReplaySpeed)
+        : undefined,
+    eventTimeSpanMs:
+      input.eventTimeSpanMs !== undefined
+        ? Number(input.eventTimeSpanMs)
+        : undefined,
+    wallClockPublishSpanMs:
+      input.wallClockPublishSpanMs !== undefined
+        ? Number(input.wallClockPublishSpanMs)
+        : undefined,
   };
 
   fs.appendFileSync(getInternalLogPath(input.logDir), `${JSON.stringify(record)}\n`);
@@ -401,6 +443,12 @@ function writeCsv(logDir: string, records: Array<MqttTrafficRecord & { warmup: b
         record.subscriberCount,
         record.estimatedDeliveryBytes,
         record.warmup,
+        record.targetPublishTime ?? "",
+        record.actualPublishTime ?? "",
+        record.publishLagMs ?? "",
+        record.effectiveReplaySpeed ?? "",
+        record.eventTimeSpanMs ?? "",
+        record.wallClockPublishSpanMs ?? "",
       ]
         .map(escapeCsv)
         .join(","),

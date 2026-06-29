@@ -32,6 +32,45 @@ jest.mock('fs', () => ({
 import { StreamingQueryChunkAggregatorOperator } from './StreamingQueryChunkAggregatorOperator';
 import fs from 'fs';
 
+const CHUNKED_LATENCY_HEADERS = [
+    'window_number',
+    'query_registered_at',
+    'first_data_received_at',
+    'expected_window_close',
+    'registration_anchored_expected_close',
+    'event_time_window_start',
+    'event_time_window_end',
+    'event_time_window_close',
+    'wall_clock_window_close',
+    'anchor_aligned_window_close',
+    'last_chunk_received_at',
+    'interval_trigger_at',
+    'result_emitted_at',
+    'delay_past_expected_close_ms',
+    'delay_past_data_start_ms',
+    'interval_wait_ms',
+    'computation_ms',
+    'result_value',
+    'required_chunk_intervals',
+    'last_required_chunk_received_at',
+    'semantic_ready_at',
+    'window_close_to_ready_ms',
+    'ready_to_emit_ms',
+    'wall_clock_close_to_result_ms',
+    'anchor_aligned_window_close_to_result_ms',
+    'latency_domain_status',
+    'trigger_type',
+    'emission_reason',
+    'window_semantics',
+    'logical_trigger_time',
+    'window_start',
+    'window_end',
+    'window_data_close_time',
+    'latency_from_logical_trigger_ms',
+    'latency_from_window_close_ms',
+    'metadata_source',
+];
+
 const QUERY_SINGLE_WINDOW = `
 PREFIX : <https://rsp.js/>
 REGISTER RStream <output> AS
@@ -51,6 +90,11 @@ WHERE {
 }`;
 
 describe('StreamingQueryChunkAggregatorOperator', () => {
+    function parseLatencyLogLine(line: string): Record<string, string> {
+        const trimmed = line.trim();
+        const values = trimmed.split(',');
+        return Object.fromEntries(CHUNKED_LATENCY_HEADERS.map((header, index) => [header, values[index] ?? '']));
+    }
     let operator: StreamingQueryChunkAggregatorOperator;
 
     beforeEach(() => {
@@ -337,8 +381,8 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             const samplesPerChunk = samplesPerChunkByRate[rateHz];
             const chunksPerStep = windowSlide / chunkSize;
             const chunksPerFullWindow = windowRange / chunkSize;
-            const chunkEndExclusive = windowNumber * chunksPerStep;
-            const chunkStartIndex = Math.max(0, chunkEndExclusive - Math.min(chunksPerFullWindow, chunkEndExclusive));
+            const chunkStartIndex = (windowNumber - 1) * chunksPerStep;
+            const chunkEndExclusive = chunkStartIndex + chunksPerFullWindow;
 
             const windowValues = topicSeries.flatMap((series) =>
                 series.slice(
@@ -357,11 +401,8 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
         ): number => {
             const chunksPerStep = windowSlide / chunkSize;
             const chunksPerFullWindow = windowRange / chunkSize;
-            const chunkEndExclusive = windowNumber * chunksPerStep;
-            const requiredChunksPerTopic = windowNumber === 1
-                ? chunksPerStep
-                : Math.min(chunksPerFullWindow, chunkEndExclusive);
-            const chunkStartIndex = Math.max(0, chunkEndExclusive - requiredChunksPerTopic);
+            const chunkStartIndex = (windowNumber - 1) * chunksPerStep;
+            const chunkEndExclusive = chunkStartIndex + chunksPerFullWindow;
 
             const selectedChunks = Array.from(topicChunks.values()).flatMap((chunks) =>
                 chunks.filter(
@@ -395,7 +436,9 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             channelSkewMs: number,
         ) => {
             const totalWindows = 35;
-            const totalChunks = totalWindows * (windowSlide / chunkSize);
+            const chunksPerStep = windowSlide / chunkSize;
+            const chunksPerFullWindow = windowRange / chunkSize;
+            const totalChunks = (totalWindows - 1) * chunksPerStep + chunksPerFullWindow;
             const topicSeries = [
                 buildRawSeries(0, rateHz, totalChunks),
                 buildRawSeries(1, rateHz, totalChunks),
@@ -1094,13 +1137,12 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             );
 
             expect(writeSpy).toHaveBeenCalled();
-            const logLine = writeSpy.mock.calls[0][0] as string;
-            const fields = logLine.trim().split(',');
+            const row = parseLatencyLogLine(writeSpy.mock.calls[0][0] as string);
 
-            expect(fields[12]).toBe('1000-2000');
-            expect(fields[13]).toBe('1781370000000');
-            expect(fields[14]).toBe('1781370000000');
-            expect(fields[17]).toBe('interval');
+            expect(row.required_chunk_intervals).toBe('1000-2000');
+            expect(row.last_required_chunk_received_at).toBe('1781370000000');
+            expect(row.semantic_ready_at).toBe('1781370000000');
+            expect(row.trigger_type).toBe('interval');
         });
 
         test('ready_to_emit_ms is near zero in immediate mode and reflects scheduling wait in interval mode', () => {
@@ -1140,9 +1182,9 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                 'Immediate'
             );
 
-            let fields = (writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string).trim().split(',');
-            expect(fields[16]).toBe('2');
-            expect(fields[17]).toBe('immediate');
+            let row = parseLatencyLogLine(writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string);
+            expect(row.ready_to_emit_ms).toBe('2');
+            expect(row.trigger_type).toBe('immediate');
 
             (operator as any).logLatency(
                 1,
@@ -1155,9 +1197,119 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                 'Interval'
             );
 
-            fields = (writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string).trim().split(',');
-            expect(fields[16]).toBe('1002');
-            expect(fields[17]).toBe('interval');
+            row = parseLatencyLogLine(writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string);
+            expect(row.ready_to_emit_ms).toBe('1002');
+            expect(row.trigger_type).toBe('interval');
+        });
+
+        test('mixed-domain close metadata is marked as domain_mismatch and does not write close-to-result latency', () => {
+            const proofEntry = {
+                windowStart: 1756122905256,
+                windowEnd: 1756123025256,
+                emittedAt: 0,
+                emissionReason: 'coverage_complete',
+                expectedSubqueryIds: ['subA'],
+                expectedSubqueryCount: 1,
+                requiredChunksBySubquery: { subA: ['chunk-1'] },
+                receivedChunksUsedBySubquery: { subA: ['chunk-1'] },
+                missingChunksBySubquery: { subA: [] },
+                duplicateChunksIgnoredBySubquery: { subA: [] },
+                coverageComplete: true,
+                allExpectedSubqueriesPresent: true,
+                emitted: true,
+            };
+
+            (operator as any).chunkArrivalTimes.set('chunk-1', 1782237608185);
+            (operator as any).chunkWindowMap.set('chunk-1', { start: 1756122905256, end: 1756123025256 });
+            (operator as any).queryRegisteredTime = 1782237483282;
+            (operator as any).runtimeReplayStartWallClockTime = 1756122905256;
+            (operator as any).benchmarkEventTimeAnchor = 1756122905256;
+
+            const writeSpy = jest.spyOn((operator as any).latencyLogStream, 'write');
+
+            (operator as any).logLatency(
+                1,
+                1782237603282,
+                1782237608185,
+                1782237608186,
+                1782237608187,
+                '1.0028534916666667',
+                proofEntry,
+                'Immediate',
+                {
+                    windowSemantics: 'trailing',
+                    logicalTriggerTime: 1756122935256,
+                    windowStart: 1756122905256,
+                    windowEnd: 1756123025256,
+                    windowDataCloseTime: 1756123025256,
+                    resultEmittedAt: 1782237608187,
+                    latencyFromLogicalTriggerMs: null,
+                    latencyFromWindowCloseMs: null,
+                    metadataSource: 'direct',
+                },
+            );
+
+            const row = parseLatencyLogLine(writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string);
+            expect(row.latency_domain_status).toBe('domain_mismatch');
+            expect(row.wall_clock_window_close).toBe('');
+            expect(row.wall_clock_close_to_result_ms).toBe('');
+            expect(row.anchor_aligned_window_close_to_result_ms).toBe('');
+            expect(row.window_close_to_ready_ms).toBe('');
+        });
+
+        test('valid wall-clock close metadata produces plausible close-to-result latency', () => {
+            const proofEntry = {
+                windowStart: 1756122905256,
+                windowEnd: 1756123025256,
+                emittedAt: 0,
+                emissionReason: 'coverage_complete',
+                expectedSubqueryIds: ['subA'],
+                expectedSubqueryCount: 1,
+                requiredChunksBySubquery: { subA: ['chunk-1'] },
+                receivedChunksUsedBySubquery: { subA: ['chunk-1'] },
+                missingChunksBySubquery: { subA: [] },
+                duplicateChunksIgnoredBySubquery: { subA: [] },
+                coverageComplete: true,
+                allExpectedSubqueriesPresent: true,
+                emitted: true,
+            };
+
+            (operator as any).chunkArrivalTimes.set('chunk-1', 1782237608185);
+            (operator as any).chunkWindowMap.set('chunk-1', { start: 1756122905256, end: 1756123025256 });
+            (operator as any).queryRegisteredTime = 1782237483282;
+            (operator as any).runtimeReplayStartWallClockTime = 1782237484815;
+            (operator as any).benchmarkEventTimeAnchor = 1756122905256;
+
+            const writeSpy = jest.spyOn((operator as any).latencyLogStream, 'write');
+
+            (operator as any).logLatency(
+                1,
+                1782237603282,
+                1782237608185,
+                1782237608186,
+                1782237608187,
+                '1.0028534916666667',
+                proofEntry,
+                'Immediate',
+                {
+                    windowSemantics: 'trailing',
+                    logicalTriggerTime: 1756122935256,
+                    windowStart: 1756122905256,
+                    windowEnd: 1756123025256,
+                    windowDataCloseTime: 1756123025256,
+                    resultEmittedAt: 1782237608187,
+                    latencyFromLogicalTriggerMs: null,
+                    latencyFromWindowCloseMs: null,
+                    metadataSource: 'direct',
+                },
+            );
+
+            const row = parseLatencyLogLine(writeSpy.mock.calls[writeSpy.mock.calls.length - 1][0] as string);
+            expect(row.latency_domain_status).toBe('wall_clock_mapped');
+            expect(row.wall_clock_window_close).toBe('1782237604815');
+            expect(row.wall_clock_close_to_result_ms).toBe('3372');
+            expect(row.anchor_aligned_window_close_to_result_ms).toBe('3372');
+            expect(row.window_close_to_ready_ms).toBe('3370');
         });
 
         test('incomplete chunk coverage blocks emission', async () => {
@@ -1583,6 +1735,24 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect(parentPartialStream.write.mock.calls[1][0]).toBe(
                 'parent_partial,false,1700000000000,3,1000,4000,6000,3000,2,5,42,8.4,2,13,8.4,1700000000500,500,100,"g1|g2","[{""chunkGroupId"":""g1"",""start"":1000,""end"":2500,""count"":2,""sum"":12,""avg"":6,""value"":6,""min"":2,""max"":10,""subqueries"":[""sub\\""A"",""subB""],""receivedChunkIdsBySubquery"":{""subA"":[""a1""],""subB"":[""b1""]},""duplicateChunksIgnoredBySubquery"":{""subA"":[],""subB"":[]},""missingSubqueryIds"":[],""coverageComplete"":true}]"\n',
             );
+        });
+
+        test('benchmark target window cap records finalized windows and target stop state', () => {
+            const timeoutSpy = jest
+                .spyOn(global, 'setTimeout')
+                .mockImplementation(((callback: any) => 0 as any) as typeof setTimeout);
+            try {
+                (operator as any).benchmarkTargetWindowCount = 3;
+                (operator as any).recordFinalizedWindow(1);
+                (operator as any).recordFinalizedWindow(2);
+                (operator as any).recordFinalizedWindow(3);
+
+                expect((operator as any).finalizedWindowNumbers).toEqual([1, 2, 3]);
+                expect((operator as any).benchmarkTargetWindowReached).toBe(true);
+                expect((operator as any).benchmarkStopReason).toBe('target_window_count_reached');
+            } finally {
+                timeoutSpy.mockRestore();
+            }
         });
     });
 });

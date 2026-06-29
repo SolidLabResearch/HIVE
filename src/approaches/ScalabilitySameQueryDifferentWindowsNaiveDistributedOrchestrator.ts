@@ -272,7 +272,7 @@ function startResourceUsageLogging(
     logStream.write("timestamp,cpu_user,cpu_system,rss,heapTotal,heapUsed,heapUsedMB,external\n");
   }
 
-  setInterval(() => {
+  const timer = setInterval(() => {
     const mem = process.memoryUsage();
     const cpu = process.cpuUsage();
     const now = Date.now();
@@ -289,6 +289,7 @@ function startResourceUsageLogging(
       ].join(",") + "\n",
     );
   }, intervalMs);
+  timer.unref?.();
 }
 
 startResourceUsageLogging();

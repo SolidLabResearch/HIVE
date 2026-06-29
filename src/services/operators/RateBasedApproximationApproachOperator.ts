@@ -1,25 +1,44 @@
 import { IStreamQueryOperator } from "../../util/Interfaces";
 import CONFIG from "../../config/httpServerConfig.json";
 import { RSPQLParser } from "rsp-js";
+import fs from "fs";
+import * as path from "path";
 import { ExtractedQuery, QueryMap } from "../../util/Types";
 import { CSVLogger } from "../../util/logger/CSVLogger";
 import mqtt from "mqtt";
 import {
   AggregationFunction,
   buildBenchmarkResultPayload,
+  buildBenchmarkWindowMetadata,
+  getBenchmarkStartTime,
+  getBenchmarkTargetWindowCount,
+  getApproximationCompletedWindowMode,
+  getApproximationEarlyTriggerMode,
+  getBenchmarkEventTimeAnchor,
   getResultTopic,
   getSessionId,
+  isApproximationDebugEnabled,
 } from "../../util/runtimeConfig";
+import { PartialChunkResult } from "../../util/chunkTypes";
 import { hash_string_md5 } from "../../util/Util";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 import { getCachedParsedQuery } from "../../util/queryCache";
-import { profileCount, profileSync, writeProfileArtifact } from "../../util/profiling";
+import {
+  endStageTimer,
+  profileCount,
+  profileStageSync,
+  profileSync,
+  startStageTimer,
+  writeProfileArtifact,
+  writeStageProfileArtifact,
+} from "../../util/profiling";
 import { ApproximationDiagnosticsWriter } from "./approximation/ApproximationDiagnosticsWriter";
 import { ApproximationResultPublisher } from "./approximation/ApproximationResultPublisher";
 import {
   appendTopicResult,
   cleanupOldWindows,
   computeTopicLevelApproximationResult,
+  getActiveWindowCount,
   getLatestTopicValue,
   TopicWindowBuffers,
 } from "./approximation/ApproximationWindowBuffer";
@@ -38,11 +57,25 @@ interface InactivityConfig {
   maxTimeoutMs?: number;
 }
 
+const VALUE_EXTRACT_REGEX =
+  /saref:hasValue>\s*"([^"]*)"(?:\^\^<[^>]*>)?/;
+const OUTPUT_AGGREGATION_REGEX = /SELECT\s*\((\w+)\(/i;
+
+type ApproximationWindowMessage = {
+  kind: "structured" | "adapted_legacy";
+  windowStart: number;
+  windowEnd: number;
+  value: number;
+  aggregationType: "SUM" | "AVG" | "COUNT" | "MIN" | "MAX";
+  sourceTopic: string;
+};
+
 /**
  *
  */
 export class ApproximationApproachOperator implements IStreamQueryOperator {
   private logger: CSVLogger = new CSVLogger("approximation_approach_log.csv");
+  private readonly debugEnabled: boolean = isApproximationDebugEnabled();
   private subQueries: string[] = [];
   private outputQuery: string = "";
   private queryMQTTTopicMap: Map<string, string> = new Map<string, string>();
@@ -51,6 +84,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private parser: RSPQLParser = new RSPQLParser();
   private inactivityConfig: InactivityConfig;
   private diagnosticsWriter: ApproximationDiagnosticsWriter;
+  private topicWindowParameters: Record<
+    string,
+    { width: number; aggregation: string }
+  > = {};
   private windowCount: number = 0;
   private queryRegisteredTime: number = 0;
   private windowRange: number = 120000; // 120 seconds based on RANGE 120000
@@ -58,11 +95,38 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private firstDataReceivedTime: number = 0; // Track when first data arrives (wall-clock)
   private lastDataReceivedTime: number = 0; // Track when last data was received
   private sessionId: string = getSessionId();
+  private outputAggregationType: AggregationFunction = "AVG";
   private resultPublisher: ApproximationResultPublisher;
   private activeMqttClients: any[] = [];
   private cleanupRegistered: boolean = false;
   private cachedOutputQuery: string = "";
   private cachedOutputQueryParsed: any = null;
+  private benchmarkEventTimeAnchor: number | null =
+    getBenchmarkEventTimeAnchor();
+  private runtimeReplayStartWallClockTime: number | null =
+    getBenchmarkStartTime();
+  private readonly completedWindowMode: boolean =
+    getApproximationCompletedWindowMode();
+  private readonly earlyTriggerMode: boolean =
+    getApproximationEarlyTriggerMode();
+  private readonly messageCounters = {
+    legacy_messages_seen: 0,
+    structured_messages_seen: 0,
+    adapted_legacy_messages_seen: 0,
+    suppressed_missing_window_metadata: 0,
+  };
+  private readonly benchmarkTargetWindowCount: number | null =
+    getBenchmarkTargetWindowCount();
+  private finalizedWindowNumbers: number[] = [];
+  private benchmarkTargetWindowReached: boolean = false;
+  private benchmarkStopReason:
+    | "target_window_count_reached"
+    | "finite_replay_duration_reached"
+    | "other" = "other";
+  private benchmarkWindowSummaryPath: string = path.join(
+    process.env.LOG_PATH || ".",
+    "benchmark_window_cap_summary.json",
+  );
 
   /**
    * The constructor class with optional inactivity configuration.
@@ -83,6 +147,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       this.windowRange,
       this.windowSlide,
     );
+    this.diagnosticsWriter.updateTimeAnchors({
+      runtimeReplayStartWallClockTime: this.runtimeReplayStartWallClockTime,
+      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+    });
     this.resultPublisher = new ApproximationResultPublisher(
       CONFIG.mqttBroker,
       this.activeMqttClients,
@@ -107,6 +175,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
   public cleanup(): void {
     profileSync("cleanup_time_ms", () => {
+      this.writeBenchmarkWindowSummary();
       this.resultPublisher.cleanup();
       for (const client of this.activeMqttClients.splice(0)) {
         try {
@@ -117,7 +186,63 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       }
       this.diagnosticsWriter.cleanup();
     });
+    this.logger.log(
+      `Approximation message counters: ${JSON.stringify(this.messageCounters)}`,
+    );
     writeProfileArtifact();
+    writeStageProfileArtifact();
+  }
+
+  private recordFinalizedWindow(windowNumber: number): void {
+    if (!this.finalizedWindowNumbers.includes(windowNumber)) {
+      this.finalizedWindowNumbers.push(windowNumber);
+      this.finalizedWindowNumbers.sort((left, right) => left - right);
+    }
+
+    if (
+      this.benchmarkTargetWindowCount !== null &&
+      this.finalizedWindowNumbers.length >= this.benchmarkTargetWindowCount
+    ) {
+      this.benchmarkTargetWindowReached = true;
+      this.benchmarkStopReason = "target_window_count_reached";
+      this.logger.log(
+        `Benchmark target window reached: target=${this.benchmarkTargetWindowCount} finalWindows=${this.finalizedWindowNumbers.join(",")}`,
+      );
+      this.writeBenchmarkWindowSummary();
+      setTimeout(() => {
+        this.cleanup();
+        process.exit(0);
+      }, 50);
+    }
+  }
+
+  private writeBenchmarkWindowSummary(): void {
+    if (this.benchmarkTargetWindowCount === null) {
+      return;
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(this.benchmarkWindowSummaryPath), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        this.benchmarkWindowSummaryPath,
+        JSON.stringify(
+          {
+            targetWindowCount: this.benchmarkTargetWindowCount,
+            emittedFinalWindowCount: this.finalizedWindowNumbers.length,
+            finalWindowNumbers: this.finalizedWindowNumbers,
+            stoppedAfterTargetWindows: this.benchmarkTargetWindowReached,
+            stopReason: this.benchmarkStopReason,
+            approach: "approximation",
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      console.error("Error writing benchmark window summary:", error);
+    }
   }
 
   /**
@@ -161,6 +286,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     // this.subQueries = [];
     this.extractedQueries = [];
     await this.setMQTTTopicMap();
+    this.topicWindowParameters = await this.createTopicWindowParameters(
+      this.extractedQueries,
+    );
     console.log(
       `Init completed. Current subqueries count: ${this.subQueries.length}`,
     );
@@ -184,7 +312,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
         const parsed = getCachedParsedQuery<any>(this.parser, topic.rspql_query);
 
         const width = parsed.s2r[0]?.width;
-        const aggregationMatch = topic.rspql_query.match(/SELECT\s*\((\w+)\(/i);
+        const aggregationMatch = topic.rspql_query.match(
+          OUTPUT_AGGREGATION_REGEX,
+        );
         const aggregation = aggregationMatch
           ? aggregationMatch[1].toUpperCase()
           : "AVG";
@@ -225,9 +355,11 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       console.log(
         `Derived ${this.extractedQueries.length} active reusable-result topics from provided subqueries.`,
       );
-      console.log(
-        `Active approximation MQTT topics: ${JSON.stringify(Array.from(this.queryMQTTTopicMap.values()))}`,
-      );
+      if (this.debugEnabled) {
+        console.log(
+          `Active approximation MQTT topics: ${JSON.stringify(Array.from(this.queryMQTTTopicMap.values()))}`,
+        );
+      }
       return;
     }
 
@@ -287,9 +419,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       throw new Error("No subqueries to aggregate.");
     }
 
-    const window_parameters = await this.createTopicWindowParameters(
-      this.extractedQueries,
-    );
+    const window_parameters =
+      Object.keys(this.topicWindowParameters).length > 0
+        ? this.topicWindowParameters
+        : await this.createTopicWindowParameters(this.extractedQueries);
 
     if (this.queryMQTTTopicMap.size === 0) {
       console.log("No MQTT topics found for the subqueries.");
@@ -309,15 +442,24 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       this.windowRange,
       this.windowSlide,
     );
+    this.diagnosticsWriter.updateTimeAnchors({
+      runtimeReplayStartWallClockTime: this.runtimeReplayStartWallClockTime,
+      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+    });
 
     // Extract aggregation type from output query
-    const outputAggregationMatch =
-      this.outputQuery.match(/SELECT\s*\((\w+)\(/i);
+    const outputAggregationMatch = this.outputQuery.match(
+      OUTPUT_AGGREGATION_REGEX,
+    );
     const outputAggregationType = outputAggregationMatch
-      ? outputAggregationMatch[1].toUpperCase()
+      ? (outputAggregationMatch[1].toUpperCase() as AggregationFunction)
       : "AVG";
+    this.outputAggregationType = outputAggregationType;
     this.logger.log(
       `Output query aggregation type detected: ${outputAggregationType}`,
+    );
+    this.logger.log(
+      `Benchmark target window cap ${this.benchmarkTargetWindowCount !== null ? `enabled target=${this.benchmarkTargetWindowCount}` : "disabled"}`,
     );
 
     if (outputQueryParsed === null || outputQueryParsed === undefined) {
@@ -328,8 +470,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       throw new Error("No extracted queries found for aggregation.");
     }
 
-    const s2rQueries = this.extractedQueries.map(
-      (query) => getCachedParsedQuery<any>(this.parser, query.rspql_query).s2r[0],
+    const s2rQueries = this.extractedQueries.map((query) =>
+      getCachedParsedQuery<any>(this.parser, query.rspql_query).s2r[0],
     );
     if (s2rQueries.length === 0) {
       throw new Error("No valid s2r queries found for aggregation.");
@@ -371,11 +513,15 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       this.logger.log("Reconnecting to MQTT broker");
     });
 
-    const that = this;
-
     rsp_client.on("connect", () => {
       // Successfully connected to the MQTT broker
       this.logger.log("MQTT Client Connected for Approximation Operator");
+      this.logger.log(
+        `Approximation mode configuration: ${JSON.stringify({
+          completedWindowMode: this.completedWindowMode,
+          earlyTriggerMode: this.earlyTriggerMode,
+        })}`,
+      );
 
       // Subscribe to relevant topics
       const topics = Array.from(this.queryMQTTTopicMap.values());
@@ -395,25 +541,28 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       }
 
       // Subscribing to the different subQueries for the R2S result values to approximate for the output query.
+      rsp_client.subscribe(r2sTopics, { qos: 1 }, (err: any) => {
+        if (err) {
+          console.error(`Failed to subscribe to topics ${r2sTopics.join(",")}:`, err);
+          return;
+        }
 
-      for (const mqttTopic of r2sTopics) {
-        rsp_client.subscribe(mqttTopic, (err: any) => {
-          if (err) {
-            console.error(`Failed to subscribe to topic ${mqttTopic}:`, err);
-          } else {
-            console.log(`Successfully subscribed to topic ${mqttTopic}`);
-          }
-        });
-      }
+        console.log(
+          `Successfully subscribed to ${r2sTopics.length} approximation topics`,
+        );
+      });
 
       // Use separate buffers for each topic/variable
       const windowBuffers: TopicWindowBuffers = new Map();
+      const latestStructuredWindowEndByTopic: Map<string, number> = new Map();
 
       // Global tracking of latest values from all topics - this persists across windows
       const globalLatestValues: Map<
         string,
         { value: number; timestamp: number }
       > = new Map();
+      let nextOutputWindowNumber = 1;
+      let structuredWindowAnchor: number | null = this.benchmarkEventTimeAnchor;
 
       let lastTriggerTime = Date.now();
       let lastDataReceivedTime = Date.now(); // Track when we last received any data
@@ -423,7 +572,252 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       let streamStartTime = Date.now(); // Track when the stream started
       const MAX_STREAM_DURATION = 240000; // Allow enough time for three 60s output windows plus buffer
 
+      const emitStructuredReadyWindows = () => {
+        const readinessStartedAt = startStageTimer();
+        if (structuredWindowAnchor === null) {
+          endStageTimer(
+            "approximation.completed_window_readiness_check_ms",
+            readinessStartedAt,
+          );
+          return;
+        }
+
+        while (true) {
+          if (
+            this.benchmarkTargetWindowCount !== null &&
+            nextOutputWindowNumber > this.benchmarkTargetWindowCount
+          ) {
+            endStageTimer(
+              "approximation.completed_window_readiness_check_ms",
+              readinessStartedAt,
+            );
+            return;
+          }
+
+          const windowStart =
+            structuredWindowAnchor +
+            (nextOutputWindowNumber - 1) * outputQuerySlide;
+          const windowEnd = windowStart + outputQueryWidth;
+          const allTopicsClosed = r2sTopics.every((expectedTopic) => {
+            const latestEnd = latestStructuredWindowEndByTopic.get(expectedTopic);
+            return latestEnd !== undefined && latestEnd >= windowEnd;
+          });
+
+          if (!allTopicsClosed) {
+            endStageTimer(
+              "approximation.completed_window_readiness_check_ms",
+              readinessStartedAt,
+            );
+            return;
+          }
+
+          const aggregationResults: Record<string, number | string> = {};
+          const latestValues: Record<string, number> = {};
+          let totalValidBuffers = 0;
+
+          windowBuffers.forEach((buffer, topicKey) => {
+            cleanupOldWindows(buffer, windowStart);
+            const activeWindowCount = getActiveWindowCount(buffer);
+            if (activeWindowCount > 0) {
+              totalValidBuffers += 1;
+              const target = { start: windowStart, end: windowEnd };
+              const topicResult = profileStageSync(
+                "approximation.aggregation_math_ms",
+                () =>
+                  computeTopicLevelApproximationResult(
+                    buffer,
+                    target,
+                  ),
+              );
+              aggregationResults[topicKey] = topicResult;
+              if (typeof topicResult === "number") {
+                latestValues[topicKey] = topicResult;
+              }
+            } else {
+              const mostRecentValue = getLatestTopicValue(windowBuffers.get(topicKey));
+              if (mostRecentValue !== undefined) {
+                latestValues[topicKey] = mostRecentValue;
+              }
+            }
+          });
+
+          r2sTopics.forEach((expectedTopic) => {
+            if (
+              latestValues[expectedTopic] === undefined &&
+              windowBuffers.has(expectedTopic)
+            ) {
+              const mostRecentValue = getLatestTopicValue(
+                windowBuffers.get(expectedTopic),
+              );
+              if (mostRecentValue !== undefined) {
+                latestValues[expectedTopic] = mostRecentValue;
+              }
+            }
+          });
+
+          const allAvailableValues = Object.values(latestValues);
+          if (allAvailableValues.length === 0) {
+            endStageTimer(
+              "approximation.completed_window_readiness_check_ms",
+              readinessStartedAt,
+            );
+            return;
+          }
+
+          let unifiedResult: number;
+          switch (outputAggregationType) {
+            case "MAX":
+              unifiedResult = Math.max(...allAvailableValues);
+              break;
+            case "MIN":
+              unifiedResult = Math.min(...allAvailableValues);
+              break;
+            case "SUM":
+              unifiedResult = allAvailableValues.reduce((sum, val) => sum + val, 0);
+              break;
+            case "COUNT":
+              unifiedResult = allAvailableValues.length;
+              break;
+            case "AVG":
+            default:
+              unifiedResult =
+                allAvailableValues.reduce((sum, val) => sum + val, 0) /
+                allAvailableValues.length;
+              break;
+          }
+
+          const individualTopicsResults: Record<string, number | string> = {
+            ...aggregationResults,
+          };
+          Object.keys(latestValues).forEach((topicKey) => {
+            if (individualTopicsResults[topicKey] === undefined) {
+              individualTopicsResults[topicKey] = latestValues[topicKey];
+            }
+          });
+
+          const currentOutputWindowNumber = nextOutputWindowNumber;
+          this.windowCount = currentOutputWindowNumber;
+          const resultEmittedAt = Date.now();
+          const registrationAnchoredExpectedClose =
+            this.diagnosticsWriter.getExpectedWindowCloseTime(
+              currentOutputWindowNumber,
+            );
+          const alignedWindowMetadata = buildBenchmarkWindowMetadata({
+            windowSemantics: process.env.RSP_WINDOW_SEMANTICS || "trailing",
+            logicalTriggerTime: windowEnd - outputQueryWidth / 2,
+            windowStart,
+            windowEnd,
+            windowDataCloseTime: windowEnd,
+            resultEmittedAt,
+            metadataSource: "reconstructed",
+          });
+
+          this.diagnosticsWriter.logLatency(
+            currentOutputWindowNumber,
+            this.firstDataReceivedTime,
+            registrationAnchoredExpectedClose,
+            this.lastDataReceivedTime,
+            resultEmittedAt,
+            String(unifiedResult),
+            {
+              ...alignedWindowMetadata,
+              approximationStatus: "completed_window_approximation",
+            } as ReturnType<typeof buildBenchmarkWindowMetadata>,
+          );
+
+          const finalResult = {
+            approach: "approximation",
+            aggregationType: this.outputAggregationType,
+            sessionId: this.sessionId,
+            timestamp: resultEmittedAt,
+            window: { start: windowStart, end: windowEnd },
+            unifiedResult,
+            value: unifiedResult,
+            unifiedAverage:
+              this.outputAggregationType === "AVG" ? unifiedResult : undefined,
+            individualTopics: individualTopicsResults,
+            metadata: {
+              validBuffers: totalValidBuffers,
+              expectedTopics: r2sTopics.length,
+              availableTopics: Object.keys(individualTopicsResults),
+              topicCount: allAvailableValues.length,
+              hasMultipleTopics: allAvailableValues.length >= 2,
+              latestValuesUsed: Object.keys(latestValues),
+              globalValuesAvailable: globalLatestValues.size,
+              usingGlobalValues: false,
+              approximationStatus: "completed_window_approximation",
+              registrationAnchoredExpectedClose,
+              eventTimeWindowClose: windowEnd,
+            },
+          };
+
+          if (rsp_client.connected) {
+            const publishedPayload = profileStageSync(
+              "approximation.final_payload_json_stringify_ms",
+              () =>
+                JSON.stringify({
+                  ...finalResult,
+                  ...buildBenchmarkResultPayload(
+                    "approximation",
+                    this.outputAggregationType,
+                    this.sessionId,
+                    unifiedResult,
+                    currentOutputWindowNumber,
+                    {},
+                    {
+                      windowSemantics: alignedWindowMetadata.windowSemantics,
+                      logicalTriggerTime: alignedWindowMetadata.logicalTriggerTime,
+                      windowStart: alignedWindowMetadata.windowStart,
+                      windowEnd: alignedWindowMetadata.windowEnd,
+                      windowDataCloseTime: alignedWindowMetadata.windowDataCloseTime,
+                      resultEmittedAt: alignedWindowMetadata.resultEmittedAt,
+                      latencyFromLogicalTriggerMs:
+                        alignedWindowMetadata.latencyFromLogicalTriggerMs,
+                      latencyFromWindowCloseMs:
+                        alignedWindowMetadata.latencyFromWindowCloseMs,
+                      metadataSource: alignedWindowMetadata.metadataSource,
+                      registrationAnchoredExpectedClose,
+                      eventTimeWindowClose: windowEnd,
+                      approximationStatus: "completed_window_approximation",
+                    },
+                  ),
+                }),
+            );
+
+            const publishStartedAt = startStageTimer();
+            rsp_client.publish(
+              resultTopic,
+              publishedPayload,
+              { qos: 1 },
+              (error) => {
+                endStageTimer(
+                  "approximation.final_mqtt_publish_total_ms",
+                  publishStartedAt,
+                );
+                if (error) {
+                  console.error("Failed to publish aggregated results:", error);
+                  this.logger.log(`Failed to publish aggregated results: ${error}`);
+                } else {
+                  recordPublishedMqttMessage({
+                    topic: resultTopic,
+                    payload: publishedPayload,
+                    messageType: "superquery_result",
+                    warmup: currentOutputWindowNumber === 1,
+                  });
+                  profileCount("mqtt_messages_published");
+                  profileCount("emitted_results");
+                  this.recordFinalizedWindow(currentOutputWindowNumber);
+                }
+              },
+            );
+          }
+
+          nextOutputWindowNumber += 1;
+        }
+      };
+
       rsp_client.on("message", (topic: string, message: any) => {
+        const callbackStartedAt = startStageTimer();
         // this.logger.log(`Received message on topic ${topic}: ${message.toString()}`);
 
         // Track when data is received for latency calculations
@@ -439,11 +833,61 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
         try {
           const data = message.toString();
           profileCount("mqtt_messages_received");
+          const structuredWindowMessage = this.parseApproximationWindowMessage(
+            data,
+            topic,
+            outputAggregationType,
+          );
+          if (structuredWindowMessage) {
+            profileStageSync("approximation.structured_branch_decision_ms", () => {
+              this.logger.log(
+                `Approximation branch decision: topic=${topic} branch=${structuredWindowMessage.kind} window_start=${structuredWindowMessage.windowStart} window_end=${structuredWindowMessage.windowEnd}`,
+              );
+            });
+            if (structuredWindowAnchor === null) {
+              structuredWindowAnchor = structuredWindowMessage.windowStart;
+            }
+
+            profileStageSync("approximation.buffer_update_ms", () => {
+              appendTopicResult(windowBuffers, topic, {
+                start: structuredWindowMessage.windowStart,
+                end: structuredWindowMessage.windowEnd,
+                value: structuredWindowMessage.value,
+                agg: structuredWindowMessage.aggregationType,
+              });
+              latestStructuredWindowEndByTopic.set(
+                topic,
+                structuredWindowMessage.windowEnd,
+              );
+              globalLatestValues.set(topic, {
+                value: structuredWindowMessage.value,
+                timestamp: structuredWindowMessage.windowEnd,
+              });
+            });
+            emitStructuredReadyWindows();
+            endStageTimer(
+              "approximation.mqtt_message_callback_total_ms",
+              callbackStartedAt,
+            );
+            return;
+          }
+
+          if (this.completedWindowMode && !this.earlyTriggerMode) {
+            this.messageCounters.legacy_messages_seen += 1;
+            this.messageCounters.suppressed_missing_window_metadata += 1;
+            this.logger.log(
+              `Approximation branch decision: topic=${topic} branch=suppressed_missing_window_metadata payload=${data}`,
+            );
+            endStageTimer(
+              "approximation.mqtt_message_callback_total_ms",
+              callbackStartedAt,
+            );
+            return;
+          }
+
           // Parse the RDF triple to extract the numeric value
           // Look for patterns like: hasValue> "number"^^<type>
-          const valueMatch = data.match(
-            /saref:hasValue>\s*"([^"]*)"(?:\^\^<[^>]*>)?/,
-          );
+          const valueMatch = data.match(VALUE_EXTRACT_REGEX);
           let value: number;
 
           if (valueMatch && valueMatch[1]) {
@@ -528,13 +972,13 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             `Updated global latest value for topic ${topic}: ${value} at ${now}`,
           );
 
-          if (process.env.STREAMING_QUERY_HIVE_DEBUG_CHUNKS === "1") {
+          if (this.debugEnabled) {
             const allTopicBufferSizes: Record<string, number> = {};
             windowBuffers.forEach((buffer, topicKey) => {
-              allTopicBufferSizes[topicKey] = buffer.length;
+              allTopicBufferSizes[topicKey] = getActiveWindowCount(buffer);
             });
             this.logger.log(
-              `After adding result - Topic ${topic} buffer size: ${windowBuffers.get(topic)!.length}; all topic buffer sizes: ${JSON.stringify(allTopicBufferSizes)}`,
+              `After adding result - Topic ${topic} buffer size: ${getActiveWindowCount(windowBuffers.get(topic))}; all topic buffer sizes: ${JSON.stringify(allTopicBufferSizes)}`,
             );
           }
 
@@ -587,7 +1031,11 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             // Check how many topics have valid data in the current window BEFORE cleanup
             let topicsWithValidData = 0;
             windowBuffers.forEach((buffer) => {
-              if (buffer.length > 0 && buffer[buffer.length - 1].end >= windowStartGlobal) {
+              const activeWindowCount = getActiveWindowCount(buffer);
+              if (
+                activeWindowCount > 0 &&
+                buffer.windows[buffer.windows.length - 1].end >= windowStartGlobal
+              ) {
                 topicsWithValidData++;
               }
             });
@@ -612,7 +1060,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             // Log buffer sizes before cleanup for each topic
             const topicBufferSizes: Record<string, number> = {};
             windowBuffers.forEach((buffer, topicKey) => {
-              topicBufferSizes[topicKey] = buffer.length;
+              topicBufferSizes[topicKey] = getActiveWindowCount(buffer);
             });
             this.logger.log(
               `Current window buffer sizes before cleanup: ${JSON.stringify(topicBufferSizes)}`,
@@ -627,13 +1075,16 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
               cleanupOldWindows(buffer, windowStartGlobal);
 
               this.logger.log(
-                `Topic ${topicKey} buffer size after cleanup: ${buffer.length}`,
+                `Topic ${topicKey} buffer size after cleanup: ${getActiveWindowCount(buffer)}`,
               );
-              this.logger.log(
-                `Topic ${topicKey} buffer contents after cleanup: ${JSON.stringify(buffer)}`,
-              );
+              if (this.debugEnabled) {
+                this.logger.log(
+                  `Topic ${topicKey} buffer contents after cleanup: ${JSON.stringify(buffer.windows.slice(buffer.headIndex))}`,
+                );
+              }
 
-              if (buffer.length > 0) {
+              const activeWindowCount = getActiveWindowCount(buffer);
+              if (activeWindowCount > 0) {
                 totalValidBuffers++;
                 const target = { start: windowStartGlobal, end: now };
                 const topicResult = computeTopicLevelApproximationResult(
@@ -686,6 +1137,23 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             const hasMultipleTopicData = Object.keys(latestValues).length >= 2;
             const hasAnyValidData =
               totalValidBuffers > 0 || Object.keys(latestValues).length > 0;
+
+            if (
+              this.benchmarkTargetWindowCount !== null &&
+              this.windowCount >= this.benchmarkTargetWindowCount
+            ) {
+              this.logger.log(
+                `Benchmark target window cap reached before legacy aggregation: target=${this.benchmarkTargetWindowCount} emitted=${this.windowCount}`,
+              );
+              this.benchmarkTargetWindowReached = true;
+              this.benchmarkStopReason = "target_window_count_reached";
+              this.writeBenchmarkWindowSummary();
+              setTimeout(() => {
+                this.cleanup();
+                process.exit(0);
+              }, 50);
+              return;
+            }
 
             if (hasAnyValidData) {
               // Calculate unified cross-sensor average using latest values from all available topics
@@ -743,9 +1211,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   break;
               }
 
-              this.logger.log(
-                `Computing unified cross-sensor ${outputAggregationType.toLowerCase()} using ${allAvailableValuesFromGlobal.length >= 2 ? "global" : "windowed"} values: ${JSON.stringify(allAvailableValues)} from topics: ${JSON.stringify(topicsUsedForAverage)} -> ${unifiedResult}`,
-              ); // Prepare individual topics results - prefer aggregation results, fallback to latest values, then global values
+            this.logger.log(
+              `Computing unified cross-sensor ${outputAggregationType.toLowerCase()} using ${allAvailableValuesFromGlobal.length >= 2 ? "global" : "windowed"} values: ${this.debugEnabled ? JSON.stringify(allAvailableValues) : `[${allAvailableValues.length} values]`} from topics: ${this.debugEnabled ? JSON.stringify(topicsUsedForAverage) : `[${topicsUsedForAverage.length} topics]`} -> ${unifiedResult}`,
+            ); // Prepare individual topics results - prefer aggregation results, fallback to latest values, then global values
               const individualTopicsResults: Record<string, number | string> = {
                 ...aggregationResults,
               };
@@ -765,14 +1233,14 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
               // Publish unified result similar to other approaches
               const finalResult = {
                 approach: "approximation",
-                aggregationType: outputAggregationType,
+                aggregationType: this.outputAggregationType,
                 sessionId: this.sessionId,
                 timestamp: now,
                 window: { start: windowStartGlobal, end: now },
                 unifiedResult: unifiedResult,
                 value: unifiedResult,
                 unifiedAverage:
-                  outputAggregationType === "AVG" ? unifiedResult : undefined, // Keep for backward compatibility
+                  this.outputAggregationType === "AVG" ? unifiedResult : undefined, // Keep for backward compatibility
                 individualTopics: individualTopicsResults,
                 metadata: {
                   validBuffers: totalValidBuffers,
@@ -786,9 +1254,15 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                 },
               };
 
-              this.logger.log(
-                `Final aggregation results: ${JSON.stringify(finalResult)}`,
-              );
+              if (this.debugEnabled) {
+                this.logger.log(
+                  `Final aggregation results: ${JSON.stringify(finalResult)}`,
+                );
+              } else {
+                this.logger.log(
+                  `Final aggregation results ready for publishing: window=${this.windowCount + 1}, topics=${Object.keys(individualTopicsResults).length}, aggregation=${this.outputAggregationType}`,
+                );
+              }
 
               // Check if client is connected before publishing
               if (rsp_client.connected) {
@@ -799,6 +1273,16 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   this.diagnosticsWriter.getExpectedWindowCloseTime(
                     this.windowCount,
                   );
+                const centeredWindowMetadata = buildBenchmarkWindowMetadata({
+                  windowSemantics: process.env.RSP_WINDOW_SEMANTICS || "trailing",
+                  logicalTriggerTime:
+                    expectedWindowClose - this.windowRange / 2,
+                  windowStart: expectedWindowClose - this.windowRange,
+                  windowEnd: expectedWindowClose,
+                  windowDataCloseTime: expectedWindowClose,
+                  resultEmittedAt,
+                  metadataSource: "reconstructed",
+                });
                 this.diagnosticsWriter.logLatency(
                   this.windowCount,
                   this.firstDataReceivedTime,
@@ -806,15 +1290,31 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   this.lastDataReceivedTime,
                   resultEmittedAt,
                   String(unifiedResult),
+                  centeredWindowMetadata,
                 );
                 const publishedPayload = JSON.stringify({
                   ...finalResult,
                   ...buildBenchmarkResultPayload(
                     "approximation",
-                    outputAggregationType as AggregationFunction,
+                    this.outputAggregationType,
                     this.sessionId,
                     unifiedResult,
                     this.windowCount,
+                    {
+                      windowSemantics: centeredWindowMetadata.windowSemantics,
+                      logicalTriggerTime:
+                        centeredWindowMetadata.logicalTriggerTime,
+                      windowStart: centeredWindowMetadata.windowStart,
+                      windowEnd: centeredWindowMetadata.windowEnd,
+                      windowDataCloseTime:
+                        centeredWindowMetadata.windowDataCloseTime,
+                      resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
+                      latencyFromLogicalTriggerMs:
+                        centeredWindowMetadata.latencyFromLogicalTriggerMs,
+                      latencyFromWindowCloseMs:
+                        centeredWindowMetadata.latencyFromWindowCloseMs,
+                      metadataSource: centeredWindowMetadata.metadataSource,
+                    },
                   ),
                 });
 
@@ -842,6 +1342,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                       });
                       profileCount("mqtt_messages_published");
                       profileCount("emitted_results");
+                      this.recordFinalizedWindow(this.windowCount);
                       console.log(
                         `Successfully published unified cross-sensor ${outputAggregationType.toLowerCase()}: ${unifiedResult} (from ${allAvailableValues.length} topics)`,
                       );
@@ -870,7 +1371,107 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             `Error processing message from topic ${topic}: ${error}`,
           );
         }
+        endStageTimer(
+          "approximation.mqtt_message_callback_total_ms",
+          callbackStartedAt,
+        );
       });
     });
+  }
+
+  private parseApproximationWindowMessage(
+    rawData: string,
+    topic: string,
+    fallbackAggregationType: AggregationFunction,
+  ): ApproximationWindowMessage | null {
+    let parsed: any;
+    try {
+      parsed = profileStageSync(
+        "approximation.structured_json_parse_ms",
+        () => JSON.parse(rawData),
+      );
+    } catch {
+      return null;
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const structuredChunkResult = parsed as PartialChunkResult;
+    const directWindowStart = Number(
+      structuredChunkResult.window?.start ?? parsed.window_start,
+    );
+    const directWindowEnd = Number(
+      structuredChunkResult.window?.end ?? parsed.window_end,
+    );
+    const timestampFrom = Number(parsed.timestamp_from);
+    const timestampTo = Number(parsed.timestamp_to);
+    const windowStart = Number.isFinite(directWindowStart)
+      ? directWindowStart
+      : Number.isFinite(timestampFrom)
+        ? timestampFrom
+        : NaN;
+    const windowEnd = Number.isFinite(directWindowEnd)
+      ? directWindowEnd
+      : Number.isFinite(timestampTo)
+        ? timestampTo
+        : NaN;
+    const value = Number(
+      structuredChunkResult.value ??
+        parsed.value ??
+        parsed.resultValue ??
+        structuredChunkResult.avg ??
+        parsed.avg ??
+        structuredChunkResult.sum ??
+        parsed.sum ??
+        structuredChunkResult.min ??
+        parsed.min ??
+        structuredChunkResult.max ??
+        parsed.max,
+    );
+    const aggregationType = String(
+      structuredChunkResult.aggregateFunction ??
+        parsed.aggregateFunction ??
+        parsed.aggregationType ??
+        fallbackAggregationType,
+    ).toUpperCase() as "SUM" | "AVG" | "COUNT" | "MIN" | "MAX";
+
+    if (
+      Number.isFinite(windowStart) &&
+      Number.isFinite(windowEnd) &&
+      Number.isFinite(value)
+    ) {
+      const hasStructuredEnvelope =
+        parsed.message_format === "structured_reusable_result";
+      const hasNestedWindow =
+        structuredChunkResult.window &&
+        Number.isFinite(Number(structuredChunkResult.window.start)) &&
+        Number.isFinite(Number(structuredChunkResult.window.end));
+      const hasFlatStructuredWindow =
+        Number.isFinite(Number(parsed.window_start)) &&
+        Number.isFinite(Number(parsed.window_end));
+      const kind =
+        hasStructuredEnvelope && (hasNestedWindow || hasFlatStructuredWindow)
+          ? "structured"
+          : "adapted_legacy";
+      if (kind === "structured") {
+        this.messageCounters.structured_messages_seen += 1;
+      } else {
+        this.messageCounters.adapted_legacy_messages_seen += 1;
+      }
+
+      return {
+        kind,
+        windowStart,
+        windowEnd,
+        value,
+        aggregationType,
+        sourceTopic:
+          String(parsed.source_topic || parsed.reusable_result_topic || topic),
+      };
+    }
+
+    return null;
   }
 }

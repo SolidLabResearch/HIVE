@@ -1,11 +1,61 @@
 import fs from "fs";
-import { profileSync } from "../../../util/profiling";
+import { profileStageSync, profileSync } from "../../../util/profiling";
+import { buildBenchmarkWindowMetadata } from "../../../util/runtimeConfig";
 import type { CSVLogger } from "../../../util/logger/CSVLogger";
 import type {
   ChunkEmissionProofEntry,
   ComparableWindowDiagnostics,
   ParentPartialDiagnostics,
 } from "./types";
+
+export type ChunkedLatencyDomainResolution = {
+  wallClockWindowClose: number | null;
+  latencyDomainStatus:
+    | "wall_clock_mapped"
+    | "runtime_anchor_missing"
+    | "event_time_missing"
+    | "domain_mismatch";
+};
+
+export function resolveChunkedWallClockWindowClose(args: {
+  eventTimeWindowClose: number | null;
+  runtimeReplayStartWallClockTime: number | null;
+  benchmarkEventTimeAnchor: number | null;
+  queryRegisteredTime: number;
+}): ChunkedLatencyDomainResolution {
+  if (!Number.isFinite(args.eventTimeWindowClose)) {
+    return {
+      wallClockWindowClose: null,
+      latencyDomainStatus: "event_time_missing",
+    };
+  }
+
+  if (
+    !Number.isFinite(args.runtimeReplayStartWallClockTime) ||
+    !Number.isFinite(args.benchmarkEventTimeAnchor)
+  ) {
+    return {
+      wallClockWindowClose: null,
+      latencyDomainStatus: "runtime_anchor_missing",
+    };
+  }
+
+  const wallClockWindowClose =
+    Number(args.runtimeReplayStartWallClockTime) +
+    (Number(args.eventTimeWindowClose) - Number(args.benchmarkEventTimeAnchor));
+
+  if (Math.abs(wallClockWindowClose - args.queryRegisteredTime) > 86400000) {
+    return {
+      wallClockWindowClose: null,
+      latencyDomainStatus: "domain_mismatch",
+    };
+  }
+
+  return {
+    wallClockWindowClose,
+    latencyDomainStatus: "wall_clock_mapped",
+  };
+}
 
 export function initializeLatencyLogging(
   resolveLogFilePath: (fileName: string) => string,
@@ -22,11 +72,11 @@ export function initializeLatencyLogging(
     flags: "a",
   });
 
-  if (writeLatencyHeader) {
-    latencyLogStream.write(
-      "window_number,query_registered_at,first_data_received_at,expected_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,interval_wait_ms,computation_ms,result_value,required_chunk_intervals,last_required_chunk_received_at,semantic_ready_at,window_close_to_ready_ms,ready_to_emit_ms,trigger_type,emission_reason\n",
-    );
-  }
+    if (writeLatencyHeader) {
+      latencyLogStream.write(
+        "window_number,query_registered_at,first_data_received_at,expected_window_close,registration_anchored_expected_close,event_time_window_start,event_time_window_end,event_time_window_close,wall_clock_window_close,anchor_aligned_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,interval_wait_ms,computation_ms,result_value,required_chunk_intervals,last_required_chunk_received_at,semantic_ready_at,window_close_to_ready_ms,ready_to_emit_ms,wall_clock_close_to_result_ms,anchor_aligned_window_close_to_result_ms,latency_domain_status,trigger_type,emission_reason,window_semantics,logical_trigger_time,window_start,window_end,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,metadata_source\n",
+      );
+    }
 
   const diagnosticsLogFilePath = resolveLogFilePath(`chunked_window_diagnostics${consumerIdx}.csv`);
   const writeDiagnosticsHeader = !fs.existsSync(diagnosticsLogFilePath);
@@ -81,7 +131,10 @@ export function logLatency(args: {
   useImmediateTrigger: boolean;
   chunkWindowMap: Map<string, { start: number; end: number }>;
   chunkArrivalTimes: Map<string, number>;
+  runtimeReplayStartWallClockTime: number | null;
+  benchmarkEventTimeAnchor: number | null;
   latencyLogStream?: fs.WriteStream;
+  metadata?: ReturnType<typeof buildBenchmarkWindowMetadata>;
 }): void {
   const latencyFromQueryReg = args.resultTime - args.expectedWindowClose;
   const expectedFromDataStart =
@@ -95,10 +148,46 @@ export function logLatency(args: {
   let requiredChunkIntervals = "";
   let lastRequiredChunkReceivedAt = args.lastChunkReceivedAt;
   let semanticReadyAt = args.lastChunkReceivedAt;
-  let windowCloseToReadyMs = args.resultTime - args.expectedWindowClose;
+  let windowCloseToReadyMs: number | "" = "";
   let readyToEmitMs = 0;
+  const maxPlausibleLatencyMs = 120000;
   const triggerType = args.triggerSource ? args.triggerSource.toLowerCase() : "interval";
   const emissionReason = args.proofEntry?.emissionReason ?? "unknown";
+  const metadata = args.metadata ?? buildBenchmarkWindowMetadata({
+    windowSemantics: process.env.RSP_WINDOW_SEMANTICS || "trailing",
+    logicalTriggerTime: args.expectedWindowClose - 60000,
+    windowStart: args.expectedWindowClose - 120000,
+    windowEnd: args.expectedWindowClose,
+    windowDataCloseTime: args.expectedWindowClose,
+    resultEmittedAt: args.resultTime,
+    metadataSource: "reconstructed",
+  });
+  const eventTimeWindowStart = metadata.windowStart ?? null;
+  const eventTimeWindowEnd = metadata.windowEnd ?? null;
+  const eventTimeWindowClose = metadata.windowDataCloseTime ?? null;
+  const { wallClockWindowClose, latencyDomainStatus } =
+    resolveChunkedWallClockWindowClose({
+      eventTimeWindowClose,
+      runtimeReplayStartWallClockTime: args.runtimeReplayStartWallClockTime,
+      benchmarkEventTimeAnchor: args.benchmarkEventTimeAnchor,
+      queryRegisteredTime: args.queryRegisteredTime,
+    });
+  const wallClockCloseToResultMs =
+    wallClockWindowClose !== null ? args.resultTime - wallClockWindowClose : "";
+  const anchorAlignedWindowClose = wallClockWindowClose ?? "";
+  const anchorAlignedWindowCloseToResultMs = wallClockCloseToResultMs;
+  const latencyFromLogicalTriggerMs =
+    wallClockWindowClose !== null &&
+    Number.isFinite(metadata.logicalTriggerTime) &&
+    Number.isFinite(args.benchmarkEventTimeAnchor) &&
+    Number.isFinite(args.runtimeReplayStartWallClockTime)
+      ? args.resultTime -
+        (Number(args.runtimeReplayStartWallClockTime) +
+          (Number(metadata.logicalTriggerTime) -
+            Number(args.benchmarkEventTimeAnchor)))
+      : "";
+  const latencyFromWindowCloseMs =
+    wallClockWindowClose !== null ? args.resultTime - wallClockWindowClose : "";
 
   if (args.proofEntry && args.proofEntry.receivedChunksUsedBySubquery) {
     const intervals: string[] = [];
@@ -120,15 +209,27 @@ export function logLatency(args: {
       lastRequiredChunkReceivedAt = maxArrival;
       semanticReadyAt = maxArrival;
     }
-    windowCloseToReadyMs = semanticReadyAt - args.expectedWindowClose;
+    windowCloseToReadyMs =
+      wallClockWindowClose !== null ? semanticReadyAt - wallClockWindowClose : "";
     readyToEmitMs = args.resultTime - semanticReadyAt;
   }
 
-  if (args.latencyLogStream) {
-    args.latencyLogStream.write(
-      `${args.windowNumber},${args.queryRegisteredTime},${args.firstDataReceivedTime},${args.expectedWindowClose},${args.lastChunkReceivedAt},${args.intervalTriggerAt},${args.resultTime},${latencyFromQueryReg},${latencyFromDataStart},${intervalWaitTime},${computationTime},${args.value},${requiredChunkIntervals},${lastRequiredChunkReceivedAt},${semanticReadyAt},${windowCloseToReadyMs},${readyToEmitMs},${triggerType},${emissionReason}\n`,
+  if (
+    wallClockWindowClose !== null &&
+    Math.abs(Number(wallClockCloseToResultMs)) > maxPlausibleLatencyMs
+  ) {
+    throw new Error(
+      `Chunked latency plausibility check failed for window ${args.windowNumber}: wall_clock_close_to_result_ms=${wallClockCloseToResultMs}`,
     );
   }
+
+  profileStageSync("chunked.diagnostics_write_ms", () => {
+    if (args.latencyLogStream) {
+      args.latencyLogStream.write(
+        `${args.windowNumber},${args.queryRegisteredTime},${args.firstDataReceivedTime},${args.expectedWindowClose},${args.expectedWindowClose},${eventTimeWindowStart ?? ""},${eventTimeWindowEnd ?? ""},${eventTimeWindowClose ?? ""},${wallClockWindowClose ?? ""},${anchorAlignedWindowClose},${args.lastChunkReceivedAt},${args.intervalTriggerAt},${args.resultTime},${latencyFromQueryReg},${latencyFromDataStart},${intervalWaitTime},${computationTime},${args.value},${requiredChunkIntervals},${lastRequiredChunkReceivedAt},${semanticReadyAt},${windowCloseToReadyMs},${readyToEmitMs},${wallClockCloseToResultMs},${anchorAlignedWindowCloseToResultMs},${latencyDomainStatus},${triggerType},${emissionReason},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${metadata.windowDataCloseTime ?? ""},${latencyFromLogicalTriggerMs},${latencyFromWindowCloseMs},${metadata.metadataSource}\n`,
+      );
+    }
+  });
   console.log(`LATENCY: Window ${args.windowNumber}:`);
   console.log(
     `  - Delay past expected close: ${latencyFromQueryReg}ms (expected close: ${args.expectedWindowClose}, result: ${args.resultTime})`,
@@ -156,13 +257,13 @@ export function writeComparableDiagnostics(args: {
   debugChunksEnabled: boolean;
   logger: CSVLogger;
 }): void {
-  profileSync("diagnostics_write_time_ms", () => {
+  profileStageSync("chunked.diagnostics_write_ms", () => profileSync("diagnostics_write_time_ms", () => {
     if (args.diagnosticsLogStream) {
       args.diagnosticsLogStream.write(
         `${args.benchmarkEventTimeAnchor ?? ""},${args.diagnostics.externalWindowNumber},${args.diagnostics.externalWindowStart},${args.diagnostics.externalWindowEnd},"${args.diagnostics.internalChunkGroupIds.join("|")}","${JSON.stringify(args.diagnostics.internalChunks).replace(/"/g, '""')}",${args.diagnostics.recomposedCount ?? ""},${args.diagnostics.recomposedSum ?? ""},${args.diagnostics.recomposedAvg ?? ""},${args.diagnostics.recomposedMin ?? ""},${args.diagnostics.recomposedMax ?? ""},${args.diagnostics.resultValue}\n`,
       );
     }
-  });
+  }));
   if (args.debugChunksEnabled) {
     args.logger.log(
       `Chunked window diagnostics: ${JSON.stringify({
@@ -189,7 +290,7 @@ export function writeParentPartialDiagnostics(args: {
   debugChunksEnabled: boolean;
   logger: CSVLogger;
 }): void {
-  profileSync("diagnostics_write_time_ms", () => {
+  profileStageSync("chunked.diagnostics_write_ms", () => profileSync("diagnostics_write_time_ms", () => {
     if (args.parentPartialDiagnosticsStream) {
       const internalChunksJson = JSON.stringify(args.diagnostics.internalChunks).replace(
         /"/g,
@@ -219,7 +320,7 @@ export function writeParentPartialDiagnostics(args: {
       ].join(",");
       args.parentPartialDiagnosticsStream.write(`${line}\n`);
     }
-  });
+  }));
 
   if (args.debugChunksEnabled) {
     args.logger.log(

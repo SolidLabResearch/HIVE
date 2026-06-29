@@ -3,10 +3,12 @@ import { RSPEngine, RSPQLParser } from "rsp-js";
 import { turtleStringToStore } from "../util/Util";
 import {
     AggregationFunction,
+    buildBenchmarkTopicName,
     buildBenchmarkResultPayload,
     buildOutputSelectClause,
     buildSubQuerySelectClause,
     getConfiguredAggregation,
+    getBenchmarkTargetWindowCount,
     getOutputWindowRange,
     getOutputWindowStep,
     getResultTopic,
@@ -28,6 +30,7 @@ function buildSubQuery1(
     subWindowRange: number,
     subWindowStep: number,
 ) {
+const wearableTopic = buildBenchmarkTopicName("wearableX");
 return `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
@@ -35,9 +38,9 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <subquery1_output> AS
 SELECT ${buildSubQuerySelectClause(aggregationFunction, "WearableX")}
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${subWindowRange} STEP ${subWindowStep}]
+FROM NAMED WINDOW <mqtt://localhost:1883/${wearableTopic}> ON STREAM <mqtt://localhost:1883/${wearableTopic}> [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
-    WINDOW <mqtt://localhost:1883/wearableX> {
+    WINDOW <mqtt://localhost:1883/${wearableTopic}> {
         ?s1 saref:hasValue ?value .
         ?s1 saref:hasTimestamp ?ts .
         ?s1 saref:relatesToProperty dahccsensors:wearableX .
@@ -51,6 +54,7 @@ function buildSubQuery2(
     subWindowRange: number,
     subWindowStep: number,
 ) {
+const smartphoneTopic = buildBenchmarkTopicName("smartphoneX");
 return `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
@@ -58,9 +62,9 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <subquery2_output> AS
 SELECT ${buildSubQuerySelectClause(aggregationFunction, "SmartphoneX")}
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${subWindowRange} STEP ${subWindowStep}]
+FROM NAMED WINDOW <mqtt://localhost:1883/${smartphoneTopic}> ON STREAM <mqtt://localhost:1883/${smartphoneTopic}> [RANGE ${subWindowRange} STEP ${subWindowStep}]
 WHERE {
-    WINDOW <mqtt://localhost:1883/smartphoneX> {
+    WINDOW <mqtt://localhost:1883/${smartphoneTopic}> {
         ?s2 saref:hasValue ?value .
         ?s2 saref:hasTimestamp ?ts .
         ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
@@ -74,6 +78,8 @@ function buildSuperQuery(
     outputWindowRange: number,
     outputWindowStep: number,
 ) {
+const wearableTopic = buildBenchmarkTopicName("wearableX");
+const smartphoneTopic = buildBenchmarkTopicName("smartphoneX");
 return `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
@@ -81,17 +87,17 @@ PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
 PREFIX : <https://rsp.js>
 REGISTER RStream <sensor_averages> AS
 SELECT ${buildOutputSelectClause(aggregationFunction)}
-FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
-FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <mqtt://localhost:1883/${wearableTopic}> ON STREAM <mqtt://localhost:1883/${wearableTopic}> [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
+FROM NAMED WINDOW <mqtt://localhost:1883/${smartphoneTopic}> ON STREAM <mqtt://localhost:1883/${smartphoneTopic}> [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
 WHERE {
     {
-        WINDOW <mqtt://localhost:1883/wearableX> {
+        WINDOW <mqtt://localhost:1883/${wearableTopic}> {
             ?s1 saref:hasValue ?value .
             ?s1 saref:hasTimestamp ?ts .
             ?s1 saref:relatesToProperty dahccsensors:wearableX .
         }
     } UNION {
-        WINDOW <mqtt://localhost:1883/smartphoneX> {
+        WINDOW <mqtt://localhost:1883/${smartphoneTopic}> {
             ?s2 saref:hasValue ?value .
             ?s2 saref:hasTimestamp ?ts .
             ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
@@ -126,13 +132,7 @@ function initLog(logFilePath: string): (message: string) => void {
  * Returns a function that appends one row per window.
  */
 function initLatencyLog(filePath: string): (
-    windowNumber: number,
-    queryRegisteredAt: number,
-    firstDataReceivedAt: number,
-    expectedWindowClose: number,
-    lastObsReceivedAt: number,
-    resultEmittedAt: number,
-    value: string,
+    row: Record<string, string | number | null>,
 ) => void {
     const writeHeader = !fs.existsSync(filePath);
     const stream = fs.createWriteStream(filePath, { flags: "a" });
@@ -141,21 +141,111 @@ function initLatencyLog(filePath: string): (
             "window_number,query_registered_at,first_data_received_at," +
             "expected_window_close,last_obs_received_at,result_emitted_at," +
             "latency_from_query_reg_ms,latency_from_data_start_ms," +
-            "latency_from_last_obs_ms,result_value\n",
+            "latency_from_last_obs_ms,window_semantics,logical_trigger_time," +
+            "window_start,window_end,window_data_close_time," +
+            "latency_from_logical_trigger_ms,latency_from_window_close_ms," +
+            "metadata_source,result_value,event_count,sum_value,avg_value," +
+            "first_event_timestamp,last_event_timestamp\n",
         );
     }
-    return (
-        windowNumber, queryRegisteredAt, firstDataReceivedAt,
-        expectedWindowClose, lastObsReceivedAt, resultEmittedAt, value,
-    ) => {
-        const latFromReg      = resultEmittedAt - queryRegisteredAt;
-        const latFromDataStart = resultEmittedAt - (firstDataReceivedAt + (windowNumber - 1) * 60000);
-        const latFromLastObs  = resultEmittedAt - lastObsReceivedAt;
+
+    const columns = [
+        "window_number",
+        "query_registered_at",
+        "first_data_received_at",
+        "expected_window_close",
+        "last_obs_received_at",
+        "result_emitted_at",
+        "latency_from_query_reg_ms",
+        "latency_from_data_start_ms",
+        "latency_from_last_obs_ms",
+        "window_semantics",
+        "logical_trigger_time",
+        "window_start",
+        "window_end",
+        "window_data_close_time",
+        "latency_from_logical_trigger_ms",
+        "latency_from_window_close_ms",
+        "metadata_source",
+        "result_value",
+        "event_count",
+        "sum_value",
+        "avg_value",
+        "first_event_timestamp",
+        "last_event_timestamp",
+    ];
+
+    return (row) => {
         stream.write(
-            `${windowNumber},${queryRegisteredAt},${firstDataReceivedAt},` +
-            `${expectedWindowClose},${lastObsReceivedAt},${resultEmittedAt},` +
-            `${latFromReg},${latFromDataStart},${latFromLastObs},${value}\n`,
+            `${columns.map((column) => row[column] ?? "").join(",")}\n`,
         );
+    };
+}
+
+type ParsedBindingFields = {
+    resultValue: number | null;
+    eventCount: number | null;
+    sumValue: number | null;
+    avgValue: number | null;
+    firstEventTimestamp: string | null;
+    lastEventTimestamp: string | null;
+};
+
+type WindowPartialAggregate = {
+    logicalTriggerTime: number | null;
+    windowStart: number | null;
+    windowEnd: number | null;
+    windowDataCloseTime: number | null;
+    windowSemantics: string;
+    metadataSource: string;
+    expectedWindowClose: number | null;
+    firstEventTimestamp: string | null;
+    lastEventTimestamp: string | null;
+    streamKeys: Set<string>;
+    partialCount: number;
+    totalEventCount: number;
+    totalSumValue: number;
+    avgValues: number[];
+    resultEmittedAt: number | null;
+    lastObservedAt: number | null;
+    latencyFromLogicalTriggerMs: number | null;
+    latencyFromWindowCloseMs: number | null;
+};
+
+function parseBindingFields(binding: any): ParsedBindingFields {
+    const entry = (key: string) => {
+        if (binding instanceof Map) {
+            return binding.get(`?${key}`)?.value ?? binding.get(key)?.value ?? null;
+        }
+        if (binding?.entries) {
+            if (typeof binding.entries.get === "function") {
+                return binding.entries.get(key)?.value ?? null;
+            }
+            return binding.entries[key]?.value ?? null;
+        }
+        return binding?.[key]?.value ?? null;
+    };
+
+    const toNumber = (value: unknown): number | null => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const toStringOrNull = (value: unknown): string | null => {
+        if (value === undefined || value === null) {
+            return null;
+        }
+        const stringValue = String(value).trim();
+        return stringValue === "" ? null : stringValue;
+    };
+
+    return {
+        resultValue: toNumber(entry("resultValue") ?? entry("avgValue")),
+        eventCount: toNumber(entry("eventCount")),
+        sumValue: toNumber(entry("sumValue")),
+        avgValue: toNumber(entry("avgValue")),
+        firstEventTimestamp: toStringOrNull(entry("firstEventTimestamp")),
+        lastEventTimestamp: toStringOrNull(entry("lastEventTimestamp")),
     };
 }
 
@@ -263,6 +353,8 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
     const outputWindowStep = getOutputWindowStep();
     const sessionId = getSessionId();
     const resultTopic = getResultTopic("naive_distributed/output");
+    const benchmarkTargetWindowCount = getBenchmarkTargetWindowCount();
+    const benchmarkWindowSummaryPath = `${process.env.LOG_PATH || "."}/benchmark_window_cap_summary.json`;
     const subQuery1 = buildSubQuery1(
         aggregationFunction,
         subWindowRange,
@@ -286,6 +378,8 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
     // Shared timing state — updated by all three engines' MQTT callbacks
     let firstDataReceivedTime = 0;
     let lastObsReceivedTime   = 0;
+    const finalizedWindowNumbers = new Set<number>();
+    const partialsByWindowNumber = new Map<number, WindowPartialAggregate>();
 
     const onData = (wallClock: number) => {
         if (firstDataReceivedTime === 0) firstDataReceivedTime = wallClock;
@@ -312,10 +406,6 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
     });
 
     // ── Super-query result handler ────────────────────────────────────────────
-    const windowRange = outputWindowRange;
-    const windowStep  = outputWindowStep;
-    let windowCount = 0;
-
     superEmitter.on("RStream", (object: any) => {
         // Log in the same format as FetchingClientSide so that
         // extract-results-from-logs.js can parse this file identically.
@@ -331,65 +421,119 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
             : [object.bindings];
 
         for (const binding of bindings) {
-            let resultValue: string | null = null;
+            const parsed = parseBindingFields(binding);
+            const emittedWindowNumber = Number(object?.window_number);
+            const logicalTriggerTime = Number(object?.logical_trigger_time);
+            const windowStart = Number(object?.window_start);
+            const windowEnd = Number(object?.window_end);
+            const windowDataCloseTime = Number(object?.window_data_close_time);
+            const emittedAt = Number(object?.result_emitted_at);
+            const latencyFromLogicalTriggerMs = Number(object?.latency_from_logical_trigger_ms);
+            const latencyFromWindowCloseMs = Number(object?.latency_from_window_close_ms);
+            const metadataSource = object?.metadata_source ? String(object.metadata_source) : "direct";
+            const windowSemantics = object?.window_semantics ? String(object.window_semantics) : "trailing";
+            const windowName = object?.window_name ? String(object.window_name) : "unknown";
 
-            if (binding instanceof Map) {
-                resultValue =
-                    (binding as Map<string, any>).get("?resultValue")?.value ??
-                    (binding as Map<string, any>).get("?avgValue")?.value ??
-                    null;
-            } else if (binding.entries) {
-                try {
-                    if (typeof binding.entries.get === "function") {
-                        resultValue =
-                            binding.entries.get("resultValue")?.value ??
-                            binding.entries.get("avgValue")?.value ??
-                            null;
-                    } else {
-                        resultValue =
-                            (binding.entries as any).resultValue?.value ??
-                            (binding.entries as any).avgValue?.value ??
-                            null;
-                    }
-                } catch (_) { /* ignore */ }
-            } else {
-                try {
-                    resultValue =
-                        (binding as any).resultValue?.value ??
-                        (binding as any).avgValue?.value ??
-                        null;
-                } catch (_) { /* ignore */ }
-            }
-
-            if (!resultValue) {
+            if (
+                !Number.isFinite(emittedWindowNumber) ||
+                !Number.isFinite(windowStart) ||
+                !Number.isFinite(windowEnd) ||
+                !Number.isFinite(windowDataCloseTime) ||
+                !Number.isFinite(logicalTriggerTime) ||
+                !Number.isFinite(emittedAt) ||
+                !Number.isFinite(parsed.resultValue) ||
+                !Number.isFinite(parsed.eventCount) ||
+                !Number.isFinite(parsed.sumValue)
+            ) {
                 console.log("DEBUG: Could not parse resultValue from binding:", binding);
                 continue;
             }
-            const resolvedResultValue = resultValue;
+            const windowNumber = emittedWindowNumber;
+            const eventCount = parsed.eventCount as number;
+            const sumValue = parsed.sumValue as number;
+            const existing = partialsByWindowNumber.get(windowNumber) || {
+                logicalTriggerTime,
+                windowStart,
+                windowEnd,
+                windowDataCloseTime,
+                windowSemantics,
+                metadataSource,
+                expectedWindowClose: windowDataCloseTime,
+                firstEventTimestamp: parsed.firstEventTimestamp,
+                lastEventTimestamp: parsed.lastEventTimestamp,
+                streamKeys: new Set<string>(),
+                partialCount: 0,
+                totalEventCount: 0,
+                totalSumValue: 0,
+                avgValues: [],
+                resultEmittedAt: emittedAt,
+                lastObservedAt: lastObsReceivedTime || emittedAt,
+                latencyFromLogicalTriggerMs,
+                latencyFromWindowCloseMs,
+            };
 
-            windowCount++;
-            const resultTime = Date.now();
-            const expectedClose =
-                queryRegisteredTime + windowRange + (windowCount - 1) * windowStep;
-            const latency = resultTime - expectedClose;
+            if (existing.streamKeys.has(windowName)) {
+                continue;
+            }
 
-            log(`LATENCY: Window ${windowCount}:`);
-            log(`  - From query registration: ${latency}ms (expected close: ${expectedClose}, result: ${resultTime})`);
+            existing.streamKeys.add(windowName);
+            existing.partialCount += 1;
+            existing.totalEventCount += eventCount;
+            existing.totalSumValue += sumValue;
+            if (Number.isFinite(parsed.avgValue)) {
+                existing.avgValues.push(parsed.avgValue as number);
+            }
+            existing.resultEmittedAt = Number.isFinite(existing.resultEmittedAt as number)
+                ? Math.max(existing.resultEmittedAt as number, emittedAt)
+                : emittedAt;
+            existing.lastObservedAt = lastObsReceivedTime || emittedAt;
+            existing.firstEventTimestamp = existing.firstEventTimestamp || parsed.firstEventTimestamp;
+            existing.lastEventTimestamp = parsed.lastEventTimestamp || existing.lastEventTimestamp;
+            partialsByWindowNumber.set(windowNumber, existing);
+
+            if (existing.partialCount < 2 || finalizedWindowNumbers.has(windowNumber)) {
+                continue;
+            }
+
+            const resultTime = existing.resultEmittedAt as number;
+            const expectedClose = existing.expectedWindowClose as number;
+            const resolvedResultValue = aggregationFunction === "AVG"
+                ? existing.totalSumValue / existing.totalEventCount
+                : existing.totalSumValue;
+            finalizedWindowNumbers.add(windowNumber);
+
+            log(`LATENCY: Window ${windowNumber}:`);
+            log(`  - From logical trigger: ${existing.latencyFromLogicalTriggerMs}ms (expected close: ${expectedClose}, result: ${resultTime})`);
             log(`Successfully published unified cross-sensor resultValue: ${resolvedResultValue}`);
             console.log(
-                `Window ${windowCount}: resultValue = ${resolvedResultValue}, latency from registration = ${latency}ms`,
+                `Window ${windowNumber}: resultValue = ${resolvedResultValue}, latency from logical trigger = ${existing.latencyFromLogicalTriggerMs}ms`,
             );
 
-            // Write to per-window latency CSV (same format as other approaches)
-            logLatency(
-                windowCount,
-                queryRegisteredTime,
-                firstDataReceivedTime || queryRegisteredTime,
-                expectedClose,
-                lastObsReceivedTime  || resultTime,
-                resultTime,
-                resolvedResultValue,
-            );
+            logLatency({
+                window_number: windowNumber,
+                query_registered_at: queryRegisteredTime,
+                first_data_received_at: firstDataReceivedTime || queryRegisteredTime,
+                expected_window_close: expectedClose,
+                last_obs_received_at: existing.lastObservedAt,
+                result_emitted_at: resultTime,
+                latency_from_query_reg_ms: resultTime - queryRegisteredTime,
+                latency_from_data_start_ms: resultTime - (firstDataReceivedTime || queryRegisteredTime),
+                latency_from_last_obs_ms: resultTime - (existing.lastObservedAt || resultTime),
+                window_semantics: existing.windowSemantics,
+                logical_trigger_time: existing.logicalTriggerTime,
+                window_start: existing.windowStart,
+                window_end: existing.windowEnd,
+                window_data_close_time: existing.windowDataCloseTime,
+                latency_from_logical_trigger_ms: existing.latencyFromLogicalTriggerMs,
+                latency_from_window_close_ms: existing.latencyFromWindowCloseMs,
+                metadata_source: existing.metadataSource,
+                result_value: resolvedResultValue,
+                event_count: existing.totalEventCount,
+                sum_value: existing.totalSumValue,
+                avg_value: resolvedResultValue,
+                first_event_timestamp: existing.firstEventTimestamp,
+                last_event_timestamp: existing.lastEventTimestamp,
+            });
 
             // Publish result to the naive_distributed/output MQTT topic so that
             // capture-results.js can subscribe to it as a secondary capture path.
@@ -403,10 +547,18 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
                     "naive_distributed",
                     aggregationFunction,
                     sessionId,
-                    Number.parseFloat(resolvedResultValue),
-                    windowCount,
+                    resolvedResultValue,
+                    windowNumber,
                 ),
-                windowNumber: windowCount,
+                windowNumber,
+                eventCount: existing.totalEventCount,
+                sumValue: existing.totalSumValue,
+                avgValue: resolvedResultValue,
+                firstEventTimestamp: existing.firstEventTimestamp,
+                lastEventTimestamp: existing.lastEventTimestamp,
+                windowStart: existing.windowStart,
+                windowEnd: existing.windowEnd,
+                logicalTriggerTime: existing.logicalTriggerTime,
             });
             pubClient.on("connect", () => {
                 pubClient.publish(
@@ -421,13 +573,30 @@ async function NaiveDistributedApproachOrchestrator(): Promise<void> {
                                 topic: resultTopic,
                                 payload: resultPayload,
                                 messageType: "superquery_result",
-                                warmup: windowCount === 1,
+                                warmup: windowNumber === 1,
                             });
                         }
                         pubClient.end();
                     },
                 );
             });
+
+            if (
+                Number.isFinite(benchmarkTargetWindowCount) &&
+                finalizedWindowNumbers.size >= (benchmarkTargetWindowCount as number)
+            ) {
+                fs.writeFileSync(
+                    benchmarkWindowSummaryPath,
+                    `${JSON.stringify({
+                        targetWindowCount: benchmarkTargetWindowCount,
+                        emittedFinalWindowCount: finalizedWindowNumbers.size,
+                        finalWindowNumbers: [...finalizedWindowNumbers].sort((left, right) => left - right),
+                        stoppedAfterTargetWindows: true,
+                        stopReason: "target_window_count_reached",
+                        approach: "naive_distributed",
+                    }, null, 2)}\n`,
+                );
+            }
         }
     });
 
@@ -460,7 +629,7 @@ function startResourceUsageLogging(
             "timestamp,cpu_user,cpu_system,rss,heapTotal,heapUsed,heapUsedMB,external\n",
         );
     }
-    setInterval(() => {
+    const timer = setInterval(() => {
         const mem = process.memoryUsage();
         const cpu = process.cpuUsage();
         const now = Date.now();
@@ -474,9 +643,10 @@ function startResourceUsageLogging(
                 mem.heapUsed,
                 (mem.heapUsed / 1024 / 1024).toFixed(2),
                 mem.external,
-            ].join(",") + "\n";
+        ].join(",") + "\n";
         logStream.write(line);
     }, intervalMs);
+    timer.unref?.();
 }
 
 startResourceUsageLogging();

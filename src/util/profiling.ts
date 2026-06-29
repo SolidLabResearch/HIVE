@@ -63,6 +63,29 @@ type ProfileSummary = {
   };
 };
 
+type StageStats = {
+  count: number;
+  total_ms: number;
+  mean_ms: number;
+  p95_ms: number;
+  max_ms: number;
+};
+
+type StageProfileSummary = {
+  processId: number;
+  parentProcessId: number;
+  processRole: string;
+  processRoleGroup: string;
+  approach: string | null;
+  pattern: string | null;
+  iteration: string | null;
+  benchmarkTimestamp: string;
+  startedAt: string | null;
+  finishedAt: string;
+  artifactPath: string | null;
+  stages: Record<string, StageStats>;
+};
+
 const enabled = ["1", "true", "yes", "on"].includes(
   (process.env.HIVE_PROFILE || "").trim().toLowerCase(),
 );
@@ -72,9 +95,18 @@ const bucket: ProfileBucket = {
   timingsMs: new Map<string, number>(),
 };
 
+const stageProfileEnabled = ["1", "true", "yes", "on"].includes(
+  (process.env.STREAMING_QUERY_HIVE_PROFILE_APPROXIMATION || "")
+    .trim()
+    .toLowerCase(),
+);
+
+const stageDurationsMs: Map<string, number[]> = new Map();
+
 let exitHookRegistered = false;
 let flushed = false;
 let signalHooksRegistered = false;
+let stageFlushed = false;
 
 function sanitize(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]+/g, "_");
@@ -220,6 +252,107 @@ function flushProfileSummary() {
   console.error(`HIVE_PROFILE ${JSON.stringify(summary)}`);
 }
 
+function resolveStageArtifactPath(): string | null {
+  const explicitFile = (process.env.HIVE_STAGE_PROFILE_OUTPUT_FILE || "").trim();
+  if (explicitFile) {
+    return path.resolve(explicitFile);
+  }
+
+  const outputDir = (process.env.LOG_PATH || "").trim();
+  if (!outputDir) {
+    return null;
+  }
+
+  const processRole = sanitize(getProcessRole());
+  const approach = sanitize(process.env.BENCHMARK_APPROACH || "unknown");
+  if (approach === "approximation") {
+    if (processRole.includes("approximation_orchestrator")) {
+      return path.resolve(outputDir, "approximation_root_cpu_attribution_summary.json");
+    }
+    if (processRole.includes("approximation_bee_worker")) {
+      return path.resolve(outputDir, "approximation_cpu_attribution_summary.json");
+    }
+    return path.resolve(
+      outputDir,
+      `approximation_cpu_attribution_summary.${processRole}.${process.pid}.json`,
+    );
+  }
+  if (approach === "chunked") {
+    if (processRole.includes("chunked_orchestrator")) {
+      return path.resolve(outputDir, "chunked_root_cpu_attribution_summary.json");
+    }
+    if (processRole.includes("chunked_bee_worker")) {
+      return path.resolve(outputDir, "chunked_cpu_attribution_summary.json");
+    }
+    return path.resolve(
+      outputDir,
+      `chunked_cpu_attribution_summary.${processRole}.${process.pid}.json`,
+    );
+  }
+  return path.resolve(outputDir, `${approach}_cpu_attribution_summary.${processRole}.${process.pid}.json`);
+}
+
+function buildStageSummary(
+  artifactPath: string | null,
+  finishedAt: string,
+): StageProfileSummary {
+  const processRole = getProcessRole();
+  const stages = Object.fromEntries(
+    Array.from(stageDurationsMs.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, values]) => {
+        const sorted = [...values].sort((left, right) => left - right);
+        const count = sorted.length;
+        const total_ms = sorted.reduce((sum, value) => sum + value, 0);
+        const mean_ms = count > 0 ? total_ms / count : 0;
+        const p95Index = count > 0 ? Math.min(count - 1, Math.max(0, Math.ceil(count * 0.95) - 1)) : 0;
+        const p95_ms = count > 0 ? sorted[p95Index] : 0;
+        const max_ms = count > 0 ? sorted[count - 1] : 0;
+        return [
+          name,
+          {
+            count,
+            total_ms,
+            mean_ms,
+            p95_ms,
+            max_ms,
+          } satisfies StageStats,
+        ];
+      }),
+  );
+
+  return {
+    processId: process.pid,
+    parentProcessId: process.ppid,
+    processRole,
+    processRoleGroup: getProcessRoleGroup(processRole),
+    approach: process.env.BENCHMARK_APPROACH || null,
+    pattern: process.env.BENCHMARK_SCALE || null,
+    iteration: process.env.BENCHMARK_ITERATION || null,
+    benchmarkTimestamp: new Date().toISOString(),
+    startedAt: process.env.HIVE_PROFILE_STARTED_AT || null,
+    finishedAt,
+    artifactPath,
+    stages,
+  };
+}
+
+function flushStageProfileSummary() {
+  if (!stageProfileEnabled || stageFlushed) {
+    return;
+  }
+
+  stageFlushed = true;
+  const finishedAt = new Date().toISOString();
+  const artifactPath = resolveStageArtifactPath();
+  const summary = buildStageSummary(artifactPath, finishedAt);
+
+  if (artifactPath) {
+    fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+    fs.writeFileSync(artifactPath, `${JSON.stringify(summary, null, 2)}\n`);
+  }
+}
+
 function resolveArtifactPath(): string | null {
   const explicitFile = (process.env.HIVE_PROFILE_OUTPUT_FILE || "").trim();
   if (explicitFile) {
@@ -311,6 +444,7 @@ export async function profileAsync<T>(name: string, fn: () => Promise<T>): Promi
 
 export function flushProfileIfEnabled(): void {
   writeProfileArtifact();
+  writeStageProfileArtifact();
 }
 
 export function writeProfileArtifact(): void {
@@ -334,4 +468,58 @@ export function writeProfileArtifact(): void {
 
   fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
   fs.writeFileSync(artifactPath, `${JSON.stringify(summary, null, 2)}\n`);
+}
+
+export function isStageProfileEnabled(): boolean {
+  return stageProfileEnabled;
+}
+
+export function profileStageTime(name: string, durationMs: number): void {
+  if (!stageProfileEnabled) {
+    return;
+  }
+  const values = stageDurationsMs.get(name) || [];
+  values.push(durationMs);
+  stageDurationsMs.set(name, values);
+}
+
+export function profileStageSync<T>(name: string, fn: () => T): T {
+  if (!stageProfileEnabled) {
+    return fn();
+  }
+
+  const start = process.hrtime.bigint();
+  try {
+    return fn();
+  } finally {
+    profileStageTime(name, Number(process.hrtime.bigint() - start) / 1e6);
+  }
+}
+
+export async function profileStageAsync<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  if (!stageProfileEnabled) {
+    return fn();
+  }
+
+  const start = process.hrtime.bigint();
+  try {
+    return await fn();
+  } finally {
+    profileStageTime(name, Number(process.hrtime.bigint() - start) / 1e6);
+  }
+}
+
+export function startStageTimer(): bigint {
+  return process.hrtime.bigint();
+}
+
+export function endStageTimer(name: string, start: bigint): void {
+  if (!stageProfileEnabled) {
+    return;
+  }
+  profileStageTime(name, Number(process.hrtime.bigint() - start) / 1e6);
+}
+
+export function writeStageProfileArtifact(): void {
+  flushStageProfileSummary();
 }

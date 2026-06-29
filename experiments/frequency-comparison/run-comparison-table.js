@@ -6,7 +6,7 @@
  * Metrics computed:
  *   Avg Latency (ms)  — mean of latency_from_last_obs_ms per window
  *   Std Dev (ms)      — std-dev of latency_from_last_obs_ms per window
- *   Avg CPU (%)       — average per-interval CPU% from resource logs
+ *   CPU-seconds       — cumulative process-tree CPU time
  *   Max Mem (MB)      — peak heapUsedMB from resource logs
  *   Value             — mean result value across windows
  *   Error vs Fetching — |value - fetching_value| / |fetching_value| × 100
@@ -21,6 +21,7 @@ const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
+const { computeCpuSecondsFromLegacyTreeRows } = require('../utils/processTreeMetrics');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -42,12 +43,14 @@ const APPROACHES = [
         logFiles: [
             'fetching_client_side_log.csv',
             'fetching_client_side_resource_usage.csv',
+            'fetching_client_side_process_tree_resource_usage.csv',
             'fetching_latency_log.csv',
             'replayer-log.csv',
         ],
         latencyFile:   'fetching_latency_log.csv',
         latencyColumn: 'latency_from_last_obs_ms',  // result_emitted_at - last_obs_received_at
         resourceFile:  'fetching_client_side_resource_usage.csv',
+        treeResourceFile: 'fetching_client_side_process_tree_resource_usage.csv',
     },
     {
         name:         'Approximation',
@@ -56,12 +59,14 @@ const APPROACHES = [
         logFiles: [
             'approximation_approach_log.csv',
             'approximation_approach_resource_usage.csv',
+            'approximation_approach_process_tree_resource_usage.csv',
             'approximation_latency_log.csv',
             'replayer-log.csv',
         ],
         latencyFile:   'approximation_latency_log.csv',
         latencyColumn: 'latency_from_last_data_ms', // result_emitted_at - last_data_received_at
         resourceFile:  'approximation_approach_resource_usage.csv',
+        treeResourceFile: 'approximation_approach_process_tree_resource_usage.csv',
     },
     {
         name:         'Chunked',
@@ -70,12 +75,14 @@ const APPROACHES = [
         logFiles: [
             'streaming_query_chunk_aggregator_log.csv',
             'streaming_query_hive_resource_log.csv',
+            'streaming_query_hive_process_tree_resource_log.csv',
             'chunked_latency_log.csv',
             'replayer-log.csv',
         ],
         latencyFile:   'chunked_latency_log.csv',
         latencyColumn: 'computation_ms',            // result_emitted_at - interval_trigger_at (pure processing time)
         resourceFile:  'streaming_query_hive_resource_log.csv',
+        treeResourceFile: 'streaming_query_hive_process_tree_resource_log.csv',
     },
     {
         name:         'Naive Distributed',
@@ -232,46 +239,46 @@ function parseLatencyCSV(filePath, latencyColumn) {
 
 // ─── Parse resource CSV ───────────────────────────────────────────────────────
 
-function parseResourceCSV(filePath) {
-    if (!fs.existsSync(filePath)) return null;
+function parseResourceCSV(primaryFilePath, treeFilePath) {
+    if (!fs.existsSync(primaryFilePath) && !fs.existsSync(treeFilePath)) return null;
 
-    const lines = fs.readFileSync(filePath, 'utf8').trim().split('\n');
-    if (lines.length < 2) return null;
-
-    const cpuPercents = [];
-    const heapMBs     = [];
-
-    const header  = lines[0].split(',');
-    const tsIdx   = header.indexOf('timestamp');
-    const cpuIdx  = header.indexOf('cpu_user');
-    const heapIdx = header.indexOf('heapUsedMB');
-
-    if (tsIdx < 0 || cpuIdx < 0 || heapIdx < 0) return null;
-
-    for (let i = 1; i < lines.length; i++) {
-        const curr = lines[i].split(',');
-        if (curr.length < Math.max(tsIdx, cpuIdx, heapIdx) + 1) continue;
-
-        heapMBs.push(parseFloat(curr[heapIdx]));
-
-        if (i >= 2) {
-            const prev       = lines[i - 1].split(',');
-            const deltaTime  = parseFloat(curr[tsIdx]) - parseFloat(prev[tsIdx]);
-            const deltaCpuMs = parseFloat(curr[cpuIdx]) - parseFloat(prev[cpuIdx]);
-            if (deltaTime > 0) {
-                // cpu_user stored as microseconds / 1000 = milliseconds
-                // cpuPercent = deltaCpuMs / (deltaTime_ms * numCores) * 100
-                cpuPercents.push((deltaCpuMs / (deltaTime * NUM_CORES)) * 100);
+    const heapMBs = [];
+    if (fs.existsSync(primaryFilePath)) {
+        const lines = fs.readFileSync(primaryFilePath, 'utf8').trim().split('\n');
+        if (lines.length >= 2) {
+            const header  = lines[0].split(',');
+            const heapIdx = header.indexOf('heapUsedMB');
+            if (heapIdx >= 0) {
+                for (let i = 1; i < lines.length; i++) {
+                    const curr = lines[i].split(',');
+                    if (curr.length > heapIdx) {
+                        heapMBs.push(parseFloat(curr[heapIdx]));
+                    }
+                }
             }
         }
     }
 
-    const avgCPU = cpuPercents.length > 0
-        ? cpuPercents.reduce((a, b) => a + b, 0) / cpuPercents.length
-        : NaN;
+    let cpuSeconds = NaN;
+    if (fs.existsSync(treeFilePath)) {
+        const lines = fs.readFileSync(treeFilePath, 'utf8').trim().split('\n');
+        if (lines.length >= 2) {
+            const headers = lines[0].split(',');
+            const rows = lines.slice(1).map((line) => {
+                const values = line.split(',');
+                const row = {};
+                headers.forEach((name, index) => {
+                    row[name] = values[index];
+                });
+                return row;
+            });
+            cpuSeconds = computeCpuSecondsFromLegacyTreeRows(rows, { cpuKey: 'tree_cpu_seconds' }).cumulativeCpuSeconds;
+        }
+    }
+
     const maxMem = heapMBs.length > 0 ? Math.max(...heapMBs) : NaN;
 
-    return { avgCPU, maxMem };
+    return { cpuSeconds, maxMem };
 }
 
 // ─── Statistics helpers ───────────────────────────────────────────────────────
@@ -297,7 +304,7 @@ function generateTable(metrics) {
             name:       m.name,
             avgLatency: m.avgLatency,
             stdDev:     m.stdDev,
-            avgCPU:     m.avgCPU,
+            cpuSeconds: m.cpuSeconds,
             maxMem:     m.maxMem,
             value:      m.avgValue,
             error,
@@ -308,14 +315,14 @@ function generateTable(metrics) {
     const fmt = (v, decimals = 2) => isNaN(v) ? 'N/A' : v.toFixed(decimals);
 
     const COL = [22, 22, 13, 15, 16, 14, 23];
-    const headers = ['Approach', 'Avg Latency (ms)', 'Std Dev (ms)', 'Avg CPU (%)', 'Max Mem (MB)', 'Value', 'Error vs Fetching'];
+    const headers = ['Approach', 'Avg Latency (ms)', 'Std Dev (ms)', 'CPU-seconds', 'Max Mem (MB)', 'Value', 'Error vs Fetching'];
     const sep = COL.map(n => '-'.repeat(n));
 
     const fmtRow = r => [
         r.name,
         fmt(r.avgLatency, 1),
         fmt(r.stdDev, 1),
-        fmt(r.avgCPU, 2),
+        fmt(r.cpuSeconds, 2),
         fmt(r.maxMem, 1),
         fmt(r.value, 3),
         fmt(r.error, 2) + (isNaN(r.error) ? '' : '%'),
@@ -372,9 +379,10 @@ function generateTable(metrics) {
         const approachDir  = path.join(OUT_DIR, approach.key);
         const latencyPath  = path.join(approachDir, approach.latencyFile);
         const resourcePath = path.join(approachDir, approach.resourceFile);
+        const treeResourcePath = path.join(approachDir, approach.treeResourceFile);
 
         const windows   = parseLatencyCSV(latencyPath, approach.latencyColumn);
-        const resources = parseResourceCSV(resourcePath);
+        const resources = parseResourceCSV(resourcePath, treeResourcePath);
 
         let avgLatency = NaN, stdDev = NaN, avgValue = NaN;
 
@@ -397,7 +405,7 @@ function generateTable(metrics) {
             key:        approach.key,
             avgLatency,
             stdDev,
-            avgCPU:     resources?.avgCPU  ?? NaN,
+            cpuSeconds: resources?.cpuSeconds ?? NaN,
             maxMem:     resources?.maxMem  ?? NaN,
             avgValue,
         });

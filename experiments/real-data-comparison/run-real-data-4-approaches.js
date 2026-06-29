@@ -1,783 +1,1082 @@
 #!/usr/bin/env node
 
-/**
- * Real Data 4-Way Comparison Experiment
- * Uses actual smartphone.acceleration.x and wearable.acceleration.x data
- * Compares: Fetching Client Side, Naive Distributed, Approximation, and Chunked approaches
- * Metrics: Window Close Latency, Accuracy (using Fetching as baseline)
- */
+const { spawn, execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const { parse } = require("csv-parse/sync");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
+const { finalizeMqttTrafficArtifacts } = require("../../dist/util/mqttTraffic");
+const { startProcessTreeResourceLogging } = require("../../scripts/analysis-js/process-tree-resource-sampler");
+const { compareResults } = require("../../analysis/accuracy/accuracy-comparison-custom-patterns.js");
+const {
+  attachComparableTiming,
+  buildWindowMetadataFromRow,
+} = require("../../scripts/analysis-js/generate-one-pattern-three-approach-n3-summary.js");
+const { buildTrimmedIterationSelection } = require("../../scripts/benchmark/run-all-paper-benchmarks.js");
 
-const { spawn, execSync } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const { parse } = require('csv-parse/sync');
-const { createBenchmarkReplayRunEnv } = require('../utils/benchmarkReplayEnv');
-const { finalizeMqttTrafficArtifacts } = require('../../dist/util/mqttTraffic');
+const OUTPUT_WINDOW_RANGE_MS = 120000;
+const OUTPUT_WINDOW_STEP_MS = 60000;
+const PAPER_TARGET_WINDOWS = 35;
+const DEFAULT_REPLAY_FREQUENCY_HZ = 4;
+const DEFAULT_DROP_WARMUP = 3;
+const DEFAULT_DROP_COOLDOWN = 2;
+const DEFAULT_ANALYSIS_WINDOW_START = 4;
+const DEFAULT_ANALYSIS_WINDOW_END = 33;
+const DEFAULT_TIMEOUT_BUFFER_MS = 2 * 60 * 1000;
+const LOGS_DIR = path.join("experiments", "real-data-comparison", "logs");
+const REAL_DATA_TOPIC_PREFIX_ROOT = "real-data-paper-ready";
 
 const APPROACHES = [
   {
-    name: 'fetching',
-    label: 'Fetching Client Side',
-    orchestrator: 'dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js',
+    name: "fetching",
+    label: "Fetching Client Side",
+    orchestrator: "dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js",
+    processTreeFile: "fetching_client_side_process_tree_resource_usage.csv",
     logFiles: {
-      main: 'fetching_client_side_log.csv',
-      resource: 'fetching_client_side_resource_usage.csv',
-      latency: 'fetching_latency_log.csv',
-      replayer: 'replayer-log.csv'
-    }
+      main: "fetching_client_side_log.csv",
+      resource: "fetching_client_side_resource_usage.csv",
+      latency: "fetching_latency_log.csv",
+      replayer: "replayer-log.csv",
+    },
   },
   {
-    name: 'approximation',
-    label: 'Approximation',
-    orchestrator: 'dist/approaches/StreamingQueryApproximationApproachOrchestrator.js',
+    name: "approximation",
+    label: "Approximation",
+    orchestrator: "dist/approaches/StreamingQueryApproximationApproachOrchestrator.js",
+    processTreeFile: "approximation_approach_process_tree_resource_usage.csv",
     logFiles: {
-      main: 'approximation_approach_log.csv',
-      resource: 'approximation_approach_resource_usage.csv',
-      latency: 'approximation_latency_log.csv',
-      replayer: 'replayer-log.csv'
-    }
+      main: "approximation_approach_log.csv",
+      resource: "approximation_approach_resource_usage.csv",
+      latency: "approximation_latency_log.csv",
+      replayer: "replayer-log.csv",
+    },
   },
   {
-    name: 'chunked',
-    label: 'Chunked',
-    orchestrator: 'dist/approaches/StreamingQueryChunkedApproachOrchestrator.js',
+    name: "chunked",
+    label: "Chunked",
+    orchestrator: "dist/approaches/StreamingQueryChunkedApproachOrchestrator.js",
+    processTreeFile: "streaming_query_hive_process_tree_resource_log.csv",
     logFiles: {
-      main: 'streaming_query_chunk_aggregator_log.csv',
-      resource: 'streaming_query_hive_resource_log.csv',
-      latency: 'chunked_latency_log.csv',
-      replayer: 'replayer-log.csv'
-    }
+      main: "streaming_query_chunk_aggregator_log.csv",
+      resource: "streaming_query_hive_resource_log.csv",
+      latency: "chunked_latency_log.csv",
+      replayer: "replayer-log.csv",
+    },
   },
   {
-    name: 'naive_distributed',
-    label: 'Naive Distributed',
-    orchestrator: 'dist/approaches/StreamingQueryNaiveDistributedApproachOrchestrator.js',
+    name: "naive_distributed",
+    label: "Naive Distributed",
+    orchestrator: "dist/approaches/StreamingQueryNaiveDistributedApproachOrchestrator.js",
+    processTreeFile: "naive_distributed_approach_process_tree_resource_usage.csv",
     logFiles: {
-      main: 'naive_distributed_approach_log.csv',
-      resource: 'naive_distributed_approach_resource_usage.csv',
-      latency: 'naive_distributed_latency_log.csv',
-      replayer: 'replayer-log.csv'
-    }
-  }
+      main: "naive_distributed_approach_log.csv",
+      resource: "naive_distributed_approach_resource_usage.csv",
+      latency: "naive_distributed_latency_log.csv",
+      replayer: "replayer-log.csv",
+    },
+  },
 ];
 
-const args = process.argv.slice(2);
-let iterArg = 3; // Default
-const iterIndex = args.findIndex(a => a === '--iterations' || a === '-i');
-if (iterIndex !== -1 && args[iterIndex + 1]) {
-  iterArg = parseInt(args[iterIndex + 1], 10);
+function parseCliArgs(argv) {
+  const args = {
+    analyzeOnly: false,
+    iterations: 3,
+  };
+
+  const positional = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "analyze-only") {
+      args.analyzeOnly = true;
+      continue;
+    }
+    if (arg === "--iterations" || arg === "-i") {
+      const value = Number.parseInt(argv[index + 1] || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`${arg} requires a positive integer`);
+      }
+      args.iterations = value;
+      index += 1;
+      continue;
+    }
+    positional.push(arg);
+  }
+
+  if (positional.length > 0) {
+    throw new Error(`Unknown argument(s): ${positional.join(", ")}`);
+  }
+
+  return args;
 }
 
-const ITERATIONS = iterArg; // Number of times to run each approach for statistical significance
-const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
-const LOGS_DIR = 'experiments/real-data-comparison/logs';
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function readText(filePath) {
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+}
+
+function writeJson(filePath, value) {
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function writeCsv(filePath, rows, headers) {
+  const header = `${headers.join(",")}\n`;
+  const body = rows.map((row) => (
+    headers.map((key) => {
+      const value = row[key];
+      if (value === undefined || value === null) {
+        return "";
+      }
+      const asString = String(value);
+      return /[",\n]/.test(asString)
+        ? `"${asString.replace(/"/g, '""')}"`
+        : asString;
+    }).join(",")
+  )).join("\n");
+  fs.writeFileSync(filePath, body ? `${header}${body}\n` : header);
+}
+
+function toNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function mean(values) {
+  if (values.length === 0) {
+    return null;
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function parseCsv(filePath) {
+  const content = readText(filePath).trim();
+  if (!content) {
+    return [];
+  }
+  return parse(content, {
+    columns: true,
+    skip_empty_lines: true,
+    relax_quotes: true,
+    relax_column_count: true,
+  });
+}
+
+function summarizeMetric(values) {
+  const cleanValues = values.filter((value) => Number.isFinite(value));
+  return {
+    count: cleanValues.length,
+    mean: mean(cleanValues),
+    min: cleanValues.length > 0 ? Math.min(...cleanValues) : null,
+    max: cleanValues.length > 0 ? Math.max(...cleanValues) : null,
+  };
+}
+
+function parseMqttTrafficSummary(logDir) {
+  const summaryPath = path.join(logDir, "mqtt_traffic_summary.json");
+  if (!fs.existsSync(summaryPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+  } catch (error) {
+    console.error(`Error parsing MQTT traffic summary ${summaryPath}:`, error.message);
+    return null;
+  }
+}
+
+function parseMqttTrafficCsv(logDir) {
+  return parseCsv(path.join(logDir, "mqtt_traffic.csv"));
+}
+
+function buildMqttSummary(logDir) {
+  const csvRows = parseMqttTrafficCsv(logDir);
+  return {
+    summary: parseMqttTrafficSummary(logDir),
+    csvRows,
+    messageCounts: summarizeMqttMessageCounts(csvRows),
+  };
+}
+
+function summarizeMqttMessageCounts(csvRows) {
+  const normalizedRows = csvRows.map((row) => ({
+    ...row,
+    warmup: String(row.warmup || "").trim().toLowerCase() === "true",
+  }));
+  const steadyRows = normalizedRows.filter((row) => !row.warmup);
+  const countedRows = steadyRows.length > 0 ? steadyRows : normalizedRows;
+  const countsByType = {};
+
+  for (const row of countedRows) {
+    const type = String(row.messageType || "unknown").trim() || "unknown";
+    countsByType[type] = (countsByType[type] || 0) + 1;
+  }
+
+  return {
+    total: countedRows.length,
+    byType: countsByType,
+  };
+}
+
+function getLastObservedAt(record, approachName) {
+  if (approachName === "fetching" || approachName === "naive_distributed") {
+    return toNumber(record.last_obs_received_at);
+  }
+  if (approachName === "approximation") {
+    return toNumber(record.last_data_received_at);
+  }
+  return toNumber(record.last_chunk_received_at);
+}
+
+function normalizeLatencyRows(approachName, records, mqttSummary) {
+  const rows = records.map((record) => {
+    const windowNumber = toNumber(record.window_number);
+    const queryRegisteredAt = toNumber(record.query_registered_at);
+    const firstDataReceivedAt = toNumber(record.first_data_received_at);
+    const expectedWindowClose = toNumber(record.expected_window_close);
+    const resultEmittedAt = toNumber(record.result_emitted_at);
+    const resultValue = toNumber(record.result_value);
+    const lastObservedAt = getLastObservedAt(record, approachName);
+    const metadata = buildWindowMetadataFromRow(record, {
+      expectedWindowClose,
+      resultEmittedAt,
+    });
+
+    return {
+      approach: approachName,
+      windowNumber,
+      queryRegisteredAt,
+      firstDataReceivedAt,
+      expectedWindowClose,
+      lastObservedAt,
+      resultEmittedAt,
+      resultValue,
+      windowStart: metadata.windowStart,
+      windowEnd: metadata.windowEnd,
+      windowDataCloseTime: metadata.windowDataCloseTime,
+      windowSemantics: metadata.windowSemantics,
+      logicalTriggerTime: metadata.logicalTriggerTime,
+      latencyFromLogicalTriggerMs: metadata.latencyFromLogicalTriggerMs,
+      latencyFromWindowCloseMs: metadata.latencyFromWindowCloseMs,
+      wallClockCloseToResultMs: toNumber(record.wall_clock_close_to_result_ms),
+      latencyDomainStatus: String(record.latency_domain_status || "").trim(),
+      metadataSource: metadata.metadataSource,
+      registrationToResultMs:
+        Number.isFinite(queryRegisteredAt) && Number.isFinite(resultEmittedAt)
+          ? resultEmittedAt - queryRegisteredAt
+          : null,
+      dataStartToResultMs:
+        Number.isFinite(firstDataReceivedAt) && Number.isFinite(resultEmittedAt)
+          ? resultEmittedAt - firstDataReceivedAt
+          : null,
+      lastDataToResultMs:
+        Number.isFinite(lastObservedAt) && Number.isFinite(resultEmittedAt)
+          ? resultEmittedAt - lastObservedAt
+          : null,
+    };
+  }).filter((row) => (
+    Number.isFinite(row.windowNumber) &&
+    Number.isFinite(row.resultEmittedAt) &&
+    Number.isFinite(row.resultValue)
+  ));
+
+  const byWindow = new Map();
+  for (const row of rows) {
+    byWindow.set(row.windowNumber, row);
+  }
+
+  return attachComparableTiming(
+    [...byWindow.values()].sort((left, right) => left.windowNumber - right.windowNumber),
+    mqttSummary,
+  );
+}
+
+function summarizeProcessTreeMetrics(logDir, processTreeFile, emittedWindowCount) {
+  const rows = parseCsv(path.join(logDir, processTreeFile)).map((row) => ({
+    timestamp: toNumber(row.timestamp),
+    treeRssBytes: toNumber(row.tree_rss_bytes),
+    treeCpuSeconds: toNumber(row.tree_cpu_seconds),
+  })).filter((row) => (
+    Number.isFinite(row.timestamp) &&
+    Number.isFinite(row.treeRssBytes) &&
+    Number.isFinite(row.treeCpuSeconds)
+  ));
+
+  const rssMiB = rows
+    .map((row) => row.treeRssBytes / (1024 * 1024))
+    .filter((value) => Number.isFinite(value));
+  const totalCpuSeconds = rows.length > 0 ? rows[rows.length - 1].treeCpuSeconds : null;
+
+  return {
+    sampleCount: rows.length,
+    cpuSeconds: totalCpuSeconds,
+    cpuSecondsPerEmittedWindow:
+      Number.isFinite(totalCpuSeconds) && emittedWindowCount > 0
+        ? totalCpuSeconds / emittedWindowCount
+        : null,
+    meanRssMiB: mean(rssMiB),
+    peakRssMiB: rssMiB.length > 0 ? Math.max(...rssMiB) : null,
+  };
+}
+
+function countMissingFromExpected(rows, startWindow, endWindow) {
+  const seen = new Set(rows.map((row) => row.windowNumber));
+  let missing = 0;
+  for (let windowNumber = startWindow; windowNumber <= endWindow; windowNumber += 1) {
+    if (!seen.has(windowNumber)) {
+      missing += 1;
+    }
+  }
+  return missing;
+}
+
+function selectWindows(rows, startWindow, endWindow) {
+  return rows.filter((row) => row.windowNumber >= startWindow && row.windowNumber <= endWindow);
+}
+
+function buildPaperConfig(iterationCount) {
+  const effectiveIterations = Math.max(iterationCount, PAPER_TARGET_WINDOWS);
+  const trimmed = buildTrimmedIterationSelection({
+    iterations: effectiveIterations,
+    dropWarmup: DEFAULT_DROP_WARMUP,
+    dropCooldown: DEFAULT_DROP_COOLDOWN,
+  });
+
+  return {
+    targetWindows:
+      Number.parseInt(process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "", 10) ||
+      PAPER_TARGET_WINDOWS,
+    analysisWindowStart: trimmed.startIteration || DEFAULT_ANALYSIS_WINDOW_START,
+    analysisWindowEnd: trimmed.endIteration || DEFAULT_ANALYSIS_WINDOW_END,
+    trimmedIterations: trimmed.iterations,
+    trimmedLabel: trimmed.label,
+    defaultReplayFrequencyHz:
+      Number.parseFloat(process.env.WEARABLE_FREQUENCY || "") || DEFAULT_REPLAY_FREQUENCY_HZ,
+    outputWindowRangeMs:
+      Number.parseInt(process.env.OUTPUT_WINDOW_RANGE || "", 10) || OUTPUT_WINDOW_RANGE_MS,
+    outputWindowStepMs:
+      Number.parseInt(process.env.OUTPUT_WINDOW_STEP || "", 10) || OUTPUT_WINDOW_STEP_MS,
+  };
+}
+
+function getApproachByName(name) {
+  return APPROACHES.find((approach) => approach.name === name) || null;
+}
+
+function computeReplayDurationSeconds(paperConfig) {
+  return Math.ceil(
+    (paperConfig.outputWindowRangeMs +
+      ((paperConfig.targetWindows + 2) * paperConfig.outputWindowStepMs)) / 1000,
+  );
+}
+
+function computeRunTimeoutMs(env, paperConfig) {
+  const explicitTimeoutMs = Number.parseInt(env.STREAMING_QUERY_HIVE_BENCHMARK_TIMEOUT_MS || "", 10);
+  if (Number.isFinite(explicitTimeoutMs) && explicitTimeoutMs > 0) {
+    return explicitTimeoutMs;
+  }
+  return (computeReplayDurationSeconds(paperConfig) * 1000) + DEFAULT_TIMEOUT_BUFFER_MS;
+}
+
+function resolveFiniteReplayDurationSeconds(env, paperConfig) {
+  const inheritedDurationSeconds = Number.parseInt(
+    env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS || "",
+    10,
+  );
+  const requiredDurationSeconds = computeReplayDurationSeconds(paperConfig);
+
+  if (!Number.isFinite(inheritedDurationSeconds) || inheritedDurationSeconds <= 0) {
+    return requiredDurationSeconds;
+  }
+
+  return Math.max(inheritedDurationSeconds, requiredDurationSeconds);
+}
 
 class RealDataComparisonRunner {
-  constructor() {
+  constructor(options = {}) {
+    this.iterations = options.iterations || 3;
     this.results = [];
     this.replayEnv = createBenchmarkReplayRunEnv(process.env);
-
-    if (!fs.existsSync(LOGS_DIR)) {
-      fs.mkdirSync(LOGS_DIR, { recursive: true });
-    }
+    this.paperConfig = buildPaperConfig(this.iterations);
+    ensureDir(LOGS_DIR);
   }
 
   cleanupStaleProcesses() {
     try {
-      execSync('pkill -f "dist/approaches" 2>/dev/null || true', { stdio: 'ignore' });
-    } catch (_) {}
+      execSync('pkill -f "dist/approaches" 2>/dev/null || true', { stdio: "ignore" });
+    } catch {}
     try {
-      execSync('pkill -f "dist/services/BeeWorker" 2>/dev/null || true', { stdio: 'ignore' });
-    } catch (_) {}
+      execSync('pkill -f "dist/services/BeeWorker" 2>/dev/null || true', { stdio: "ignore" });
+    } catch {}
     try {
-      execSync('lsof -ti:8080 | xargs kill -9 2>/dev/null || true', { stdio: 'ignore' });
-    } catch (_) {}
-    // Give OS time to release resources
-    return new Promise(resolve => setTimeout(resolve, 1500));
+      execSync("lsof -ti:8080 | xargs kill -9 2>/dev/null || true", { stdio: "ignore" });
+    } catch {}
+    return new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+
+  buildRunEnv(approach, logDir, iteration) {
+    const targetWindows = this.paperConfig.targetWindows;
+    const replayDurationSeconds = resolveFiniteReplayDurationSeconds(process.env, this.paperConfig);
+    const topicPrefix = `${REAL_DATA_TOPIC_PREFIX_ROOT}/${approach.name}`;
+    const sessionId = `real-data-paper-ready-${approach.name}-iteration${iteration}`;
+
+    return this.replayEnv.withBenchmarkReplayEnv({
+      ...process.env,
+      DATA_PATH: ".",
+      LOG_PATH: logDir,
+      SESSION_ID: process.env.SESSION_ID || sessionId,
+      BENCHMARK_SCENARIO: "real-data-comparison",
+      BENCHMARK_SCALE: "real-data",
+      BENCHMARK_APPROACH: approach.name,
+      BENCHMARK_ITERATION: String(iteration),
+      STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX:
+        process.env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX || topicPrefix,
+      WEARABLE_FREQUENCY:
+        process.env.WEARABLE_FREQUENCY || String(DEFAULT_REPLAY_FREQUENCY_HZ),
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: "1",
+      STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: String(targetWindows),
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS:
+        String(replayDurationSeconds),
+      STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD:
+        process.env.STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD || "1",
+      STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE:
+        process.env.STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE || "1",
+      STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE:
+        process.env.STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_USE_IMMEDIATE_TRIGGER:
+        approach.name === "chunked"
+          ? "1"
+          : (process.env.STREAMING_QUERY_HIVE_CHUNKED_USE_IMMEDIATE_TRIGGER || "1"),
+      STREAMING_QUERY_HIVE_BENCHMARK_TIMEOUT_MS:
+        process.env.STREAMING_QUERY_HIVE_BENCHMARK_TIMEOUT_MS ||
+        String(computeRunTimeoutMs(process.env, this.paperConfig)),
+    });
   }
 
   async runSingleTest(approach, iteration) {
     await this.cleanupStaleProcesses();
     return new Promise((resolve, reject) => {
       const runLabel = `${approach.label} - Iteration ${iteration}`;
-      console.log(`\n${'='.repeat(80)}`);
-      console.log(`🧪 Running: ${runLabel}`);
-      console.log('='.repeat(80));
+      console.log(`\n${"=".repeat(80)}`);
+      console.log(`Running: ${runLabel}`);
+      console.log("=".repeat(80));
 
       const logDir = path.join(LOGS_DIR, approach.name, `iteration${iteration}`);
-      if (!fs.existsSync(logDir)) {
-        fs.mkdirSync(logDir, { recursive: true });
-      }
+      ensureDir(logDir);
 
-      // Set environment to use the base smartphone/wearable data
-      // The DATA_PATH should be empty or just the base directory name
-      const env = this.replayEnv.withBenchmarkReplayEnv({
-        ...process.env,
-        DATA_PATH: '', // Uses default which points to the base data directories
-        LOG_PATH: logDir,
-        BENCHMARK_SCENARIO: 'real-data-comparison',
-        BENCHMARK_SCALE: 'real-data',
-        BENCHMARK_APPROACH: approach.name,
-        BENCHMARK_ITERATION: String(iteration),
-      });
-
+      const env = this.buildRunEnv(approach, logDir, iteration);
       const startTime = Date.now();
 
       try {
-        // Start the approach process
-        console.log(`Starting ${approach.label} orchestrator...`);
-        const orchestrator = spawn('node', [approach.orchestrator], {
-          stdio: 'inherit',
-          env: env
+        const orchestrator = spawn("node", [approach.orchestrator], {
+          stdio: "inherit",
+          env,
+        });
+        const resourceSampler = startProcessTreeResourceLogging(
+          path.join(logDir, approach.processTreeFile),
+          orchestrator.pid,
+          100,
+        );
+
+        let settled = false;
+        let publisher = null;
+        let timeout = null;
+        let publisherFinished = false;
+        let publisherExitCode = null;
+        let publisherError = null;
+        let orchestratorFinished = false;
+        let orchestratorExitCode = null;
+        let orchestratorSignal = null;
+        let orchestratorError = null;
+
+        const finalize = (result) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+
+          if (timeout) {
+            clearTimeout(timeout);
+          }
+          try {
+            publisher?.kill();
+          } catch {}
+          try {
+            orchestrator.kill();
+          } catch {}
+          try {
+            resourceSampler.stop();
+          } catch {}
+
+          this.copyLogFiles(approach, logDir);
+          const mqttTrafficSummary = finalizeMqttTrafficArtifacts({ logDir });
+
+          resolve({
+            ...result,
+            approach: approach.name,
+            iteration,
+            logDir,
+            mqttTrafficSummary,
+          });
+        };
+
+        const maybeFinalizeSuccessfulRun = () => {
+          if (!publisherFinished || !orchestratorFinished) {
+            return;
+          }
+
+          const duration = (Date.now() - startTime) / 1000;
+          if (publisherError) {
+            finalize({
+              success: false,
+              duration,
+              error: publisherError,
+            });
+            return;
+          }
+
+          if (publisherExitCode !== 0) {
+            finalize({
+              success: false,
+              duration,
+              error: `publisher exited with code ${publisherExitCode}`,
+            });
+            return;
+          }
+
+          if (orchestratorError) {
+            finalize({
+              success: false,
+              duration,
+              error: orchestratorError,
+            });
+            return;
+          }
+
+          if (orchestratorExitCode !== 0) {
+            finalize({
+              success: false,
+              duration,
+              error: `orchestrator exited with code ${orchestratorExitCode}${orchestratorSignal ? ` signal ${orchestratorSignal}` : ""}`,
+            });
+            return;
+          }
+
+          finalize({
+            success: true,
+            duration,
+            error: null,
+          });
+        };
+
+        orchestrator.on("error", (error) => {
+          orchestratorFinished = true;
+          orchestratorError = error.message;
+          maybeFinalizeSuccessfulRun();
         });
 
-        // Start publisher after a short delay
+        orchestrator.on("close", (code, signal) => {
+          orchestratorFinished = true;
+          orchestratorExitCode = code;
+          orchestratorSignal = signal;
+          maybeFinalizeSuccessfulRun();
+        });
+
         setTimeout(() => {
-          console.log('Starting data publisher...');
-          const publisher = spawn('node', ['dist/streamer/src/publish.js'], {
-            stdio: 'inherit',
-            env: env
+          publisher = spawn("node", ["dist/streamer/src/publish.js"], {
+            stdio: "inherit",
+            env,
           });
 
-          // Set up timeout
-          const timeout = setTimeout(() => {
-            console.log('⏰ Timeout reached, killing processes...');
-            orchestrator.kill();
-            publisher.kill();
-          }, TIMEOUT_MS);
+          timeout = setTimeout(() => {
+            console.log("Timeout reached, stopping publisher/orchestrator.");
+            try {
+              orchestrator.kill();
+            } catch {}
+            try {
+              publisher.kill();
+            } catch {}
+          }, computeRunTimeoutMs(env, this.paperConfig));
 
-          // Wait for publisher to finish
-          publisher.on('close', (code) => {
-            clearTimeout(timeout);
-            orchestrator.kill();
-
-            const endTime = Date.now();
-            const duration = (endTime - startTime) / 1000;
-
-            console.log(`\n${code === 0 ? '✅' : '⚠️'} ${runLabel} completed in ${duration.toFixed(1)}s`);
-
-            // Copy log files
-            this.copyLogFiles(approach, logDir);
-            const mqttTrafficSummary = finalizeMqttTrafficArtifacts({ logDir });
-
-            resolve({
-              approach: approach.name,
-              iteration,
-              duration,
-              success: code === 0,
-              logDir,
-              mqttTrafficSummary,
-            });
+          publisher.on("close", (code) => {
+            publisherFinished = true;
+            publisherExitCode = code;
+            maybeFinalizeSuccessfulRun();
           });
 
-          publisher.on('error', (err) => {
-            clearTimeout(timeout);
-            orchestrator.kill();
-            reject(err);
+          publisher.on("error", (error) => {
+            publisherFinished = true;
+            publisherError = error.message;
+            maybeFinalizeSuccessfulRun();
           });
         }, 2000);
-
-        orchestrator.on('error', (err) => {
-          console.error(`💥 Failed to start ${approach.label}:`, err);
-          reject(err);
-        });
-
       } catch (error) {
-        const endTime = Date.now();
-        const duration = (endTime - startTime) / 1000;
-
-        console.error(`💥 ${runLabel} failed:`, error.message);
-
-        resolve({
-          approach: approach.name,
-          iteration,
-          duration,
-          success: false,
-          error: error.message,
-          logDir
-        });
+        reject(error);
       }
     });
   }
 
   copyLogFiles(approach, logDir) {
     for (const logFile of Object.values(approach.logFiles)) {
-      const srcPath = path.join('.', logFile);
-      const destPath = path.join(logDir, logFile);
-
-      if (fs.existsSync(srcPath)) {
-        fs.copyFileSync(srcPath, destPath);
-        fs.unlinkSync(srcPath); // Clean up
-        console.log(`📄 Copied ${logFile} to ${logDir}`);
+      const sourcePath = path.join(".", logFile);
+      const destinationPath = path.join(logDir, logFile);
+      if (!fs.existsSync(sourcePath)) {
+        continue;
       }
+      fs.copyFileSync(sourcePath, destinationPath);
+      fs.unlinkSync(sourcePath);
     }
   }
 
   async runAllTests() {
-    console.log('🚀 Starting Real Data 4-Way Comparison');
-    console.log(`Approaches: ${APPROACHES.map(a => a.label).join(', ')}`);
-    console.log(`Iterations per approach: ${ITERATIONS}`);
-    console.log(`Data: smartphone.acceleration.x & wearable.acceleration.x\n`);
+    console.log("Starting real-data 4-approach comparison");
+    console.log(`Approaches: ${APPROACHES.map((approach) => approach.label).join(", ")}`);
+    console.log(`Iterations per approach: ${this.iterations}`);
+    console.log(`Target windows per run: ${this.paperConfig.targetWindows}`);
+    console.log(`Trimmed analysis windows: ${this.paperConfig.analysisWindowStart}..${this.paperConfig.analysisWindowEnd}`);
+    console.log(`Default replay frequency: ${this.paperConfig.defaultReplayFrequencyHz} Hz\n`);
 
-    const totalTests = APPROACHES.length * ITERATIONS;
+    const totalTests = APPROACHES.length * this.iterations;
     let completedTests = 0;
 
     for (const approach of APPROACHES) {
-      for (let iteration = 1; iteration <= ITERATIONS; iteration++) {
+      for (let iteration = 1; iteration <= this.iterations; iteration += 1) {
         try {
           const result = await this.runSingleTest(approach, iteration);
           this.results.push(result);
-          completedTests++;
-
-          console.log(`\n📊 Progress: ${completedTests}/${totalTests} tests completed\n`);
-
-          // Small delay between tests
-          await new Promise(resolve => setTimeout(resolve, 3000));
         } catch (error) {
-          console.error(`💥 Test failed: ${approach.label} iteration ${iteration}`, error);
           this.results.push({
             approach: approach.name,
             iteration,
             success: false,
-            error: error.message
-          });
-          completedTests++;
-        }
-      }
-    }
-
-    console.log('\n✅ All experiments completed!\n');
-  }
-
-  parseReplayerLog(logPath) {
-    if (!fs.existsSync(logPath)) {
-      return null;
-    }
-
-    try {
-      const content = fs.readFileSync(logPath, 'utf8');
-      const lines = content.trim().split('\n');
-
-      if (lines.length < 2) {
-        return null;
-      }
-
-      // Parse CSV manually or use the last line with summary
-      const records = parse(content, { columns: true, skip_empty_lines: true });
-
-      // Look for summary line with intended/successful/failed
-      const summaryRecord = records.find(r => r.intended && r.successful && r.failed);
-
-      if (summaryRecord) {
-        return {
-          intended: parseInt(summaryRecord.intended),
-          successful: parseInt(summaryRecord.successful),
-          failed: parseInt(summaryRecord.failed),
-          successRate: (parseInt(summaryRecord.successful) / parseInt(summaryRecord.intended)) * 100
-        };
-      }
-
-      return null;
-    } catch (error) {
-      console.error(`Error parsing replayer log ${logPath}:`, error.message);
-      return null;
-    }
-  }
-
-  parseLatencyLog(logPath) {
-    if (!fs.existsSync(logPath)) {
-      return null;
-    }
-
-    try {
-      const content = fs.readFileSync(logPath, 'utf8');
-      const records = parse(content, { columns: true, skip_empty_lines: true });
-
-      const results = records.map(record => {
-        // Handle different column names across approaches
-        const latency = parseInt(
-          record.latency_from_last_obs_ms || 
-          record.latency_from_last_data_ms || 
-          record.computation_ms || 
-          "0"
-        );
-
-        return {
-          timestamp: parseInt(record.result_emitted_at),
-          latency: latency,
-          value: parseFloat(record.result_value)
-        };
-      });
-
-      return results;
-    } catch (error) {
-      console.error(`Error parsing latency log ${logPath}:`, error.message);
-      return null;
-    }
-  }
-
-  parseMqttTrafficSummary(logDir) {
-    const summaryPath = path.join(logDir, 'mqtt_traffic_summary.json');
-    if (!fs.existsSync(summaryPath)) {
-      return null;
-    }
-
-    try {
-      return JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
-    } catch (error) {
-      console.error(`Error parsing MQTT traffic summary ${summaryPath}:`, error.message);
-      return null;
-    }
-  }
-
-  parseMainLog(logPath) {
-    if (!fs.existsSync(logPath)) {
-      return null;
-    }
-
-    try {
-      const content = fs.readFileSync(logPath, 'utf8');
-      const records = parse(content, { 
-        columns: true, 
-        skip_empty_lines: true,
-        relax_quotes: true,
-        relax_column_count: true
-      });
-
-      // Extract window close events and result values
-      const windowCloseEvents = [];
-      const resultValues = [];
-
-      records.forEach(record => {
-        // Debug: log first 5 records
-        if (records.indexOf(record) < 5) {
-          // console.log(`DEBUG Record: ${JSON.stringify(record)}`);
-        }
-
-        // Look for window close latency in message
-        if (record.message && record.message.includes('Window closed')) {
-          const latencyMatch = record.message.match(/latency:\s*([\d.]+)\s*ms/);
-          if (latencyMatch) {
-            windowCloseEvents.push({
-              timestamp: parseInt(record.timestamp),
-              latency: parseFloat(latencyMatch[1])
-            });
-          }
-        }
-
-        // Extract result values
-        let val = null;
-        if (record.message) {
-          // Fetching approach pattern: "RStream result generated: -10.767... (count: 478) at timestamp: ..."
-          if (record.message.includes('RStream result generated:')) {
-            const fetchingMatch = record.message.match(/RStream result generated:\s*([-0-9.]+)/);
-            if (fetchingMatch) {
-              val = parseFloat(fetchingMatch[1]);
-              // console.log(`DEBUG matched fetching: ${val}`);
-            }
-          }
-
-          // Approximation approach pattern: "Successfully published unified cross-sensor avg: -10.760... (from 2 topics)"
-          if (val === null && record.message.includes('unified cross-sensor')) {
-            const approxMatch = record.message.match(/unified cross-sensor (?:avg|max):\s*([-0-9.]+)/);
-            if (approxMatch) {
-              val = parseFloat(approxMatch[1]);
-              // console.log(`DEBUG matched approx: ${val}`);
-            }
-          }
-
-          // Chunked approach pattern: "calculated result <...> <...> "-10.767..."^^<...>"
-          if (val === null && record.message.includes('calculated result')) {
-            const chunkedMatch = record.message.match(/calculated result.*hasValue>\s*\\?"?([-0-9.]+)\\?"?/);
-            if (chunkedMatch) {
-              val = parseFloat(chunkedMatch[1]);
-              // console.log(`DEBUG matched chunked: ${val}`);
-            }
-          }
-
-          // Naive Distributed approach pattern: "Successfully published unified cross-sensor avgValue: -10.767..."
-          if (val === null && record.message.includes('unified cross-sensor avgValue')) {
-            const naiveMatch = record.message.match(/unified cross-sensor avgValue:\s*([-0-9.]+)/);
-            if (naiveMatch) {
-              val = parseFloat(naiveMatch[1]);
-            }
-          }
-
-          // Legacy patterns
-          if (val === null && (
-            record.message.includes('avgWearableX') ||
-            record.message.includes('avgSmartphoneX') ||
-            record.message.includes('Result:')
-          )) {
-            const valueMatch = record.message.match(/([-0-9.]+\.?\d*)/);
-            if (valueMatch) val = parseFloat(valueMatch[1]);
-          }
-        }
-
-        if (val !== null && !isNaN(val)) {
-          console.log(`FOUND RESULT: ${val} at ${record.timestamp}`);
-          resultValues.push({
-            timestamp: parseInt(record.timestamp),
-            value: val
+            error: error.message,
           });
         }
-      });
-
-      const latencies = windowCloseEvents.map(e => e.latency);
-
-      return {
-        recordCount: records.length,
-        windowCloseCount: windowCloseEvents.length,
-        avgLatency: latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : null,
-        minLatency: latencies.length > 0 ? Math.min(...latencies) : null,
-        maxLatency: latencies.length > 0 ? Math.max(...latencies) : null,
-        latencies: latencies,
-        resultValues: resultValues.map(r => r.value),
-        resultCount: resultValues.length
-      };
-    } catch (error) {
-      console.error(`Error parsing main log ${logPath}:`, error.message);
-      return null;
-    }
-  }
-
-  calculateAccuracy(baselineValues, comparisonValues) {
-    if (!baselineValues || !comparisonValues ||
-        baselineValues.length === 0 || comparisonValues.length === 0) {
-      return null;
-    }
-
-    const minLength = Math.min(baselineValues.length, comparisonValues.length);
-    let matches = 0;
-    let totalAbsError = 0;
-    let totalRelError = 0;
-
-    for (let i = 0; i < minLength; i++) {
-      const baseline = baselineValues[i];
-      const comparison = comparisonValues[i];
-
-      const tolerance = 0.001;
-      if (Math.abs(baseline - comparison) < tolerance) {
-        matches++;
-      }
-
-      totalAbsError += Math.abs(baseline - comparison);
-      if (baseline !== 0) {
-        totalRelError += Math.abs((baseline - comparison) / baseline);
+        completedTests += 1;
+        console.log(`Progress: ${completedTests}/${totalTests}`);
+        await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }
-
-    return {
-      matchRate: (matches / minLength) * 100,
-      mae: totalAbsError / minLength,
-      mape: (totalRelError / minLength) * 100,
-      comparedCount: minLength
-    };
   }
 
-  parseLatencyLog(logPath) {
-    if (!fs.existsSync(logPath)) {
-      return null;
-    }
-
-    try {
-      const content = fs.readFileSync(logPath, 'utf8');
-      const records = parse(content, { columns: true, skip_empty_lines: true });
-
-      const results = records.map(record => {
-        // Try different latency column names
-        const latency = parseInt(record.latency_from_last_obs_ms || 
-                                 record.latency_from_last_data_ms || 
-                                 record.computation_ms || 
-                                 "0");
-        
-        return {
-          timestamp: parseInt(record.result_emitted_at),
-          latency: latency,
-          value: parseFloat(record.result_value)
-        };
-      });
-
-      return results;
-    } catch (error) {
-      console.error(`Error parsing latency log ${logPath}:`, error.message);
-      return null;
-    }
-  }
-
-  analyzeResults() {
-    console.log('\n🔍 Analyzing Results...\n');
-
-    const analysis = {
-      byApproach: {}
-    };
-
-    // Collect metrics for each approach
+  discoverExistingResults() {
+    this.results = [];
     for (const approach of APPROACHES) {
-      // Include timed-out runs too — log files are written even when the publisher is killed
-      const approachResults = this.results.filter(r => r.approach === approach.name && r.logDir);
-
-      if (approachResults.length === 0) {
-        console.log(`⚠️  No successful results for ${approach.label}`);
+      const approachDir = path.join(LOGS_DIR, approach.name);
+      if (!fs.existsSync(approachDir)) {
         continue;
       }
-
-      const latencies = [];
-      const allResultValues = [];
-      const mqttTrafficSummaries = [];
-
-      approachResults.forEach(result => {
-        const mainLogPath = path.join(result.logDir, approach.logFiles.main);
-        const latencyLogPath = path.join(result.logDir, approach.logFiles.latency);
-        const mqttTrafficSummary = this.parseMqttTrafficSummary(result.logDir);
-        if (mqttTrafficSummary) {
-          mqttTrafficSummaries.push(mqttTrafficSummary);
-        }
-        
-        // Prefer latency log for more accurate data
-        const latencyData = this.parseLatencyLog(latencyLogPath);
-        if (latencyData && latencyData.length > 0) {
-          latencyData.forEach(entry => {
-            latencies.push(entry.latency);
+      const iterations = fs.readdirSync(approachDir)
+        .filter((entry) => /^iteration\d+$/.test(entry))
+        .sort((left, right) => Number(left.replace("iteration", "")) - Number(right.replace("iteration", "")));
+      for (const entry of iterations) {
+        const iteration = Number.parseInt(entry.replace("iteration", ""), 10);
+        const logDir = path.join(approachDir, entry);
+        if (fs.existsSync(path.join(logDir, approach.logFiles.latency))) {
+          this.results.push({
+            approach: approach.name,
+            iteration,
+            success: true,
+            logDir,
           });
-          allResultValues.push(latencyData.map(e => e.value));
-        } else {
-          // Fallback to main log parsing
-          const mainData = this.parseMainLog(mainLogPath);
-          if (mainData) {
-            if (mainData.latencies.length > 0) {
-              latencies.push(...mainData.latencies);
-            }
-            if (mainData.resultValues.length > 0) {
-              allResultValues.push(mainData.resultValues);
-            }
-          }
         }
-      });
+      }
+    }
+  }
+
+  buildIterationRecord(runResult) {
+    const approach = getApproachByName(runResult.approach);
+    if (!approach || !runResult.logDir) {
+      return null;
+    }
+
+    const latencyRows = parseCsv(path.join(runResult.logDir, approach.logFiles.latency));
+    const mqttSummary = buildMqttSummary(runResult.logDir);
+    const normalizedRows = normalizeLatencyRows(approach.name, latencyRows, mqttSummary);
+    const trimmedRows = selectWindows(
+      normalizedRows,
+      this.paperConfig.analysisWindowStart,
+      this.paperConfig.analysisWindowEnd,
+    );
+    const resourceMetrics = summarizeProcessTreeMetrics(
+      runResult.logDir,
+      approach.processTreeFile,
+      normalizedRows.length,
+    );
+
+    return {
+      approach: approach.name,
+      label: approach.label,
+      iteration: runResult.iteration,
+      success: runResult.success !== false,
+      runDurationSeconds: Number.isFinite(runResult.duration) ? runResult.duration : null,
+      rawWindowCount: normalizedRows.length,
+      trimmedWindowCount: trimmedRows.length,
+      expectedTrimmedWindowCount:
+        this.paperConfig.analysisWindowEnd - this.paperConfig.analysisWindowStart + 1,
+      missingTrimmedWindows: countMissingFromExpected(
+        trimmedRows,
+        this.paperConfig.analysisWindowStart,
+        this.paperConfig.analysisWindowEnd,
+      ),
+      latency: {
+        rawCloseToResultMs: summarizeMetric(normalizedRows.map((row) => row.anchorAlignedWindowCloseToResultMs)),
+        trimmedCloseToResultMs: summarizeMetric(trimmedRows.map((row) => row.anchorAlignedWindowCloseToResultMs)),
+        rawWindowCloseMs: summarizeMetric(normalizedRows.map((row) => row.latencyFromWindowCloseMs)),
+        trimmedWindowCloseMs: summarizeMetric(trimmedRows.map((row) => row.latencyFromWindowCloseMs)),
+      },
+      resourceMetrics,
+      mqttTrafficSummary: mqttSummary.summary,
+      mqttMessageCountTotal: mqttSummary.messageCounts.total,
+      mqttMessageCountsByType: mqttSummary.messageCounts.byType,
+      normalizedRows,
+      trimmedRows,
+    };
+  }
+
+  buildPaperAnalysis(iterationRecordsByApproach) {
+    const fetchingRecords = iterationRecordsByApproach.fetching || [];
+    const baselineByIteration = new Map(
+      fetchingRecords.map((record) => [record.iteration, record]),
+    );
+    const chunkedComparableOutputOnly = String(
+      process.env.STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY || "0",
+    ).trim() === "1";
+    const chunkedCadenceOnly = String(
+      process.env.STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY || "0",
+    ).trim() === "1";
+    const chunkedUseImmediateTrigger = String(
+      process.env.STREAMING_QUERY_HIVE_CHUNKED_USE_IMMEDIATE_TRIGGER || "1",
+    ).trim() !== "0";
+    const analysis = {
+      methodology: {
+        targetWindows: this.paperConfig.targetWindows,
+        analyzedWindows: `${this.paperConfig.analysisWindowStart}..${this.paperConfig.analysisWindowEnd}`,
+        outputWindowRangeMs: this.paperConfig.outputWindowRangeMs,
+        outputWindowStepMs: this.paperConfig.outputWindowStepMs,
+        replayFrequencyHz: this.paperConfig.defaultReplayFrequencyHz,
+        approximationCompletedWindowMode: true,
+        chunkedSemanticReadyMode:
+          !chunkedComparableOutputOnly && !chunkedCadenceOnly && chunkedUseImmediateTrigger,
+        compactReusableResultPayload: true,
+        cpuMetric: "cpu_seconds",
+      },
+      byApproach: {},
+    };
+
+    for (const approach of APPROACHES) {
+      const records = iterationRecordsByApproach[approach.name] || [];
+      const comparisons = [];
+
+      for (const record of records) {
+        const baseline = baselineByIteration.get(record.iteration);
+        if (!baseline) {
+          continue;
+        }
+        const comparison = compareResults(baseline.trimmedRows, record.trimmedRows);
+        comparisons.push({
+          iteration: record.iteration,
+          matchedWindowCount: comparison.matchedWindowCount,
+          fetchingOnlyWindows: comparison.baselineOnlyCount,
+          approachOnlyWindows: comparison.approachOnlyCount,
+          missingWindows: comparison.baselineOnlyCount,
+          extraWindows: comparison.approachOnlyCount,
+          mae: comparison.mae,
+          mape: comparison.mape,
+          rmse: comparison.rmse,
+        });
+      }
 
       analysis.byApproach[approach.name] = {
         label: approach.label,
-        iterations: approachResults.length,
-        avgLatency: latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : null,
-        minLatency: latencies.length > 0 ? Math.min(...latencies) : null,
-        maxLatency: latencies.length > 0 ? Math.max(...latencies) : null,
-        windowCloseCount: latencies.length,
-        resultValues: allResultValues.length > 0 ? allResultValues[0] : [], // Use first iteration for comparison
-        mqttTraffic: mqttTrafficSummaries.length > 0
-          ? Object.keys(mqttTrafficSummaries[0]).reduce((acc, key) => {
-              acc[key] =
-                mqttTrafficSummaries.reduce((sum, summary) => sum + Number(summary[key] || 0), 0) /
-                mqttTrafficSummaries.length;
-              return acc;
-            }, {})
-          : null,
+        iterations: records.length,
+        rawWindowCountMean: mean(records.map((record) => record.rawWindowCount)),
+        trimmedWindowCountMean: mean(records.map((record) => record.trimmedWindowCount)),
+        closeToResultLatencyMs: summarizeMetric(
+          records.map((record) => record.latency.trimmedCloseToResultMs.mean),
+        ),
+        meanRssMiB: mean(records.map((record) => record.resourceMetrics.meanRssMiB)),
+        peakRssMiB: mean(records.map((record) => record.resourceMetrics.peakRssMiB)),
+        cpuSeconds: summarizeMetric(records.map((record) => record.resourceMetrics.cpuSeconds)),
+        cpuSecondsPerWindow: summarizeMetric(
+          records.map((record) => record.resourceMetrics.cpuSecondsPerEmittedWindow),
+        ),
+        mqttPublishedBytes: summarizeMetric(
+          records.map((record) => toNumber(record.mqttTrafficSummary?.published_application_bytes)),
+        ),
+        mqttEstimatedDeliveryBytes: summarizeMetric(
+          records.map((record) => toNumber(record.mqttTrafficSummary?.estimated_delivery_bytes)),
+        ),
+        mqttMessageCount: summarizeMetric(
+          records.map((record) => record.mqttMessageCountTotal),
+        ),
+        completeness: {
+          matchedWindowCount: summarizeMetric(comparisons.map((comparison) => comparison.matchedWindowCount)),
+          fetchingOnlyWindows: summarizeMetric(comparisons.map((comparison) => comparison.fetchingOnlyWindows)),
+          approachOnlyWindows: summarizeMetric(comparisons.map((comparison) => comparison.approachOnlyWindows)),
+          missingWindows: summarizeMetric(comparisons.map((comparison) => comparison.missingWindows)),
+          extraWindows: summarizeMetric(comparisons.map((comparison) => comparison.extraWindows)),
+        },
+        accuracy: {
+          mae: summarizeMetric(comparisons.map((comparison) => comparison.mae)),
+          mape: summarizeMetric(comparisons.map((comparison) => comparison.mape)),
+          rmse: summarizeMetric(comparisons.map((comparison) => comparison.rmse)),
+        },
+        comparisons,
+        records,
       };
     }
 
     return analysis;
   }
 
-  generateReport(analysis) {
-    console.log('\n' + '='.repeat(100));
-    console.log('REAL DATA 4-WAY COMPARISON REPORT');
-    console.log('='.repeat(100));
-    console.log('Data Source: smartphone.acceleration.x & wearable.acceleration.x');
-    console.log('Baseline for Accuracy: Fetching Client Side Approach\n');
+  analyzeResults() {
+    console.log("\nAnalyzing results...\n");
 
+    const legacy = {
+      byApproach: {},
+    };
+    const iterationRecordsByApproach = {};
+
+    for (const approach of APPROACHES) {
+      const records = this.results
+        .filter((result) => result.approach === approach.name && result.logDir)
+        .map((result) => this.buildIterationRecord(result))
+        .filter(Boolean);
+      iterationRecordsByApproach[approach.name] = records;
+
+      const latencies = records
+        .flatMap((record) => record.normalizedRows.map((row) => row.anchorAlignedWindowCloseToResultMs))
+        .filter((value) => Number.isFinite(value));
+      const firstResultValues = records[0]?.normalizedRows.map((row) => row.resultValue) || [];
+
+      legacy.byApproach[approach.name] = {
+        label: approach.label,
+        iterations: records.length,
+        avgLatency: mean(latencies),
+        minLatency: latencies.length > 0 ? Math.min(...latencies) : null,
+        maxLatency: latencies.length > 0 ? Math.max(...latencies) : null,
+        windowCloseCount: latencies.length,
+        resultValues: firstResultValues,
+        mqttTraffic: records[0]?.mqttTrafficSummary || null,
+      };
+    }
+
+    const paper = this.buildPaperAnalysis(iterationRecordsByApproach);
+    return {
+      legacy,
+      paper,
+    };
+  }
+
+  generateLegacyReport(analysis) {
     const fetchingResults = analysis.byApproach.fetching?.resultValues || [];
-
-    console.log('| Approach              | Iterations | Avg Latency | Min Latency | Max Latency | Windows | Accuracy | MAE      | MAPE     |');
-    console.log('|----------------------|------------|-------------|-------------|-------------|---------|----------|----------|----------|');
-
-    const csvRows = [];
-    csvRows.push('Approach,Iterations,Avg_Latency_ms,Min_Latency_ms,Max_Latency_ms,Window_Count,Accuracy_%,MAE,MAPE_%,published_application_bytes,estimated_delivery_bytes,published_bandwidth_kb_s,estimated_delivery_bandwidth_kb_s,raw_input_published_bytes,raw_input_estimated_delivery_bytes,raw_input_subscriber_count,reuse_layer_estimated_delivery_bytes,reuse_layer_bandwidth_kb_s,chunk_result_estimated_delivery_bytes,chunk_result_count,chunk_bandwidth_kb_s');
+    const csvRows = [
+      "Approach,Iterations,Avg_Latency_ms,Min_Latency_ms,Max_Latency_ms,Window_Count,Accuracy_%,MAE,MAPE_%,published_application_bytes,estimated_delivery_bytes,published_bandwidth_kb_s,estimated_delivery_bandwidth_kb_s,raw_input_published_bytes,raw_input_estimated_delivery_bytes,raw_input_subscriber_count,reuse_layer_estimated_delivery_bytes,reuse_layer_bandwidth_kb_s,chunk_result_estimated_delivery_bytes,chunk_result_count,chunk_bandwidth_kb_s",
+    ];
 
     for (const approach of APPROACHES) {
       const data = analysis.byApproach[approach.name];
-
       if (!data) {
-        console.log(`| ${approach.label.padEnd(20)} | No Data    |             |             |             |         |          |          |          |`);
         continue;
       }
 
-      const avgLat = data.avgLatency ? data.avgLatency.toFixed(2) : 'N/A';
-      const minLat = data.minLatency ? data.minLatency.toFixed(2) : 'N/A';
-      const maxLat = data.maxLatency ? data.maxLatency.toFixed(2) : 'N/A';
-      const winCount = data.windowCloseCount || 'N/A';
-      const iterations = data.iterations || 0;
-      const traffic = data.mqttTraffic || {};
-
-      let accuracy = 'N/A';
-      let mae = 'N/A';
-      let mape = 'N/A';
-
-      if (approach.name === 'fetching') {
-        accuracy = '100.0% (baseline)';
-        mae = '0.000000';
-        mape = '0.00%';
+      let accuracy = "";
+      let mae = "";
+      let mape = "";
+      if (approach.name === "fetching") {
+        accuracy = "100";
+        mae = "0";
+        mape = "0";
       } else if (data.resultValues && fetchingResults.length > 0) {
-        const acc = this.calculateAccuracy(fetchingResults, data.resultValues);
-        if (acc) {
-          accuracy = `${acc.matchRate.toFixed(1)}%`;
-          mae = acc.mae.toFixed(6);
-          mape = `${acc.mape.toFixed(2)}%`;
-        }
+        const baselineRows = fetchingResults.map((value, index) => ({
+          windowStart: index,
+          windowEnd: index + 1,
+          resultValue: value,
+        }));
+        const candidateRows = data.resultValues.map((value, index) => ({
+          windowStart: index,
+          windowEnd: index + 1,
+          resultValue: value,
+        }));
+        const comparison = compareResults(baselineRows, candidateRows);
+        accuracy = comparison.matchedWindowCount > 0
+          ? `${(comparison.matchedWindowCount / Math.max(baselineRows.length, 1)) * 100}`
+          : "";
+        mae = comparison.mae ?? "";
+        mape = comparison.mape ?? "";
       }
 
-      const label = approach.label.padEnd(20);
-      const iterStr = iterations.toString().padEnd(10);
-      const avgLatStr = (avgLat + ' ms').padEnd(11);
-      const minLatStr = (minLat + ' ms').padEnd(11);
-      const maxLatStr = (maxLat + ' ms').padEnd(11);
-      const winStr = winCount.toString().padEnd(7);
-      const accStr = accuracy.padEnd(8);
-      const maeStr = mae.padEnd(8);
-      const mapeStr = mape.padEnd(8);
-
-      console.log(`| ${label} | ${iterStr} | ${avgLatStr} | ${minLatStr} | ${maxLatStr} | ${winStr} | ${accStr} | ${maeStr} | ${mapeStr} |`);
-
-      csvRows.push(
-        `${approach.label},${iterations},${avgLat},${minLat},${maxLat},${winCount},` +
-        `${accuracy.replace('%', '').replace(' (baseline)', '')},${mae},${mape.replace('%', '')},` +
-        `${traffic.published_application_bytes ?? 0},${traffic.estimated_delivery_bytes ?? 0},${traffic.published_bandwidth_kb_s ?? 0},${traffic.estimated_delivery_bandwidth_kb_s ?? 0},${traffic.raw_input_published_bytes ?? 0},${traffic.raw_input_estimated_delivery_bytes ?? 0},${traffic.raw_input_subscriber_count ?? 0},${traffic.reuse_layer_estimated_delivery_bytes ?? 0},${traffic.reuse_layer_bandwidth_kb_s ?? 0},${traffic.chunk_result_estimated_delivery_bytes ?? 0},${traffic.chunk_result_count ?? 0},${traffic.chunk_bandwidth_kb_s ?? 0}`
-      );
+      const traffic = data.mqttTraffic || {};
+      csvRows.push([
+        approach.label,
+        data.iterations,
+        data.avgLatency ?? "",
+        data.minLatency ?? "",
+        data.maxLatency ?? "",
+        data.windowCloseCount ?? "",
+        accuracy,
+        mae,
+        mape,
+        traffic.published_application_bytes ?? 0,
+        traffic.estimated_delivery_bytes ?? 0,
+        traffic.published_bandwidth_kb_s ?? 0,
+        traffic.estimated_delivery_bandwidth_kb_s ?? 0,
+        traffic.raw_input_published_bytes ?? 0,
+        traffic.raw_input_estimated_delivery_bytes ?? 0,
+        traffic.raw_input_subscriber_count ?? 0,
+        traffic.reuse_layer_estimated_delivery_bytes ?? 0,
+        traffic.reuse_layer_bandwidth_kb_s ?? 0,
+        traffic.chunk_result_estimated_delivery_bytes ?? 0,
+        traffic.chunk_result_count ?? 0,
+        traffic.chunk_bandwidth_kb_s ?? 0,
+      ].join(","));
     }
 
-    console.log('\n' + '='.repeat(100));
-
-    // Save CSV
-    const csvPath = path.join(LOGS_DIR, 'real_data_comparison_results.csv');
-    fs.writeFileSync(csvPath, csvRows.join('\n'));
-    console.log(`\n📊 CSV report saved to: ${csvPath}`);
-
-    // Save JSON
-    const jsonPath = path.join(LOGS_DIR, 'real_data_comparison_results.json');
-    fs.writeFileSync(jsonPath, JSON.stringify({
+    fs.writeFileSync(
+      path.join(LOGS_DIR, "real_data_comparison_results.csv"),
+      `${csvRows.join("\n")}\n`,
+    );
+    writeJson(path.join(LOGS_DIR, "real_data_comparison_results.json"), {
       timestamp: new Date().toISOString(),
-      dataSource: 'smartphone.acceleration.x & wearable.acceleration.x',
-      baseline: 'Fetching Client Side',
-      approaches: APPROACHES.map(a => a.label),
-      iterations: ITERATIONS,
-      analysis: analysis,
-      rawResults: this.results
-    }, null, 2));
-    console.log(`📊 JSON report saved to: ${jsonPath}`);
+      analysis,
+      rawResults: this.results,
+    });
   }
 
-  generateSummary(analysis) {
-    console.log('\n' + '='.repeat(100));
-    console.log('SUMMARY STATISTICS');
-    console.log('='.repeat(100));
+  writePaperArtifacts(paperAnalysis) {
+    const rawPath = path.join(LOGS_DIR, "real_data_paper_ready_raw_summary.json");
+    const trimmedJsonPath = path.join(
+      LOGS_DIR,
+      `real_data_paper_ready_${this.paperConfig.trimmedLabel}_summary.json`,
+    );
+    const trimmedCsvPath = path.join(
+      LOGS_DIR,
+      `real_data_paper_ready_${this.paperConfig.trimmedLabel}_summary.csv`,
+    );
 
-    console.log('\n📈 Performance Comparison:');
-    console.log('─'.repeat(80));
+    writeJson(rawPath, paperAnalysis);
+    writeJson(trimmedJsonPath, {
+      methodology: paperAnalysis.methodology,
+      byApproach: Object.fromEntries(
+        Object.entries(paperAnalysis.byApproach).map(([approach, data]) => [
+          approach,
+          {
+            label: data.label,
+            iterations: data.iterations,
+            closeToResultLatencyMs: data.closeToResultLatencyMs,
+            meanRssMiB: data.meanRssMiB,
+            peakRssMiB: data.peakRssMiB,
+            cpuSeconds: data.cpuSeconds,
+            cpuSecondsPerWindow: data.cpuSecondsPerWindow,
+            mqttPublishedBytes: data.mqttPublishedBytes,
+            mqttEstimatedDeliveryBytes: data.mqttEstimatedDeliveryBytes,
+            mqttMessageCount: data.mqttMessageCount,
+            completeness: data.completeness,
+            accuracy: data.accuracy,
+          },
+        ]),
+      ),
+    });
 
-    const fetchingData = analysis.byApproach.fetching;
+    const csvRows = APPROACHES.map((approach) => {
+      const data = paperAnalysis.byApproach[approach.name];
+      return {
+        approach: data?.label || approach.label,
+        iterations: data?.iterations ?? 0,
+        analyzed_windows: paperAnalysis.methodology.analyzedWindows,
+        latency_mean_ms: data?.closeToResultLatencyMs?.mean ?? "",
+        latency_min_ms: data?.closeToResultLatencyMs?.min ?? "",
+        latency_max_ms: data?.closeToResultLatencyMs?.max ?? "",
+        mean_rss_mib: data?.meanRssMiB ?? "",
+        peak_rss_mib: data?.peakRssMiB ?? "",
+        cpu_seconds_mean: data?.cpuSeconds?.mean ?? "",
+        cpu_seconds_per_window_mean: data?.cpuSecondsPerWindow?.mean ?? "",
+        mqtt_published_bytes_mean: data?.mqttPublishedBytes?.mean ?? "",
+        mqtt_estimated_delivery_bytes_mean: data?.mqttEstimatedDeliveryBytes?.mean ?? "",
+        mqtt_message_count_mean: data?.mqttMessageCount?.mean ?? "",
+        matched_windows_mean: data?.completeness?.matchedWindowCount?.mean ?? "",
+        fetching_only_windows_mean: data?.completeness?.fetchingOnlyWindows?.mean ?? "",
+        approach_only_windows_mean: data?.completeness?.approachOnlyWindows?.mean ?? "",
+        mae_mean: data?.accuracy?.mae?.mean ?? "",
+        mape_mean: data?.accuracy?.mape?.mean ?? "",
+        rmse_mean: data?.accuracy?.rmse?.mean ?? "",
+      };
+    });
 
-    for (const approach of APPROACHES) {
-      const data = analysis.byApproach[approach.name];
+    writeCsv(trimmedCsvPath, csvRows, [
+      "approach",
+      "iterations",
+      "analyzed_windows",
+      "latency_mean_ms",
+      "latency_min_ms",
+      "latency_max_ms",
+      "mean_rss_mib",
+      "peak_rss_mib",
+      "cpu_seconds_mean",
+      "cpu_seconds_per_window_mean",
+      "mqtt_published_bytes_mean",
+      "mqtt_estimated_delivery_bytes_mean",
+      "mqtt_message_count_mean",
+      "matched_windows_mean",
+      "fetching_only_windows_mean",
+      "approach_only_windows_mean",
+      "mae_mean",
+      "mape_mean",
+      "rmse_mean",
+    ]);
+  }
 
-      if (!data) continue;
-
-      const avgLat = data.avgLatency ? data.avgLatency.toFixed(2) : 'N/A';
-
-      let latencyComparison = '';
-      if (fetchingData && data.avgLatency && fetchingData.avgLatency) {
-        const diff = data.avgLatency - fetchingData.avgLatency;
-        const pct = ((diff / fetchingData.avgLatency) * 100).toFixed(1);
-        latencyComparison = diff > 0
-          ? `(+${pct}% vs baseline)`
-          : `(${pct}% vs baseline)`;
-      }
-
-      console.log(`${approach.label.padEnd(25)}: Avg Latency = ${avgLat} ms ${latencyComparison}`);
-    }
-
-    console.log('\n📊 Key Findings:');
-    console.log('─'.repeat(80));
-
-    // Find fastest approach
-    const latencies = APPROACHES
-      .map(a => ({ name: a.label, latency: analysis.byApproach[a.name]?.avgLatency }))
-      .filter(a => a.latency !== null);
-
-    if (latencies.length > 0) {
-      const fastest = latencies.reduce((min, curr) =>
-        curr.latency < min.latency ? curr : min
-      );
-      console.log(`🏆 Fastest approach: ${fastest.name} (${fastest.latency.toFixed(2)} ms avg)`);
-    }
-
-    console.log('\n' + '='.repeat(100));
+  generateReport(analysis) {
+    this.generateLegacyReport(analysis.legacy);
+    this.writePaperArtifacts(analysis.paper);
   }
 
   async run() {
     const startTime = Date.now();
-
-    console.log('📋 Prerequisites Check:');
-
-    console.log('  ✓ Ensure MQTT broker is running (mosquitto)');
-    console.log('  ✓ Data files exist in src/streamer/data/');
-    console.log('  ✓ Project is built (npm run build)\n');
-
     await this.runAllTests();
     const analysis = this.analyzeResults();
     this.generateReport(analysis);
-    this.generateSummary(analysis);
-
-    const duration = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
-    console.log(`\n⏱️  Total execution time: ${duration} minutes`);
-    console.log('\n🎉 Real data comparison complete!\n');
+    const durationMinutes = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+    console.log(`Total execution time: ${durationMinutes} minutes`);
   }
 }
 
-// Command line interface
 async function main() {
-  const args = process.argv.slice(2);
+  const args = parseCliArgs(process.argv.slice(2));
+  const runner = new RealDataComparisonRunner({ iterations: args.iterations });
 
-  if (args.length > 0 && args[0] === 'analyze-only') {
-    console.log('📊 Running analysis only (skipping experiments)...\n');
-    const runner = new RealDataComparisonRunner();
-    
-    // Discover existing results from the file system
-    for (const approach of APPROACHES) {
-      const approachDir = path.join(LOGS_DIR, approach.name);
-      if (fs.existsSync(approachDir)) {
-        const iterations = fs.readdirSync(approachDir).filter(d => d.startsWith('iteration'));
-        for (const iter of iterations) {
-          const iterNum = parseInt(iter.replace('iteration', ''));
-          const logDir = path.join(approachDir, iter);
-          
-          // Check if at least the main log exists
-          if (fs.existsSync(path.join(logDir, approach.logFiles.main))) {
-            runner.results.push({
-              approach: approach.name,
-              iteration: iterNum,
-              success: true, // Assume success if logs exist
-              logDir: logDir
-            });
-          }
-        }
-      }
-    }
-    
-    console.log(`Discovered ${runner.results.length} iterations to analyze.`);
-    
-    // Load existing results from logs
+  if (args.analyzeOnly) {
+    runner.discoverExistingResults();
     const analysis = runner.analyzeResults();
     runner.generateReport(analysis);
-    runner.generateSummary(analysis);
-  } else {
-    const runner = new RealDataComparisonRunner();
-    await runner.run();
+    return;
   }
+
+  await runner.run();
 }
 
 if (require.main === module) {
-  main().catch(error => {
-    console.error('💥 Comparison runner failed:', error);
+  main().catch((error) => {
+    console.error("Comparison runner failed:", error);
     process.exit(1);
   });
+} else {
+  module.exports = {
+    APPROACHES,
+    RealDataComparisonRunner,
+    buildPaperConfig,
+    computeReplayDurationSeconds,
+    computeRunTimeoutMs,
+    resolveFiniteReplayDurationSeconds,
+    normalizeLatencyRows,
+    parseCliArgs,
+    summarizeProcessTreeMetrics,
+  };
 }
-
-module.exports = RealDataComparisonRunner;

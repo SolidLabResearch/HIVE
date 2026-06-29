@@ -1,19 +1,24 @@
 import fs from "fs";
+import mqtt from "mqtt";
 import { Orchestrator } from "../orchestrator/Orchestrator";
 
 import { CSVLogger } from "../util/logger/CSVLogger";
 import {
-  buildBenchmarkStreamIri,
   buildBenchmarkTopicName,
-  buildOutputSelectClause,
-  buildSubQuerySelectClause,
   getConfiguredAggregation,
   getOutputWindowRange,
   getOutputWindowStep,
   getSubWindowRange,
   getSubWindowStep,
 } from "../util/runtimeConfig";
+import CONFIG from "../config/httpServerConfig.json";
+import {
+  buildQueryTargetScalingSubQuery,
+  buildQueryTargetScalingSuperQuery,
+  getConfiguredBenchmarkTargets,
+} from "../util/queryTargets";
 import { resourceTraceSnapshot } from "../util/resourceTrace";
+import { writeStageProfileArtifact } from "../util/profiling";
 /**
  *
  */
@@ -31,81 +36,31 @@ async function StreamingQueryHiveApproachOrchestrator() {
   const subWindowStep = getSubWindowStep();
   const outputWindowRange = getOutputWindowRange();
   const outputWindowStep = getOutputWindowStep();
-  const wearableTopicName = buildBenchmarkTopicName("wearableX");
-  const smartphoneTopicName = buildBenchmarkTopicName("smartphoneX");
-  const wearableStreamIri = buildBenchmarkStreamIri("wearableX");
-  const smartphoneStreamIri = buildBenchmarkStreamIri("smartphoneX");
+  const targets = getConfiguredBenchmarkTargets();
 
   logger.log(
-    `Chunked orchestrator config: aggregation=${aggFunc}, subWindowRange=${subWindowRange}, subWindowStep=${subWindowStep}`,
+    `Chunked orchestrator config: aggregation=${aggFunc}, subWindowRange=${subWindowRange}, subWindowStep=${subWindowStep}, targets=${targets.map((target) => target.name).join(",")}`,
   );
 
-  // Add sub-queries
-  const query1 = `
-            PREFIX mqtt_broker: <mqtt://localhost:1883/>
-    PREFIX saref: <https://saref.etsi.org/core/>
-PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
-PREFIX : <https://rsp.js>
-REGISTER RStream <output> AS
-SELECT ${buildSubQuerySelectClause(aggFunc, "WearableX")}
-FROM NAMED WINDOW <${wearableStreamIri}> ON STREAM mqtt_broker:${wearableTopicName} [RANGE ${subWindowRange} STEP ${subWindowStep}]
-WHERE {
-    WINDOW <${wearableStreamIri}> {
-        ?s1 saref:hasValue ?value .
-        ?s1 saref:hasTimestamp ?ts .
-        ?s1 saref:relatesToProperty dahccsensors:wearableX .
-}
-}
-    `;
-  const query2 = `
-                PREFIX mqtt_broker: <mqtt://localhost:1883/>
-PREFIX saref: <https://saref.etsi.org/core/>
-PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
-PREFIX : <https://rsp.js>
-REGISTER RStream <output> AS
-    SELECT ${buildSubQuerySelectClause(aggFunc, "SmartphoneX")}
-    FROM NAMED WINDOW <${smartphoneStreamIri}> ON STREAM mqtt_broker:${smartphoneTopicName} [RANGE ${subWindowRange} STEP ${subWindowStep}]
-WHERE {
-    WINDOW <${smartphoneStreamIri}> {
-        ?s2 saref:hasValue ?value .
-        ?s2 saref:hasTimestamp ?ts .
-        ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
-    }
-}
-    `;
-
-  orchestrator.addSubQuery(query1);
-  orchestrator.addSubQuery(query2);
+  for (const target of targets) {
+    orchestrator.addSubQuery(
+      buildQueryTargetScalingSubQuery(
+        target,
+        aggFunc,
+        subWindowRange,
+        subWindowStep,
+      ),
+    );
+  }
   logger.log(
     `Sub-queries added: ${JSON.stringify(orchestrator.getSubQueries())}`,
   );
-  // Register a query
-  const registeredQuery = `
-PREFIX mqtt_broker: <mqtt://localhost:1883/>
-PREFIX saref: <https://saref.etsi.org/core/>
-PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
-PREFIX : <https://rsp.js>
-
-REGISTER RStream <sensor_averages> AS
-SELECT ${buildOutputSelectClause(aggFunc)}
-FROM NAMED WINDOW <${wearableStreamIri}> ON STREAM mqtt_broker:${wearableTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
-FROM NAMED WINDOW <${smartphoneStreamIri}> ON STREAM mqtt_broker:${smartphoneTopicName} [RANGE ${outputWindowRange} STEP ${outputWindowStep}]
-WHERE {
-    {
-        WINDOW <${wearableStreamIri}> {
-            ?s1 saref:hasValue ?value .
-            ?s1 saref:hasTimestamp ?ts .
-            ?s1 saref:relatesToProperty dahccsensors:wearableX .
-        }
-    } UNION {
-        WINDOW <${smartphoneStreamIri}> {
-            ?s2 saref:hasValue ?value .
-            ?s2 saref:hasTimestamp ?ts .
-            ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
-        }
-    }
-}
-    `;
+  const registeredQuery = buildQueryTargetScalingSuperQuery(
+    targets,
+    aggFunc,
+    outputWindowRange,
+    outputWindowStep,
+  );
   logger.log("Registered Query");
   orchestrator.registerQuery(registeredQuery);
   console.log("Registered query:", orchestrator.getRegisteredQuery());
@@ -113,6 +68,61 @@ WHERE {
   // Run sub-queries
   // Run registered query
   orchestrator.runRegisteredQuery();
+  if (["1", "true", "yes", "on"].includes((process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY || "").trim().toLowerCase())) {
+    const controlTopic = buildBenchmarkTopicName("__benchmark_control__");
+    const controlClient = mqtt.connect(CONFIG.mqttBroker);
+    let shutdownStarted = false;
+
+    const shutdown = async () => {
+      if (shutdownStarted) {
+        return;
+      }
+      shutdownStarted = true;
+      try {
+        await orchestrator.stop();
+      } catch (error) {
+        console.error("Error stopping chunked orchestrator:", error);
+      } finally {
+        writeStageProfileArtifact();
+        try {
+          controlClient.end(true);
+        } catch (error) {
+          console.error("Error closing chunked control client:", error);
+        }
+        process.exit(0);
+      }
+    };
+
+    controlClient.on("connect", () => {
+      controlClient.subscribe(controlTopic, { qos: 1 }, (err) => {
+        if (err) {
+          console.error(`Failed to subscribe to benchmark control topic ${controlTopic}:`, err);
+        } else {
+          console.log(`Subscribed to benchmark control topic ${controlTopic} with QoS 1`);
+        }
+      });
+    });
+
+    controlClient.on("message", (topic, message) => {
+      if (topic !== controlTopic) {
+        return;
+      }
+      try {
+        const parsed = JSON.parse(message.toString());
+        if (parsed?.type === "finite_replay_complete") {
+          console.log(`Finite replay complete signal received: ${JSON.stringify({
+            topic: controlTopic,
+            source: parsed?.source ?? null,
+          })}`);
+          setTimeout(() => {
+            void shutdown();
+          }, 50);
+        }
+      } catch (error) {
+        console.error("Error parsing benchmark control message:", error);
+      }
+    });
+  }
   resourceTraceSnapshot(
     "registered_query_started",
     "chunked orchestrator handed off to BeeWorker",
@@ -139,7 +149,7 @@ function startResourceUsageLogging(
       "timestamp,cpu_user,cpu_system,rss,heapTotal,heapUsed,heapUsedMB,external\n",
     );
   }
-  setInterval(() => {
+  const timer = setInterval(() => {
     const mem = process.memoryUsage();
     const cpu = process.cpuUsage();
     const now = Date.now();
@@ -156,6 +166,7 @@ function startResourceUsageLogging(
       ].join(",") + "\n";
     logStream.write(line);
   }, intervalMs);
+  timer.unref?.();
 }
 
 startResourceUsageLogging();

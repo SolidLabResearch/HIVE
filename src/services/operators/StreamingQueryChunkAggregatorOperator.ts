@@ -8,12 +8,24 @@ import { IStreamQueryOperator } from "../../util/Interfaces";
 import { CSVLogger } from "../../util/logger/CSVLogger";
 import { hash_string_md5, storeToString } from "../../util/Util";
 import { getCachedChunkRewrite, getCachedParsedQuery } from "../../util/queryCache";
-import { profileAsync, profileCount, profileSync, writeProfileArtifact } from "../../util/profiling";
+import {
+  endStageTimer,
+  profileAsync,
+  profileCount,
+  profileStageSync,
+  profileSync,
+  startStageTimer,
+  writeProfileArtifact,
+  writeStageProfileArtifact,
+} from "../../util/profiling";
 import { R2ROperator } from "./r2r";
 import {
   AggregationFunction,
   buildBenchmarkResultPayload,
+  buildBenchmarkWindowMetadata,
   getBenchmarkEventTimeAnchor,
+  getBenchmarkStartTime,
+  getBenchmarkTargetWindowCount,
   getChunkedUseImmediateTrigger,
   getResultTopic,
   getSessionId,
@@ -69,6 +81,7 @@ import {
 import {
   initializeLatencyLogging as initializeLatencyLoggingPure,
   logLatency as logLatencyPure,
+  resolveChunkedWallClockWindowClose,
   writeComparableDiagnostics as writeComparableDiagnosticsPure,
   writeParentPartialDiagnostics as writeParentPartialDiagnosticsPure,
 } from "./chunked/ChunkedDiagnosticsWriter";
@@ -114,6 +127,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private ignoredLegacyChunkCount: number = 0;
   private duplicateChunkCount: number = 0;
   private benchmarkEventTimeAnchor: number | null;
+  private runtimeReplayStartWallClockTime: number | null;
   private timestampDomainMin: number | null;
   private timestampDomainMax: number | null;
   private rejectedContaminatedTimestampCount: number = 0;
@@ -132,6 +146,17 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private firstTickTimeout: ReturnType<typeof setTimeout> | null = null;
   private cleanupRegistered: boolean = false;
+  private benchmarkTargetWindowCount: number | null =
+    getBenchmarkTargetWindowCount();
+  private finalizedWindowNumbers: number[] = [];
+  private benchmarkTargetWindowReached: boolean = false;
+  private benchmarkStopReason:
+    | "target_window_count_reached"
+    | "finite_replay_duration_reached"
+    | "other" = "other";
+  private benchmarkWindowSummaryPath: string = this.resolveLogFilePath(
+    "benchmark_window_cap_summary.json",
+  );
   /**
    *
    */
@@ -145,6 +170,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.logger = new CSVLogger(this.resolveLogFilePath(`streaming_query_chunk_aggregator_log${consumerIdx}.csv`));
     this.sessionId = getSessionId();
     this.benchmarkEventTimeAnchor = getBenchmarkEventTimeAnchor();
+    this.runtimeReplayStartWallClockTime = getBenchmarkStartTime();
     this.timestampDomainMin = getTimestampDomainMin();
     this.timestampDomainMax = getTimestampDomainMax();
     this.chunkedDebugSummaryPath = this.resolveLogFilePath(`chunked_debug_summary${consumerIdx}.json`);
@@ -177,6 +203,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.persistChunkedDebugSummary(true);
     this.persistChunkedEmissionProof(true);
     this.queryRegisteredTime = Date.now(); // Record when query is registered
+    this.logger.log(
+      `Benchmark target window cap ${this.benchmarkTargetWindowCount !== null ? `enabled target=${this.benchmarkTargetWindowCount}` : "disabled"}`,
+    );
     this.registerCleanupHook();
     resourceTraceSnapshot("startup", "chunked bee worker constructed");
   }
@@ -195,6 +224,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   public cleanup(): void {
     resourceTraceSnapshot("before_cleanup", "chunked bee worker cleanup");
     profileSync("cleanup_time_ms", () => {
+      this.writeBenchmarkWindowSummary();
       if (this.intervalHandle) {
         clearInterval(this.intervalHandle);
         this.intervalHandle = null;
@@ -242,7 +272,57 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.persistChunkedDebugSummary(true);
     this.persistChunkedEmissionProof(true);
     writeProfileArtifact();
+    writeStageProfileArtifact();
     resourceTraceSnapshot("after_cleanup", "chunked bee worker cleanup complete");
+  }
+
+  private recordFinalizedWindow(windowNumber: number): void {
+    if (!this.finalizedWindowNumbers.includes(windowNumber)) {
+      this.finalizedWindowNumbers.push(windowNumber);
+      this.finalizedWindowNumbers.sort((left, right) => left - right);
+    }
+
+    if (
+      this.benchmarkTargetWindowCount !== null &&
+      this.finalizedWindowNumbers.length >= this.benchmarkTargetWindowCount
+    ) {
+      this.benchmarkTargetWindowReached = true;
+      this.benchmarkStopReason = "target_window_count_reached";
+      this.logger.log(
+        `Benchmark target window reached: target=${this.benchmarkTargetWindowCount} finalWindows=${this.finalizedWindowNumbers.join(",")}`,
+      );
+      this.writeBenchmarkWindowSummary();
+      setTimeout(() => {
+        this.cleanup();
+        process.exit(0);
+      }, 50);
+    }
+  }
+
+  private writeBenchmarkWindowSummary(): void {
+    if (this.benchmarkTargetWindowCount === null) {
+      return;
+    }
+
+    try {
+      fs.writeFileSync(
+        this.benchmarkWindowSummaryPath,
+        JSON.stringify(
+          {
+            targetWindowCount: this.benchmarkTargetWindowCount,
+            emittedFinalWindowCount: this.finalizedWindowNumbers.length,
+            finalWindowNumbers: this.finalizedWindowNumbers,
+            stoppedAfterTargetWindows: this.benchmarkTargetWindowReached,
+            stopReason: this.benchmarkStopReason,
+            approach: "chunked",
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      console.error("Error writing benchmark window summary:", error);
+    }
   }
 
   private resolveLogFilePath(fileName: string): string {
@@ -278,6 +358,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     value: string,
     proofEntry?: ChunkEmissionProofEntry | null,
     triggerSource?: string,
+    metadata?: ReturnType<typeof buildBenchmarkWindowMetadata>,
   ) {
     logLatencyPure({
       windowNumber,
@@ -296,7 +377,10 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       useImmediateTrigger: this.useImmediateTrigger,
       chunkWindowMap: this.chunkWindowMap,
       chunkArrivalTimes: this.chunkArrivalTimes,
+      runtimeReplayStartWallClockTime: this.runtimeReplayStartWallClockTime,
+      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
       latencyLogStream: this.latencyLogStream,
+      metadata,
     });
   }
 
@@ -371,7 +455,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
   private normalizeChunkPayload(message: string): PartialChunkResult | null {
     try {
-      return profileSync("serialization_parsing_ms", () => {
+      return profileStageSync("chunked.structured_json_parse_ms", () =>
+        profileSync("serialization_parsing_ms", () => {
         const parsed = JSON.parse(message);
         if (
           parsed &&
@@ -429,7 +514,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           };
         }
         return null;
-      });
+      }));
     } catch {
       // legacy payload, keep null to skip structured aggregation
     }
@@ -694,43 +779,28 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
 
         if (partialsForAggregation.length === state.expectedSubqueryIds.length) {
-          if (state.comparableOutputCadenceOnly) {
-            const summary = this.summarizeChunkGroup(
-              chunkGroupId,
-              bySubquery,
-              state.outputAggregationFunction,
-              coverageState,
-            );
-            const completedGroup = {
-              chunkGroupId,
-              start: summary.start,
-              end: summary.end,
-              summary,
-            };
-            state.completedChunkGroups.set(chunkGroupId, completedGroup);
-            insertCompletedChunkGroupOrdered(
-              state.orderedCompletedChunkGroups,
-              completedGroup,
-            );
-            this.chunkedDebugSummary.completedChunkGroupCount += 1;
-            profileCount("chunk_groups_completed");
-            this.debugChunkLog(
-              `buffered complete chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
-            );
-          } else {
-            this.debugChunkLog(
-              `final emission chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
-            );
-            await this.executeR2ROperator(
-              partialsForAggregation,
-              chunkGroupId,
-              undefined,
-              state.outputAggregationFunction,
-              coverageState,
-              `${triggerSource.toLowerCase()}_ready_check`,
-            );
-            emittedCount += 1;
-          }
+          const summary = this.summarizeChunkGroup(
+            chunkGroupId,
+            bySubquery,
+            state.outputAggregationFunction,
+            coverageState,
+          );
+          const completedGroup = {
+            chunkGroupId,
+            start: summary.start,
+            end: summary.end,
+            summary,
+          };
+          state.completedChunkGroups.set(chunkGroupId, completedGroup);
+          insertCompletedChunkGroupOrdered(
+            state.orderedCompletedChunkGroups,
+            completedGroup,
+          );
+          this.chunkedDebugSummary.completedChunkGroupCount += 1;
+          profileCount("chunk_groups_completed");
+          this.debugChunkLog(
+            `buffered complete chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
+          );
           state.chunksByWindow.delete(chunkGroupId);
           state.chunkCoverageByWindow.delete(chunkGroupId);
         } else {
@@ -740,155 +810,132 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         }
       }
 
-      if (state.comparableOutputCadenceOnly) {
-        while (
-          state.nextComparableWindowStartIndex + state.chunksPerComparableWindow <=
-          state.orderedCompletedChunkGroups.length
-        ) {
-          const windowChunkGroups = state.orderedCompletedChunkGroups.slice(
-            state.nextComparableWindowStartIndex,
-            state.nextComparableWindowStartIndex + state.chunksPerComparableWindow,
-          );
-          if (!hasContiguousChunkGroups(windowChunkGroups)) {
-            profileCount("missingChunkGroups");
-            break;
-          }
-
-          const firstGroupId = windowChunkGroups[0]?.chunkGroupId ?? "unknown";
-          const lastGroupId =
-            windowChunkGroups[windowChunkGroups.length - 1]?.chunkGroupId ??
-            "unknown";
-          const comparableWindowId = `${firstGroupId}..${lastGroupId}`;
-          const comparableDiagnostics = this.recomposeComparableWindow(
-            windowChunkGroups,
-            state.outputAggregationFunction,
-          );
-          if (comparableDiagnostics) {
-            if (this.windowCount === 0) {
-              resourceTraceSnapshot(
-                "after_first_comparable_window_emitted",
-                "first comparable window ready",
-                {
-                  externalWindowStart:
-                    comparableDiagnostics.externalWindowStart,
-                  externalWindowEnd: comparableDiagnostics.externalWindowEnd,
-                },
-              );
-            }
-            this.chunkedDebugSummary.comparableWindowEmissionCount += 1;
-            profileCount("comparable_windows_emitted");
-            this.chunkedDebugSummary.lastComparableWindowStart =
-              comparableDiagnostics.externalWindowStart;
-            this.chunkedDebugSummary.lastComparableWindowEnd =
-              comparableDiagnostics.externalWindowEnd;
-          }
-
-          this.debugChunkLog(
-            `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}`,
-          );
-          await this.executeR2ROperator(
-            [],
-            comparableWindowId,
-            comparableDiagnostics ?? undefined,
-            state.outputAggregationFunction,
-            undefined,
-            `${triggerSource.toLowerCase()}_ready_check`,
-          );
-          emittedCount += 1;
-          this.persistChunkedDebugSummary();
-          state.nextComparableWindowStartIndex += state.chunkGroupsPerOutputStep;
+      while (
+        state.nextComparableWindowStartIndex + state.chunksPerComparableWindow <=
+        state.orderedCompletedChunkGroups.length
+      ) {
+        const windowChunkGroups = state.orderedCompletedChunkGroups.slice(
+          state.nextComparableWindowStartIndex,
+          state.nextComparableWindowStartIndex + state.chunksPerComparableWindow,
+        );
+        if (!hasContiguousChunkGroups(windowChunkGroups)) {
+          profileCount("missingChunkGroups");
+          break;
         }
 
-        if (
-          !this.parentPartialAvailabilityLogged &&
-          state.orderedCompletedChunkGroups.length >= state.chunkGroupsPerOutputStep
-        ) {
-          const parentPartialGroups = state.orderedCompletedChunkGroups.slice(
-            0,
-            state.chunkGroupsPerOutputStep,
-          );
-          const parentPartialSummary = this.summarizeWindowRecomposition(
-            parentPartialGroups,
-            state.outputAggregationFunction,
-          );
-          if (parentPartialSummary) {
-            const emittedAtMs = Date.now();
-            this.writeParentPartialDiagnostics({
-              outputType: "parent_partial",
-              comparable: false,
-              benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-              parentWindowNumber: 1,
-              parentWindowStart:
-                this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime,
-              parentWindowEndOrCoveredUntil:
-                (this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime) +
-                this.windowSlide,
-              parentRangeMs: this.windowRange,
-              coveredDurationMs: this.windowSlide,
-              chunksUsed: state.chunkGroupsPerOutputStep,
-              eventCount: parentPartialSummary.recomposedCount,
-              sum: parentPartialSummary.recomposedSum,
-              avg: parentPartialSummary.recomposedAvg,
-              min: parentPartialSummary.recomposedMin,
-              max: parentPartialSummary.recomposedMax,
-              resultValue: parentPartialSummary.resultValue,
-              emittedAtMs,
-              elapsedSinceRegistrationMs:
-                emittedAtMs - this.queryRegisteredTime,
-              delayPastPartialTriggerMs:
-                emittedAtMs - (this.queryRegisteredTime + this.windowSlide),
-              internalChunkIds: parentPartialSummary.internalChunkGroupIds,
-              internalChunks: parentPartialSummary.internalChunks,
-            });
-            this.parentPartialAvailabilityLogged = true;
+        const firstGroupId = windowChunkGroups[0]?.chunkGroupId ?? "unknown";
+        const lastGroupId =
+          windowChunkGroups[windowChunkGroups.length - 1]?.chunkGroupId ??
+          "unknown";
+        const comparableWindowId = `${firstGroupId}..${lastGroupId}`;
+        const comparableDiagnostics = this.recomposeComparableWindow(
+          windowChunkGroups,
+          state.outputAggregationFunction,
+        );
+        if (comparableDiagnostics) {
+          if (this.windowCount === 0) {
+            resourceTraceSnapshot(
+              "after_first_comparable_window_emitted",
+              "first comparable window ready",
+              {
+                externalWindowStart:
+                  comparableDiagnostics.externalWindowStart,
+                externalWindowEnd: comparableDiagnostics.externalWindowEnd,
+              },
+            );
           }
+          this.chunkedDebugSummary.comparableWindowEmissionCount += 1;
+          profileCount("comparable_windows_emitted");
+          this.chunkedDebugSummary.lastComparableWindowStart =
+            comparableDiagnostics.externalWindowStart;
+          this.chunkedDebugSummary.lastComparableWindowEnd =
+            comparableDiagnostics.externalWindowEnd;
         }
 
-        if (state.nextComparableWindowStartIndex > 0) {
-          const retainFrom = Math.max(
-            0,
-            state.nextComparableWindowStartIndex - state.chunkGroupsPerOutputStep,
-          );
-          const evictedGroups = state.orderedCompletedChunkGroups.slice(0, retainFrom);
-          for (const group of evictedGroups) {
-            state.completedChunkGroups.delete(group.chunkGroupId);
-            if (group.summary && group.summary.receivedChunkIdsBySubquery) {
-              for (const chunkIds of Object.values(group.summary.receivedChunkIdsBySubquery)) {
-                for (const chunkId of chunkIds) {
-                  this.chunkArrivalTimes.delete(chunkId);
-                  this.chunkWindowMap.delete(chunkId);
-                }
-              }
-            }
-          }
-          state.orderedCompletedChunkGroups.splice(0, retainFrom);
-          state.nextComparableWindowStartIndex = Math.min(
-            state.chunkGroupsPerOutputStep,
-            state.orderedCompletedChunkGroups.length,
-          );
+        this.debugChunkLog(
+          `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}`,
+        );
+        await this.executeR2ROperator(
+          [],
+          comparableWindowId,
+          comparableDiagnostics ?? undefined,
+          state.outputAggregationFunction,
+          undefined,
+          `${triggerSource.toLowerCase()}_ready_check`,
+        );
+        emittedCount += 1;
+        this.persistChunkedDebugSummary();
+        state.nextComparableWindowStartIndex += state.chunkGroupsPerOutputStep;
+      }
+
+      if (
+        state.comparableOutputCadenceOnly &&
+        !this.parentPartialAvailabilityLogged &&
+        state.orderedCompletedChunkGroups.length >= state.chunkGroupsPerOutputStep
+      ) {
+        const parentPartialGroups = state.orderedCompletedChunkGroups.slice(
+          0,
+          state.chunkGroupsPerOutputStep,
+        );
+        const parentPartialSummary = this.summarizeWindowRecomposition(
+          parentPartialGroups,
+          state.outputAggregationFunction,
+        );
+        if (parentPartialSummary) {
+          const emittedAtMs = Date.now();
+          this.writeParentPartialDiagnostics({
+            outputType: "parent_partial",
+            comparable: false,
+            benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+            parentWindowNumber: 1,
+            parentWindowStart:
+              this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime,
+            parentWindowEndOrCoveredUntil:
+              (this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime) +
+              this.windowSlide,
+            parentRangeMs: this.windowRange,
+            coveredDurationMs: this.windowSlide,
+            chunksUsed: state.chunkGroupsPerOutputStep,
+            eventCount: parentPartialSummary.recomposedCount,
+            sum: parentPartialSummary.recomposedSum,
+            avg: parentPartialSummary.recomposedAvg,
+            min: parentPartialSummary.recomposedMin,
+            max: parentPartialSummary.recomposedMax,
+            resultValue: parentPartialSummary.resultValue,
+            emittedAtMs,
+            elapsedSinceRegistrationMs:
+              emittedAtMs - this.queryRegisteredTime,
+            delayPastPartialTriggerMs:
+              emittedAtMs - (this.queryRegisteredTime + this.windowSlide),
+            internalChunkIds: parentPartialSummary.internalChunkGroupIds,
+            internalChunks: parentPartialSummary.internalChunks,
+          });
+          this.parentPartialAvailabilityLogged = true;
         }
-      } else {
-        // Immediate / non-comparable cadence: Clean up evicted/emitted chunks from the maps
-        for (const [chunkGroupId, bySubquery] of readyGroups) {
-          const coverageState = state.chunkCoverageByWindow.get(chunkGroupId);
-          const partialsForAggregation: PartialChunkResult[] = [];
-          for (const subqueryId of state.expectedSubqueryIds) {
-            const partial = bySubquery.get(subqueryId);
-            if (partial) {
-              partialsForAggregation.push(partial);
-            }
-          }
-          if (partialsForAggregation.length === state.expectedSubqueryIds.length) {
-            if (coverageState && coverageState.receivedChunkIdsBySubquery) {
-              for (const chunkIds of Object.values(coverageState.receivedChunkIdsBySubquery)) {
-                for (const chunkId of chunkIds) {
-                  this.chunkArrivalTimes.delete(chunkId);
-                  this.chunkWindowMap.delete(chunkId);
-                }
+      }
+
+      if (state.nextComparableWindowStartIndex > 0) {
+        const retainFrom = Math.max(
+          0,
+          state.nextComparableWindowStartIndex - state.chunkGroupsPerOutputStep,
+        );
+        const evictedGroups = state.orderedCompletedChunkGroups.slice(0, retainFrom);
+        for (const group of evictedGroups) {
+          state.completedChunkGroups.delete(group.chunkGroupId);
+          if (group.summary && group.summary.receivedChunkIdsBySubquery) {
+            for (const chunkIds of Object.values(group.summary.receivedChunkIdsBySubquery)) {
+              for (const chunkId of chunkIds) {
+                this.chunkArrivalTimes.delete(chunkId);
+                this.chunkWindowMap.delete(chunkId);
               }
             }
           }
         }
+        state.orderedCompletedChunkGroups.splice(0, retainFrom);
+        state.nextComparableWindowStartIndex = Math.max(
+          0,
+          state.nextComparableWindowStartIndex - retainFrom,
+        );
       }
 
       if (triggerSource === "Interval") {
@@ -923,6 +970,48 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       debugChunksEnabled: this.debugChunksEnabled,
       logger: this.logger,
     });
+  }
+
+  private buildWindowMetadata(
+    partials: PartialChunkResult[],
+    comparableDiagnostics: ComparableWindowDiagnostics | undefined,
+    resultEmittedAt: number,
+  ) {
+    const directSource = partials[0]?.window ?? null;
+    const comparableWindowEnd = comparableDiagnostics?.externalWindowEnd ?? null;
+    const comparableWindowStart = comparableDiagnostics?.externalWindowStart ?? null;
+    const windowSemantics =
+      directSource?.windowSemantics || process.env.RSP_WINDOW_SEMANTICS || "trailing";
+
+    const directLogicalTriggerTime = Number(directSource?.logicalTriggerTime);
+    const directWindowDataCloseTime = Number(directSource?.windowDataCloseTime);
+    const hasDirectCloseMetadata = Number.isFinite(directWindowDataCloseTime);
+
+    return {
+      ...buildBenchmarkWindowMetadata({
+        windowSemantics,
+        logicalTriggerTime: comparableDiagnostics
+          ? comparableWindowEnd
+          : Number.isFinite(directLogicalTriggerTime)
+            ? directLogicalTriggerTime
+            : null,
+        windowStart: comparableWindowStart ?? partials[0]?.window.start ?? null,
+        windowEnd: comparableWindowEnd ?? partials[0]?.window.end ?? null,
+        windowDataCloseTime: comparableDiagnostics
+          ? comparableWindowEnd
+          : hasDirectCloseMetadata
+            ? directWindowDataCloseTime
+            : partials[0]?.window.end ?? null,
+        resultEmittedAt,
+        metadataSource: comparableDiagnostics
+          ? "reconstructed"
+          : hasDirectCloseMetadata
+            ? "direct"
+            : "reconstructed",
+      }),
+      latencyFromLogicalTriggerMs: null,
+      latencyFromWindowCloseMs: null,
+    };
   }
 
   /**
@@ -1166,6 +1255,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
 
       // Interval handle — will be started (and restarted) aligned to first data arrival
       chunkClient.on("message", async (topic: string, message: any) => {
+        const callbackStartedAt = startStageTimer();
         if (this.debugChunksEnabled) {
           this.logger.log(`Received chunk message on topic ${topic}`);
         }
@@ -1216,6 +1306,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           this.chunkedDebugSummary.structuredChunkMessageCount += 1;
           const chunkTimestamp = normalized.window.start;
           if (this.isContaminatedTimestamp(chunkTimestamp, topic)) {
+            endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
             return;
           }
           if (!this.firstObservedEventTimestampByTopic.has(topic)) {
@@ -1351,6 +1442,7 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         if (this.useImmediateTrigger) {
           await processChunks("Immediate");
         }
+        endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
       });
 
       // Initial interval — runs at startup as a safety net before first data arrives.
@@ -1486,17 +1578,38 @@ For example, the allResults object might look like this:
       console.error("No aggregation function detected in the output query.");
       return;
     }
-    const directResult = profileSync("structured_recomposition_time_ms", () =>
-      comparableDiagnostics
-        ? comparableDiagnostics.resultValue
-        : this.recomputeExactResultFromPartials(
-            partials,
-            detectAggregationFunction as AggregationFunction,
-          ),
+    const directResult = profileStageSync(
+      "chunked.aggregation_recomposition_ms",
+      () =>
+        profileSync("structured_recomposition_time_ms", () =>
+          comparableDiagnostics
+            ? comparableDiagnostics.resultValue
+            : this.recomputeExactResultFromPartials(
+                partials,
+                detectAggregationFunction as AggregationFunction,
+              ),
+        ),
     );
 
-    if (Number.isFinite(directResult)) {
-      const resultValue = String(directResult);
+      if (Number.isFinite(directResult)) {
+      if (
+        this.benchmarkTargetWindowCount !== null &&
+        this.windowCount >= this.benchmarkTargetWindowCount
+      ) {
+        this.logger.log(
+          `Benchmark target window cap reached before direct emission: target=${this.benchmarkTargetWindowCount} emitted=${this.windowCount}`,
+        );
+        this.benchmarkTargetWindowReached = true;
+        this.benchmarkStopReason = "target_window_count_reached";
+        this.writeBenchmarkWindowSummary();
+        setTimeout(() => {
+          this.cleanup();
+          process.exit(0);
+        }, 50);
+        return;
+      }
+
+        const resultValue = String(directResult);
       if (comparableDiagnostics) {
         this.writeComparableDiagnostics(comparableDiagnostics);
       }
@@ -1521,50 +1634,98 @@ For example, the allResults object might look like this:
       }
 
       this.windowCount++;
-      const expectedWindowClose = this.getExpectedWindowCloseTime(
+      const registrationAnchoredExpectedClose = this.getExpectedWindowCloseTime(
         this.windowCount,
+      );
+      const centeredWindowMetadata = this.buildWindowMetadata(
+        partials,
+        comparableDiagnostics,
+        resultEmittedAt,
       );
       const triggerSource = emissionReason.startsWith("immediate") ? "Immediate" : "Interval";
       this.logLatency(
         this.windowCount,
-        expectedWindowClose,
+        registrationAnchoredExpectedClose,
         this.lastChunkReceivedTime,
         this.intervalTriggerTime,
         resultEmittedAt,
         resultValue,
         proofEntry,
         triggerSource,
+        centeredWindowMetadata,
       );
 
       const resultTopic = getResultTopic("output");
       const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
-      const payload = profileSync("serialization_parsing_ms", () =>
-        useBenchmarkPayload
-          ? JSON.stringify(
-              buildBenchmarkResultPayload(
-                "chunked",
-                detectAggregationFunction as AggregationFunction,
-                this.sessionId,
-                Number.parseFloat(resultValue),
-                this.windowCount,
-                comparableDiagnostics
-                  ? {
-                      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                      windowStart: comparableDiagnostics.externalWindowStart,
-                      windowEnd: comparableDiagnostics.externalWindowEnd,
-                      recomposedCount: comparableDiagnostics.recomposedCount,
-                      recomposedSum: comparableDiagnostics.recomposedSum,
-                      recomposedAvg: comparableDiagnostics.recomposedAvg,
-                      internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
-                      internalChunks: comparableDiagnostics.internalChunks,
-                    }
-                  : {},
-              ),
-            )
-          : outputQueryEvent,
+      const { wallClockWindowClose, latencyDomainStatus } =
+        resolveChunkedWallClockWindowClose({
+          eventTimeWindowClose: centeredWindowMetadata.windowDataCloseTime,
+          runtimeReplayStartWallClockTime: this.runtimeReplayStartWallClockTime,
+          benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+          queryRegisteredTime: this.queryRegisteredTime,
+        });
+      const wallClockCloseToResultMs =
+        wallClockWindowClose !== null
+          ? resultEmittedAt - wallClockWindowClose
+          : null;
+      const payload = profileStageSync(
+        "chunked.final_payload_json_stringify_ms",
+        () =>
+          profileSync("serialization_parsing_ms", () =>
+            useBenchmarkPayload
+              ? JSON.stringify(
+                  buildBenchmarkResultPayload(
+                    "chunked",
+                    detectAggregationFunction as AggregationFunction,
+                      this.sessionId,
+                      Number.parseFloat(resultValue),
+                      this.windowCount,
+                      comparableDiagnostics
+                        ? {
+                            benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                            windowStart: comparableDiagnostics.externalWindowStart,
+                            windowEnd: comparableDiagnostics.externalWindowEnd,
+                            recomposedCount: comparableDiagnostics.recomposedCount,
+                            recomposedSum: comparableDiagnostics.recomposedSum,
+                            recomposedAvg: comparableDiagnostics.recomposedAvg,
+                            internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
+                            internalChunks: comparableDiagnostics.internalChunks,
+                          }
+                        : {},
+                      {
+                        windowSemantics: centeredWindowMetadata.windowSemantics,
+                        logicalTriggerTime:
+                          centeredWindowMetadata.logicalTriggerTime,
+                        windowStart: centeredWindowMetadata.windowStart,
+                        windowEnd: centeredWindowMetadata.windowEnd,
+                        windowDataCloseTime:
+                          centeredWindowMetadata.windowDataCloseTime,
+                        resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
+                        latencyFromLogicalTriggerMs: null,
+                        latencyFromWindowCloseMs: null,
+                        metadataSource: centeredWindowMetadata.metadataSource,
+                        registrationAnchoredExpectedClose,
+                        eventTimeWindowStart: centeredWindowMetadata.windowStart,
+                        eventTimeWindowEnd: centeredWindowMetadata.windowEnd,
+                        eventTimeWindowClose:
+                          centeredWindowMetadata.windowDataCloseTime,
+                        wallClockWindowClose,
+                        wallClockCloseToResultMs,
+                        latencyDomainStatus,
+                        anchorAlignedWindowClose: wallClockWindowClose,
+                        anchorAlignedWindowCloseToResultMs:
+                          wallClockCloseToResultMs,
+                      },
+                    ),
+                )
+              : outputQueryEvent,
+          ),
       );
       this.logger.log(`calculated result ${payload}`);
+      const publishStartedAt = startStageTimer();
       await this.publishWithSharedClient(resultTopic, payload, { qos: 1 });
+      endStageTimer("chunked.final_mqtt_publish_total_ms", publishStartedAt);
+      this.recordFinalizedWindow(this.windowCount);
       recordPublishedMqttMessage({
         topic: resultTopic,
         payload,
@@ -1651,22 +1812,58 @@ For example, the allResults object might look like this:
           proofEntry.emittedAt = resultEmittedAt;
           this.recordChunkEmissionProof(proofEntry);
         }
+        if (
+          this.benchmarkTargetWindowCount !== null &&
+          this.windowCount >= this.benchmarkTargetWindowCount
+        ) {
+          this.logger.log(
+            `Benchmark target window cap reached before fallback emission: target=${this.benchmarkTargetWindowCount} emitted=${this.windowCount}`,
+          );
+          this.benchmarkTargetWindowReached = true;
+          this.benchmarkStopReason = "target_window_count_reached";
+          this.writeBenchmarkWindowSummary();
+          setTimeout(() => {
+            this.cleanup();
+            process.exit(0);
+          }, 50);
+          finalize();
+          return;
+        }
+
         this.windowCount++;
-        const expectedWindowClose = this.getExpectedWindowCloseTime(
+        const registrationAnchoredExpectedClose = this.getExpectedWindowCloseTime(
           this.windowCount,
+        );
+        const centeredWindowMetadata = this.buildWindowMetadata(
+          partials,
+          comparableDiagnostics,
+          resultEmittedAt,
         );
         const triggerSource = emissionReason.startsWith("immediate") ? "Immediate" : "Interval";
         this.logLatency(
           this.windowCount,
-          expectedWindowClose,
+          registrationAnchoredExpectedClose,
           this.lastChunkReceivedTime,
           this.intervalTriggerTime,
           resultEmittedAt,
           resultValue,
           proofEntry,
           triggerSource,
+          centeredWindowMetadata,
         );
 
+        const { wallClockWindowClose, latencyDomainStatus } =
+          resolveChunkedWallClockWindowClose({
+            eventTimeWindowClose: centeredWindowMetadata.windowDataCloseTime,
+            runtimeReplayStartWallClockTime:
+              this.runtimeReplayStartWallClockTime,
+            benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+            queryRegisteredTime: this.queryRegisteredTime,
+          });
+        const wallClockCloseToResultMs =
+          wallClockWindowClose !== null
+            ? resultEmittedAt - wallClockWindowClose
+            : null;
         // Publish the output query event to the MQTT broker
         const resultTopic = getResultTopic("output");
         const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
@@ -1678,6 +1875,41 @@ For example, the allResults object might look like this:
                 this.sessionId,
                 Number.parseFloat(resultValue),
                 this.windowCount,
+                comparableDiagnostics
+                  ? {
+                      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                      windowStart: comparableDiagnostics.externalWindowStart,
+                      windowEnd: comparableDiagnostics.externalWindowEnd,
+                      recomposedCount: comparableDiagnostics.recomposedCount,
+                      recomposedSum: comparableDiagnostics.recomposedSum,
+                      recomposedAvg: comparableDiagnostics.recomposedAvg,
+                      internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
+                      internalChunks: comparableDiagnostics.internalChunks,
+                    }
+                  : {},
+                {
+                  windowSemantics: centeredWindowMetadata.windowSemantics,
+                  logicalTriggerTime: centeredWindowMetadata.logicalTriggerTime,
+                  windowStart: centeredWindowMetadata.windowStart,
+                  windowEnd: centeredWindowMetadata.windowEnd,
+                  windowDataCloseTime:
+                    centeredWindowMetadata.windowDataCloseTime,
+                  resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
+                  latencyFromLogicalTriggerMs: null,
+                  latencyFromWindowCloseMs: null,
+                  metadataSource: centeredWindowMetadata.metadataSource,
+                  registrationAnchoredExpectedClose,
+                  eventTimeWindowStart: centeredWindowMetadata.windowStart,
+                  eventTimeWindowEnd: centeredWindowMetadata.windowEnd,
+                  eventTimeWindowClose:
+                    centeredWindowMetadata.windowDataCloseTime,
+                  wallClockWindowClose,
+                  wallClockCloseToResultMs,
+                  latencyDomainStatus,
+                  anchorAlignedWindowClose: wallClockWindowClose,
+                  anchorAlignedWindowCloseToResultMs:
+                    wallClockCloseToResultMs,
+                },
               ),
             )
           : outputQueryEvent;
@@ -1691,6 +1923,7 @@ For example, the allResults object might look like this:
             profileCount("reconstructed_superquery_results");
             this.persistChunkedDebugSummary();
             profileCount("emitted_results");
+            this.recordFinalizedWindow(this.windowCount);
             finalize();
           },
         );

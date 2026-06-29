@@ -1,7 +1,8 @@
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { createBenchmarkReplayRunEnv } = require('../../experiments/utils/benchmarkReplayEnv');
+const { startProcessTreeResourceLogging } = require('./process-tree-resource-sampler');
 
 const RUNS = 1;
 const LOGS_DIR = 'logs/approximation-approach';
@@ -9,10 +10,73 @@ const APPROACH_CMD = ['node', ['dist/approaches/StreamingQueryApproximationAppro
 const PUBLISH_CMD = ['node', ['dist/streamer/src/publish.js']];
 const LOG_FILES = [
   'approximation_approach_log.csv',
+  'approximation_latency_log.csv',
   'approximation_approach_resource_usage.csv',
+  'approximation_approach_process_tree_resource_usage.csv',
   'replayer-log.csv'
 ];
-const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const DEFAULT_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const TIMEOUT_MS = Number.parseInt(
+  process.env.STREAMING_QUERY_HIVE_BENCHMARK_TIMEOUT_MS || String(DEFAULT_TIMEOUT_MS),
+  10,
+) || DEFAULT_TIMEOUT_MS;
+const TARGET_WINDOW_COUNT = Number.parseInt(
+  process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "",
+  10,
+);
+const USE_TARGET_WINDOW_CAP = Number.isFinite(TARGET_WINDOW_COUNT) && TARGET_WINDOW_COUNT > 0;
+const SKIP_LINGERING_CLEANUP = process.env.STREAMING_QUERY_HIVE_SKIP_LINGERING_PROCESS_CLEANUP === '1';
+
+function resolveIterationDir(iter) {
+  return process.env.LOG_PATH ? path.resolve(process.env.LOG_PATH) : path.join(LOGS_DIR, `iteration${iter}`);
+}
+
+function killLingeringProcesses() {
+  if (SKIP_LINGERING_CLEANUP) {
+    return;
+  }
+  try { execSync('pkill -f StreamingQueryHiveApproachOrchestrator.js'); } catch (e) { }
+  try { execSync('pkill -f publish.js'); } catch (e) { }
+}
+
+function readJsonIfExists(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8').trim();
+  return content ? JSON.parse(content) : null;
+}
+
+function finalizeRunSummary(iterDir) {
+  const runSummaryPath = path.join(iterDir, 'run_summary.json');
+  const capSummaryPath = path.join(iterDir, 'benchmark_window_cap_summary.json');
+  const runSummary = readJsonIfExists(runSummaryPath) || {};
+  const capSummary = readJsonIfExists(capSummaryPath) || {};
+  const finalSummary = {
+    ...runSummary,
+    ...capSummary,
+    targetWindowCount: Number.isFinite(TARGET_WINDOW_COUNT) ? TARGET_WINDOW_COUNT : runSummary.targetWindowCount ?? null,
+    emittedFinalWindowCount: capSummary.emittedFinalWindowCount ?? runSummary.emittedFinalWindowCount ?? null,
+    finalWindowNumbers: capSummary.finalWindowNumbers ?? runSummary.finalWindowNumbers ?? [],
+    stoppedAfterTargetWindows: capSummary.stoppedAfterTargetWindows ?? runSummary.stoppedAfterTargetWindows ?? false,
+    stopReason: capSummary.stopReason ?? runSummary.stopReason ?? runSummary.publisherExitReason ?? 'other',
+  };
+  fs.writeFileSync(runSummaryPath, `${JSON.stringify(finalSummary, null, 2)}\n`);
+}
+
+function waitForTargetWindowSummary(iterDir) {
+  const capSummaryPath = path.join(iterDir, 'benchmark_window_cap_summary.json');
+  return new Promise((resolve) => {
+    const interval = setInterval(() => {
+      const summary = readJsonIfExists(capSummaryPath);
+      if (summary?.stoppedAfterTargetWindows) {
+        clearInterval(interval);
+        resolve(summary);
+      }
+    }, 250);
+  });
+}
 
 // Check if we should run pattern tests
 const args = process.argv.slice(2);
@@ -25,6 +89,8 @@ async function runOnce(iter, patternName = null, dataPath = null) {
   const runLabel = patternName ? `${patternName} - Run ${iter}` : `Run ${iter}`;
   console.log(`--- ${runLabel} ---`);
 
+  killLingeringProcesses();
+
   // Set environment variable if using custom data path
   const replayEnv = createBenchmarkReplayRunEnv(process.env);
   const env = replayEnv.withBenchmarkReplayEnv(
@@ -36,6 +102,9 @@ async function runOnce(iter, patternName = null, dataPath = null) {
     stdio: 'inherit',
     env: env
   });
+  const iterDir = resolveIterationDir(iter);
+  const processTreeLogPath = path.join(iterDir, 'approximation_approach_process_tree_resource_usage.csv');
+  const treeSampler = startProcessTreeResourceLogging(processTreeLogPath, approach.pid, 100);
 
   // Start the publisher process after a short delay
   await new Promise(res => setTimeout(res, 2000));
@@ -52,29 +121,52 @@ async function runOnce(iter, patternName = null, dataPath = null) {
   }, TIMEOUT_MS);
 
   // Wait for publisher to finish or timeout
-  await new Promise((resolve) => {
-    publisher.on('exit', () => resolve());
-  });
+  if (USE_TARGET_WINDOW_CAP) {
+    await Promise.race([
+      new Promise((resolve) => {
+        approach.on('exit', () => resolve('approach_exit'));
+      }),
+      waitForTargetWindowSummary(iterDir),
+    ]);
+    if (approach.exitCode === null && approach.signalCode === null) {
+      approach.kill();
+    }
+    if (publisher.exitCode === null && publisher.signalCode === null) {
+      publisher.kill();
+    }
+    await new Promise((resolve) => {
+      publisher.on('exit', () => resolve());
+    });
+  } else {
+    await new Promise((resolve) => {
+      publisher.on('exit', () => resolve());
+    });
 
-  // Wait for approach to finish or timeout
-  await new Promise((resolve) => {
-    approach.on('exit', () => resolve());
-  });
+    // Wait for approach to finish or timeout
+    await new Promise((resolve) => {
+      approach.on('exit', () => resolve());
+    });
+  }
 
   clearTimeout(timeout);
+  treeSampler.stop();
 
   // Move/rename log files into a subfolder for this iteration
-  const iterDir = patternName 
+  const outputDir = patternName 
     ? path.join(LOGS_DIR, 'patterns', patternName, `iteration${iter}`)
-    : path.join(LOGS_DIR, `iteration${iter}`);
+    : resolveIterationDir(iter);
   
-  if (!fs.existsSync(iterDir)) fs.mkdirSync(iterDir, { recursive: true });
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
   for (const file of LOG_FILES) {
     if (fs.existsSync(file)) {
-      const newName = path.join(iterDir, file);
+      const newName = path.join(outputDir, file);
       fs.renameSync(file, newName);
     }
+  }
+
+  if (USE_TARGET_WINDOW_CAP) {
+    finalizeRunSummary(outputDir);
   }
 }
 
