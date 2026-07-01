@@ -837,6 +837,9 @@ function buildBenchmarkEnv(config) {
     CUSTOM_PATTERN_RETRIES: String(config.retries),
     PAPER_BENCHMARK_SMOKE: config.smoke ? "1" : "0",
     STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: String(benchmarkFiniteReplayDurationSeconds),
+    ...(Number.isFinite(config.targetWindows) && config.targetWindows > 0
+      ? { STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: String(config.targetWindows) }
+      : {}),
     STREAMING_QUERY_HIVE_SKIP_BROKER_PREFLIGHT: skipBrokerPreflight ? "1" : "0",
     CUSTOM_PATTERN_SELECTED_PATTERNS: config.patterns ? config.patterns.join(",") : "",
     CUSTOM_PATTERN_SELECTED_APPROACHES: config.approaches ? config.approaches.join(",") : "",
@@ -885,6 +888,15 @@ function createJobDefinitions(config) {
           "experiments/pattern-analysis/run-custom-patterns-comparison.js",
           "--iterations",
           String(config.iterations),
+          ...(config.patterns && config.patterns.length > 0
+            ? ["--patterns", config.patterns.join(",")]
+            : []),
+          ...(config.approaches && config.approaches.length > 0
+            ? ["--approaches", config.approaches.join(",")]
+            : []),
+          ...(Number.isFinite(config.targetWindows) && config.targetWindows > 0
+            ? ["--target-windows", String(config.targetWindows)]
+            : []),
           "--pattern-test-timeout",
           String(config.patternTestTimeout),
           "--retries",
@@ -904,39 +916,55 @@ function createJobDefinitions(config) {
 }
 
 function snapshotRealDataArtifacts(sourceRoot, outputDir) {
-  copyDirectory(sourceRoot, path.join(outputDir, "real-data", "raw"));
-
-  const approachDirs = fs.existsSync(sourceRoot)
-    ? fs.readdirSync(sourceRoot).filter((entry) => fs.statSync(path.join(sourceRoot, entry)).isDirectory())
+  const resultsJsonPath = path.join(sourceRoot, "real_data_comparison_results.json");
+  const rawResults = fs.existsSync(resultsJsonPath)
+    ? (JSON.parse(fs.readFileSync(resultsJsonPath, "utf8")).rawResults || [])
     : [];
+  const copiedLogDirs = [];
 
-  for (const approach of approachDirs) {
-    const approachSource = path.join(sourceRoot, approach);
-    const iterationDirs = listIterationDirs(approachSource);
-    for (const iterationDir of iterationDirs) {
-      const iterationSource = path.join(approachSource, iterationDir);
-      const latencyDestination = path.join(outputDir, "latency", "real-data", approach, iterationDir);
-      const resourceDestination = path.join(outputDir, "resources", "real-data", approach, iterationDir);
-      const naiveDestination = path.join(outputDir, "naive-distributed", "real-data", approach, iterationDir);
+  for (const result of rawResults) {
+    if (!result?.approach || !result?.iteration || !result?.logDir) {
+      continue;
+    }
 
-      const files = fs.readdirSync(iterationSource);
-      for (const fileName of files) {
-        const sourceFile = path.join(iterationSource, fileName);
-        if (!fs.statSync(sourceFile).isFile()) {
-          continue;
-        }
-        if (fileName.includes("latency")) {
-          copyFileIfExists(sourceFile, path.join(latencyDestination, fileName));
-        }
-        if (fileName.includes("resource")) {
-          copyFileIfExists(sourceFile, path.join(resourceDestination, fileName));
-        }
-        if (approach === "naive_distributed") {
-          copyFileIfExists(sourceFile, path.join(naiveDestination, fileName));
-        }
+    const rawIterationDir = path.isAbsolute(result.logDir)
+      ? result.logDir
+      : path.resolve(REPO_ROOT, result.logDir);
+    if (!fs.existsSync(rawIterationDir) || !fs.statSync(rawIterationDir).isDirectory()) {
+      continue;
+    }
+
+    const iterationDir = `iteration${result.iteration}`;
+    const rawDestination = path.join(outputDir, "real-data", "raw", result.approach, iterationDir);
+    const latencyDestination = path.join(outputDir, "latency", "real-data", result.approach, iterationDir);
+    const resourceDestination = path.join(outputDir, "resources", "real-data", result.approach, iterationDir);
+    const naiveDestination = path.join(outputDir, "naive-distributed", "real-data", result.approach, iterationDir);
+
+    copyDirectory(rawIterationDir, rawDestination);
+    copiedLogDirs.push(rawIterationDir);
+
+    const files = fs.readdirSync(rawIterationDir);
+    for (const fileName of files) {
+      const sourceFile = path.join(rawIterationDir, fileName);
+      if (!fs.statSync(sourceFile).isFile()) {
+        continue;
+      }
+      if (fileName.includes("latency")) {
+        copyFileIfExists(sourceFile, path.join(latencyDestination, fileName));
+      }
+      if (fileName.includes("resource")) {
+        copyFileIfExists(sourceFile, path.join(resourceDestination, fileName));
+      }
+      if (result.approach === "naive_distributed") {
+        copyFileIfExists(sourceFile, path.join(naiveDestination, fileName));
       }
     }
   }
+
+  return {
+    copiedSourceLogDirs: copiedLogDirs,
+    copiedCaseCount: copiedLogDirs.length,
+  };
 }
 
 function snapshotPatternArtifacts(sourceRoot, outputDir) {
@@ -1013,6 +1041,16 @@ function installBenchmarkSignalHandlers() {
   process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
 }
 
+function shouldMirrorChildOutput(env = process.env) {
+  const raw = String(env.STREAMING_QUERY_HIVE_BENCHMARK_MIRROR_CHILD_OUTPUT || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(raw);
+}
+
 async function runCommand(job, logDir, dryRun) {
   const stdoutPath = path.join(logDir, `${job.name}.stdout.log`);
   const stderrPath = path.join(logDir, `${job.name}.stderr.log`);
@@ -1036,6 +1074,7 @@ async function runCommand(job, logDir, dryRun) {
   const stdoutStream = fs.createWriteStream(stdoutPath);
   const stderrStream = fs.createWriteStream(stderrPath);
   const combinedStream = fs.createWriteStream(combinedPath);
+  const mirrorChildOutput = shouldMirrorChildOutput(job.env || process.env);
 
   return new Promise((resolve) => {
     const startedAt = Date.now();
@@ -1071,13 +1110,17 @@ async function runCommand(job, logDir, dryRun) {
     child.stdout.on("data", (chunk) => {
       stdoutStream.write(chunk);
       combinedStream.write(chunk);
-      process.stdout.write(chunk);
+      if (mirrorChildOutput) {
+        process.stdout.write(chunk);
+      }
     });
 
     child.stderr.on("data", (chunk) => {
       stderrStream.write(chunk);
       combinedStream.write(chunk);
-      process.stderr.write(chunk);
+      if (mirrorChildOutput) {
+        process.stderr.write(chunk);
+      }
     });
 
     child.on("close", (code) => {
@@ -1573,5 +1616,7 @@ if (require.main === module) {
     formatCommandLine,
     createJobDefinitions,
     runCommand,
+    snapshotRealDataArtifacts,
+    shouldMirrorChildOutput,
   };
 }

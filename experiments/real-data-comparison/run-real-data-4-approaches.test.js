@@ -6,12 +6,23 @@ const {
   APPROACHES,
   RealDataComparisonRunner,
   buildPaperConfig,
+  computeRequiredEventTimeCoverageMs,
   computeReplayDurationSeconds,
   computeRunTimeoutMs,
   getApproachByName,
+  hasSuccessfulTargetWindowCapSummary,
+  isBoundedTargetStopExitAcceptable,
   parseCliArgs,
+  prepareFreshIterationLogDir,
+  readBenchmarkWindowSummary,
   resolveFiniteReplayDurationSeconds,
+  shouldEnableFetchingStartupFirstEmitted,
+  shouldStopPublisherAfterTargetReached,
+  writeFallbackRunSummary,
 } = require("./run-real-data-4-approaches.js");
+const {
+  attachComparableTiming,
+} = require("../../scripts/analysis-js/generate-one-pattern-three-approach-n3-summary.js");
 
 function writeCsv(filePath, headers, rows) {
   const body = rows.map((row) => headers.map((header) => row[header] ?? "").join(",")).join("\n");
@@ -130,13 +141,30 @@ function writeApproachFixtures(rootDir, approachName, options = {}) {
   return iterationDir;
 }
 
+function writeText(filePath, content) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content);
+}
+
 describe("real-data paper-ready analysis", () => {
   test("timeout scales with replay duration for 35-window paper runs", () => {
     const paperConfig = buildPaperConfig(1);
 
+    expect(computeRequiredEventTimeCoverageMs(paperConfig)).toBe(2160000);
     expect(computeReplayDurationSeconds(paperConfig)).toBe(2340);
     expect(computeRunTimeoutMs({}, paperConfig)).toBe(2460000);
     expect(computeRunTimeoutMs({ STREAMING_QUERY_HIVE_BENCHMARK_TIMEOUT_MS: "12345" }, paperConfig)).toBe(12345);
+  });
+
+  test("5-window startup gates require 360 seconds of event-time coverage plus replay margin", () => {
+    const paperConfig = buildPaperConfig(1, { targetWindowCount: 5 });
+
+    expect(computeRequiredEventTimeCoverageMs(paperConfig)).toBe(360000);
+    expect(computeReplayDurationSeconds(paperConfig)).toBe(540);
+    expect(resolveFiniteReplayDurationSeconds({}, paperConfig)).toBe(540);
+    expect(resolveFiniteReplayDurationSeconds({
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: "300",
+    }, paperConfig)).toBe(540);
   });
 
   test("real-data runner ignores inherited finite replay durations that are shorter than required", () => {
@@ -232,6 +260,7 @@ describe("real-data paper-ready analysis", () => {
       "chunked",
     ]);
     expect(startupEnv.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS).toBe("1");
+    expect(startupEnv.STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE).toBe("1");
 
     const steadyRunner = new RealDataComparisonRunner({
       iterations: 1,
@@ -240,6 +269,14 @@ describe("real-data paper-ready analysis", () => {
     });
     const steadyEnv = steadyRunner.buildRunEnv(APPROACHES[1], "/tmp/log", 1);
     expect(steadyEnv.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS).toBe("35");
+    expect(steadyEnv.STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE).toBe("0");
+  });
+
+  test("startup-first-emitted helper only enables the fetching shortcut for bounded startup pilots", () => {
+    expect(shouldEnableFetchingStartupFirstEmitted(1)).toBe(true);
+    expect(shouldEnableFetchingStartupFirstEmitted(5)).toBe(true);
+    expect(shouldEnableFetchingStartupFirstEmitted(6)).toBe(false);
+    expect(shouldEnableFetchingStartupFirstEmitted(35)).toBe(false);
   });
 
   test("real-data runner uses the base smartphone and wearable datasets", () => {
@@ -247,6 +284,243 @@ describe("real-data paper-ready analysis", () => {
     const env = runner.buildRunEnv(APPROACHES[0], "/tmp/log", 1);
 
     expect(env.DATA_PATH).toBe(".");
+  });
+
+  test("buildRunEnv refreshes benchmark replay anchors per approach iteration run", () => {
+    const runner = new RealDataComparisonRunner({ iterations: 1 });
+    const originalNow = Date.now;
+    let currentNow = 1000;
+    Date.now = jest.fn(() => currentNow);
+
+    try {
+      const env1 = runner.buildRunEnv(APPROACHES[0], "/tmp/log-a", 1);
+      currentNow = 9000;
+      const env2 = runner.buildRunEnv(APPROACHES[1], "/tmp/log-b", 1);
+
+      expect(env1.STREAMING_QUERY_HIVE_BENCHMARK_START_TIME).toBe("1000");
+      expect(env1.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR).toBe("1000");
+      expect(env2.STREAMING_QUERY_HIVE_BENCHMARK_START_TIME).toBe("9000");
+      expect(env2.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR).toBe("9000");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  test("buildRunEnv isolates benchmark MQTT topics per approach iteration", () => {
+    const runner = new RealDataComparisonRunner({
+      iterations: 3,
+      approachNames: ["fetching", "approximation", "chunked"],
+      targetWindowCount: 5,
+    });
+
+    const iteration1Env = runner.buildRunEnv(APPROACHES[0], "/tmp/log-1", 1);
+    const iteration2Env = runner.buildRunEnv(APPROACHES[0], "/tmp/log-2", 2);
+    const chunkedIteration3Env = runner.buildRunEnv(APPROACHES[2], "/tmp/log-3", 3);
+
+    expect(iteration1Env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX).toBe(
+      "real-data-paper-ready/fetching/iteration1",
+    );
+    expect(iteration2Env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX).toBe(
+      "real-data-paper-ready/fetching/iteration2",
+    );
+    expect(chunkedIteration3Env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX).toBe(
+      "real-data-paper-ready/chunked/iteration3",
+    );
+  });
+
+  test("publisher-stop helper recognizes a successful target-window summary", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-window-summary-"));
+
+    try {
+      fs.writeFileSync(
+        path.join(tempRoot, "benchmark_window_cap_summary.json"),
+        `${JSON.stringify({
+          targetWindowCount: 5,
+          emittedFinalWindowCount: 5,
+          finalWindowNumbers: [1, 2, 3, 4, 5],
+          stoppedAfterTargetWindows: true,
+          stopReason: "target_window_count_reached",
+          approach: "approximation",
+        }, null, 2)}\n`,
+      );
+
+      expect(readBenchmarkWindowSummary(tempRoot)).toMatchObject({
+        stoppedAfterTargetWindows: true,
+        stopReason: "target_window_count_reached",
+      });
+      expect(shouldStopPublisherAfterTargetReached(tempRoot)).toBe(true);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("publisher-stop helper ignores missing or non-target summaries", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-window-summary-miss-"));
+
+    try {
+      expect(readBenchmarkWindowSummary(tempRoot)).toBeNull();
+      expect(shouldStopPublisherAfterTargetReached(tempRoot)).toBe(false);
+
+      fs.writeFileSync(
+        path.join(tempRoot, "benchmark_window_cap_summary.json"),
+        `${JSON.stringify({
+          stoppedAfterTargetWindows: false,
+          stopReason: "other",
+        }, null, 2)}\n`,
+      );
+
+      expect(shouldStopPublisherAfterTargetReached(tempRoot)).toBe(false);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("bounded target-stop exit helper accepts SIGTERM only after a successful cap summary", () => {
+    expect(isBoundedTargetStopExitAcceptable(0, null, false)).toBe(true);
+    expect(isBoundedTargetStopExitAcceptable(null, "SIGTERM", false)).toBe(false);
+    expect(isBoundedTargetStopExitAcceptable(null, "SIGTERM", true)).toBe(true);
+    expect(isBoundedTargetStopExitAcceptable(0, null, true)).toBe(true);
+    expect(isBoundedTargetStopExitAcceptable(1, null, true)).toBe(false);
+  });
+
+  test("bounded target-stop writes a completed fallback run summary when the publisher summary is missing", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-fallback-summary-"));
+
+    try {
+      const logDir = path.join(tempRoot, "fetching", "iteration1");
+      fs.mkdirSync(logDir, { recursive: true });
+
+      const summary = writeFallbackRunSummary(logDir, {
+        emittedFinalWindowCount: 5,
+        targetWindowCount: 5,
+        stopReason: "target_window_count_reached",
+        stoppedAfterTargetWindows: true,
+        finalWindowNumbers: [1, 2, 3, 4, 5],
+      });
+
+      expect(summary.completionStatus).toBe("completed");
+      expect(summary.publisherExitReason).toBe("target_window_count_reached");
+      expect(summary.emittedFinalWindowCount).toBe(5);
+      expect(summary.finalWindowNumbers).toEqual([1, 2, 3, 4, 5]);
+
+      const writtenSummary = JSON.parse(fs.readFileSync(path.join(logDir, "run_summary.json"), "utf8"));
+      expect(writtenSummary.completionStatus).toBe("completed");
+      expect(writtenSummary.stopReason).toBe("target_window_count_reached");
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("successful target-window cap summaries are treated as completed bounded runs", () => {
+    expect(hasSuccessfulTargetWindowCapSummary({
+      targetWindowCount: 5,
+      emittedFinalWindowCount: 5,
+      stoppedAfterTargetWindows: true,
+      stopReason: "target_window_count_reached",
+    })).toBe(true);
+
+    expect(hasSuccessfulTargetWindowCapSummary({
+      targetWindowCount: 5,
+      emittedFinalWindowCount: 4,
+      stoppedAfterTargetWindows: true,
+      stopReason: "target_window_count_reached",
+    })).toBe(false);
+
+    expect(hasSuccessfulTargetWindowCapSummary({
+      targetWindowCount: 5,
+      emittedFinalWindowCount: 5,
+      stoppedAfterTargetWindows: false,
+      stopReason: "target_window_count_reached",
+    })).toBe(false);
+  });
+
+  test("bounded target-stop fallback summaries can be written for multiple iterations", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-fallback-summary-multi-"));
+
+    try {
+      const benchmarkSummary = {
+        emittedFinalWindowCount: 5,
+        targetWindowCount: 5,
+        stopReason: "target_window_count_reached",
+        stoppedAfterTargetWindows: true,
+        finalWindowNumbers: [1, 2, 3, 4, 5],
+      };
+
+      for (const iteration of [1, 2]) {
+        const logDir = path.join(tempRoot, "fetching", `iteration${iteration}`);
+        fs.mkdirSync(logDir, { recursive: true });
+        writeFallbackRunSummary(logDir, benchmarkSummary);
+      }
+
+      for (const iteration of [1, 2]) {
+        const writtenSummary = JSON.parse(
+          fs.readFileSync(path.join(tempRoot, "fetching", `iteration${iteration}`, "run_summary.json"), "utf8"),
+        );
+        expect(writtenSummary.completionStatus).toBe("completed");
+        expect(writtenSummary.stopReason).toBe("target_window_count_reached");
+        expect(writtenSummary.finalWindowNumbers).toEqual([1, 2, 3, 4, 5]);
+      }
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareFreshIterationLogDir removes stale files only from the targeted iteration directory", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-clean-"));
+
+    try {
+      const targetDir = path.join(tempRoot, "approximation", "iteration1");
+      const siblingIterationDir = path.join(tempRoot, "approximation", "iteration2");
+      const siblingApproachDir = path.join(tempRoot, "fetching", "iteration1");
+
+      writeText(path.join(targetDir, "approximation_latency_log.csv"), "stale-latency\n");
+      writeText(path.join(targetDir, "mqtt_traffic_summary.json"), "{\"stale\":true}\n");
+      writeText(path.join(siblingIterationDir, "keep.txt"), "keep-iteration2\n");
+      writeText(path.join(siblingApproachDir, "keep.txt"), "keep-fetching\n");
+
+      prepareFreshIterationLogDir(targetDir);
+
+      expect(fs.existsSync(targetDir)).toBe(true);
+      expect(fs.readdirSync(targetDir)).toEqual([]);
+      expect(fs.readFileSync(path.join(siblingIterationDir, "keep.txt"), "utf8")).toBe("keep-iteration2\n");
+      expect(fs.readFileSync(path.join(siblingApproachDir, "keep.txt"), "utf8")).toBe("keep-fetching\n");
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareFreshIterationLogDir removes stale latency and MQTT summaries before a new iteration run", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-clean-stale-"));
+
+    try {
+      const targetDir = path.join(tempRoot, "approximation", "iteration1");
+      writeText(path.join(targetDir, "approximation_latency_log.csv"), "old-row\n");
+      writeText(path.join(targetDir, "mqtt_traffic_summary.json"), "{\"published_application_bytes\":123}\n");
+
+      prepareFreshIterationLogDir(targetDir);
+
+      expect(fs.existsSync(path.join(targetDir, "approximation_latency_log.csv"))).toBe(false);
+      expect(fs.existsSync(path.join(targetDir, "mqtt_traffic_summary.json"))).toBe(false);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareFreshIterationLogDir creates the iteration directory for a fresh run", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-clean-fresh-"));
+
+    try {
+      const targetDir = path.join(tempRoot, "chunked", "iteration1");
+      expect(fs.existsSync(targetDir)).toBe(false);
+
+      prepareFreshIterationLogDir(targetDir);
+
+      expect(fs.existsSync(targetDir)).toBe(true);
+      expect(fs.statSync(targetDir).isDirectory()).toBe(true);
+      expect(fs.readdirSync(targetDir)).toEqual([]);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   test("analyzeResults trims windows 4..33 and reports completeness, latency, CPU-seconds, and MQTT counts", () => {
@@ -283,6 +557,10 @@ describe("real-data paper-ready analysis", () => {
 
       expect(analysis.paper.methodology.targetWindows).toBe(35);
       expect(analysis.paper.methodology.analyzedWindows).toBe("4..33");
+      expect(analysis.paper.methodology.firstOutputTriggerOffsetMs).toBe(60000);
+      expect(analysis.paper.methodology.steadyStateLatencyMetric).toBe(
+        "result_emitted_at - mapped_output_trigger_wall_clock_ms",
+      );
 
       expect(analysis.paper.byApproach.fetching.closeToResultLatencyMs.mean).toBe(500);
       expect(analysis.paper.byApproach.fetching.cpuSeconds.mean).toBe(7);
@@ -290,6 +568,7 @@ describe("real-data paper-ready analysis", () => {
       expect(analysis.paper.byApproach.fetching.mqttPublishedBytes.mean).toBe(1000);
       expect(analysis.paper.byApproach.fetching.mqttEstimatedDeliveryBytes.mean).toBe(2000);
       expect(analysis.paper.byApproach.fetching.mqttMessageCount.mean).toBe(4);
+      expect(analysis.paper.byApproach.fetching.outputTriggerCadence.trimmed.ok).toBe(true);
       expect(analysis.paper.byApproach.fetching.completeness.matchedWindowCount.mean).toBe(30);
       expect(analysis.paper.byApproach.fetching.accuracy.mae.mean).toBe(0);
       expect(analysis.paper.byApproach.fetching.accuracy.rmse.mean).toBe(0);
@@ -304,8 +583,55 @@ describe("real-data paper-ready analysis", () => {
       expect(analysis.paper.byApproach.approximation.cpuSeconds.mean).toBe(9);
       expect(analysis.paper.byApproach.approximation.cpuSecondsPerWindow.mean).toBeCloseTo(9 / 34, 6);
       expect(analysis.paper.byApproach.approximation.mqttMessageCount.mean).toBe(4);
+      expect(analysis.paper.byApproach.approximation.outputTriggerCadence.trimmed.ok).toBe(false);
+      expect(analysis.paper.byApproach.approximation.outputTriggerCadence.trimmed.issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            iteration: 1,
+            type: "window_gap",
+            previousWindowNumber: 19,
+            currentWindowNumber: 21,
+            windowDelta: 2,
+          }),
+        ]),
+      );
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  test("fallback comparable timing maps window 1 to the first output step tick", () => {
+    const rows = attachComparableTiming(
+      [
+        {
+          windowNumber: 1,
+          resultEmittedAt: 61500,
+          latencyFromWindowCloseMs: null,
+          latencyDomainStatus: "",
+          wallClockCloseToResultMs: null,
+        },
+        {
+          windowNumber: 2,
+          resultEmittedAt: 121500,
+          latencyFromWindowCloseMs: null,
+          latencyDomainStatus: "",
+          wallClockCloseToResultMs: null,
+        },
+      ],
+      {
+        csvRows: [
+          { timestamp: "0", messageType: "raw_input_stream", warmup: "false" },
+        ],
+        firstTimestampsByType: {
+          raw_input_stream: 0,
+        },
+      },
+    );
+
+    expect(rows[0].mappedOutputTriggerWallClockMs).toBe(60000);
+    expect(rows[0].anchorAlignedExpectedWindowClose).toBe(60000);
+    expect(rows[0].anchorAlignedWindowCloseToResultMs).toBe(1500);
+    expect(rows[1].mappedOutputTriggerWallClockMs).toBe(120000);
+    expect(rows[1].anchorAlignedWindowCloseToResultMs).toBe(1500);
   });
 });

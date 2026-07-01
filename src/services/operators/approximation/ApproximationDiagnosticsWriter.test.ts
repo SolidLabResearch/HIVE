@@ -17,6 +17,16 @@ describe("ApproximationDiagnosticsWriter", () => {
     jest.clearAllMocks();
   });
 
+  test("computes registration-anchored expected closes for windows 1, 2, and 3", () => {
+    const writer = new ApproximationDiagnosticsWriter(1782236789582, 120000, 60000);
+
+    expect(writer.getExpectedWindowCloseTime(1)).toBe(1782236909582);
+    expect(writer.getExpectedWindowCloseTime(2)).toBe(1782236969582);
+    expect(writer.getExpectedWindowCloseTime(3)).toBe(1782237029582);
+
+    writer.cleanup();
+  });
+
   test("omits close-to-result latency when only event-time window metadata is available", () => {
     const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
     const writer = new ApproximationDiagnosticsWriter(1782236789582, 120000, 60000);

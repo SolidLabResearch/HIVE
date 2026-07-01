@@ -127,4 +127,21 @@ describe('StreamToMQTT deterministic replay timestamps', () => {
         expect(publisher.originalObservationTimestamps.get('https://example.com/obs/1')).toBe('2020-01-01T00:00:00.000Z');
         expect(publisher.originalObservationTimestamps.get('https://example.com/obs/2')).toBe('2020-01-01T00:01:00.000Z');
     });
+
+    test('tracks cumulative replayed event time across loop resets for diagnostics', () => {
+        const { publisher } = createPublisher();
+
+        publisher.loopDurationMs = 60_000;
+        publisher.replayLoopIndex = 0;
+        expect(publisher.getCumulativeEventTimeSpanMs(0)).toBe(0);
+        expect(publisher.getCumulativeEventTimeSpanMs(60_000)).toBe(60_000);
+
+        publisher.replayLoopIndex = 1;
+        expect(publisher.getCumulativeEventTimeSpanMs(0)).toBe(60_000);
+        expect(publisher.getCumulativeEventTimeSpanMs(60_000)).toBe(120_000);
+
+        publisher.replayLoopIndex = 3;
+        expect(publisher.getCumulativeEventTimeSpanMs(15_000)).toBe(195_000);
+        expect(publisher.getCumulativeEventTimeSpanMs(undefined)).toBeUndefined();
+    });
 });

@@ -11,6 +11,7 @@ const { compareResults } = require("../../analysis/accuracy/accuracy-comparison-
 const {
   attachComparableTiming,
   buildWindowMetadataFromRow,
+  verifyOutputStepCadence,
 } = require("../../scripts/analysis-js/generate-one-pattern-three-approach-n3-summary.js");
 const { buildTrimmedIterationSelection } = require("../../scripts/benchmark/run-all-paper-benchmarks.js");
 
@@ -144,12 +145,46 @@ function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
+function prepareFreshIterationLogDir(dirPath) {
+  fs.rmSync(dirPath, { recursive: true, force: true });
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
 function readText(filePath) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 }
 
 function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function writeFallbackRunSummary(logDir, benchmarkSummary, existingSummary = null) {
+  const runSummaryPath = path.join(logDir, "run_summary.json");
+  if (existingSummary?.completionStatus === "completed") {
+    return existingSummary;
+  }
+
+  const fallbackSummary = {
+    ...existingSummary,
+    publisherExitReason: existingSummary?.publisherExitReason || (
+      benchmarkSummary?.stopReason === "target_window_count_reached"
+        ? "target_window_count_reached"
+        : "bounded_target_stop"
+    ),
+    completionStatus: "completed",
+    emittedFinalWindowCount:
+      benchmarkSummary?.emittedFinalWindowCount ?? existingSummary?.emittedFinalWindowCount ?? null,
+    targetWindowCount:
+      benchmarkSummary?.targetWindowCount ?? existingSummary?.targetWindowCount ?? null,
+    stopReason: benchmarkSummary?.stopReason || existingSummary?.stopReason || null,
+    stoppedAfterTargetWindows:
+      benchmarkSummary?.stoppedAfterTargetWindows ?? existingSummary?.stoppedAfterTargetWindows ?? null,
+    finalWindowNumbers:
+      benchmarkSummary?.finalWindowNumbers ?? existingSummary?.finalWindowNumbers ?? [],
+  };
+
+  writeJson(runSummaryPath, fallbackSummary);
+  return fallbackSummary;
 }
 
 function writeCsv(filePath, rows, headers) {
@@ -251,6 +286,46 @@ function summarizeMqttMessageCounts(csvRows) {
   };
 }
 
+function readBenchmarkWindowSummary(logDir) {
+  const summaryPath = path.join(logDir, "benchmark_window_cap_summary.json");
+  if (!fs.existsSync(summaryPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+  } catch (error) {
+    console.error(`Error parsing benchmark window summary ${summaryPath}:`, error.message);
+    return null;
+  }
+}
+
+function shouldStopPublisherAfterTargetReached(logDir) {
+  const summary = readBenchmarkWindowSummary(logDir);
+  return summary?.stoppedAfterTargetWindows === true &&
+    summary?.stopReason === "target_window_count_reached";
+}
+
+function hasSuccessfulTargetWindowCapSummary(summary) {
+  return summary?.stoppedAfterTargetWindows === true &&
+    summary?.stopReason === "target_window_count_reached" &&
+    Number.isFinite(summary?.targetWindowCount) &&
+    Number.isFinite(summary?.emittedFinalWindowCount) &&
+    summary.emittedFinalWindowCount >= summary.targetWindowCount;
+}
+
+function isBoundedTargetStopExitAcceptable(code, signal, targetReached) {
+  if (!targetReached) {
+    return code === 0;
+  }
+
+  return code === 0 || signal === "SIGTERM";
+}
+
+function shouldEnableFetchingStartupFirstEmitted(targetWindows) {
+  return Number.isFinite(targetWindows) && targetWindows > 0 && targetWindows <= 5;
+}
+
 function getLastObservedAt(record, approachName) {
   if (approachName === "fetching" || approachName === "naive_distributed") {
     return toNumber(record.last_obs_received_at);
@@ -278,6 +353,10 @@ function normalizeLatencyRows(approachName, records, mqttSummary) {
     return {
       approach: approachName,
       windowNumber,
+      warmup:
+        record.warmup === undefined || record.warmup === null || String(record.warmup).trim() === ""
+          ? null
+          : String(record.warmup).trim().toLowerCase() === "true",
       queryRegisteredAt,
       firstDataReceivedAt,
       expectedWindowClose,
@@ -400,10 +479,19 @@ function getApproachByName(name) {
   return APPROACHES.find((approach) => approach.name === name) || null;
 }
 
+function computeRequiredEventTimeCoverageMs(paperConfig) {
+  return (
+    paperConfig.outputWindowRangeMs +
+    ((paperConfig.targetWindows - 1) * paperConfig.outputWindowStepMs)
+  );
+}
+
 function computeReplayDurationSeconds(paperConfig) {
   return Math.ceil(
-    (paperConfig.outputWindowRangeMs +
-      ((paperConfig.targetWindows + 2) * paperConfig.outputWindowStepMs)) / 1000,
+    (
+      computeRequiredEventTimeCoverageMs(paperConfig) +
+      (3 * paperConfig.outputWindowStepMs)
+    ) / 1000,
   );
 }
 
@@ -436,7 +524,6 @@ class RealDataComparisonRunner {
       ? APPROACHES.filter((approach) => options.approachNames.includes(approach.name))
       : APPROACHES;
     this.results = [];
-    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
     this.paperConfig = buildPaperConfig(this.iterations, {
       targetWindowCount: options.targetWindowCount,
     });
@@ -459,10 +546,11 @@ class RealDataComparisonRunner {
   buildRunEnv(approach, logDir, iteration) {
     const targetWindows = this.paperConfig.targetWindows;
     const replayDurationSeconds = resolveFiniteReplayDurationSeconds(process.env, this.paperConfig);
-    const topicPrefix = `${REAL_DATA_TOPIC_PREFIX_ROOT}/${approach.name}`;
+    const topicPrefix = `${REAL_DATA_TOPIC_PREFIX_ROOT}/${approach.name}/iteration${iteration}`;
     const sessionId = `real-data-paper-ready-${approach.name}-iteration${iteration}`;
+    const replayEnv = createBenchmarkReplayRunEnv(process.env);
 
-    return this.replayEnv.withBenchmarkReplayEnv({
+    return replayEnv.withBenchmarkReplayEnv({
       ...process.env,
       DATA_PATH: ".",
       LOG_PATH: logDir,
@@ -475,6 +563,10 @@ class RealDataComparisonRunner {
         process.env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX || topicPrefix,
       WEARABLE_FREQUENCY:
         process.env.WEARABLE_FREQUENCY || String(DEFAULT_REPLAY_FREQUENCY_HZ),
+      STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE:
+        approach.name === "fetching" && shouldEnableFetchingStartupFirstEmitted(targetWindows)
+          ? "1"
+          : (process.env.STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE || "0"),
       STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: "1",
       STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: String(targetWindows),
       STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS:
@@ -508,7 +600,7 @@ class RealDataComparisonRunner {
       console.log("=".repeat(80));
 
       const logDir = path.join(LOGS_DIR, approach.name, `iteration${iteration}`);
-      ensureDir(logDir);
+      prepareFreshIterationLogDir(logDir);
 
       const env = this.buildRunEnv(approach, logDir, iteration);
       const startTime = Date.now();
@@ -529,11 +621,32 @@ class RealDataComparisonRunner {
         let timeout = null;
         let publisherFinished = false;
         let publisherExitCode = null;
+        let publisherSignal = null;
         let publisherError = null;
         let orchestratorFinished = false;
         let orchestratorExitCode = null;
         let orchestratorSignal = null;
         let orchestratorError = null;
+        let boundedTargetStopTriggered = false;
+        let boundedTargetStopPoll = null;
+
+        const stopBoundedRunAfterTargetReached = () => {
+          if (boundedTargetStopTriggered || !shouldStopPublisherAfterTargetReached(logDir)) {
+            return;
+          }
+
+          boundedTargetStopTriggered = true;
+          console.log(
+            `Target window cap reached for ${approach.name} iteration ${iteration}; stopping publisher/orchestrator for bounded run handoff.`,
+          );
+
+          try {
+            publisher?.kill("SIGTERM");
+          } catch {}
+          try {
+            orchestrator.kill("SIGTERM");
+          } catch {}
+        };
 
         const finalize = (result) => {
           if (settled) {
@@ -543,6 +656,9 @@ class RealDataComparisonRunner {
 
           if (timeout) {
             clearTimeout(timeout);
+          }
+          if (boundedTargetStopPoll) {
+            clearInterval(boundedTargetStopPoll);
           }
           try {
             publisher?.kill();
@@ -556,6 +672,14 @@ class RealDataComparisonRunner {
 
           this.copyLogFiles(approach, logDir);
           const mqttTrafficSummary = finalizeMqttTrafficArtifacts({ logDir });
+          const benchmarkSummary = readBenchmarkWindowSummary(logDir);
+          const runSummaryPath = path.join(logDir, "run_summary.json");
+          const existingRunSummary = fs.existsSync(runSummaryPath)
+            ? JSON.parse(fs.readFileSync(runSummaryPath, "utf8"))
+            : null;
+          const runSummary = hasSuccessfulTargetWindowCapSummary(benchmarkSummary)
+            ? writeFallbackRunSummary(logDir, benchmarkSummary, existingRunSummary)
+            : existingRunSummary;
 
           resolve({
             ...result,
@@ -563,6 +687,7 @@ class RealDataComparisonRunner {
             iteration,
             logDir,
             mqttTrafficSummary,
+            runSummary,
           });
         };
 
@@ -572,6 +697,7 @@ class RealDataComparisonRunner {
           }
 
           const duration = (Date.now() - startTime) / 1000;
+          const boundedTargetReached = shouldStopPublisherAfterTargetReached(logDir);
           if (publisherError) {
             finalize({
               success: false,
@@ -581,11 +707,15 @@ class RealDataComparisonRunner {
             return;
           }
 
-          if (publisherExitCode !== 0) {
+          if (!isBoundedTargetStopExitAcceptable(
+            publisherExitCode,
+            publisherSignal,
+            boundedTargetReached && boundedTargetStopTriggered,
+          )) {
             finalize({
               success: false,
               duration,
-              error: `publisher exited with code ${publisherExitCode}`,
+              error: `publisher exited with code ${publisherExitCode}${publisherSignal ? ` signal ${publisherSignal}` : ""}`,
             });
             return;
           }
@@ -599,7 +729,11 @@ class RealDataComparisonRunner {
             return;
           }
 
-          if (orchestratorExitCode !== 0) {
+          if (!isBoundedTargetStopExitAcceptable(
+            orchestratorExitCode,
+            orchestratorSignal,
+            boundedTargetReached && boundedTargetStopTriggered,
+          )) {
             finalize({
               success: false,
               duration,
@@ -625,6 +759,14 @@ class RealDataComparisonRunner {
           orchestratorFinished = true;
           orchestratorExitCode = code;
           orchestratorSignal = signal;
+          if (code === 0 && publisher && !publisherFinished &&
+            shouldStopPublisherAfterTargetReached(logDir)) {
+            publisherFinished = true;
+            publisherExitCode = 0;
+            try {
+              publisher.kill("SIGTERM");
+            } catch {}
+          }
           maybeFinalizeSuccessfulRun();
         });
 
@@ -633,6 +775,8 @@ class RealDataComparisonRunner {
             stdio: "inherit",
             env,
           });
+          boundedTargetStopPoll = setInterval(stopBoundedRunAfterTargetReached, 250);
+          boundedTargetStopPoll.unref?.();
 
           timeout = setTimeout(() => {
             console.log("Timeout reached, stopping publisher/orchestrator.");
@@ -644,9 +788,10 @@ class RealDataComparisonRunner {
             } catch {}
           }, computeRunTimeoutMs(env, this.paperConfig));
 
-          publisher.on("close", (code) => {
+          publisher.on("close", (code, signal) => {
             publisherFinished = true;
             publisherExitCode = code;
+            publisherSignal = signal;
             maybeFinalizeSuccessfulRun();
           });
 
@@ -749,6 +894,8 @@ class RealDataComparisonRunner {
       approach.processTreeFile,
       normalizedRows.length,
     );
+    const rawCadence = verifyOutputStepCadence(normalizedRows);
+    const trimmedCadence = verifyOutputStepCadence(trimmedRows);
 
     return {
       approach: approach.name,
@@ -772,6 +919,10 @@ class RealDataComparisonRunner {
         trimmedWindowCloseMs: summarizeMetric(trimmedRows.map((row) => row.latencyFromWindowCloseMs)),
       },
       resourceMetrics,
+      cadence: {
+        raw: rawCadence,
+        trimmed: trimmedCadence,
+      },
       mqttTrafficSummary: mqttSummary.summary,
       mqttMessageCountTotal: mqttSummary.messageCounts.total,
       mqttMessageCountsByType: mqttSummary.messageCounts.byType,
@@ -800,12 +951,15 @@ class RealDataComparisonRunner {
         analyzedWindows: `${this.paperConfig.analysisWindowStart}..${this.paperConfig.analysisWindowEnd}`,
         outputWindowRangeMs: this.paperConfig.outputWindowRangeMs,
         outputWindowStepMs: this.paperConfig.outputWindowStepMs,
+        firstOutputTriggerOffsetMs: this.paperConfig.outputWindowStepMs,
         replayFrequencyHz: this.paperConfig.defaultReplayFrequencyHz,
         approximationCompletedWindowMode: true,
         chunkedSemanticReadyMode:
           !chunkedComparableOutputOnly && !chunkedCadenceOnly && chunkedUseImmediateTrigger,
         compactReusableResultPayload: true,
         cpuMetric: "cpu_seconds",
+        startupLatencyMetric: "first_result_registration_to_result_ms",
+        steadyStateLatencyMetric: "result_emitted_at - mapped_output_trigger_wall_clock_ms",
       },
       byApproach: {},
     };
@@ -856,6 +1010,24 @@ class RealDataComparisonRunner {
         mqttMessageCount: summarizeMetric(
           records.map((record) => record.mqttMessageCountTotal),
         ),
+        outputTriggerCadence: {
+          raw: {
+            ok: records.every((record) => record.cadence.raw.ok),
+            checkedPairs: records.map((record) => record.cadence.raw.checkedPairs),
+            issues: records.flatMap((record) => record.cadence.raw.issues.map((issue) => ({
+              iteration: record.iteration,
+              ...issue,
+            }))),
+          },
+          trimmed: {
+            ok: records.every((record) => record.cadence.trimmed.ok),
+            checkedPairs: records.map((record) => record.cadence.trimmed.checkedPairs),
+            issues: records.flatMap((record) => record.cadence.trimmed.issues.map((issue) => ({
+              iteration: record.iteration,
+              ...issue,
+            }))),
+          },
+        },
         completeness: {
           matchedWindowCount: summarizeMetric(comparisons.map((comparison) => comparison.matchedWindowCount)),
           fetchingOnlyWindows: summarizeMetric(comparisons.map((comparison) => comparison.fetchingOnlyWindows)),
@@ -1117,11 +1289,19 @@ if (require.main === module) {
     RealDataComparisonRunner,
     buildPaperConfig,
     computeReplayDurationSeconds,
+    computeRequiredEventTimeCoverageMs,
     computeRunTimeoutMs,
     getApproachByName,
+    hasSuccessfulTargetWindowCapSummary,
+    isBoundedTargetStopExitAcceptable,
+    readBenchmarkWindowSummary,
     resolveFiniteReplayDurationSeconds,
     normalizeLatencyRows,
     parseCliArgs,
+    prepareFreshIterationLogDir,
+    shouldEnableFetchingStartupFirstEmitted,
+    shouldStopPublisherAfterTargetReached,
     summarizeProcessTreeMetrics,
+    writeFallbackRunSummary,
   };
 }

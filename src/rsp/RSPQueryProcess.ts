@@ -410,8 +410,7 @@ export class RSPQueryProcess {
         ];
         for (const candidate of candidates) {
             if (Number.isFinite(candidate.start) && Number.isFinite(candidate.end)) {
-                const explicit = { start: candidate.start as number, end: candidate.end as number };
-                return this.remapWindowBoundsToBenchmarkAnchor(explicit, range, step);
+                return { start: candidate.start as number, end: candidate.end as number };
             }
         }
 

@@ -29,6 +29,14 @@ const MODE_DEFAULTS = {
     warmupWindows: [1],
     shutdownWindows: [],
   },
+  "startup-first-emitted": {
+    expectedIterations: 35,
+    targetWindows: 5,
+    steadyWindowStart: 1,
+    steadyWindowEnd: 5,
+    warmupWindows: [],
+    shutdownWindows: [],
+  },
 };
 
 function parseArgs(argv) {
@@ -99,7 +107,7 @@ function printHelp() {
   console.log(`Usage: node analysis/real-data-comparison/generate-real-data-3approach-metrics.js [options]
 
 Options:
-  --mode <steady-state|startup-cost>
+  --mode <steady-state|startup-cost|startup-first-emitted>
   --input-root <path>           Real-data logs root or top-level paper output root
   --output <path>               Markdown report path
   --expected-iterations <n>     Override expected iterations for validation
@@ -193,6 +201,10 @@ function formatBool(value) {
   return value ? "yes" : "no";
 }
 
+function formatOptional(value, digits = 2) {
+  return Number.isFinite(value) ? value.toFixed(digits) : "n/a";
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
@@ -236,11 +248,27 @@ function collectIterationArtifacts(logsRoot, approachName, iteration) {
   const mqttSummaryPath = path.join(iterationDir, "mqtt_traffic_summary.json");
 
   const latencyRows = parseCsv(latencyPath);
+  const rawLatencyRowsByWindow = new Map(
+    latencyRows
+      .map((row) => [Number.parseInt(String(row.window_number || ""), 10), row])
+      .filter(([windowNumber]) => Number.isFinite(windowNumber)),
+  );
   const mqttSummary = fs.existsSync(mqttSummaryPath) ? readJson(mqttSummaryPath) : null;
   const normalizedRows = normalizeLatencyRows(approachName, latencyRows, { summary: mqttSummary, csvRows: [] });
   const capSummary = fs.existsSync(capSummaryPath) ? readJson(capSummaryPath) : null;
   const runSummary = fs.existsSync(runSummaryPath) ? readJson(runSummaryPath) : null;
   const processTreeMetrics = summarizeProcessTreeMetrics(iterationDir, approach.processTreeFile, normalizedRows.length);
+  const artifactWarnings = [];
+
+  if (
+    Number.isFinite(capSummary?.emittedFinalWindowCount) &&
+    normalizedRows.length > 0 &&
+    capSummary.emittedFinalWindowCount !== normalizedRows.length
+  ) {
+    artifactWarnings.push(
+      `${approachName}/iteration${iteration}: benchmark_window_cap_summary.json reports ${capSummary.emittedFinalWindowCount} finalized windows but ${path.basename(latencyPath)} contains ${normalizedRows.length} rows`,
+    );
+  }
 
   return {
     approachName,
@@ -250,6 +278,8 @@ function collectIterationArtifacts(logsRoot, approachName, iteration) {
     capSummary,
     runSummary,
     processTreeMetrics,
+    artifactWarnings,
+    rawLatencyRowsByWindow,
     files: {
       latencyPath,
       capSummaryPath,
@@ -258,6 +288,27 @@ function collectIterationArtifacts(logsRoot, approachName, iteration) {
       mqttSummaryPath,
     },
   };
+}
+
+function hasSuccessfulBoundedCompletionEvidence(capSummary) {
+  return capSummary?.stoppedAfterTargetWindows === true &&
+    capSummary?.stopReason === "target_window_count_reached" &&
+    Number.isFinite(capSummary?.targetWindowCount) &&
+    Number.isFinite(capSummary?.emittedFinalWindowCount) &&
+    capSummary.emittedFinalWindowCount >= capSummary.targetWindowCount;
+}
+
+function isCompletedBoundedIteration(record) {
+  if (record?.runSummary?.completionStatus === "completed") {
+    return true;
+  }
+
+  return hasSuccessfulBoundedCompletionEvidence(record?.capSummary);
+}
+
+function toNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function buildExpectedConfig(mode, overrides = {}) {
@@ -291,6 +342,301 @@ function computeAccuracy(baselineRows, candidateRows) {
     mapeApplicableWindowCount: comparison.mapeApplicableWindowCount,
     maxAbsoluteError: absoluteErrors.length > 0 ? Math.max(...absoluteErrors) : null,
     exactAgainstFetching: absoluteErrors.every((value) => Math.abs(value) <= Number.EPSILON),
+  };
+}
+
+function summarizeCountsByKey(values) {
+  const counts = {};
+  for (const value of values) {
+    const key = String(value || "unknown");
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function formatCountsByKey(counts) {
+  const entries = Object.entries(counts || {}).sort((left, right) => left[0].localeCompare(right[0]));
+  if (entries.length === 0) {
+    return "n/a";
+  }
+  return entries.map(([key, count]) => `${key}:${count}`).join(", ");
+}
+
+function selectFirstUsableStartupRow(rows) {
+  return rows.find((row) => row.warmup !== true) || null;
+}
+
+function computeWallClockMappedStartupLatency(row, rawLatencyRow = null) {
+  const comparableLatencyUpperBoundMs = 120000 * 10;
+  const rawWallClockCloseToResultMs = toNumber(rawLatencyRow?.wall_clock_close_to_result_ms);
+  const rawResultEmittedAt = toNumber(rawLatencyRow?.result_emitted_at);
+  const rawWindowEnd = toNumber(
+    rawLatencyRow?.event_time_window_close
+      ?? rawLatencyRow?.window_data_close_time
+      ?? rawLatencyRow?.logical_trigger_time
+      ?? rawLatencyRow?.window_end,
+  );
+
+  if (
+    Number.isFinite(rawWallClockCloseToResultMs) &&
+    rawWallClockCloseToResultMs >= 0 &&
+    rawWallClockCloseToResultMs <= comparableLatencyUpperBoundMs
+  ) {
+    return {
+      startupLatencyMs: rawWallClockCloseToResultMs,
+      startupLatencySource: "wallClockCloseToResultMs",
+      startupLatencyValid: true,
+      startupLatencyFailureReason: null,
+      latencyDomainStatus: "wall_clock_mapped",
+      wallClockWindowCloseMs: toNumber(rawLatencyRow?.wall_clock_window_close),
+    };
+  }
+
+  if (
+    Number.isFinite(row.wallClockCloseToResultMs) &&
+    row.wallClockCloseToResultMs >= 0 &&
+    row.wallClockCloseToResultMs <= comparableLatencyUpperBoundMs &&
+    row.latencyDomainStatus === "wall_clock_mapped"
+  ) {
+    return {
+      startupLatencyMs: row.wallClockCloseToResultMs,
+      startupLatencySource: "wallClockCloseToResultMs",
+      startupLatencyValid: true,
+      startupLatencyFailureReason: null,
+      latencyDomainStatus: "wall_clock_mapped",
+      wallClockWindowCloseMs: null,
+    };
+  }
+
+  if (
+    Number.isFinite(rawResultEmittedAt) &&
+    Number.isFinite(rawWindowEnd)
+  ) {
+    const mappedLatencyMs = rawResultEmittedAt - rawWindowEnd;
+    if (mappedLatencyMs >= 0 && mappedLatencyMs <= comparableLatencyUpperBoundMs) {
+      return {
+        startupLatencyMs: mappedLatencyMs,
+        startupLatencySource: "resultEmittedAtMinusWindowEnd",
+        startupLatencyValid: true,
+        startupLatencyFailureReason: null,
+        latencyDomainStatus: "wall_clock_mapped",
+        wallClockWindowCloseMs: rawWindowEnd,
+      };
+    }
+  }
+
+  return null;
+}
+
+function selectStartupLatency(row, rawLatencyRow = null) {
+  const rawLatencyFromWindowCloseMs = toNumber(rawLatencyRow?.latency_from_window_close_ms);
+  const rawLatencyFromLogicalTriggerMs = toNumber(rawLatencyRow?.latency_from_logical_trigger_ms);
+  const comparableLatencyUpperBoundMs = 120000 * 10;
+  const buildComparableLatency = (startupLatencyMs, startupLatencySource, latencyDomainStatus, diagnosticsOnly = false) => ({
+    startupLatencyMs,
+    startupLatencySource,
+    startupLatencyValid: !diagnosticsOnly,
+    startupLatencyFailureReason: diagnosticsOnly ? "non_comparable_latency_domain" : null,
+    latencyDomainStatus,
+    diagnosticsOnly,
+    diagnosticDirectWindowCloseMs: rawLatencyFromWindowCloseMs,
+    diagnosticDirectLogicalTriggerMs: rawLatencyFromLogicalTriggerMs,
+  });
+
+  if (row.latencyDomainStatus === "domain_mismatch") {
+    return {
+      startupLatencyMs: null,
+      startupLatencySource: "domain_mismatch",
+      startupLatencyValid: false,
+      startupLatencyFailureReason: "latency_domain_mismatch",
+      latencyDomainStatus: "domain_mismatch",
+      diagnosticsOnly: false,
+      diagnosticDirectWindowCloseMs: rawLatencyFromWindowCloseMs,
+      diagnosticDirectLogicalTriggerMs: rawLatencyFromLogicalTriggerMs,
+    };
+  }
+
+  const mappedLatency = computeWallClockMappedStartupLatency(row, rawLatencyRow);
+  if (mappedLatency) {
+    return {
+      ...mappedLatency,
+      diagnosticsOnly: false,
+      diagnosticDirectWindowCloseMs: rawLatencyFromWindowCloseMs,
+      diagnosticDirectLogicalTriggerMs: rawLatencyFromLogicalTriggerMs,
+    };
+  }
+
+  if (Number.isFinite(row.anchorAlignedWindowCloseToResultMs) && row.anchorAlignedWindowCloseToResultMs >= 0) {
+    return buildComparableLatency(
+      row.anchorAlignedWindowCloseToResultMs,
+      "anchorAlignedWindowCloseToResultMs",
+      "wall_clock_mapped",
+    );
+  }
+
+  if (
+    Number.isFinite(rawLatencyFromWindowCloseMs) &&
+    rawLatencyFromWindowCloseMs >= 0 &&
+    rawLatencyFromWindowCloseMs <= comparableLatencyUpperBoundMs
+  ) {
+    return buildComparableLatency(
+      rawLatencyFromWindowCloseMs,
+      "latencyFromWindowCloseMs",
+      "direct_window_close",
+      true,
+    );
+  }
+
+  if (
+    Number.isFinite(rawLatencyFromLogicalTriggerMs) &&
+    rawLatencyFromLogicalTriggerMs >= 0 &&
+    rawLatencyFromLogicalTriggerMs <= comparableLatencyUpperBoundMs
+  ) {
+    return buildComparableLatency(
+      rawLatencyFromLogicalTriggerMs,
+      "latencyFromLogicalTriggerMs",
+      "direct_logical_trigger",
+      true,
+    );
+  }
+
+  return {
+    startupLatencyMs: null,
+    startupLatencySource: "unavailable",
+    startupLatencyValid: false,
+    startupLatencyFailureReason: "missing_comparable_close_to_result_latency",
+    latencyDomainStatus: row.latencyDomainStatus || null,
+    diagnosticsOnly: false,
+    diagnosticDirectWindowCloseMs: rawLatencyFromWindowCloseMs,
+    diagnosticDirectLogicalTriggerMs: rawLatencyFromLogicalTriggerMs,
+  };
+}
+
+function buildStartupFirstEmittedEntry(record) {
+  const firstUsableRow = selectFirstUsableStartupRow(record.normalizedRows);
+  const warmupRowsSkipped = record.normalizedRows.filter((row) => row.warmup === true).length;
+  if (!firstUsableRow) {
+    return {
+      approach: record.approachName,
+      iteration: record.iteration,
+      usable: false,
+      noUsableResultReason: record.normalizedRows.length === 0
+        ? "no_result_rows"
+        : "only_warmup_result_rows",
+      warmupRowsSkipped,
+      firstEmittedWindowNumber: null,
+      resultValue: null,
+      startupLatencyMs: null,
+      startupLatencySource: "unavailable",
+      startupLatencyValid: false,
+      startupLatencyFailureReason: record.normalizedRows.length === 0
+        ? "no_result_rows"
+        : "only_warmup_result_rows",
+      latencyDomainStatus: null,
+      registrationToResultMs: null,
+      dataStartToResultMs: null,
+      lastDataToResultMs: null,
+      finalWindowNumbers: record.capSummary?.finalWindowNumbers || [],
+      emittedFinalWindowCount: record.capSummary?.emittedFinalWindowCount ?? null,
+      targetWindowCount: record.capSummary?.targetWindowCount ?? null,
+      stopReason: record.capSummary?.stopReason || null,
+      runCompleted: isCompletedBoundedIteration(record),
+      diagnosticStopReasonTargetReached: record.capSummary?.stopReason === "target_window_count_reached",
+      diagnosticReachedTargetWindowUpperBound:
+        Array.isArray(record.capSummary?.finalWindowNumbers)
+        && Number.isFinite(record.capSummary?.targetWindowCount)
+        && record.capSummary.finalWindowNumbers.length === record.capSummary.targetWindowCount,
+    };
+  }
+
+  const rawLatencyRow = record.rawLatencyRowsByWindow.get(firstUsableRow.windowNumber) || null;
+  const selectedLatency = selectStartupLatency(firstUsableRow, rawLatencyRow);
+  return {
+    approach: record.approachName,
+    iteration: record.iteration,
+    usable: true,
+    noUsableResultReason: null,
+    warmupRowsSkipped,
+    firstEmittedWindowNumber: firstUsableRow.windowNumber,
+    resultValue: firstUsableRow.resultValue,
+    startupLatencyMs: selectedLatency.startupLatencyMs,
+    startupLatencySource: selectedLatency.startupLatencySource,
+    startupLatencyValid: selectedLatency.startupLatencyValid,
+    startupLatencyFailureReason: selectedLatency.startupLatencyFailureReason,
+    latencyDomainStatus: selectedLatency.latencyDomainStatus,
+    diagnosticDirectWindowCloseMs: selectedLatency.diagnosticDirectWindowCloseMs,
+    diagnosticDirectLogicalTriggerMs: selectedLatency.diagnosticDirectLogicalTriggerMs,
+    registrationToResultMs: firstUsableRow.registrationToResultMs,
+    dataStartToResultMs: firstUsableRow.dataStartToResultMs,
+    lastDataToResultMs: firstUsableRow.lastDataToResultMs,
+    finalWindowNumbers: record.capSummary?.finalWindowNumbers || [],
+    emittedFinalWindowCount: record.capSummary?.emittedFinalWindowCount ?? null,
+    targetWindowCount: record.capSummary?.targetWindowCount ?? null,
+    stopReason: record.capSummary?.stopReason || null,
+    runCompleted: isCompletedBoundedIteration(record),
+    diagnosticStopReasonTargetReached: record.capSummary?.stopReason === "target_window_count_reached",
+    diagnosticReachedTargetWindowUpperBound:
+      Array.isArray(record.capSummary?.finalWindowNumbers)
+      && Number.isFinite(record.capSummary?.targetWindowCount)
+      && record.capSummary.finalWindowNumbers.length === record.capSummary.targetWindowCount,
+  };
+}
+
+function compareFirstEmittedAgainstFetching(fetchingRecord, candidateEntry) {
+  if (!candidateEntry.usable) {
+    return {
+      comparable: false,
+      alignment: "not_comparable",
+      note: candidateEntry.noUsableResultReason || "candidate_missing_usable_row",
+      metrics: null,
+    };
+  }
+  if (!fetchingRecord) {
+    return {
+      comparable: false,
+      alignment: "not_comparable",
+      note: "missing_fetching_iteration",
+      metrics: null,
+    };
+  }
+
+  const fetchingEntry = buildStartupFirstEmittedEntry(fetchingRecord);
+  if (!fetchingEntry.usable) {
+    return {
+      comparable: false,
+      alignment: "not_comparable",
+      note: fetchingEntry.noUsableResultReason || "fetching_missing_usable_row",
+      metrics: null,
+    };
+  }
+
+  const fetchingByWindow = new Map(fetchingRecord.normalizedRows.map((row) => [row.windowNumber, row]));
+  const baselineRow = candidateEntry.firstEmittedWindowNumber === fetchingEntry.firstEmittedWindowNumber
+    ? fetchingByWindow.get(fetchingEntry.firstEmittedWindowNumber)
+    : fetchingByWindow.get(candidateEntry.firstEmittedWindowNumber);
+
+  if (!baselineRow) {
+    return {
+      comparable: false,
+      alignment: "not_comparable",
+      note: `fetching_missing_window_${candidateEntry.firstEmittedWindowNumber}`,
+      metrics: null,
+    };
+  }
+
+  return {
+    comparable: true,
+    alignment: candidateEntry.firstEmittedWindowNumber === fetchingEntry.firstEmittedWindowNumber
+      ? "matched_first_emitted_window"
+      : "matched_candidate_window_in_fetching",
+    note: candidateEntry.firstEmittedWindowNumber === fetchingEntry.firstEmittedWindowNumber
+      ? "same_first_emitted_window"
+      : `candidate_window_${candidateEntry.firstEmittedWindowNumber}_aligned_to_fetching`,
+    metrics: computeAccuracy([baselineRow], [{
+      windowNumber: candidateEntry.firstEmittedWindowNumber,
+      resultValue: candidateEntry.resultValue,
+    }]),
+    fetchingFirstEmittedWindowNumber: fetchingEntry.firstEmittedWindowNumber,
   };
 }
 
@@ -342,7 +688,7 @@ function analyzeRealDataResults(options) {
       const expectedWindows = Array.from({ length: expected.targetWindows }, (_, index) => index + 1);
       const finalWindowsMatch = JSON.stringify(finalWindowNumbers) === JSON.stringify(expectedWindows);
       const stopReasonMatch = record.capSummary?.stopReason === "target_window_count_reached";
-      const runCompleted = record.runSummary?.completionStatus === "completed";
+      const runCompleted = isCompletedBoundedIteration(record);
       return {
         iteration: record.iteration,
         finalWindowsMatch,
@@ -381,9 +727,14 @@ function analyzeRealDataResults(options) {
   const steadyStateLatency = [];
   const startupLatency = [];
   const accuracyRows = [];
+  const startupFirstEmittedRows = [];
 
   for (const approachSummary of perApproach) {
     const { approachName, iterationRecords } = approachSummary;
+
+    for (const record of iterationRecords) {
+      warnings.push(...record.artifactWarnings);
+    }
 
     if (options.mode === "steady-state") {
       const record = iterationRecords[0];
@@ -426,7 +777,7 @@ function analyzeRealDataResults(options) {
           `${approachName}: expected ${expected.targetWindows} windows, found ${record.normalizedRows.length}`,
         );
       }
-    } else {
+    } else if (options.mode === "startup-cost") {
       const comparableStartupLatency = [];
       const registrationToResult = [];
       const dataStartToResult = [];
@@ -482,6 +833,112 @@ function analyzeRealDataResults(options) {
           exactAgainstFetching: perIterationAccuracy.every((row) => row.exactAgainstFetching),
         });
       }
+    } else {
+      const perIterationEntries = iterationRecords.map((record) => {
+        const entry = buildStartupFirstEmittedEntry(record);
+        const comparison = approachName === "fetching"
+          ? {
+            comparable: null,
+            alignment: "baseline",
+            note: "baseline_fetching",
+            metrics: null,
+          }
+          : compareFirstEmittedAgainstFetching(fetchingByIteration.get(record.iteration), entry);
+
+        if (!entry.usable) {
+          errors.push(
+            `${approachName}/iteration${record.iteration}: no usable non-warmup result row (${entry.noUsableResultReason})`,
+          );
+        }
+
+        if (entry.usable && !entry.startupLatencyValid) {
+          errors.push(
+            `${approachName}/iteration${record.iteration}: first usable row has invalid comparable startup latency (${entry.startupLatencyFailureReason})`,
+          );
+        }
+
+        if (!entry.runCompleted) {
+          errors.push(
+            `${approachName}/iteration${record.iteration}: missing bounded-run completion evidence (run_summary.json or successful benchmark_window_cap_summary.json)`,
+          );
+        }
+
+        if (!entry.diagnosticStopReasonTargetReached) {
+          warnings.push(
+            `${approachName}/iteration${record.iteration}: diagnostic stop reason is ${entry.stopReason || "missing"}; startup-first-emitted only requires a usable first row`,
+          );
+        }
+
+        if (!entry.diagnosticReachedTargetWindowUpperBound) {
+          warnings.push(
+            `${approachName}/iteration${record.iteration}: diagnostic final windows ${entry.finalWindowNumbers.length > 0 ? entry.finalWindowNumbers.join(",") : "none"} did not reach the target-window upper bound ${entry.targetWindowCount ?? "n/a"}`,
+          );
+        }
+
+        return {
+          ...entry,
+          startupValid: entry.usable && entry.startupLatencyValid && entry.runCompleted,
+          accuracyComparable: comparison.comparable,
+          accuracyAlignment: comparison.alignment,
+          accuracyNote: comparison.note,
+          fetchingFirstEmittedWindowNumber: comparison.fetchingFirstEmittedWindowNumber ?? null,
+          accuracyMetrics: comparison.metrics,
+        };
+      });
+
+      startupFirstEmittedRows.push(...perIterationEntries);
+
+      startupLatency.push({
+        approach: approachName,
+        usableFirstEmittedRows: perIterationEntries.filter((entry) => entry.startupValid).length,
+        missingFirstEmittedRows: perIterationEntries.filter((entry) => !entry.startupValid).length,
+        firstEmittedWindowNumber: summarize(perIterationEntries.filter((entry) => entry.startupValid).map((entry) => entry.firstEmittedWindowNumber)),
+        startupLatencyMs: summarize(perIterationEntries.filter((entry) => entry.startupValid).map((entry) => entry.startupLatencyMs)),
+        registrationToResultMs: summarize(perIterationEntries.filter((entry) => entry.startupValid).map((entry) => entry.registrationToResultMs)),
+        dataStartToResultMs: summarize(perIterationEntries.filter((entry) => entry.startupValid).map((entry) => entry.dataStartToResultMs)),
+        lastDataToResultMs: summarize(perIterationEntries.filter((entry) => entry.startupValid).map((entry) => entry.lastDataToResultMs)),
+        startupLatencySourceCounts: summarizeCountsByKey(
+          perIterationEntries.filter((entry) => entry.startupValid).map((entry) => entry.startupLatencySource),
+        ),
+        latencyDomainStatusCounts: summarizeCountsByKey(
+          perIterationEntries.filter((entry) => entry.startupValid).map((entry) => entry.latencyDomainStatus || "missing"),
+        ),
+      });
+
+      const validDomains = new Set(
+        perIterationEntries
+          .filter((entry) => entry.startupValid)
+          .map((entry) => entry.latencyDomainStatus),
+      );
+      if (validDomains.size > 0 && (validDomains.size !== 1 || !validDomains.has("wall_clock_mapped"))) {
+        errors.push(
+          `${approachName}: startup-first-emitted comparable latency rows must all be wall_clock_mapped; found ${[...validDomains].sort().join(",")}`,
+        );
+      }
+
+      if (approachName !== "fetching") {
+        const comparableEntries = perIterationEntries.filter((entry) => entry.accuracyComparable && entry.accuracyMetrics);
+        accuracyRows.push({
+          approach: approachName,
+          comparableIterationCount: comparableEntries.length,
+          nonComparableIterationCount: perIterationEntries.length - comparableEntries.length,
+          matchedFirstEmittedWindowCount: comparableEntries.filter((entry) => entry.accuracyAlignment === "matched_first_emitted_window").length,
+          matchedCandidateWindowCount: comparableEntries.filter((entry) => entry.accuracyAlignment === "matched_candidate_window_in_fetching").length,
+          matchedWindowCount: comparableEntries.reduce((sum, entry) => sum + entry.accuracyMetrics.matchedWindowCount, 0),
+          baselineOnlyCount: comparableEntries.reduce((sum, entry) => sum + entry.accuracyMetrics.baselineOnlyCount, 0),
+          approachOnlyCount: comparableEntries.reduce((sum, entry) => sum + entry.accuracyMetrics.approachOnlyCount, 0),
+          mae: mean(comparableEntries.map((entry) => entry.accuracyMetrics.mae)),
+          rmse: mean(comparableEntries.map((entry) => entry.accuracyMetrics.rmse)),
+          mape: mean(comparableEntries.map((entry) => entry.accuracyMetrics.mape)),
+          mapeApplicableWindowCount: comparableEntries.reduce((sum, entry) => sum + entry.accuracyMetrics.mapeApplicableWindowCount, 0),
+          maxAbsoluteError: comparableEntries.length > 0
+            ? Math.max(...comparableEntries.map((entry) => entry.accuracyMetrics.maxAbsoluteError || 0))
+            : null,
+          exactAgainstFetching: comparableEntries.length > 0
+            ? comparableEntries.every((entry) => entry.accuracyMetrics.exactAgainstFetching)
+            : false,
+        });
+      }
     }
   }
 
@@ -498,6 +955,7 @@ function analyzeRealDataResults(options) {
     perApproach,
     steadyStateLatency,
     startupLatency,
+    startupFirstEmittedRows,
     accuracyRows,
     warnings,
     errors,
@@ -514,30 +972,64 @@ function buildMarkdownTable(headers, rows) {
 }
 
 function renderReport(result) {
+  const completenessHeaders = result.mode === "startup-first-emitted"
+    ? ["Approach", "Iterations found", "Startup-valid first-emitted rows", "Missing startup-valid rows", "All diagnostic stop reasons hit target", "All diagnostic final windows hit upper bound", "All run summaries completed"]
+    : ["Approach", "Iterations found", "All stop reasons ok", "All final windows ok", "All run summaries completed"];
   const completenessTable = buildMarkdownTable(
-    ["Approach", "Iterations found", "All stop reasons ok", "All final windows ok", "All run summaries completed"],
-    result.perApproach.map((entry) => [
-      `\`${entry.approachName}\``,
-      String(entry.iterationRecords.length),
-      formatBool(entry.completeness.every((row) => row.stopReasonMatch)),
-      formatBool(entry.completeness.every((row) => row.finalWindowsMatch)),
-      formatBool(entry.completeness.every((row) => row.runCompleted)),
-    ]),
+    completenessHeaders,
+    result.perApproach.map((entry) => {
+      const startupSummary = result.startupLatency.find((row) => row.approach === entry.approachName);
+      return result.mode === "startup-first-emitted"
+        ? [
+          `\`${entry.approachName}\``,
+          String(entry.iterationRecords.length),
+          String(startupSummary?.usableFirstEmittedRows ?? 0),
+          String(startupSummary?.missingFirstEmittedRows ?? 0),
+          formatBool(entry.completeness.every((row) => row.stopReasonMatch)),
+          formatBool(entry.completeness.every((row) => row.finalWindowsMatch)),
+          formatBool(entry.completeness.every((row) => row.runCompleted)),
+        ]
+        : [
+          `\`${entry.approachName}\``,
+          String(entry.iterationRecords.length),
+          formatBool(entry.completeness.every((row) => row.stopReasonMatch)),
+          formatBool(entry.completeness.every((row) => row.finalWindowsMatch)),
+          formatBool(entry.completeness.every((row) => row.runCompleted)),
+        ];
+    }),
   );
 
+  const accuracyHeaders = result.mode === "startup-first-emitted"
+    ? ["Approach vs fetching", "Comparable iterations", "Not comparable", "Same first-emitted window", "Window-aligned to fetching", "MAE", "RMSE", "MAPE", "Max abs error", "Chunked exact"]
+    : ["Approach vs fetching", "Matched windows", "Baseline-only", "Approach-only", "MAE", "RMSE", "MAPE", "Max abs error", "Chunked exact"];
   const accuracyTable = buildMarkdownTable(
-    ["Approach vs fetching", "Matched windows", "Baseline-only", "Approach-only", "MAE", "RMSE", "MAPE", "Max abs error", "Chunked exact"],
-    result.accuracyRows.map((row) => [
-      `\`${row.approach}\``,
-      String(row.matchedWindowCount),
-      String(row.baselineOnlyCount),
-      String(row.approachOnlyCount),
-      formatNumber(row.mae, 6),
-      formatNumber(row.rmse, 6),
-      formatNumber(row.mape, 6),
-      formatNumber(row.maxAbsoluteError, 6),
-      row.approach === "chunked" ? formatBool(row.exactAgainstFetching) : "n/a",
-    ]),
+    accuracyHeaders,
+    result.accuracyRows.map((row) => (
+      result.mode === "startup-first-emitted"
+        ? [
+          `\`${row.approach}\``,
+          String(row.comparableIterationCount),
+          String(row.nonComparableIterationCount),
+          String(row.matchedFirstEmittedWindowCount),
+          String(row.matchedCandidateWindowCount),
+          formatNumber(row.mae, 6),
+          formatNumber(row.rmse, 6),
+          formatNumber(row.mape, 6),
+          formatNumber(row.maxAbsoluteError, 6),
+          row.approach === "chunked" ? formatBool(row.exactAgainstFetching) : "n/a",
+        ]
+        : [
+          `\`${row.approach}\``,
+          String(row.matchedWindowCount),
+          String(row.baselineOnlyCount),
+          String(row.approachOnlyCount),
+          formatNumber(row.mae, 6),
+          formatNumber(row.rmse, 6),
+          formatNumber(row.mape, 6),
+          formatNumber(row.maxAbsoluteError, 6),
+          row.approach === "chunked" ? formatBool(row.exactAgainstFetching) : "n/a",
+        ]
+    )),
   );
 
   const warnings = result.warnings.length > 0
@@ -616,33 +1108,34 @@ ${errors}
 `;
   }
 
-  const startupTable = buildMarkdownTable(
-    ["Approach", "Startup cost mean ms", "Startup cost std", "Min", "Max", "Close-to-result mean ms", "Data-start-to-result mean ms"],
-    result.startupLatency.map((row) => [
-      `\`${row.approach}\``,
-      formatNumber(row.startupCostMs.mean),
-      formatNumber(row.startupCostMs.std),
-      formatNumber(row.startupCostMs.min),
-      formatNumber(row.startupCostMs.max),
-      formatNumber(row.closeToResultMs.mean),
-      formatNumber(row.dataStartToResultMs.mean),
-    ]),
-  );
+  if (result.mode === "startup-cost") {
+    const startupTable = buildMarkdownTable(
+      ["Approach", "Startup cost mean ms", "Startup cost std", "Min", "Max", "Close-to-result mean ms", "Data-start-to-result mean ms"],
+      result.startupLatency.map((row) => [
+        `\`${row.approach}\``,
+        formatNumber(row.startupCostMs.mean),
+        formatNumber(row.startupCostMs.std),
+        formatNumber(row.startupCostMs.min),
+        formatNumber(row.startupCostMs.max),
+        formatNumber(row.closeToResultMs.mean),
+        formatNumber(row.dataStartToResultMs.mean),
+      ]),
+    );
 
-  const resourceTable = buildMarkdownTable(
-    ["Approach", "CPU seconds mean", "CPU seconds std", "Mean RSS MiB mean", "Mean RSS MiB std", "Peak RSS MiB mean", "Peak RSS MiB std"],
-    result.perApproach.map((entry) => [
-      `\`${entry.approachName}\``,
-      formatNumber(entry.processResourceSummary.cpuSeconds.mean, 3),
-      formatNumber(entry.processResourceSummary.cpuSeconds.std, 3),
-      formatNumber(entry.processResourceSummary.meanRssMiB.mean, 2),
-      formatNumber(entry.processResourceSummary.meanRssMiB.std, 2),
-      formatNumber(entry.processResourceSummary.peakRssMiB.mean, 2),
-      formatNumber(entry.processResourceSummary.peakRssMiB.std, 2),
-    ]),
-  );
+    const resourceTable = buildMarkdownTable(
+      ["Approach", "CPU seconds mean", "CPU seconds std", "Mean RSS MiB mean", "Mean RSS MiB std", "Peak RSS MiB mean", "Peak RSS MiB std"],
+      result.perApproach.map((entry) => [
+        `\`${entry.approachName}\``,
+        formatNumber(entry.processResourceSummary.cpuSeconds.mean, 3),
+        formatNumber(entry.processResourceSummary.cpuSeconds.std, 3),
+        formatNumber(entry.processResourceSummary.meanRssMiB.mean, 2),
+        formatNumber(entry.processResourceSummary.meanRssMiB.std, 2),
+        formatNumber(entry.processResourceSummary.peakRssMiB.mean, 2),
+        formatNumber(entry.processResourceSummary.peakRssMiB.std, 2),
+      ]),
+    );
 
-  return `# Real-Data 3-Approach 35x1 Startup-Cost Summary
+    return `# Real-Data 3-Approach 35x1 Startup-Cost Summary
 
 Input root:
 \`${result.logsRoot}\`
@@ -663,6 +1156,107 @@ ${completenessTable}
 ## Startup Latency
 
 ${startupTable}
+
+## Accuracy
+
+${accuracyTable}
+
+## Resources
+
+${resourceTable}
+
+## Warnings
+
+${warnings}
+
+## Errors
+
+${errors}
+`;
+  }
+
+  const startupSummaryTable = buildMarkdownTable(
+    ["Approach", "Startup-valid first-emitted rows", "Missing startup-valid rows", "First emitted window mean", "First emitted window min", "First emitted window max", "Startup latency mean ms", "Startup latency std", "Latency sources", "Latency domains"],
+    result.startupLatency.map((row) => [
+      `\`${row.approach}\``,
+      String(row.usableFirstEmittedRows),
+      String(row.missingFirstEmittedRows),
+      formatNumber(row.firstEmittedWindowNumber.mean),
+      formatNumber(row.firstEmittedWindowNumber.min),
+      formatNumber(row.firstEmittedWindowNumber.max),
+      formatNumber(row.startupLatencyMs.mean),
+      formatNumber(row.startupLatencyMs.std),
+      formatCountsByKey(row.startupLatencySourceCounts),
+      formatCountsByKey(row.latencyDomainStatusCounts),
+    ]),
+  );
+
+  const iterationTable = buildMarkdownTable(
+    ["Approach", "Iteration", "Startup-valid", "Warmup rows skipped", "First emitted window", "Startup latency ms", "Latency source", "Latency domain", "Direct window-close diagnostic ms", "Direct logical-trigger diagnostic ms", "Result value", "Stop reason diagnostic", "Final windows diagnostic", "Accuracy comparable", "Accuracy alignment", "Accuracy note"],
+    result.startupFirstEmittedRows.map((row) => [
+      `\`${row.approach}\``,
+      String(row.iteration),
+      formatBool(row.startupValid),
+      String(row.warmupRowsSkipped),
+      formatOptional(row.firstEmittedWindowNumber, 0),
+      formatNumber(row.startupLatencyMs),
+      `\`${row.startupLatencySource}\``,
+      `\`${row.latencyDomainStatus || "missing"}\``,
+      formatNumber(row.diagnosticDirectWindowCloseMs),
+      formatNumber(row.diagnosticDirectLogicalTriggerMs),
+      formatNumber(row.resultValue, 6),
+      `\`${row.stopReason || "missing"}\``,
+      `\`${row.finalWindowNumbers.length > 0 ? row.finalWindowNumbers.join(",") : "none"} / ${row.targetWindowCount ?? "n/a"}\``,
+      row.accuracyComparable === null ? "baseline" : formatBool(row.accuracyComparable),
+      `\`${row.accuracyAlignment}\``,
+      `\`${row.accuracyNote}\``,
+    ]),
+  );
+
+  const resourceTable = buildMarkdownTable(
+    ["Approach", "CPU seconds mean", "CPU seconds std", "Mean RSS MiB mean", "Mean RSS MiB std", "Peak RSS MiB mean", "Peak RSS MiB std"],
+    result.perApproach.map((entry) => [
+      `\`${entry.approachName}\``,
+      formatNumber(entry.processResourceSummary.cpuSeconds.mean, 3),
+      formatNumber(entry.processResourceSummary.cpuSeconds.std, 3),
+      formatNumber(entry.processResourceSummary.meanRssMiB.mean, 2),
+      formatNumber(entry.processResourceSummary.meanRssMiB.std, 2),
+      formatNumber(entry.processResourceSummary.peakRssMiB.mean, 2),
+      formatNumber(entry.processResourceSummary.peakRssMiB.std, 2),
+    ]),
+  );
+
+  return `# Real-Data 3-Approach First-Emitted Startup Summary
+
+Input root:
+\`${result.logsRoot}\`
+
+Selected approaches exact:
+\`${formatBool(result.selectedApproachesExact)}\`
+
+Startup metric:
+First usable non-warmup emitted result row per iteration, requiring \`wall_clock_mapped\` close-to-result latency for cross-approach comparison
+
+Window policy:
+- target windows per iteration: ${result.expected.targetWindows}
+- target windows are an upper bound / flush allowance, not a startup completion requirement
+- warmup rows are skipped only when the row is explicitly marked \`warmup=true\`
+- the first usable row does not need to be window 1
+- first usable rows may be windows 1..${result.expected.targetWindows}
+- final-window completeness and stop reason are diagnostic only for startup-first-emitted
+- accuracy is aligned against \`fetching\` by iteration and first emitted window number where possible
+
+## Completeness
+
+${completenessTable}
+
+## Startup Latency Summary
+
+${startupSummaryTable}
+
+## Per-Iteration First-Emitted Rows
+
+${iterationTable}
 
 ## Accuracy
 

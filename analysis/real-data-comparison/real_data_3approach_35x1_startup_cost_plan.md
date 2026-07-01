@@ -1,17 +1,21 @@
 # Real-Data 3-Approach 35x1 Startup-Cost Plan
 
+Status:
+`rejected for 3-approach paper reporting on 2026-06-30`
+
 Date:
 `2026-06-29`
 
 Mode:
 startup-cost
 
-Decision:
-- approaches: `fetching`, `approximation`, `chunked`
-- excluded: `naive_distributed`
-- iterations per approach: `35`
-- target windows per iteration: `1`
-- startup metric is first-window aggregate startup cost across independent iterations
+Rejection reason:
+- `target-windows=1` is not a valid common startup-cost shape across `fetching`, `approximation`, and `chunked`
+- `chunked` emitted result-bearing window-1 rows across the run set, but `approximation` did not reliably persist a usable window-1 latency row
+- the `35x1` output therefore cannot be used as a single comparable 3-approach paper artifact
+
+Superseded by:
+- [`analysis/real-data-comparison/real_data_3approach_35x5_startup_first_emitted_plan.md`](/Users/kushbisen/Code/streaming-query-hive/analysis/real-data-comparison/real_data_3approach_35x5_startup_first_emitted_plan.md)
 
 ## Local Validation Performed
 
@@ -32,7 +36,7 @@ node experiments/real-data-comparison/run-real-data-4-approaches.js \
   --target-windows 1
 ```
 
-## Server Command
+## Historical Server Command
 
 Use the top-level wrapper on the server so the run has a concrete archived output directory:
 
@@ -52,7 +56,7 @@ node scripts/benchmark/run-all-paper-benchmarks.js \
   --output-dir results/paper-benchmarks/real-data-3approach-startup-35x1-2026-06-29
 ```
 
-## Post-Run Analysis Command
+## Historical Analysis Command
 
 ```bash
 node analysis/real-data-comparison/generate-real-data-3approach-metrics.js \
@@ -61,21 +65,14 @@ node analysis/real-data-comparison/generate-real-data-3approach-metrics.js \
   --output analysis/real-data-comparison/real_data_3approach_35x1_startup_cost_report.md
 ```
 
-## Required Validation After the Server Run
+## Why This Plan Is Rejected
 
-- Exactly these approach directories are present in the real-data snapshot:
-  - `fetching`
-  - `approximation`
-  - `chunked`
-- `naive_distributed` does not appear in the real-data snapshot.
-- Each selected approach has exactly `35` iteration directories.
-- Each selected approach reaches window `1` only in every iteration.
-- Startup latency summary must use first-window results across independent iterations.
-- Accuracy should align first-window results against `fetching` by iteration when available.
-- CPU metric must be process-tree CPU-seconds with mean and standard deviation across the `35` independent iterations.
-- RSS metrics must report mean RSS MiB mean plus standard deviation, and peak RSS MiB mean plus standard deviation.
+- The helper assumed exactly one usable row per iteration and required that row to be window `1`.
+- That assumption fails for approximation on the existing `35x1` output.
+- A startup report that treats missing approximation rows as equivalent to valid first-window rows would understate incompleteness and overstate comparability.
+- The replacement design uses bounded `target-windows=5` runs and takes the first usable non-warmup emitted row instead.
 
-## Methodology Notes
+## Historical Methodology Notes
 
 - This run is only for startup cost.
 - The helper treats `registrationToResultMs` as the aggregate startup cost.

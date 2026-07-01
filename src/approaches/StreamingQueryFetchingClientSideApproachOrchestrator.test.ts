@@ -232,6 +232,28 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     expect(mqttClients).toHaveLength(0);
   });
 
+  test("startup-first-emitted mode accepts the first emitted fetching row before settled finalization", () => {
+    const operator = createOperator({
+      STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
+      STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE: "1",
+      STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: String(WINDOW_START),
+      STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: "5",
+    });
+    const scheduleSpy = jest
+      .spyOn(operator as any, "scheduleBenchmarkShutdown")
+      .mockImplementation(() => undefined);
+
+    lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject(1800, 1));
+
+    expect((operator as any).acceptedCompleteWindowCount).toBe(1);
+    expect((operator as any).windowCount).toBe(1);
+    expect((operator as any).finalizedWindowNumbers).toEqual([1]);
+    expect(scheduleSpy).not.toHaveBeenCalled();
+    expect(mqttClients).toHaveLength(1);
+    mqttClients[0].emit("connect");
+    expect(mqttClients[0].publish).toHaveBeenCalledTimes(1);
+  });
+
   test("duplicate windows are still suppressed in deterministic mode", () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",

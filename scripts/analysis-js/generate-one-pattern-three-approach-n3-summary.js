@@ -630,15 +630,71 @@ function selectRunScopedFirstRawInputAt(rows, mqttSummary) {
   return toNumber(mqttSummary?.firstTimestampsByType?.raw_input_stream);
 }
 
+function computeMappedOutputTriggerWallClockMs(firstRawInputAt, windowNumber) {
+  return (
+    Number.isFinite(firstRawInputAt) &&
+    Number.isFinite(windowNumber)
+  )
+    ? firstRawInputAt + (windowNumber * BENCHMARK_WINDOW_STEP_MS)
+    : null;
+}
+
+function verifyOutputStepCadence(rows) {
+  const sortedRows = [...rows]
+    .filter((row) => Number.isFinite(row.windowNumber))
+    .sort((left, right) => left.windowNumber - right.windowNumber);
+  const issues = [];
+  let checkedPairs = 0;
+
+  for (let index = 1; index < sortedRows.length; index += 1) {
+    const previous = sortedRows[index - 1];
+    const current = sortedRows[index];
+    if (current.windowNumber === previous.windowNumber) {
+      continue;
+    }
+
+    checkedPairs += 1;
+    const windowDelta = current.windowNumber - previous.windowNumber;
+    const triggerDelta = Number.isFinite(previous.mappedOutputTriggerWallClockMs) &&
+      Number.isFinite(current.mappedOutputTriggerWallClockMs)
+      ? current.mappedOutputTriggerWallClockMs - previous.mappedOutputTriggerWallClockMs
+      : null;
+
+    if (windowDelta !== 1) {
+      issues.push({
+        type: 'window_gap',
+        previousWindowNumber: previous.windowNumber,
+        currentWindowNumber: current.windowNumber,
+        windowDelta,
+      });
+    }
+
+    if (Number.isFinite(triggerDelta) && triggerDelta !== BENCHMARK_WINDOW_STEP_MS * windowDelta) {
+      issues.push({
+        type: 'trigger_delta_mismatch',
+        previousWindowNumber: previous.windowNumber,
+        currentWindowNumber: current.windowNumber,
+        triggerDelta,
+        expectedTriggerDelta: BENCHMARK_WINDOW_STEP_MS * windowDelta,
+      });
+    }
+  }
+
+  return {
+    ok: issues.length === 0,
+    checkedPairs,
+    expectedStepMs: BENCHMARK_WINDOW_STEP_MS,
+    issues,
+  };
+}
+
 function attachComparableTiming(rows, mqttSummary) {
   const firstRawInputAt = selectRunScopedFirstRawInputAt(rows, mqttSummary);
   return rows.map((row) => {
-    const anchorAlignedExpectedWindowClose = (
-      Number.isFinite(firstRawInputAt) &&
-      Number.isFinite(row.windowNumber)
-    )
-      ? firstRawInputAt + BENCHMARK_WINDOW_RANGE_MS + ((row.windowNumber - 1) * BENCHMARK_WINDOW_STEP_MS)
-      : null;
+    const mappedOutputTriggerWallClockMs = computeMappedOutputTriggerWallClockMs(
+      firstRawInputAt,
+      row.windowNumber,
+    );
     const runtimeComparableLatency = (
       row.latencyDomainStatus === 'wall_clock_mapped' &&
       Number.isFinite(row.wallClockCloseToResultMs)
@@ -650,25 +706,26 @@ function attachComparableTiming(rows, mqttSummary) {
       row.latencyFromWindowCloseMs >= 0 &&
       row.latencyFromWindowCloseMs <= (BENCHMARK_WINDOW_RANGE_MS * 10)
     )
-      ? row.latencyFromWindowCloseMs
-      : null;
+          ? row.latencyFromWindowCloseMs
+          : null;
     const fallbackComparableLatency = (
-      Number.isFinite(anchorAlignedExpectedWindowClose) &&
+      Number.isFinite(mappedOutputTriggerWallClockMs) &&
       Number.isFinite(row.resultEmittedAt) &&
-      (row.resultEmittedAt - anchorAlignedExpectedWindowClose) >= 0 &&
-      (row.resultEmittedAt - anchorAlignedExpectedWindowClose) <= (BENCHMARK_WINDOW_RANGE_MS * 10)
+      (row.resultEmittedAt - mappedOutputTriggerWallClockMs) >= 0 &&
+      (row.resultEmittedAt - mappedOutputTriggerWallClockMs) <= (BENCHMARK_WINDOW_RANGE_MS * 10)
     )
-      ? row.resultEmittedAt - anchorAlignedExpectedWindowClose
+      ? row.resultEmittedAt - mappedOutputTriggerWallClockMs
       : null;
     return {
       ...row,
       rawInputFirstPublishedAt: firstRawInputAt,
-      anchorAlignedExpectedWindowClose,
+      anchorAlignedExpectedWindowClose: mappedOutputTriggerWallClockMs,
+      mappedOutputTriggerWallClockMs,
       anchorAlignedWindowCloseToResultMs: Number.isFinite(runtimeComparableLatency)
         ? runtimeComparableLatency
         : Number.isFinite(directComparableLatency)
           ? directComparableLatency
-        : fallbackComparableLatency,
+          : fallbackComparableLatency,
     };
   });
 }
@@ -1194,5 +1251,6 @@ if (require.main === module) {
   module.exports = {
     attachComparableTiming,
     buildWindowMetadataFromRow,
+    verifyOutputStepCadence,
   };
 }

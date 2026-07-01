@@ -99,6 +99,9 @@ export class FetchingAllDataClientSide {
   private benchmarkFiniteReplayMode: boolean = ["1", "true", "yes", "on"].includes(
     (process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY || "").trim().toLowerCase(),
   );
+  private startupFirstEmittedMode: boolean = ["1", "true", "yes", "on"].includes(
+    (process.env.STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE || "").trim().toLowerCase(),
+  );
   private deterministicEventTimeMode: boolean = ["1", "true", "yes", "on"].includes(
     (process.env.STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME || "").trim().toLowerCase(),
   );
@@ -903,6 +906,27 @@ export class FetchingAllDataClientSide {
     };
   }
 
+  private deriveBenchmarkWindowNumber(
+    logicalWindow: DerivedLogicalWindow | null,
+  ): number | null {
+    if (
+      !logicalWindow ||
+      this.benchmarkEventTimeAnchor === null ||
+      !Number.isFinite(this.expectedWindowInterval) ||
+      this.expectedWindowInterval <= 0
+    ) {
+      return null;
+    }
+
+    const relativeOffset = logicalWindow.start - this.benchmarkEventTimeAnchor;
+    const windowIndex = Math.round(relativeOffset / this.expectedWindowInterval);
+    if (!Number.isFinite(windowIndex) || windowIndex < 0) {
+      return null;
+    }
+
+    return windowIndex + 1;
+  }
+
   private writeWindowDiagnostics(
     windowNumber: number | "" | null,
     logicalWindow: DerivedLogicalWindow | null,
@@ -1087,6 +1111,211 @@ export class FetchingAllDataClientSide {
               nextEventCount: Number.isFinite(eventCount) ? eventCount : null,
             })}`,
           );
+        }
+
+        const benchmarkWindowNumber = this.deriveBenchmarkWindowNumber(logicalWindow);
+
+        if (this.startupFirstEmittedMode) {
+          if (!Number.isFinite(benchmarkWindowNumber ?? NaN)) {
+            this.log(
+              `Delayed because incomplete: ${JSON.stringify({
+                logicalWindowKey: logicalWindow.key,
+                reason: "unable_to_derive_benchmark_window_number",
+              })}`,
+            );
+            continue;
+          }
+
+          if (this.emittedLogicalWindows.has(logicalWindow.key)) {
+            this.writeWindowDiagnostics(
+              "",
+              logicalWindow,
+              eventCount,
+              sumValue,
+              avgValue,
+              firstEventTimestamp,
+              lastEventTimestamp,
+              completeness.status,
+              "suppressed",
+              "duplicate_after_first_emitted_acceptance",
+              data,
+            );
+            continue;
+          }
+
+          if (
+            this.benchmarkTargetWindowCount !== null &&
+            this.acceptedCompleteWindowCount >= this.benchmarkTargetWindowCount
+          ) {
+            this.writeWindowDiagnostics(
+              "",
+              logicalWindow,
+              eventCount,
+              sumValue,
+              avgValue,
+              firstEventTimestamp,
+              lastEventTimestamp,
+              completeness.status,
+              "suppressed",
+              "target_window_count_reached",
+              data,
+            );
+            this.benchmarkTargetWindowReached = true;
+            this.benchmarkStopReason = "target_window_count_reached";
+            this.writeBenchmarkWindowSummary();
+            this.scheduleBenchmarkShutdown();
+            continue;
+          }
+
+          let startupNumericValue = avgValue;
+          if (this.aggregationFunction === "SUM") {
+            startupNumericValue = sumValue;
+          } else if (this.aggregationFunction === "COUNT") {
+            startupNumericValue = eventCount;
+          }
+
+          if (!Number.isFinite(startupNumericValue)) {
+            this.log(
+              `Delayed because incomplete: ${JSON.stringify({
+                logicalWindowKey: logicalWindow.key,
+                reason: "startup_numeric_value_not_finite",
+              })}`,
+            );
+            continue;
+          }
+
+          this.acceptedCompleteWindowCount++;
+          this.windowCount = Math.max(this.windowCount, benchmarkWindowNumber as number);
+          this.emittedLogicalWindows.add(logicalWindow.key);
+          this.recordFinalizedWindow(benchmarkWindowNumber as number);
+
+          const resultEmittedAt = currentTimestamp;
+          const expectedWindowClose = this.getExpectedWindowCloseTime(
+            benchmarkWindowNumber as number,
+          );
+          const centeredWindowMetadata = this.buildWindowMetadata(
+            object,
+            logicalWindow,
+            resultEmittedAt,
+            expectedWindowClose,
+          );
+          this.logLatency(
+            benchmarkWindowNumber as number,
+            expectedWindowClose,
+            this.lastObservationReceivedTime,
+            resultEmittedAt,
+            String(startupNumericValue),
+            centeredWindowMetadata,
+          );
+          this.writeWindowDiagnostics(
+            benchmarkWindowNumber as number,
+            logicalWindow,
+            eventCount,
+            sumValue,
+            avgValue,
+            firstEventTimestamp,
+            lastEventTimestamp,
+            completeness.status,
+            "accepted",
+            "accepted_first_emitted_window",
+            String(startupNumericValue),
+          );
+          this.log(
+            `Accepted/finalized: ${JSON.stringify({
+              window_number: benchmarkWindowNumber,
+              benchmark_event_time_anchor: this.benchmarkEventTimeAnchor,
+              window_start: logicalWindow.start,
+              window_end: logicalWindow.end,
+              rsp_window_start: windowBounds?.start ?? null,
+              rsp_window_end: windowBounds?.end ?? null,
+              event_count: eventCount,
+              expected_event_count: this.expectedEventCount,
+              sum: sumValue,
+              avg: avgValue,
+              first_event_timestamp: firstEventTimestamp || null,
+              last_event_timestamp: lastEventTimestamp || null,
+              completeness_status: completeness.status,
+              timing_filter_enabled: this.timingFilterEnabled,
+              timing_filter_bypassed_reason: this.timingFilterBypassedReason,
+              filtered_due_to_timing_count: this.filteredDueToTimingCount,
+              accepted_complete_window_count: this.acceptedCompleteWindowCount,
+            })}`,
+          );
+
+          const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
+          const aggregation_object_string = useBenchmarkPayload
+            ? JSON.stringify(
+                  buildBenchmarkResultPayload(
+                    "fetching",
+                    this.aggregationFunction,
+                    this.sessionId,
+                    startupNumericValue,
+                    benchmarkWindowNumber as number,
+                    {
+                      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+                      benchmarkWindowStart: logicalWindow.start,
+                      benchmarkWindowEnd: logicalWindow.end,
+                      rspWindowStart: windowBounds?.start ?? null,
+                      rspWindowEnd: windowBounds?.end ?? null,
+                      eventCount,
+                      sumValue,
+                      avgValue,
+                      firstEventTimestamp: firstEventTimestamp || null,
+                      lastEventTimestamp: lastEventTimestamp || null,
+                      windowSemantics: centeredWindowMetadata.windowSemantics,
+                      logicalTriggerTime: centeredWindowMetadata.logicalTriggerTime,
+                      windowStart: centeredWindowMetadata.windowStart,
+                      windowEnd: centeredWindowMetadata.windowEnd,
+                      windowDataCloseTime: centeredWindowMetadata.windowDataCloseTime,
+                      resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
+                      latencyFromLogicalTriggerMs: centeredWindowMetadata.latencyFromLogicalTriggerMs,
+                      latencyFromWindowCloseMs: centeredWindowMetadata.latencyFromWindowCloseMs,
+                      metadataSource: centeredWindowMetadata.metadataSource,
+                    },
+                  ),
+                )
+            : JSON.stringify(this.generate_aggregation_event(String(startupNumericValue)));
+          this.log(`Generated aggregation event for result: ${data}`);
+
+          const clientId = hash_string_md5(aggregation_object_string);
+          const pubClient = mqtt.connect("mqtt://localhost:1883", {
+            clean: false,
+            clientId,
+          });
+          this.mqttClients.push(pubClient);
+          profileCount("mqtt_clients_created");
+          pubClient.on("connect", () => {
+            const publishStartTime = Date.now();
+            pubClient.publish(
+              this.r2s_topic,
+              aggregation_object_string,
+              { qos: 2 },
+              (err: any) => {
+                if (err) {
+                  console.error(
+                    "Error publishing aggregation event with QoS 2:",
+                    err,
+                  );
+                  this.log(`Error publishing result: ${err}`);
+                } else {
+                  const publishEndTime = Date.now();
+                  profileCount("mqtt_messages_published");
+                  profileCount("emitted_results");
+                  recordPublishedMqttMessage({
+                    topic: this.r2s_topic,
+                    payload: aggregation_object_string,
+                    messageType: "superquery_result",
+                    warmup: (benchmarkWindowNumber as number) === 1,
+                  });
+                  this.log(
+                    `Successfully published result: ${data}, publish latency: ${publishEndTime - publishStartTime}ms`,
+                  );
+                }
+                pubClient.end();
+              },
+            );
+          });
+          continue;
         }
 
         if (!this.canFinalizeLogicalWindow(logicalWindow.end)) {

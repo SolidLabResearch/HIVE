@@ -55,6 +55,12 @@ const ALL_APPROACHES = [
   "chunked",
 ];
 
+function resolveMaybeRelativePath(inputPath) {
+  return path.isAbsolute(inputPath)
+    ? inputPath
+    : path.resolve(process.cwd(), inputPath);
+}
+
 function extractFirstDatasetTimestampMs(filePath) {
   const content = fs.readFileSync(filePath, "utf8");
   const matches = content.matchAll(
@@ -547,16 +553,23 @@ class CustomPatternComparisonRunner {
         params: "μ=-23.0, A=3.0, f=0.5Hz",
       },
     ];
-    this.selectedPatternTypes = parseSelectionList(
-      process.env.CUSTOM_PATTERN_SELECTED_PATTERNS,
-      ALL_PATTERN_TYPES,
-    );
-    this.selectedApproaches = parseSelectionList(
-      process.env.CUSTOM_PATTERN_SELECTED_APPROACHES,
-      ALL_APPROACHES,
-    );
+    this.selectedPatternTypes = Array.isArray(options.patternTypes) && options.patternTypes.length > 0
+      ? [...options.patternTypes]
+      : parseSelectionList(
+        process.env.CUSTOM_PATTERN_SELECTED_PATTERNS,
+        ALL_PATTERN_TYPES,
+      );
+    this.selectedApproaches = Array.isArray(options.approachNames) && options.approachNames.length > 0
+      ? [...options.approachNames]
+      : parseSelectionList(
+        process.env.CUSTOM_PATTERN_SELECTED_APPROACHES,
+        ALL_APPROACHES,
+      );
     this.activeAttemptCleanup = null;
     this.shutdownInProgress = false;
+    this.targetWindowCount = Number.isFinite(options.targetWindowCount)
+      ? options.targetWindowCount
+      : null;
 
     const baseApproaches = this.smokeMode ? SMOKE_APPROACHES : this.allApproaches;
     const smokePattern = this.allPatterns.find((pattern) => pattern.type === SMOKE_PATTERN_TYPE);
@@ -565,14 +578,20 @@ class CustomPatternComparisonRunner {
       : this.allPatterns;
 
     this.patterns = this.selectedPatternTypes
-      ? basePatterns.filter((pattern) => this.selectedPatternTypes.includes(pattern.type))
+      ? this.selectedPatternTypes
+        .map((patternType) => basePatterns.find((pattern) => pattern.type === patternType))
+        .filter(Boolean)
       : basePatterns;
     this.approaches = this.selectedApproaches
-      ? baseApproaches.filter((approach) => this.selectedApproaches.includes(approach))
+      ? this.selectedApproaches.filter((approach) => baseApproaches.includes(approach))
       : baseApproaches;
     this.replayEnv = createBenchmarkReplayRunEnv(process.env);
 
-    this.baseLogDir = "./logs/custom-pattern-comparison";
+    this.baseLogDir = options.outputDir
+      ? resolveMaybeRelativePath(options.outputDir)
+      : resolveMaybeRelativePath(
+        process.env.CUSTOM_PATTERN_OUTPUT_DIR || "./logs/custom-pattern-comparison",
+      );
     this.timeout = resolvePatternTestTimeoutMs(options.patternTestTimeoutMs, this.smokeMode);
     this.installSignalHandlers();
   }
@@ -791,7 +810,9 @@ class CustomPatternComparisonRunner {
     const timestampBounds = extractDatasetTimestampBoundsMs(smartphoneDataPath);
     const timestampDomainMin = benchmarkEventTimeAnchor;
 
-    const targetWindowsStr = process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "35";
+    const targetWindowsStr = this.targetWindowCount
+      ? String(this.targetWindowCount)
+      : (process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "35");
     const targetWindows = parseInt(targetWindowsStr, 10);
     const outputWindowRangeMs = parseInt(process.env.OUTPUT_WINDOW_RANGE || "120000", 10);
     const outputWindowStepMs = parseInt(process.env.OUTPUT_WINDOW_STEP || "60000", 10);
@@ -1788,10 +1809,35 @@ class CustomPatternComparisonRunner {
     console.log("RUNNING COMPREHENSIVE ANALYSIS");
     console.log("=".repeat(80));
 
+    const analysisArgs = [
+      "analysis/accuracy/accuracy-comparison-custom-patterns.js",
+      "--input-root",
+      this.baseLogDir,
+      "--output-dir",
+      path.join(this.baseLogDir, "analysis", "custom-pattern-accuracy"),
+      "--execution-summary",
+      path.join(this.baseLogDir, "custom_pattern_comparison_summary.json"),
+    ];
+
+    if (this.patterns.length > 0) {
+      analysisArgs.push("--patterns", this.patterns.map((pattern) => pattern.type).join(","));
+    }
+
+    if (this.approaches.length > 0) {
+      analysisArgs.push("--approaches", this.approaches.join(","));
+    }
+
+    if (this.iterations > 0) {
+      analysisArgs.push(
+        "--iterations",
+        Array.from({ length: this.iterations }, (_, index) => String(index + 1)).join(","),
+      );
+    }
+
     return new Promise((resolve) => {
       const proc = spawn(
         "node",
-        ["analysis/accuracy/accuracy-comparison-custom-patterns.js"],
+        analysisArgs,
         { stdio: "inherit" },
       );
 
@@ -1850,52 +1896,165 @@ function resolveRetryCount(explicitRetries, envRetries) {
   return 0;
 }
 
+function parseCliArgs(argv) {
+  const args = {
+    iterations: 35,
+    patternTestTimeoutMs: undefined,
+    retries: 0,
+    patternTypes: null,
+    approachNames: null,
+    targetWindowCount: null,
+    outputDir: null,
+    patternType: null,
+    help: false,
+  };
+
+  const positional = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = argv[index + 1];
+
+    if (arg === "--iterations" || arg === "-i") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`${arg} requires a positive integer`);
+      }
+      args.iterations = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--pattern-test-timeout" || arg === "--test-timeout") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`${arg} requires a positive integer`);
+      }
+      args.patternTestTimeoutMs = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--retries") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value < 0) {
+        throw new Error("--retries requires a non-negative integer");
+      }
+      args.retries = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--pattern" || arg === "--patterns") {
+      const parsed = parseSelectionList(next, ALL_PATTERN_TYPES);
+      if (!parsed || parsed.length === 0) {
+        throw new Error(`${arg} requires a comma-separated list of known pattern names`);
+      }
+      args.patternTypes = parsed;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--approach" || arg === "--approaches") {
+      const parsed = parseSelectionList(next, ALL_APPROACHES);
+      if (!parsed || parsed.length === 0) {
+        throw new Error(`${arg} requires a comma-separated list of known approach names`);
+      }
+      args.approachNames = parsed;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--target-windows") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error("--target-windows requires a positive integer");
+      }
+      args.targetWindowCount = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--output-dir") {
+      if (!next) {
+        throw new Error("--output-dir requires a value");
+      }
+      args.outputDir = resolveMaybeRelativePath(next);
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      args.help = true;
+      continue;
+    }
+
+    positional.push(arg);
+  }
+
+  if (positional.length > 1) {
+    throw new Error(`Unknown argument(s): ${positional.slice(1).join(", ")}`);
+  }
+
+  if (positional.length === 1) {
+    if (!ALL_PATTERN_TYPES.includes(positional[0])) {
+      throw new Error(`Unknown pattern type: ${positional[0]}`);
+    }
+    args.patternType = positional[0];
+  }
+
+  return args;
+}
+
 // Main execution
 async function main() {
-  const args = process.argv.slice(2);
+  const cliArgs = parseCliArgs(process.argv.slice(2));
 
-  // Check for iterations flag
-  let iterations = 35; // default
-  let patternTestTimeoutMs;
-  let retries = 0;
-  let filteredArgs = args;
-
-  const iterFlag = args.findIndex(
-    (arg) => arg === "--iterations" || arg === "-i",
-  );
-  if (iterFlag !== -1 && args[iterFlag + 1]) {
-    iterations = parseInt(args[iterFlag + 1], 10);
-    filteredArgs = args.filter(
-      (_, idx) => idx !== iterFlag && idx !== iterFlag + 1,
+  if (cliArgs.help) {
+    console.log("Usage:");
+    console.log(
+      "  node run-custom-patterns-comparison.js [--iterations N] [--approaches list] [--patterns list] [--target-windows N] [--output-dir path]",
     );
+    console.log(
+      "  node run-custom-patterns-comparison.js low_variability [-i N] [--approaches list] [--target-windows N] [--output-dir path]",
+    );
+    console.log("\nOptions:");
+    console.log(
+      "  --iterations, -i N          Number of iterations per test (default: 35)",
+    );
+    console.log(
+      "  --approach, --approaches    Comma-separated approaches",
+    );
+    console.log(
+      "  --pattern, --patterns       Comma-separated pattern types",
+    );
+    console.log(
+      "  --target-windows N          Target completed windows per run",
+    );
+    console.log(
+      "  --output-dir PATH           Benchmark output root (default: logs/custom-pattern-comparison)",
+    );
+    console.log(
+      "  --pattern-test-timeout MS   Per-test timeout in milliseconds (default: 240000)",
+    );
+    console.log(
+      "  --retries N                 Retry failed cases up to N additional attempts (default: 0)",
+    );
+    process.exit(0);
   }
 
-  const timeoutFlag = filteredArgs.findIndex(
-    (arg) => arg === "--pattern-test-timeout" || arg === "--test-timeout",
-  );
-  if (timeoutFlag !== -1 && filteredArgs[timeoutFlag + 1]) {
-    patternTestTimeoutMs = Number.parseInt(filteredArgs[timeoutFlag + 1], 10);
-    filteredArgs = filteredArgs.filter(
-      (_, idx) => idx !== timeoutFlag && idx !== timeoutFlag + 1,
-    );
-  }
-
-  const retriesFlag = filteredArgs.findIndex((arg) => arg === "--retries");
-  if (retriesFlag !== -1 && filteredArgs[retriesFlag + 1]) {
-    retries = Number.parseInt(filteredArgs[retriesFlag + 1], 10);
-    filteredArgs = filteredArgs.filter(
-      (_, idx) => idx !== retriesFlag && idx !== retriesFlag + 1,
-    );
-  }
-
-  const runner = new CustomPatternComparisonRunner(iterations, {
-    patternTestTimeoutMs,
-    retries,
+  const runner = new CustomPatternComparisonRunner(cliArgs.iterations, {
+    patternTestTimeoutMs: cliArgs.patternTestTimeoutMs,
+    retries: cliArgs.retries,
     smokeMode: process.env.PAPER_BENCHMARK_SMOKE === "1",
+    patternTypes: cliArgs.patternTypes,
+    approachNames: cliArgs.approachNames,
+    targetWindowCount: cliArgs.targetWindowCount,
+    outputDir: cliArgs.outputDir,
   });
 
   console.log(`\n${"=".repeat(80)}`);
-  console.log(`Configuration: Running ${iterations} iteration(s) per test`);
+  console.log(`Configuration: Running ${cliArgs.iterations} iteration(s) per test`);
   console.log(`Pattern test timeout: ${runner.timeout} ms`);
   console.log(`Retries per failed case: ${runner.retries}`);
   console.log(`Smoke mode: ${runner.smokeMode ? "enabled" : "disabled"}`);
@@ -1903,10 +2062,12 @@ async function main() {
   console.log(`Approaches: ${runner.approaches.join(", ")}`);
   console.log(`Selected patterns: ${runner.patterns.map((pattern) => pattern.type).join(", ") || "none"}`);
   console.log(`Selected approaches: ${runner.approaches.join(", ") || "none"}`);
+  console.log(`Target windows per run: ${runner.targetWindowCount || process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "35"}`);
+  console.log(`Output root: ${runner.baseLogDir}`);
   console.log(
-    `Expected total tests: ${runner.patterns.length * runner.approaches.length * iterations} (${runner.patterns.length} patterns × ${runner.approaches.length} approaches × ${iterations} iterations)`,
+    `Expected total tests: ${runner.patterns.length * runner.approaches.length * cliArgs.iterations} (${runner.patterns.length} patterns × ${runner.approaches.length} approaches × ${cliArgs.iterations} iterations)`,
   );
-  const estimatedRuntimeMs = runner.patterns.length * runner.approaches.length * iterations * runner.timeout;
+  const estimatedRuntimeMs = runner.patterns.length * runner.approaches.length * cliArgs.iterations * runner.timeout;
   const estimatedRuntimeMinutes = estimatedRuntimeMs / 60000;
   console.log(
     `Expected runtime: ~${estimatedRuntimeMinutes >= 60 ? `${(estimatedRuntimeMinutes / 60).toFixed(1)} hours` : `${Math.ceil(estimatedRuntimeMinutes)} minutes`} (${estimatedRuntimeMs} ms total)`,
@@ -1914,47 +2075,15 @@ async function main() {
   console.log("=".repeat(80));
 
   try {
-    if (filteredArgs.length === 0) {
+    if (!cliArgs.patternType) {
       // Run all patterns
       const results = await runner.runAllPatterns();
       runner.generateSummary(results);
       await runner.runAnalysis();
-    } else if (filteredArgs.length === 1) {
-      // Run specific pattern
-      const patternType = filteredArgs[0];
-      const results = await runner.runSpecificPattern(patternType);
-      runner.generateSummary(results);
     } else {
-      console.log("Usage:");
-      console.log(
-        "  node run-custom-patterns-comparison.js [--iterations N]           # Run all patterns",
-      );
-      console.log(
-        "  node run-custom-patterns-comparison.js low_variability [-i N]     # Run specific pattern",
-      );
-      console.log(
-        "  node run-custom-patterns-comparison.js step_pattern [-i N]        # Run specific pattern",
-      );
-      console.log(
-        "  node run-custom-patterns-comparison.js spike_pattern [-i N]       # Run specific pattern",
-      );
-      console.log(
-        "  node run-custom-patterns-comparison.js low_freq_oscillation [-i N]  # Run specific pattern",
-      );
-      console.log(
-        "  node run-custom-patterns-comparison.js high_freq_oscillation [-i N] # Run specific pattern",
-      );
-      console.log("\nOptions:");
-      console.log(
-        "  --iterations, -i N    Number of iterations per test (default: 35)",
-      );
-      console.log(
-        "  --pattern-test-timeout MS  Per-test timeout in milliseconds (default: 240000)",
-      );
-      console.log(
-        "  --retries N    Retry failed cases up to N additional attempts (default: 0)",
-      );
-      process.exit(1);
+      // Run specific pattern
+      const results = await runner.runSpecificPattern(cliArgs.patternType);
+      runner.generateSummary(results);
     }
 
     console.log("\n✓ All experiments completed!");
@@ -1970,4 +2099,9 @@ if (require.main === module) {
   main();
 }
 
-module.exports = CustomPatternComparisonRunner;
+module.exports = {
+  ALL_APPROACHES,
+  ALL_PATTERN_TYPES,
+  CustomPatternComparisonRunner,
+  parseCliArgs,
+};

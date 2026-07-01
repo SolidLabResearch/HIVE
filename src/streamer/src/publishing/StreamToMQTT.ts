@@ -576,6 +576,14 @@ export class StreamToMQTT {
         }
     }
 
+    private getCumulativeEventTimeSpanMs(originalOffset: number | undefined): number | undefined {
+        if (originalOffset === undefined) {
+            return undefined;
+        }
+
+        return (this.replayLoopIndex * this.loopDurationMs) + originalOffset;
+    }
+
     /**
      *
      */
@@ -728,7 +736,8 @@ export class StreamToMQTT {
                     targetPublishTime !== undefined
                         ? actualPublishTime - targetPublishTime
                         : undefined;
-                const eventTimeSpanMs = originalOffset ?? undefined;
+                const eventTimeSpanMs =
+                    this.getCumulativeEventTimeSpanMs(originalOffset);
                 const wallClockPublishSpanMs =
                     this.replayStartWallClockTime !== null
                         ? actualPublishTime - this.replayStartWallClockTime
