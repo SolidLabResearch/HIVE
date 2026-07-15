@@ -722,6 +722,9 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             {
               ...alignedWindowMetadata,
               approximationStatus: "completed_window_approximation",
+              coverageComplete: true,
+              isPartialWindow: false,
+              isComparableWindow: true,
             } as ReturnType<typeof buildBenchmarkWindowMetadata>,
           );
 
@@ -775,6 +778,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                         alignedWindowMetadata.latencyFromLogicalTriggerMs,
                       latencyFromWindowCloseMs:
                         alignedWindowMetadata.latencyFromWindowCloseMs,
+                      windowDurationMs: windowEnd - windowStart,
+                      coverageComplete: true,
+                      isPartialWindow: false,
+                      isComparableWindow: true,
                       metadataSource: alignedWindowMetadata.metadataSource,
                       registrationAnchoredExpectedClose,
                       eventTimeWindowClose: windowEnd,
@@ -1290,7 +1297,12 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   this.lastDataReceivedTime,
                   resultEmittedAt,
                   String(unifiedResult),
-                  centeredWindowMetadata,
+                  {
+                    ...centeredWindowMetadata,
+                    coverageComplete: false,
+                    isPartialWindow: true,
+                    isComparableWindow: false,
+                  } as ReturnType<typeof buildBenchmarkWindowMetadata>,
                 );
                 const publishedPayload = JSON.stringify({
                   ...finalResult,
@@ -1313,6 +1325,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                         centeredWindowMetadata.latencyFromLogicalTriggerMs,
                       latencyFromWindowCloseMs:
                         centeredWindowMetadata.latencyFromWindowCloseMs,
+                      windowDurationMs: this.windowRange,
+                      coverageComplete: false,
+                      isPartialWindow: true,
+                      isComparableWindow: false,
                       metadataSource: centeredWindowMetadata.metadataSource,
                     },
                   ),
