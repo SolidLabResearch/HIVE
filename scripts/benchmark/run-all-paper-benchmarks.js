@@ -961,9 +961,34 @@ function snapshotRealDataArtifacts(sourceRoot, outputDir) {
     }
   }
 
+  const rootSummaryFiles = [
+    "real_data_comparison_results.json",
+    "real_data_comparison_results.csv",
+    "real_data_paper_ready_raw_summary.json",
+    "real_data_startup_cost_summary.json",
+  ];
+  const summaryFiles = fs.existsSync(sourceRoot)
+    ? fs.readdirSync(sourceRoot).filter((fileName) => (
+      /^real_data_paper_ready_.+_summary\.(json|csv)$/.test(fileName)
+    ))
+    : [];
+  const copiedSummaryFiles = [];
+
+  for (const fileName of [...new Set([...rootSummaryFiles, ...summaryFiles])]) {
+    const sourcePath = path.join(sourceRoot, fileName);
+    if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+      continue;
+    }
+    const destinationPath = path.join(outputDir, "real-data", "raw", fileName);
+    if (copyFileIfExists(sourcePath, destinationPath)) {
+      copiedSummaryFiles.push(destinationPath);
+    }
+  }
+
   return {
     copiedSourceLogDirs: copiedLogDirs,
     copiedCaseCount: copiedLogDirs.length,
+    copiedSummaryFiles: copiedSummaryFiles.map((filePath) => path.relative(REPO_ROOT, filePath)),
   };
 }
 

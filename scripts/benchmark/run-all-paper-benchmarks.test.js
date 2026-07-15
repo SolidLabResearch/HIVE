@@ -212,6 +212,41 @@ describe("paper benchmark runner command construction", () => {
     }
   });
 
+  test("snapshotRealDataArtifacts preserves real-data aggregate summaries alongside raw iterations", () => {
+    const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-snapshot-summaries-source-"));
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-snapshot-summaries-out-"));
+
+    try {
+      const fetchingIteration1 = path.join(sourceRoot, "fetching", "iteration1");
+      fs.mkdirSync(fetchingIteration1, { recursive: true });
+      fs.writeFileSync(path.join(fetchingIteration1, "fetching_latency_log.csv"), "window_number\n1\n");
+      fs.writeFileSync(
+        path.join(sourceRoot, "real_data_comparison_results.json"),
+        `${JSON.stringify({
+          rawResults: [
+            {
+              approach: "fetching",
+              iteration: 1,
+              logDir: fetchingIteration1,
+            },
+          ],
+        }, null, 2)}\n`,
+      );
+      fs.writeFileSync(path.join(sourceRoot, "real_data_paper_ready_raw_summary.json"), "{\"mode\":\"steady-state\"}\n");
+      fs.writeFileSync(path.join(sourceRoot, "real_data_paper_ready_startup-cost-window-1_summary.json"), "{\"mode\":\"startup-cost\"}\n");
+      fs.writeFileSync(path.join(sourceRoot, "real_data_startup_cost_summary.json"), "{\"mode\":\"startup-cost\"}\n");
+
+      snapshotRealDataArtifacts(sourceRoot, outputDir);
+
+      expect(fs.existsSync(path.join(outputDir, "real-data", "raw", "real_data_paper_ready_raw_summary.json"))).toBe(true);
+      expect(fs.existsSync(path.join(outputDir, "real-data", "raw", "real_data_paper_ready_startup-cost-window-1_summary.json"))).toBe(true);
+      expect(fs.existsSync(path.join(outputDir, "real-data", "raw", "real_data_startup_cost_summary.json"))).toBe(true);
+    } finally {
+      fs.rmSync(sourceRoot, { recursive: true, force: true });
+      fs.rmSync(outputDir, { recursive: true, force: true });
+    }
+  });
+
   test("child benchmark output mirroring is disabled by default", () => {
     expect(shouldMirrorChildOutput({})).toBe(false);
     expect(shouldMirrorChildOutput({

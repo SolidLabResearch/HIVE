@@ -523,6 +523,56 @@ describe("real-data paper-ready analysis", () => {
     }
   });
 
+  test("copyLogFiles moves current root-written artifacts into the iteration directory", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-copy-root-"));
+    const originalCwd = process.cwd();
+
+    try {
+      process.chdir(tempRoot);
+      const logDir = path.join(tempRoot, "fetching", "iteration1");
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(path.join(tempRoot, "fetching_latency_log.csv"), "current-root-latency\n");
+      fs.writeFileSync(path.join(tempRoot, "replayer-log.csv"), "replayer-root\n");
+
+      const runner = new RealDataComparisonRunner({ iterations: 1 });
+      runner.copyLogFiles(APPROACHES[0], logDir);
+
+      expect(fs.readFileSync(path.join(logDir, "fetching_latency_log.csv"), "utf8")).toBe("current-root-latency\n");
+      expect(fs.readFileSync(path.join(logDir, "replayer-log.csv"), "utf8")).toBe("replayer-root\n");
+      expect(fs.existsSync(path.join(tempRoot, "replayer-log.csv"))).toBe(false);
+      expect(fs.existsSync(path.join(tempRoot, "fetching_latency_log.csv"))).toBe(false);
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("cleanupRealDataSummaryArtifacts removes stale root summaries before a fresh run", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-summary-cleanup-"));
+    const originalCwd = process.cwd();
+
+    try {
+      process.chdir(tempRoot);
+      const logsDir = path.join(tempRoot, "experiments", "real-data-comparison", "logs");
+      fs.mkdirSync(logsDir, { recursive: true });
+      fs.writeFileSync(path.join(logsDir, "real_data_paper_ready_trimmed-4-33_summary.json"), "{}\n");
+      fs.writeFileSync(path.join(logsDir, "real_data_paper_ready_startup-cost-window-1_summary.json"), "{}\n");
+      fs.writeFileSync(path.join(logsDir, "real_data_comparison_results.json"), "{}\n");
+      fs.writeFileSync(path.join(logsDir, "keep.txt"), "keep\n");
+
+      const runner = new RealDataComparisonRunner({ iterations: 1 });
+      runner.cleanupRealDataSummaryArtifacts();
+
+      expect(fs.existsSync(path.join(logsDir, "real_data_paper_ready_trimmed-4-33_summary.json"))).toBe(false);
+      expect(fs.existsSync(path.join(logsDir, "real_data_paper_ready_startup-cost-window-1_summary.json"))).toBe(false);
+      expect(fs.existsSync(path.join(logsDir, "real_data_comparison_results.json"))).toBe(false);
+      expect(fs.existsSync(path.join(logsDir, "keep.txt"))).toBe(true);
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   test("analyzeResults trims windows 4..33 and reports completeness, latency, CPU-seconds, and MQTT counts", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-paper-ready-"));
 
@@ -595,6 +645,147 @@ describe("real-data paper-ready analysis", () => {
           }),
         ]),
       );
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("startup-cost analysis uses window 1 across independent iterations instead of steady-state trimming", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-startup-cost-"));
+
+    try {
+      const fetchingLogDir1 = writeApproachFixtures(tempRoot, "fetching", {
+        windowNumbers: [1],
+        closeToResultMs: 400,
+      });
+      const fetchingLogDir2 = path.join(tempRoot, "fetching", "iteration2");
+      fs.mkdirSync(fetchingLogDir2, { recursive: true });
+      writeCsv(
+        path.join(fetchingLogDir2, APPROACHES[0].logFiles.latency),
+        [
+          "window_number",
+          "query_registered_at",
+          "first_data_received_at",
+          "expected_window_close",
+          "last_obs_received_at",
+          "last_data_received_at",
+          "last_chunk_received_at",
+          "result_emitted_at",
+          "window_semantics",
+          "logical_trigger_time",
+          "window_start",
+          "window_end",
+          "window_data_close_time",
+          "latency_from_logical_trigger_ms",
+          "latency_from_window_close_ms",
+          "latency_domain_status",
+          "wall_clock_close_to_result_ms",
+          "metadata_source",
+          "result_value",
+        ],
+        buildLatencyRows("fetching", {
+          windowNumbers: [1],
+          closeToResultMs: 600,
+          valueOffset: 2,
+        }),
+      );
+      writeCsv(
+        path.join(fetchingLogDir2, APPROACHES[0].processTreeFile),
+        ["timestamp", "tree_rss_bytes", "tree_cpu_seconds"],
+        [
+          { timestamp: 1000, tree_rss_bytes: 100 * 1024 * 1024, tree_cpu_seconds: 0 },
+          { timestamp: 2000, tree_rss_bytes: 120 * 1024 * 1024, tree_cpu_seconds: 8 },
+        ],
+      );
+      writeCsv(
+        path.join(fetchingLogDir2, "mqtt_traffic.csv"),
+        ["timestamp", "messageType", "warmup"],
+        [{ timestamp: 1000, messageType: "raw_input_stream", warmup: "false" }],
+      );
+      fs.writeFileSync(
+        path.join(fetchingLogDir2, "mqtt_traffic_summary.json"),
+        `${JSON.stringify({ published_application_bytes: 1200, estimated_delivery_bytes: 2200 }, null, 2)}\n`,
+      );
+
+      const approximationLogDir1 = writeApproachFixtures(tempRoot, "approximation", {
+        windowNumbers: [1],
+        closeToResultMs: 700,
+        valueOffset: 1,
+      });
+      const approximationLogDir2 = path.join(tempRoot, "approximation", "iteration2");
+      fs.mkdirSync(approximationLogDir2, { recursive: true });
+      writeCsv(
+        path.join(approximationLogDir2, APPROACHES[1].logFiles.latency),
+        [
+          "window_number",
+          "query_registered_at",
+          "first_data_received_at",
+          "expected_window_close",
+          "last_obs_received_at",
+          "last_data_received_at",
+          "last_chunk_received_at",
+          "result_emitted_at",
+          "window_semantics",
+          "logical_trigger_time",
+          "window_start",
+          "window_end",
+          "window_data_close_time",
+          "latency_from_logical_trigger_ms",
+          "latency_from_window_close_ms",
+          "latency_domain_status",
+          "wall_clock_close_to_result_ms",
+          "metadata_source",
+          "result_value",
+        ],
+        buildLatencyRows("approximation", {
+          windowNumbers: [1],
+          closeToResultMs: 900,
+          valueOffset: 3,
+        }),
+      );
+      writeCsv(
+        path.join(approximationLogDir2, APPROACHES[1].processTreeFile),
+        ["timestamp", "tree_rss_bytes", "tree_cpu_seconds"],
+        [
+          { timestamp: 1000, tree_rss_bytes: 90 * 1024 * 1024, tree_cpu_seconds: 0 },
+          { timestamp: 2000, tree_rss_bytes: 110 * 1024 * 1024, tree_cpu_seconds: 9 },
+        ],
+      );
+      writeCsv(
+        path.join(approximationLogDir2, "mqtt_traffic.csv"),
+        ["timestamp", "messageType", "warmup"],
+        [{ timestamp: 1000, messageType: "raw_input_stream", warmup: "false" }],
+      );
+      fs.writeFileSync(
+        path.join(approximationLogDir2, "mqtt_traffic_summary.json"),
+        `${JSON.stringify({ published_application_bytes: 1400, estimated_delivery_bytes: 2400 }, null, 2)}\n`,
+      );
+
+      const runner = new RealDataComparisonRunner({
+        iterations: 2,
+        approachNames: ["fetching", "approximation"],
+        targetWindowCount: 1,
+      });
+      runner.results = [
+        { approach: "fetching", iteration: 1, success: true, logDir: fetchingLogDir1 },
+        { approach: "fetching", iteration: 2, success: true, logDir: fetchingLogDir2 },
+        { approach: "approximation", iteration: 1, success: true, logDir: approximationLogDir1 },
+        { approach: "approximation", iteration: 2, success: true, logDir: approximationLogDir2 },
+      ];
+
+      const analysis = runner.analyzeResults();
+
+      expect(analysis.paper.methodology.mode).toBe("startup-cost");
+      expect(analysis.paper.methodology.analyzedWindows).toBe("1..1");
+      expect(analysis.paper.methodology.steadyStateLatencyMetric).toBeNull();
+      expect(analysis.paper.byApproach.fetching.iterations).toBe(2);
+      expect(analysis.paper.byApproach.fetching.trimmedWindowCountMean).toBe(1);
+      expect(analysis.paper.byApproach.fetching.closeToResultLatencyMs.mean).toBe(500);
+      expect(analysis.paper.byApproach.approximation.iterations).toBe(2);
+      expect(analysis.paper.byApproach.approximation.trimmedWindowCountMean).toBe(1);
+      expect(analysis.paper.byApproach.approximation.closeToResultLatencyMs.mean).toBe(800);
+      expect(analysis.paper.byApproach.approximation.accuracy.mae.mean).toBe(1);
+      expect(analysis.paper.byApproach.approximation.completeness.matchedWindowCount.mean).toBe(1);
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }

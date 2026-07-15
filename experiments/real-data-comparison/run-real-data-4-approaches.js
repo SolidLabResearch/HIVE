@@ -26,7 +26,6 @@ const DEFAULT_ANALYSIS_WINDOW_END = 33;
 const DEFAULT_TIMEOUT_BUFFER_MS = 2 * 60 * 1000;
 const LOGS_DIR = path.join("experiments", "real-data-comparison", "logs");
 const REAL_DATA_TOPIC_PREFIX_ROOT = "real-data-paper-ready";
-
 const APPROACHES = [
   {
     name: "fetching",
@@ -447,21 +446,33 @@ function selectWindows(rows, startWindow, endWindow) {
 }
 
 function buildPaperConfig(iterationCount, options = {}) {
-  const effectiveIterations = Math.max(iterationCount, PAPER_TARGET_WINDOWS);
-  const trimmed = buildTrimmedIterationSelection({
-    iterations: effectiveIterations,
-    dropWarmup: DEFAULT_DROP_WARMUP,
-    dropCooldown: DEFAULT_DROP_COOLDOWN,
-  });
-
   const configuredTargetWindows = Number.parseInt(options.targetWindowCount || "", 10);
+  const targetWindows = configuredTargetWindows > 0
+    ? configuredTargetWindows
+    : (
+      Number.parseInt(process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "", 10) ||
+      PAPER_TARGET_WINDOWS
+    );
+  const startupCostMode = targetWindows === 1;
+  const effectiveIterations = startupCostMode
+    ? Math.max(iterationCount, 1)
+    : Math.max(iterationCount, PAPER_TARGET_WINDOWS);
+  const trimmed = startupCostMode
+    ? {
+      iterations: [1],
+      startIteration: 1,
+      endIteration: 1,
+      label: "startup-cost-window-1",
+    }
+    : buildTrimmedIterationSelection({
+      iterations: effectiveIterations,
+      dropWarmup: DEFAULT_DROP_WARMUP,
+      dropCooldown: DEFAULT_DROP_COOLDOWN,
+    });
+
   return {
-    targetWindows: configuredTargetWindows > 0
-      ? configuredTargetWindows
-      : (
-        Number.parseInt(process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "", 10) ||
-        PAPER_TARGET_WINDOWS
-      ),
+    targetWindows,
+    startupCostMode,
     analysisWindowStart: trimmed.startIteration || DEFAULT_ANALYSIS_WINDOW_START,
     analysisWindowEnd: trimmed.endIteration || DEFAULT_ANALYSIS_WINDOW_END,
     trimmedIterations: trimmed.iterations,
@@ -543,6 +554,39 @@ class RealDataComparisonRunner {
     return new Promise((resolve) => setTimeout(resolve, 1500));
   }
 
+  cleanupLegacyRootLogFiles(approach) {
+    const rootLogFiles = new Set([
+      approach.processTreeFile,
+      ...Object.values(approach.logFiles),
+    ]);
+
+    for (const fileName of rootLogFiles) {
+      const sourcePath = path.join(".", fileName);
+      if (!fs.existsSync(sourcePath)) {
+        continue;
+      }
+      try {
+        fs.unlinkSync(sourcePath);
+      } catch {}
+    }
+  }
+
+  cleanupRealDataSummaryArtifacts() {
+    if (!fs.existsSync(LOGS_DIR)) {
+      return;
+    }
+
+    const summaryArtifactPattern = /^real_data_(comparison_results|paper_ready_.+_summary|startup_cost_summary)\.(json|csv)$/;
+    for (const entry of fs.readdirSync(LOGS_DIR)) {
+      if (!summaryArtifactPattern.test(entry)) {
+        continue;
+      }
+      try {
+        fs.unlinkSync(path.join(LOGS_DIR, entry));
+      } catch {}
+    }
+  }
+
   buildRunEnv(approach, logDir, iteration) {
     const targetWindows = this.paperConfig.targetWindows;
     const replayDurationSeconds = resolveFiniteReplayDurationSeconds(process.env, this.paperConfig);
@@ -601,6 +645,7 @@ class RealDataComparisonRunner {
 
       const logDir = path.join(LOGS_DIR, approach.name, `iteration${iteration}`);
       prepareFreshIterationLogDir(logDir);
+      this.cleanupLegacyRootLogFiles(approach);
 
       const env = this.buildRunEnv(approach, logDir, iteration);
       const startTime = Date.now();
@@ -959,7 +1004,10 @@ class RealDataComparisonRunner {
         compactReusableResultPayload: true,
         cpuMetric: "cpu_seconds",
         startupLatencyMetric: "first_result_registration_to_result_ms",
-        steadyStateLatencyMetric: "result_emitted_at - mapped_output_trigger_wall_clock_ms",
+        steadyStateLatencyMetric: this.paperConfig.startupCostMode
+          ? null
+          : "result_emitted_at - mapped_output_trigger_wall_clock_ms",
+        mode: this.paperConfig.startupCostMode ? "startup-cost" : "steady-state",
       },
       byApproach: {},
     };
@@ -1243,6 +1291,30 @@ class RealDataComparisonRunner {
       "mape_mean",
       "rmse_mean",
     ]);
+
+    if (this.paperConfig.startupCostMode) {
+      const startupSummaryPath = path.join(LOGS_DIR, "real_data_startup_cost_summary.json");
+      writeJson(startupSummaryPath, {
+        methodology: paperAnalysis.methodology,
+        byApproach: Object.fromEntries(
+          Object.entries(paperAnalysis.byApproach).map(([approach, data]) => [
+            approach,
+            {
+              label: data.label,
+              iterations: data.iterations,
+              startupCostMs: data.closeToResultLatencyMs,
+              resourceUsage: {
+                meanRssMiB: data.meanRssMiB,
+                peakRssMiB: data.peakRssMiB,
+                cpuSeconds: data.cpuSeconds,
+              },
+              completeness: data.completeness,
+              accuracy: data.accuracy,
+            },
+          ]),
+        ),
+      });
+    }
   }
 
   generateReport(analysis) {
@@ -1252,6 +1324,7 @@ class RealDataComparisonRunner {
 
   async run() {
     const startTime = Date.now();
+    this.cleanupRealDataSummaryArtifacts();
     await this.runAllTests();
     const analysis = this.analyzeResults();
     this.generateReport(analysis);
