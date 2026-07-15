@@ -74,7 +74,7 @@ export function initializeLatencyLogging(
 
     if (writeLatencyHeader) {
       latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,registration_anchored_expected_close,event_time_window_start,event_time_window_end,event_time_window_close,wall_clock_window_close,anchor_aligned_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,interval_wait_ms,computation_ms,result_value,required_chunk_intervals,last_required_chunk_received_at,semantic_ready_at,window_close_to_ready_ms,ready_to_emit_ms,wall_clock_close_to_result_ms,anchor_aligned_window_close_to_result_ms,latency_domain_status,trigger_type,emission_reason,window_semantics,logical_trigger_time,window_start,window_end,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,metadata_source\n",
+        "window_number,query_registered_at,first_data_received_at,expected_window_close,registration_anchored_expected_close,event_time_window_start,event_time_window_end,event_time_window_close,wall_clock_window_close,anchor_aligned_window_close,last_chunk_received_at,interval_trigger_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,interval_wait_ms,computation_ms,result_value,required_chunk_intervals,last_required_chunk_received_at,semantic_ready_at,window_close_to_ready_ms,ready_to_emit_ms,wall_clock_close_to_result_ms,anchor_aligned_window_close_to_result_ms,latency_domain_status,trigger_type,emission_reason,window_semantics,logical_trigger_time,window_start,window_end,window_duration_ms,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,coverage_complete,is_partial_window,is_comparable_window,metadata_source\n",
       );
     }
 
@@ -164,6 +164,17 @@ export function logLatency(args: {
   });
   const eventTimeWindowStart = metadata.windowStart ?? null;
   const eventTimeWindowEnd = metadata.windowEnd ?? null;
+  const windowDurationMs =
+    Number.isFinite(metadata.windowStart) && Number.isFinite(metadata.windowEnd)
+      ? Number(metadata.windowEnd) - Number(metadata.windowStart)
+      : "";
+  const coverageComplete = args.proofEntry?.coverageComplete ?? true;
+  const isComparableWindow =
+    (metadata as Record<string, unknown>).isComparableWindow ??
+    coverageComplete;
+  const isPartialWindow =
+    (metadata as Record<string, unknown>).isPartialWindow ??
+    !Boolean(isComparableWindow);
   const eventTimeWindowClose = metadata.windowDataCloseTime ?? null;
   const { wallClockWindowClose, latencyDomainStatus } =
     resolveChunkedWallClockWindowClose({
@@ -226,7 +237,7 @@ export function logLatency(args: {
   profileStageSync("chunked.diagnostics_write_ms", () => {
     if (args.latencyLogStream) {
       args.latencyLogStream.write(
-        `${args.windowNumber},${args.queryRegisteredTime},${args.firstDataReceivedTime},${args.expectedWindowClose},${args.expectedWindowClose},${eventTimeWindowStart ?? ""},${eventTimeWindowEnd ?? ""},${eventTimeWindowClose ?? ""},${wallClockWindowClose ?? ""},${anchorAlignedWindowClose},${args.lastChunkReceivedAt},${args.intervalTriggerAt},${args.resultTime},${latencyFromQueryReg},${latencyFromDataStart},${intervalWaitTime},${computationTime},${args.value},${requiredChunkIntervals},${lastRequiredChunkReceivedAt},${semanticReadyAt},${windowCloseToReadyMs},${readyToEmitMs},${wallClockCloseToResultMs},${anchorAlignedWindowCloseToResultMs},${latencyDomainStatus},${triggerType},${emissionReason},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${metadata.windowDataCloseTime ?? ""},${latencyFromLogicalTriggerMs},${latencyFromWindowCloseMs},${metadata.metadataSource}\n`,
+        `${args.windowNumber},${args.queryRegisteredTime},${args.firstDataReceivedTime},${args.expectedWindowClose},${args.expectedWindowClose},${eventTimeWindowStart ?? ""},${eventTimeWindowEnd ?? ""},${eventTimeWindowClose ?? ""},${wallClockWindowClose ?? ""},${anchorAlignedWindowClose},${args.lastChunkReceivedAt},${args.intervalTriggerAt},${args.resultTime},${latencyFromQueryReg},${latencyFromDataStart},${intervalWaitTime},${computationTime},${args.value},${requiredChunkIntervals},${lastRequiredChunkReceivedAt},${semanticReadyAt},${windowCloseToReadyMs},${readyToEmitMs},${wallClockCloseToResultMs},${anchorAlignedWindowCloseToResultMs},${latencyDomainStatus},${triggerType},${emissionReason},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${windowDurationMs},${metadata.windowDataCloseTime ?? ""},${latencyFromLogicalTriggerMs},${latencyFromWindowCloseMs},${coverageComplete},${isPartialWindow},${isComparableWindow},${metadata.metadataSource}\n`,
       );
     }
   });

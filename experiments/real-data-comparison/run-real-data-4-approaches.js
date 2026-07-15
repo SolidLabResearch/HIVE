@@ -208,6 +208,20 @@ function toNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function toBooleanOrNull(value) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return null;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
 function mean(values) {
   if (values.length === 0) {
     return null;
@@ -348,6 +362,32 @@ function normalizeLatencyRows(approachName, records, mqttSummary) {
       expectedWindowClose,
       resultEmittedAt,
     });
+    const coverageComplete = toBooleanOrNull(
+      record.coverage_complete ?? record.coverageComplete,
+    );
+    const isPartialWindow = toBooleanOrNull(
+      record.is_partial_window ?? record.isPartialWindow,
+    );
+    const explicitComparable = toBooleanOrNull(
+      record.is_comparable_window ?? record.isComparableWindow,
+    );
+    const windowDurationMs = toNumber(
+      record.window_duration_ms ?? record.windowDurationMs,
+    );
+    const resolvedWindowDurationMs = Number.isFinite(windowDurationMs)
+      ? windowDurationMs
+      : (
+        Number.isFinite(metadata.windowStart) && Number.isFinite(metadata.windowEnd)
+          ? metadata.windowEnd - metadata.windowStart
+          : null
+      );
+    const derivedComparable =
+      coverageComplete === null
+        ? null
+        : (
+          coverageComplete === true &&
+          resolvedWindowDurationMs === OUTPUT_WINDOW_RANGE_MS
+        );
 
     return {
       approach: approachName,
@@ -364,7 +404,14 @@ function normalizeLatencyRows(approachName, records, mqttSummary) {
       resultValue,
       windowStart: metadata.windowStart,
       windowEnd: metadata.windowEnd,
+      windowDurationMs: resolvedWindowDurationMs,
       windowDataCloseTime: metadata.windowDataCloseTime,
+      coverageComplete,
+      isPartialWindow,
+      isComparableWindow:
+        explicitComparable !== null
+          ? explicitComparable
+          : derivedComparable,
       windowSemantics: metadata.windowSemantics,
       logicalTriggerTime: metadata.logicalTriggerTime,
       latencyFromLogicalTriggerMs: metadata.latencyFromLogicalTriggerMs,
@@ -393,13 +440,38 @@ function normalizeLatencyRows(approachName, records, mqttSummary) {
 
   const byWindow = new Map();
   for (const row of rows) {
-    byWindow.set(row.windowNumber, row);
+    const windowKey =
+      Number.isFinite(row.windowStart) && Number.isFinite(row.windowEnd)
+        ? `${row.windowStart}:${row.windowEnd}`
+        : `window-number:${row.windowNumber}`;
+    const existing = byWindow.get(windowKey);
+    if (!existing) {
+      byWindow.set(windowKey, row);
+      continue;
+    }
+    const existingComparable = existing.isComparableWindow === true;
+    const nextComparable = row.isComparableWindow === true;
+    if (nextComparable && !existingComparable) {
+      byWindow.set(windowKey, row);
+      continue;
+    }
+    if (nextComparable === existingComparable && row.resultEmittedAt > existing.resultEmittedAt) {
+      byWindow.set(windowKey, row);
+    }
   }
 
   return attachComparableTiming(
     [...byWindow.values()].sort((left, right) => left.windowNumber - right.windowNumber),
     mqttSummary,
   );
+}
+
+function selectComparableRows(rows) {
+  const rowsWithExplicitComparableFlag = rows.filter((row) => row.isComparableWindow !== null);
+  if (rowsWithExplicitComparableFlag.length === 0) {
+    return rows;
+  }
+  return rows.filter((row) => row.isComparableWindow === true);
 }
 
 function summarizeProcessTreeMetrics(logDir, processTreeFile, emittedWindowCount) {
@@ -929,15 +1001,16 @@ class RealDataComparisonRunner {
     const latencyRows = parseCsv(path.join(runResult.logDir, approach.logFiles.latency));
     const mqttSummary = buildMqttSummary(runResult.logDir);
     const normalizedRows = normalizeLatencyRows(approach.name, latencyRows, mqttSummary);
+    const comparableRows = selectComparableRows(normalizedRows);
     const trimmedRows = selectWindows(
-      normalizedRows,
+      comparableRows,
       this.paperConfig.analysisWindowStart,
       this.paperConfig.analysisWindowEnd,
     );
     const resourceMetrics = summarizeProcessTreeMetrics(
       runResult.logDir,
       approach.processTreeFile,
-      normalizedRows.length,
+      comparableRows.length,
     );
     const rawCadence = verifyOutputStepCadence(normalizedRows);
     const trimmedCadence = verifyOutputStepCadence(trimmedRows);
@@ -948,7 +1021,7 @@ class RealDataComparisonRunner {
       iteration: runResult.iteration,
       success: runResult.success !== false,
       runDurationSeconds: Number.isFinite(runResult.duration) ? runResult.duration : null,
-      rawWindowCount: normalizedRows.length,
+      rawWindowCount: comparableRows.length,
       trimmedWindowCount: trimmedRows.length,
       expectedTrimmedWindowCount:
         this.paperConfig.analysisWindowEnd - this.paperConfig.analysisWindowStart + 1,
@@ -971,7 +1044,7 @@ class RealDataComparisonRunner {
       mqttTrafficSummary: mqttSummary.summary,
       mqttMessageCountTotal: mqttSummary.messageCounts.total,
       mqttMessageCountsByType: mqttSummary.messageCounts.byType,
-      normalizedRows,
+      normalizedRows: comparableRows,
       trimmedRows,
     };
   }

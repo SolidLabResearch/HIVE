@@ -623,17 +623,22 @@ function compareResults(baselineResults, approachResults, options = {}) {
 
   const baselineByWindow = new Map();
   const approachByWindow = new Map();
+  const hasWindowBounds = (result) =>
+    Number.isFinite(result.windowStart) && Number.isFinite(result.windowEnd);
   const bothSidesHaveWindowNumbers =
     filteredBaseline.every((result) => Number.isFinite(result.windowNumber)) &&
     filteredApproach.every((result) => Number.isFinite(result.windowNumber));
-  const hasWindowBounds = (result) =>
-    Number.isFinite(result.windowStart) && Number.isFinite(result.windowEnd);
+  const bothSidesHaveWindowBounds =
+    filteredBaseline.every((result) => hasWindowBounds(result)) &&
+    filteredApproach.every((result) => hasWindowBounds(result));
   const getWindowKey = (result) =>
-    bothSidesHaveWindowNumbers
-      ? `window-number:${result.windowNumber}`
-      : hasWindowBounds(result)
+    bothSidesHaveWindowBounds
       ? `${result.windowStart}:${result.windowEnd}`
-      : `window-number:${result.windowNumber}`;
+      : bothSidesHaveWindowNumbers
+        ? `window-number:${result.windowNumber}`
+        : hasWindowBounds(result)
+          ? `${result.windowStart}:${result.windowEnd}`
+          : `window-number:${result.windowNumber}`;
 
   for (const result of filteredBaseline) {
     baselineByWindow.set(getWindowKey(result), result);

@@ -53,6 +53,13 @@ type FetchingWindowCandidate = {
   rspWindowEnd: number | null;
 };
 
+type ComparableWindowFlags = {
+  windowDurationMs: number | null;
+  coverageComplete: boolean;
+  isPartialWindow: boolean;
+  isComparableWindow: boolean;
+};
+
 type StreamObservation = {
   timestamp: number;
   value: number;
@@ -199,7 +206,7 @@ export class FetchingAllDataClientSide {
       flags: "w",
     });
     this.latencyLogStream.write(
-      "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,window_semantics,logical_trigger_time,window_start,window_end,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,metadata_source,result_value\n",
+      "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,window_semantics,logical_trigger_time,window_start,window_end,window_duration_ms,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,coverage_complete,is_partial_window,is_comparable_window,metadata_source,result_value\n",
     );
 
     const diagnosticsLogFilePath = path.join(logRoot, `fetching_window_diagnostics${consumerIdx}.csv`);
@@ -359,6 +366,7 @@ export class FetchingAllDataClientSide {
     resultTime: number,
     value: string,
     metadata: ReturnType<typeof buildBenchmarkWindowMetadata>,
+    windowFlags: ComparableWindowFlags,
   ) {
     // Metric 1: Delay past the expected close time
     const latencyFromQueryReg = resultTime - expectedWindowClose;
@@ -376,7 +384,7 @@ export class FetchingAllDataClientSide {
 
     if (this.latencyLogStream) {
       this.latencyLogStream.write(
-        `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastObsReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastObs},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${metadata.windowDataCloseTime ?? ""},${metadata.latencyFromLogicalTriggerMs ?? ""},${metadata.latencyFromWindowCloseMs ?? ""},${metadata.metadataSource},${value}\n`,
+        `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastObsReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastObs},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${windowFlags.windowDurationMs ?? ""},${metadata.windowDataCloseTime ?? ""},${metadata.latencyFromLogicalTriggerMs ?? ""},${metadata.latencyFromWindowCloseMs ?? ""},${windowFlags.coverageComplete},${windowFlags.isPartialWindow},${windowFlags.isComparableWindow},${metadata.metadataSource},${value}\n`,
       );
     }
     console.log(`LATENCY: Window ${windowNumber}:`);
@@ -949,6 +957,25 @@ export class FetchingAllDataClientSide {
     );
   }
 
+  private buildComparableWindowFlags(
+    logicalWindow: DerivedLogicalWindow,
+    coverageComplete: boolean,
+  ): ComparableWindowFlags {
+    const windowDurationMs =
+      Number.isFinite(logicalWindow.start) && Number.isFinite(logicalWindow.end)
+        ? logicalWindow.end - logicalWindow.start
+        : null;
+    const isComparableWindow =
+      coverageComplete && windowDurationMs === this.windowRange;
+
+    return {
+      windowDurationMs,
+      coverageComplete,
+      isPartialWindow: !isComparableWindow,
+      isComparableWindow,
+    };
+  }
+
   /**
    *
    */
@@ -1143,6 +1170,45 @@ export class FetchingAllDataClientSide {
             continue;
           }
 
+          if (!this.canFinalizeLogicalWindow(logicalWindow.end)) {
+            this.writeWindowDiagnostics(
+              "",
+              logicalWindow,
+              eventCount,
+              sumValue,
+              avgValue,
+              firstEventTimestamp,
+              lastEventTimestamp,
+              completeness.status,
+              "suppressed",
+              "waiting_for_all_streams_to_progress_past_window_end",
+              data,
+            );
+            continue;
+          }
+
+          const settledAggregate = this.computeSettledWindowAggregate(logicalWindow);
+          const settledCompleteness = this.assessWindowCompleteness(
+            logicalWindow,
+            settledAggregate.eventCount,
+          );
+          if (!settledCompleteness.isSettled) {
+            this.writeWindowDiagnostics(
+              "",
+              logicalWindow,
+              settledAggregate.eventCount,
+              settledAggregate.sumValue,
+              settledAggregate.avgValue,
+              firstEventTimestamp,
+              lastEventTimestamp,
+              settledCompleteness.status,
+              "suppressed",
+              settledCompleteness.reason,
+              data,
+            );
+            continue;
+          }
+
           if (
             this.benchmarkTargetWindowCount !== null &&
             this.acceptedCompleteWindowCount >= this.benchmarkTargetWindowCount
@@ -1167,11 +1233,27 @@ export class FetchingAllDataClientSide {
             continue;
           }
 
-          let startupNumericValue = avgValue;
+          let startupNumericValue = settledAggregate.avgValue;
           if (this.aggregationFunction === "SUM") {
-            startupNumericValue = sumValue;
+            startupNumericValue = settledAggregate.sumValue;
           } else if (this.aggregationFunction === "COUNT") {
-            startupNumericValue = eventCount;
+            startupNumericValue = settledAggregate.eventCount;
+          } else if (this.aggregationFunction === "MIN") {
+            if (
+              settledAggregate.eventCount === 0 ||
+              settledAggregate.minValue === null
+            ) {
+              continue;
+            }
+            startupNumericValue = settledAggregate.minValue;
+          } else if (this.aggregationFunction === "MAX") {
+            if (
+              settledAggregate.eventCount === 0 ||
+              settledAggregate.maxValue === null
+            ) {
+              continue;
+            }
+            startupNumericValue = settledAggregate.maxValue;
           }
 
           if (!Number.isFinite(startupNumericValue)) {
@@ -1199,6 +1281,10 @@ export class FetchingAllDataClientSide {
             resultEmittedAt,
             expectedWindowClose,
           );
+          const windowFlags = this.buildComparableWindowFlags(
+            logicalWindow,
+            settledCompleteness.isSettled,
+          );
           this.logLatency(
             benchmarkWindowNumber as number,
             expectedWindowClose,
@@ -1206,18 +1292,19 @@ export class FetchingAllDataClientSide {
             resultEmittedAt,
             String(startupNumericValue),
             centeredWindowMetadata,
+            windowFlags,
           );
           this.writeWindowDiagnostics(
             benchmarkWindowNumber as number,
             logicalWindow,
-            eventCount,
-            sumValue,
-            avgValue,
+            settledAggregate.eventCount,
+            settledAggregate.sumValue,
+            settledAggregate.avgValue,
             firstEventTimestamp,
             lastEventTimestamp,
-            completeness.status,
+            settledCompleteness.status,
             "accepted",
-            "accepted_first_emitted_window",
+            "accepted_first_comparable_complete_window",
             String(startupNumericValue),
           );
           this.log(
@@ -1228,13 +1315,16 @@ export class FetchingAllDataClientSide {
               window_end: logicalWindow.end,
               rsp_window_start: windowBounds?.start ?? null,
               rsp_window_end: windowBounds?.end ?? null,
-              event_count: eventCount,
+              event_count: settledAggregate.eventCount,
               expected_event_count: this.expectedEventCount,
-              sum: sumValue,
-              avg: avgValue,
+              sum: settledAggregate.sumValue,
+              avg: settledAggregate.avgValue,
               first_event_timestamp: firstEventTimestamp || null,
               last_event_timestamp: lastEventTimestamp || null,
-              completeness_status: completeness.status,
+              completeness_status: settledCompleteness.status,
+              coverage_complete: windowFlags.coverageComplete,
+              is_partial_window: windowFlags.isPartialWindow,
+              is_comparable_window: windowFlags.isComparableWindow,
               timing_filter_enabled: this.timingFilterEnabled,
               timing_filter_bypassed_reason: this.timingFilterBypassedReason,
               filtered_due_to_timing_count: this.filteredDueToTimingCount,
@@ -1257,9 +1347,9 @@ export class FetchingAllDataClientSide {
                       benchmarkWindowEnd: logicalWindow.end,
                       rspWindowStart: windowBounds?.start ?? null,
                       rspWindowEnd: windowBounds?.end ?? null,
-                      eventCount,
-                      sumValue,
-                      avgValue,
+                      eventCount: settledAggregate.eventCount,
+                      sumValue: settledAggregate.sumValue,
+                      avgValue: settledAggregate.avgValue,
                       firstEventTimestamp: firstEventTimestamp || null,
                       lastEventTimestamp: lastEventTimestamp || null,
                       windowSemantics: centeredWindowMetadata.windowSemantics,
@@ -1270,6 +1360,10 @@ export class FetchingAllDataClientSide {
                       resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
                       latencyFromLogicalTriggerMs: centeredWindowMetadata.latencyFromLogicalTriggerMs,
                       latencyFromWindowCloseMs: centeredWindowMetadata.latencyFromWindowCloseMs,
+                      windowDurationMs: windowFlags.windowDurationMs,
+                      coverageComplete: windowFlags.coverageComplete,
+                      isPartialWindow: windowFlags.isPartialWindow,
+                      isComparableWindow: windowFlags.isComparableWindow,
                       metadataSource: centeredWindowMetadata.metadataSource,
                     },
                   ),
@@ -1490,6 +1584,10 @@ export class FetchingAllDataClientSide {
           resultEmittedAt,
           expectedWindowClose,
         );
+        const windowFlags = this.buildComparableWindowFlags(
+          logicalWindow,
+          settledCompleteness.isSettled,
+        );
         this.logLatency(
           this.windowCount,
           expectedWindowClose,
@@ -1497,6 +1595,7 @@ export class FetchingAllDataClientSide {
           resultEmittedAt,
           valueStr,
           centeredWindowMetadata,
+          windowFlags,
         );
         this.writeWindowDiagnostics(
           this.windowCount,
@@ -1526,6 +1625,9 @@ export class FetchingAllDataClientSide {
             first_event_timestamp: firstEventTimestamp || null,
             last_event_timestamp: lastEventTimestamp || null,
             completeness_status: settledCompleteness.status,
+            coverage_complete: windowFlags.coverageComplete,
+            is_partial_window: windowFlags.isPartialWindow,
+            is_comparable_window: windowFlags.isComparableWindow,
             timing_filter_enabled: this.timingFilterEnabled,
             timing_filter_bypassed_reason: this.timingFilterBypassedReason,
             filtered_due_to_timing_count: this.filteredDueToTimingCount,
@@ -1564,6 +1666,10 @@ export class FetchingAllDataClientSide {
                     resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
                     latencyFromLogicalTriggerMs: centeredWindowMetadata.latencyFromLogicalTriggerMs,
                     latencyFromWindowCloseMs: centeredWindowMetadata.latencyFromWindowCloseMs,
+                    windowDurationMs: windowFlags.windowDurationMs,
+                    coverageComplete: windowFlags.coverageComplete,
+                    isPartialWindow: windowFlags.isPartialWindow,
+                    isComparableWindow: windowFlags.isComparableWindow,
                     metadataSource: centeredWindowMetadata.metadataSource,
                   },
                 ),

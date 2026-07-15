@@ -23,6 +23,9 @@ const {
 const {
   attachComparableTiming,
 } = require("../../scripts/analysis-js/generate-one-pattern-three-approach-n3-summary.js");
+const {
+  compareResults,
+} = require("../../analysis/accuracy/accuracy-comparison-custom-patterns.js");
 
 function writeCsv(filePath, headers, rows) {
   const body = rows.map((row) => headers.map((header) => row[header] ?? "").join(",")).join("\n");
@@ -824,5 +827,115 @@ describe("real-data paper-ready analysis", () => {
     expect(rows[0].anchorAlignedWindowCloseToResultMs).toBe(1500);
     expect(rows[1].mappedOutputTriggerWallClockMs).toBe(120000);
     expect(rows[1].anchorAlignedWindowCloseToResultMs).toBe(1500);
+  });
+
+  test("startup-cost analysis ignores non-comparable fetching rows and keeps the first complete comparable window", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-startup-comparable-"));
+
+    try {
+      const fetchingDir = path.join(tempRoot, "fetching", "iteration1");
+      fs.mkdirSync(fetchingDir, { recursive: true });
+      writeCsv(
+        path.join(fetchingDir, APPROACHES[0].logFiles.latency),
+        [
+          "window_number",
+          "query_registered_at",
+          "first_data_received_at",
+          "expected_window_close",
+          "last_obs_received_at",
+          "result_emitted_at",
+          "window_start",
+          "window_end",
+          "window_duration_ms",
+          "coverage_complete",
+          "is_partial_window",
+          "is_comparable_window",
+          "result_value",
+        ],
+        [
+          {
+            window_number: 1,
+            query_registered_at: 1000,
+            first_data_received_at: 30000,
+            expected_window_close: 121000,
+            last_obs_received_at: 61000,
+            result_emitted_at: 62222,
+            window_start: 1000,
+            window_end: 121000,
+            window_duration_ms: 120000,
+            coverage_complete: "false",
+            is_partial_window: "true",
+            is_comparable_window: "false",
+            result_value: 10,
+          },
+          {
+            window_number: 1,
+            query_registered_at: 1000,
+            first_data_received_at: 30000,
+            expected_window_close: 121000,
+            last_obs_received_at: 120998,
+            result_emitted_at: 121083,
+            window_start: 1000,
+            window_end: 121000,
+            window_duration_ms: 120000,
+            coverage_complete: "true",
+            is_partial_window: "false",
+            is_comparable_window: "true",
+            result_value: 11,
+          },
+        ],
+      );
+      writeCsv(
+        path.join(fetchingDir, APPROACHES[0].processTreeFile),
+        ["timestamp", "tree_rss_bytes", "tree_cpu_seconds"],
+        [
+          { timestamp: 1000, tree_rss_bytes: 100 * 1024 * 1024, tree_cpu_seconds: 0 },
+          { timestamp: 2000, tree_rss_bytes: 110 * 1024 * 1024, tree_cpu_seconds: 1 },
+        ],
+      );
+      writeCsv(
+        path.join(fetchingDir, "mqtt_traffic.csv"),
+        ["timestamp", "messageType", "warmup"],
+        [{ timestamp: 1000, messageType: "raw_input_stream", warmup: "false" }],
+      );
+      fs.writeFileSync(
+        path.join(fetchingDir, "mqtt_traffic_summary.json"),
+        `${JSON.stringify({ published_application_bytes: 1000, estimated_delivery_bytes: 2000 }, null, 2)}\n`,
+      );
+
+      const runner = new RealDataComparisonRunner({
+        iterations: 1,
+        approachNames: ["fetching"],
+        targetWindowCount: 1,
+      });
+      runner.results = [
+        { approach: "fetching", iteration: 1, success: true, logDir: fetchingDir },
+      ];
+
+      const analysis = runner.analyzeResults();
+      const rows = analysis.paper.byApproach.fetching.records[0].normalizedRows;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].coverageComplete).toBe(true);
+      expect(rows[0].isComparableWindow).toBe(true);
+      expect(rows[0].resultValue).toBe(11);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("compareResults prefers semantic window bounds over window-number order when both are available", () => {
+    const comparison = compareResults(
+      [
+        { windowNumber: 1, windowStart: 0, windowEnd: 120000, resultValue: 10 },
+      ],
+      [
+        { windowNumber: 99, windowStart: 0, windowEnd: 120000, resultValue: 12 },
+      ],
+    );
+
+    expect(comparison.matchedWindowCount).toBe(1);
+    expect(comparison.baselineOnlyCount).toBe(0);
+    expect(comparison.approachOnlyCount).toBe(0);
+    expect(comparison.mae).toBe(2);
   });
 });

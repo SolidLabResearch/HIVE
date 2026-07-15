@@ -55,7 +55,7 @@ export class ApproximationDiagnosticsWriter {
 
     if (writeLatencyHeader) {
       this.latencyLogStream.write(
-        "window_number,query_registered_at,first_data_received_at,expected_window_close,registration_anchored_expected_close,event_time_window_close,wall_clock_window_close,last_data_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_data_ms,wall_clock_close_to_result_ms,latency_domain_status,approximation_status,window_semantics,logical_trigger_time,window_start,window_end,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,metadata_source,result_value\n",
+        "window_number,query_registered_at,first_data_received_at,expected_window_close,registration_anchored_expected_close,event_time_window_close,wall_clock_window_close,last_data_received_at,result_emitted_at,latency_from_query_reg_ms,latency_from_data_start_ms,latency_from_last_data_ms,wall_clock_close_to_result_ms,latency_domain_status,approximation_status,window_semantics,logical_trigger_time,window_start,window_end,window_duration_ms,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,coverage_complete,is_partial_window,is_comparable_window,metadata_source,result_value\n",
       );
     }
   }
@@ -189,6 +189,16 @@ export class ApproximationDiagnosticsWriter {
     const approximationStatus =
       (metadata as Record<string, unknown>).approximationStatus ??
       "completed_window_approximation";
+    const windowDurationMs =
+      Number.isFinite(metadata.windowStart) && Number.isFinite(metadata.windowEnd)
+        ? Number(metadata.windowEnd) - Number(metadata.windowStart)
+        : "";
+    const coverageComplete =
+      (metadata as Record<string, unknown>).coverageComplete ?? true;
+    const isComparableWindow =
+      (metadata as Record<string, unknown>).isComparableWindow ?? true;
+    const isPartialWindow =
+      (metadata as Record<string, unknown>).isPartialWindow ?? false;
     const latencyFromLogicalTriggerMs =
       wallClockWindowClose !== null &&
       Number.isFinite(metadata.logicalTriggerTime) &&
@@ -215,7 +225,7 @@ export class ApproximationDiagnosticsWriter {
     profileStageSync("approximation.diagnostics_write_ms", () => {
       if (this.latencyLogStream) {
         this.latencyLogStream.write(
-          `${windowNumber},${this.queryRegisteredTime},${firstDataReceivedTime},${expectedWindowClose},${expectedWindowClose},${eventTimeWindowClose ?? ""},${wallClockWindowClose ?? ""},${lastDataReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastData},${wallClockCloseToResultMs},${latencyDomainStatus},${approximationStatus},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${metadata.windowDataCloseTime ?? ""},${latencyFromLogicalTriggerMs},${latencyFromWindowCloseMs},${metadata.metadataSource},${value}\n`,
+          `${windowNumber},${this.queryRegisteredTime},${firstDataReceivedTime},${expectedWindowClose},${expectedWindowClose},${eventTimeWindowClose ?? ""},${wallClockWindowClose ?? ""},${lastDataReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastData},${wallClockCloseToResultMs},${latencyDomainStatus},${approximationStatus},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${windowDurationMs},${metadata.windowDataCloseTime ?? ""},${latencyFromLogicalTriggerMs},${latencyFromWindowCloseMs},${coverageComplete},${isPartialWindow},${isComparableWindow},${metadata.metadataSource},${value}\n`,
         );
       }
     });

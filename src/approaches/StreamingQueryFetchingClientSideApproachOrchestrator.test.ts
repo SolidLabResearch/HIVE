@@ -116,6 +116,25 @@ function buildCompleteRStreamObject(eventCount = 2400, avgValue = 1.016022401111
   };
 }
 
+function buildPartialRStreamObject(eventCount = 1200, avgValue = 1) {
+  return {
+    window: {
+      open: WINDOW_START,
+      close: WINDOW_END,
+    },
+    bindings: [
+      new Map([
+        ["?resultValue", { value: String(avgValue) }],
+        ["?eventCount", { value: String(eventCount) }],
+        ["?sumValue", { value: String(avgValue * eventCount) }],
+        ["?avgValue", { value: String(avgValue) }],
+        ["?firstEventTimestamp", { value: FIRST_EVENT_ISO }],
+        ["?lastEventTimestamp", { value: new Date(WINDOW_START + 59_000).toISOString() }],
+      ]),
+    ],
+  };
+}
+
 function configureEnv(overrides: Record<string, string>) {
   process.env = {
     ...process.env,
@@ -232,23 +251,36 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     expect(mqttClients).toHaveLength(0);
   });
 
-  test("startup-first-emitted mode accepts the first emitted fetching row before settled finalization", () => {
+  test("startup-first-emitted mode suppresses partial startup rows before full range coverage", () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE: "1",
       STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: String(WINDOW_START),
       STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: "5",
     });
-    const scheduleSpy = jest
-      .spyOn(operator as any, "scheduleBenchmarkShutdown")
-      .mockImplementation(() => undefined);
+    primeCompleteWindow(operator);
+    lastRStreamEmitter?.emit("RStream", buildPartialRStreamObject());
 
-    lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject(1800, 1));
+    expect((operator as any).acceptedCompleteWindowCount).toBe(0);
+    expect((operator as any).windowCount).toBe(0);
+    expect((operator as any).finalizedWindowNumbers).toEqual([]);
+    expect(mqttClients).toHaveLength(0);
+  });
+
+  test("startup-first-emitted mode counts the first settled complete 120-second window", () => {
+    const operator = createOperator({
+      STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
+      STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE: "1",
+      STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: String(WINDOW_START),
+      STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: "5",
+    });
+    primeCompleteWindow(operator);
+
+    lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject(2400, 1));
 
     expect((operator as any).acceptedCompleteWindowCount).toBe(1);
     expect((operator as any).windowCount).toBe(1);
     expect((operator as any).finalizedWindowNumbers).toEqual([1]);
-    expect(scheduleSpy).not.toHaveBeenCalled();
     expect(mqttClients).toHaveLength(1);
     mqttClients[0].emit("connect");
     expect(mqttClients[0].publish).toHaveBeenCalledTimes(1);
