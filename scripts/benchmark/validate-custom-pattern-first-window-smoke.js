@@ -128,6 +128,10 @@ function parseCsvList(value) {
   return value.split(",").map((entry) => entry.trim()).filter(Boolean);
 }
 
+function sortNumeric(values) {
+  return [...values].sort((left, right) => left - right);
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
@@ -359,9 +363,11 @@ function readApproachRow(runDir, approach, options = {}) {
     if (Number.isFinite(directLatencyFromWindowCloseMs)) {
       semanticWindowCloseToResultMs = directLatencyFromWindowCloseMs;
       latencyMetricSource = "fetching_latency_log";
+      semanticWindowCloseAt = Number.isFinite(wallClockWindowDataCloseTime) ? wallClockWindowDataCloseTime : null;
     } else if (Number.isFinite(resultEmittedAt) && Number.isFinite(wallClockWindowDataCloseTime)) {
       semanticWindowCloseToResultMs = resultEmittedAt - wallClockWindowDataCloseTime;
       latencyMetricSource = "fetching_latency_log";
+      semanticWindowCloseAt = wallClockWindowDataCloseTime;
     }
   } else if (Number.isFinite(semanticWindowCloseAt) && Number.isFinite(resultEmittedAt)) {
     semanticWindowCloseToResultMs = resultEmittedAt - semanticWindowCloseAt;
@@ -410,13 +416,13 @@ function readApproachRow(runDir, approach, options = {}) {
   };
 }
 
-function validatePattern(inputRoot, pattern, iteration) {
+function validatePattern(inputRoot, pattern, iteration, approaches) {
   const perApproach = {};
   const warnings = [];
   const failures = [];
   const executionSummary = readJson(path.join(inputRoot, EXECUTION_SUMMARY_FILE));
 
-  for (const approach of DEFAULT_APPROACHES) {
+  for (const approach of approaches) {
     const runDir = resolveIterationDir(inputRoot, approach, pattern, iteration);
     if (!runDir) {
       failures.push(`${approach}: missing iteration directory`);
@@ -438,7 +444,7 @@ function validatePattern(inputRoot, pattern, iteration) {
   const sharedWindowStart = fetching?.windowStart;
   const sharedWindowEnd = fetching?.windowEnd;
 
-  for (const approach of DEFAULT_APPROACHES) {
+  for (const approach of approaches) {
     const row = perApproach[approach];
     if (!row) {
       continue;
@@ -592,6 +598,7 @@ function buildTableRows(patternResults, approaches) {
       const row = patternResult.perApproach[approach];
       rows.push({
         Pattern: patternResult.pattern,
+        Iteration: patternResult.iteration,
         Approach: approach,
         "Complete window": row?.completeWindow === true ? "yes" : "no",
         "Window-close latency (ms)": formatNumber(row?.semanticWindowCloseToResultMs, 3),
@@ -611,6 +618,60 @@ function buildTableRows(patternResults, approaches) {
   return rows;
 }
 
+function median(values) {
+  const finiteValues = values.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+  if (finiteValues.length === 0) {
+    return null;
+  }
+  const midpoint = Math.floor(finiteValues.length / 2);
+  if (finiteValues.length % 2 === 1) {
+    return finiteValues[midpoint];
+  }
+  return (finiteValues[midpoint - 1] + finiteValues[midpoint]) / 2;
+}
+
+function buildAggregatedRows(patternResults, approaches, iterations) {
+  const iterationCount = iterations.length;
+  const rows = [];
+
+  const patterns = [...new Set(patternResults.map((result) => result.pattern))];
+  for (const pattern of patterns) {
+    const perPatternResults = patternResults
+      .filter((result) => result.pattern === pattern)
+      .sort((left, right) => left.iteration - right.iteration);
+
+    for (const approach of approaches) {
+      const perApproachRows = perPatternResults
+        .map((result) => result.perApproach[approach])
+        .filter(Boolean);
+      const completeWindowCount = perApproachRows.filter((row) => row.completeWindow === true).length;
+      const exactAgreementCount = approach === "fetching"
+        ? perApproachRows.filter((row) => row.completeWindow === true).length
+        : perApproachRows.filter((row) => row.exactAgreement === true).length;
+
+      rows.push({
+        Pattern: pattern,
+        Approach: approach,
+        "Complete windows": `${completeWindowCount}/${iterationCount}`,
+        "Median window-close latency (ms)": formatNumber(median(perApproachRows.map((row) => row.semanticWindowCloseToResultMs)), 3),
+        "Median average CPU (%)": formatNumber(median(perApproachRows.map((row) => row.averageCpuPct)), 3),
+        "Median peak RSS (MiB)": formatNumber(median(perApproachRows.map((row) => row.peakRssMb)), 3),
+        "Median result": formatNumber(median(perApproachRows.map((row) => row.resultValue)), 12),
+        "Median absolute error": formatNumber(median(perApproachRows.map((row) => row.absoluteError)), 12),
+        "Exact vs Fetching": `${exactAgreementCount}/${iterationCount}`,
+        MAE: formatNumber(
+          perApproachRows.length > 0
+            ? perApproachRows.reduce((sum, row) => sum + (Number.isFinite(row.absoluteError) ? row.absoluteError : 0), 0) / perApproachRows.length
+            : null,
+          12,
+        ),
+      });
+    }
+  }
+
+  return rows;
+}
+
 function formatNumber(value, digits = 6) {
   return Number.isFinite(value) ? Number(value.toFixed(digits)) : "";
 }
@@ -618,6 +679,7 @@ function formatNumber(value, digits = 6) {
 function writeCsv(filePath, rows) {
   const headers = [
     "Pattern",
+    "Iteration",
     "Approach",
     "Complete window",
     "Window-close latency (ms)",
@@ -635,6 +697,24 @@ function writeCsv(filePath, rows) {
   fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
 }
 
+function writeAggregatedCsv(filePath, rows) {
+  const headers = [
+    "Pattern",
+    "Approach",
+    "Complete windows",
+    "Median window-close latency (ms)",
+    "Median average CPU (%)",
+    "Median peak RSS (MiB)",
+    "Exact vs Fetching",
+    "MAE",
+  ];
+  const lines = [
+    headers.join(","),
+    ...rows.map((row) => headers.map((header) => row[header]).join(",")),
+  ];
+  fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
+}
+
 function renderMarkdown(summary) {
   const lines = [
     "# Custom-Pattern First-Window Smoke Validation",
@@ -642,14 +722,29 @@ function renderMarkdown(summary) {
     `Input root: \`${summary.inputRoot}\``,
     `Patterns: \`${summary.patterns.join(",")}\``,
     `Approaches: \`${summary.approaches.join(",")}\``,
+    `Iterations: \`${summary.iterations.join(",")}\``,
     "",
-    "| Pattern | Approach | Complete window | Window-close latency (ms) | Average CPU (%) | Peak RSS (MiB) | Result | Exact vs Fetching | Absolute error |",
-    "| ------- | -------- | --------------: | ------------------------: | -------------- | --------------: | -------------: | -----: | ----------------: | -------------: |",
+    "## Per-Iteration Results",
+    "",
+    "| Pattern | Iteration | Approach | Complete window | Window-close latency (ms) | Latency source | Average CPU (%) | Peak RSS (MiB) | Result | Exact vs Fetching | Absolute error |",
+    "| ------- | --------: | -------- | --------------: | ------------------------: | -------------- | ---------------: | -------------: | -----: | ----------------: | -------------: |",
   ];
 
   for (const row of summary.tableRows) {
     lines.push(
-      `| ${row.Pattern} | ${row.Approach} | ${row["Complete window"]} | ${row["Window-close latency (ms)"]} | ${row["Latency source"]} | ${row["Average CPU (%)"]} | ${row["Peak RSS (MiB)"]} | ${row.Result} | ${row["Exact vs Fetching"]} | ${row["Absolute error"]} |`,
+      `| ${row.Pattern} | ${row.Iteration} | ${row.Approach} | ${row["Complete window"]} | ${row["Window-close latency (ms)"]} | ${row["Latency source"]} | ${row["Average CPU (%)"]} | ${row["Peak RSS (MiB)"]} | ${row.Result} | ${row["Exact vs Fetching"]} | ${row["Absolute error"]} |`,
+    );
+  }
+
+  lines.push("");
+  lines.push("## Aggregated Summary");
+  lines.push("");
+  lines.push("| Pattern | Approach | Complete windows | Median window-close latency (ms) | Median average CPU (%) | Median peak RSS (MiB) | Exact vs Fetching | MAE |");
+  lines.push("| ------- | -------- | ----------------: | --------------------------------: | ---------------------: | --------------------: | ----------------: | --: |");
+
+  for (const row of summary.aggregatedTableRows) {
+    lines.push(
+      `| ${row.Pattern} | ${row.Approach} | ${row["Complete windows"]} | ${row["Median window-close latency (ms)"]} | ${row["Median average CPU (%)"]} | ${row["Median peak RSS (MiB)"]} | ${row["Exact vs Fetching"]} | ${row.MAE} |`,
     );
   }
 
@@ -676,17 +771,19 @@ function renderMarkdown(summary) {
 }
 
 function summarizeSmokeValidation(args) {
-  const patternResults = args.patterns.map((pattern) =>
-    validatePattern(args.inputRoot, pattern, args.iterations[0] || 1),
+  const iterations = sortNumeric(args.iterations);
+  const patternResults = args.patterns.flatMap((pattern) =>
+    iterations.map((iteration) => validatePattern(args.inputRoot, pattern, iteration, args.approaches)),
   );
   const failures = patternResults.flatMap((result) =>
-    result.failures.map((failure) => `${result.pattern}: ${failure}`),
+    result.failures.map((failure) => `${result.pattern} iteration ${result.iteration}: ${failure}`),
   );
   const warnings = patternResults.flatMap((result) =>
-    result.warnings.map((warning) => `${result.pattern}: ${warning}`),
+    result.warnings.map((warning) => `${result.pattern} iteration ${result.iteration}: ${warning}`),
   );
 
   const tableRows = buildTableRows(patternResults, args.approaches);
+  const aggregatedTableRows = buildAggregatedRows(patternResults, args.approaches, iterations);
 
   return {
     timestamp: new Date().toISOString(),
@@ -694,12 +791,13 @@ function summarizeSmokeValidation(args) {
     outputDir: args.outputDir,
     patterns: args.patterns,
     approaches: args.approaches,
-    iterations: args.iterations,
+    iterations,
     status: failures.length === 0 ? "pass" : "fail",
     failures,
     warnings,
     patternResults,
     tableRows,
+    aggregatedTableRows,
   };
 }
 
@@ -710,15 +808,18 @@ function main() {
   const summary = summarizeSmokeValidation(args);
   const jsonPath = path.join(args.outputDir, "summary.json");
   const csvPath = path.join(args.outputDir, "summary.csv");
+  const aggregatedCsvPath = path.join(args.outputDir, "summary.aggregated.csv");
   const mdPath = path.join(args.outputDir, "summary.md");
 
   fs.writeFileSync(jsonPath, `${JSON.stringify(summary, null, 2)}\n`);
   writeCsv(csvPath, summary.tableRows);
+  writeAggregatedCsv(aggregatedCsvPath, summary.aggregatedTableRows);
   fs.writeFileSync(mdPath, renderMarkdown(summary));
 
   console.log(`Smoke validation ${summary.status === "pass" ? "passed" : "failed"}.`);
   console.log(`Summary JSON: ${jsonPath}`);
   console.log(`Summary CSV: ${csvPath}`);
+  console.log(`Summary aggregated CSV: ${aggregatedCsvPath}`);
   console.log(`Summary MD: ${mdPath}`);
 
   if (summary.status !== "pass") {
@@ -734,6 +835,7 @@ module.exports = {
   parseArgs,
   readApproachRow,
   readFirstRawInputPublishTime,
+  renderMarkdown,
   summarizeSmokeValidation,
   validatePattern,
 };
