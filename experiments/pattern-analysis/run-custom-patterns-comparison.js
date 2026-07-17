@@ -3,7 +3,8 @@
 /**
  * Custom Pattern Analysis - All Approaches
  *
- * Tests all three approaches (Fetching, Approximation, Chunked) across 5 custom patterns:
+ * Tests all three approaches (Fetching, Approximation, Chunked) across representative
+ * and stress custom patterns.
  * 1. Low Variability (μ=-23.0, σ=0.25)
  * 2. Step Pattern (v1=-23.0, v2=-15.0, t_step=60s)
  * 3. Spike Pattern (v_base=-23.0, v_spike=-5.0, Δt=1.25s)
@@ -47,6 +48,15 @@ const ALL_PATTERN_TYPES = [
   "spike_pattern",
   "low_freq_oscillation",
   "high_freq_oscillation",
+  "spike_boundary_short",
+  "spike_boundary_medium",
+  "spike_asymmetric_long",
+  "late_burst",
+  "multiple_bursts",
+  "step_misaligned_45",
+  "step_misaligned_75",
+  "linear_ramp",
+  "asymmetric_activity",
 ];
 const ALL_APPROACHES = [
   "fetching",
@@ -551,6 +561,51 @@ class CustomPatternComparisonRunner {
         type: "high_freq_oscillation",
         name: "High Freq. Oscillation",
         params: "μ=-23.0, A=3.0, f=0.5Hz",
+      },
+      {
+        type: "spike_boundary_short",
+        name: "Spike Boundary Short",
+        params: "baseline=-23.0, spike=-5.0, start=59s, duration=4s",
+      },
+      {
+        type: "spike_boundary_medium",
+        name: "Spike Boundary Medium",
+        params: "baseline=-23.0, spike=-5.0, start=55s, duration=10s",
+      },
+      {
+        type: "spike_asymmetric_long",
+        name: "Spike Asymmetric Long",
+        params: "baseline=-23.0, spike=-5.0, start=50s, duration=20s",
+      },
+      {
+        type: "late_burst",
+        name: "Late Burst",
+        params: "baseline=-23.0, burst=-5.0, start=85s, duration=20s",
+      },
+      {
+        type: "multiple_bursts",
+        name: "Multiple Bursts",
+        params: "baseline=-23.0, burst=-5.0, bursts=25-35s and 85-95s",
+      },
+      {
+        type: "step_misaligned_45",
+        name: "Step Misaligned 45",
+        params: "v₁=-23.0, v₂=-15.0, t_step=45s",
+      },
+      {
+        type: "step_misaligned_75",
+        name: "Step Misaligned 75",
+        params: "v₁=-23.0, v₂=-15.0, t_step=75s",
+      },
+      {
+        type: "linear_ramp",
+        name: "Linear Ramp",
+        params: "start=-23.0, end=-11.0, duration=120s",
+      },
+      {
+        type: "asymmetric_activity",
+        name: "Asymmetric Activity",
+        params: "0-40:-23.0, 40-55:-8.0, 55-95:-23.0, 95-120:-15.0",
       },
     ];
     this.selectedPatternTypes = Array.isArray(options.patternTypes) && options.patternTypes.length > 0

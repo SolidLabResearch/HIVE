@@ -2,6 +2,9 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  EXACT_AGGREGATE_ABSOLUTE_TOLERANCE,
+} = require("../accuracy/accuracy-comparison-custom-patterns.js");
 const { spawnSync } = require("child_process");
 const { parse } = require("csv-parse/sync");
 
@@ -378,7 +381,7 @@ function computeAccuracySummary(baselineIterations, candidateIterations) {
     maeStd: sampleStd(perIteration.map((row) => row.mae)),
     rmseStd: sampleStd(perIteration.map((row) => row.rmse)),
     mapeStd: sampleStd(perIteration.map((row) => row.mape)),
-    exactAgainstFetching: allAbsoluteErrors.every((value) => Math.abs(value) <= Number.EPSILON),
+    exactAgainstFetching: allAbsoluteErrors.every((value) => Math.abs(value) <= EXACT_AGGREGATE_ABSOLUTE_TOLERANCE),
   };
 }
 

@@ -12,6 +12,15 @@ const DEFAULT_PATTERNS = [
   "spike_pattern",
   "low_freq_oscillation",
   "high_freq_oscillation",
+  "spike_boundary_short",
+  "spike_boundary_medium",
+  "spike_asymmetric_long",
+  "late_burst",
+  "multiple_bursts",
+  "step_misaligned_45",
+  "step_misaligned_75",
+  "linear_ramp",
+  "asymmetric_activity",
 ];
 const FILE_MAP = {
   fetching: {

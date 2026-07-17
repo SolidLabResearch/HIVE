@@ -9,7 +9,10 @@ const {
   normalizeLatencyRows,
   summarizeProcessTreeMetrics,
 } = require("../../experiments/real-data-comparison/run-real-data-4-approaches.js");
-const { compareResults } = require("../accuracy/accuracy-comparison-custom-patterns.js");
+const {
+  compareResults,
+  EXACT_AGGREGATE_ABSOLUTE_TOLERANCE,
+} = require("../accuracy/accuracy-comparison-custom-patterns.js");
 
 const SELECTED_APPROACHES = ["fetching", "approximation", "chunked"];
 const MODE_DEFAULTS = {
@@ -341,7 +344,7 @@ function computeAccuracy(baselineRows, candidateRows) {
     mape: comparison.mape,
     mapeApplicableWindowCount: comparison.mapeApplicableWindowCount,
     maxAbsoluteError: absoluteErrors.length > 0 ? Math.max(...absoluteErrors) : null,
-    exactAgainstFetching: absoluteErrors.every((value) => Math.abs(value) <= Number.EPSILON),
+    exactAgainstFetching: absoluteErrors.every((value) => Math.abs(value) <= EXACT_AGGREGATE_ABSOLUTE_TOLERANCE),
   };
 }
 

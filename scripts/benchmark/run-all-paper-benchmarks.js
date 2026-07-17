@@ -22,6 +22,15 @@ const PATTERN_DIR_MAP = {
   spike_pattern: "spike",
   low_freq_oscillation: "low-frequency-oscillation",
   high_freq_oscillation: "high-frequency-oscillation",
+  spike_boundary_short: "spike-boundary-short",
+  spike_boundary_medium: "spike-boundary-medium",
+  spike_asymmetric_long: "spike-asymmetric-long",
+  late_burst: "late-burst",
+  multiple_bursts: "multiple-bursts",
+  step_misaligned_45: "step-misaligned-45",
+  step_misaligned_75: "step-misaligned-75",
+  linear_ramp: "linear-ramp",
+  asymmetric_activity: "asymmetric-activity",
 };
 
 const VALID_SUITES = [

@@ -218,6 +218,48 @@ describe("real-data 3-approach report helper", () => {
     }
   });
 
+  test("startup-cost mode treats chunked as exact when only floating-point round-off differs from fetching", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-helper-startup-roundoff-"));
+
+    try {
+      writeIteration(tempRoot, "fetching", 1, {
+        windowNumbers: [1],
+        resultEmittedAtByWindow: { 1: 121500 },
+        closeToResultMsByWindow: { 1: 500 },
+      });
+      writeIteration(tempRoot, "approximation", 1, {
+        windowNumbers: [1],
+        resultEmittedAtByWindow: { 1: 121550 },
+        closeToResultMsByWindow: { 1: 550 },
+        valueOffset: 1,
+      });
+      writeIteration(tempRoot, "chunked", 1, {
+        windowNumbers: [1],
+        resultEmittedAtByWindow: { 1: 121500 },
+        closeToResultMsByWindow: { 1: 500 },
+      });
+
+      const fetchingLatencyPath = path.join(tempRoot, "fetching", "iteration1", APPROACHES.find((entry) => entry.name === "fetching").logFiles.latency);
+      const chunkedLatencyPath = path.join(tempRoot, "chunked", "iteration1", APPROACHES.find((entry) => entry.name === "chunked").logFiles.latency);
+      const fetchingCsv = fs.readFileSync(fetchingLatencyPath, "utf8").replace("10\n", "10.00000000000001\n");
+      const chunkedCsv = fs.readFileSync(chunkedLatencyPath, "utf8").replace("10\n", "10\n");
+      fs.writeFileSync(fetchingLatencyPath, fetchingCsv);
+      fs.writeFileSync(chunkedLatencyPath, chunkedCsv);
+
+      const result = analyzeRealDataResults({
+        mode: "startup-cost",
+        inputRoot: tempRoot,
+        expectedIterations: 1,
+        targetWindows: 1,
+      });
+
+      expect(result.errors).toEqual([]);
+      expect(result.accuracyRows.find((row) => row.approach === "chunked").exactAgainstFetching).toBe(true);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   test("startup-first-emitted mode passes when all approaches have a startup-valid first row even if one iteration only reaches windows 1,2,3", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "real-data-helper-first-emitted-partial-"));
 

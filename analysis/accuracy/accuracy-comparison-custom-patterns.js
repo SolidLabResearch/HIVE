@@ -32,6 +32,15 @@ const ALL_PATTERNS = [
   { type: "spike_pattern", name: "Spike Pattern" },
   { type: "low_freq_oscillation", name: "Low Freq. Oscillation" },
   { type: "high_freq_oscillation", name: "High Freq. Oscillation" },
+  { type: "spike_boundary_short", name: "Spike Boundary Short" },
+  { type: "spike_boundary_medium", name: "Spike Boundary Medium" },
+  { type: "spike_asymmetric_long", name: "Spike Asymmetric Long" },
+  { type: "late_burst", name: "Late Burst" },
+  { type: "multiple_bursts", name: "Multiple Bursts" },
+  { type: "step_misaligned_45", name: "Step Misaligned 45" },
+  { type: "step_misaligned_75", name: "Step Misaligned 75" },
+  { type: "linear_ramp", name: "Linear Ramp" },
+  { type: "asymmetric_activity", name: "Asymmetric Activity" },
 ];
 
 const SMOKE_PATTERNS = [ALL_PATTERNS[0]];
@@ -39,6 +48,8 @@ const FULL_REQUIRED_APPROACHES = ["fetching", "approximation", "chunked"];
 const FULL_OPTIONAL_APPROACHES = ["naive_distributed"];
 const SMOKE_REQUIRED_APPROACHES = ["fetching", "approximation"];
 const SMOKE_OPTIONAL_APPROACHES = ["chunked", "naive_distributed"];
+const EXACT_AGGREGATE_ABSOLUTE_TOLERANCE = 1e-12;
+const EXACT_AGGREGATE_COMPARISON_METHOD = "absolute_tolerance";
 
 function parseSelectionList(value, allowedValues) {
   if (!value) {
@@ -656,19 +667,38 @@ function compareResults(baselineResults, approachResults, options = {}) {
   let sumSquaredError = 0;
   let sumPercentageError = 0;
   let mapeApplicableWindowCount = 0;
+  let exactMatchCount = 0;
+  const matchedComparisons = [];
 
   for (const windowKey of matchedWindowKeys) {
     const baseline = baselineByWindow.get(windowKey).resultValue;
     const approach = approachByWindow.get(windowKey).resultValue;
-    const absoluteError = Math.abs(approach - baseline);
+    const comparison = compareAggregateResultEquivalence(approach, baseline);
+    const absoluteError = comparison.rawAbsoluteError;
 
-    sumAbsoluteError += absoluteError;
-    sumSquaredError += absoluteError ** 2;
+    if (Number.isFinite(absoluteError)) {
+      sumAbsoluteError += absoluteError;
+      sumSquaredError += absoluteError ** 2;
+    }
 
     if (Math.abs(baseline) > Number.EPSILON) {
       sumPercentageError += (absoluteError / Math.abs(baseline)) * 100;
       mapeApplicableWindowCount += 1;
     }
+
+    if (comparison.exactAgreement) {
+      exactMatchCount += 1;
+    }
+
+    matchedComparisons.push({
+      windowKey,
+      referenceResult: comparison.referenceResult,
+      producedResult: comparison.producedResult,
+      rawAbsoluteError: comparison.rawAbsoluteError,
+      exactAgreement: comparison.exactAgreement,
+      comparisonTolerance: comparison.comparisonTolerance,
+      comparisonMethod: comparison.comparisonMethod,
+    });
   }
 
   const matchedWindowCount = matchedWindowKeys.length;
@@ -686,9 +716,34 @@ function compareResults(baselineResults, approachResults, options = {}) {
       mapeApplicableWindowCount > 0
         ? sumPercentageError / mapeApplicableWindowCount
         : null,
+    exactMatchCount,
+    exactAgainstBaseline: matchedWindowCount > 0 && exactMatchCount === matchedWindowCount,
+    comparisonTolerance: EXACT_AGGREGATE_ABSOLUTE_TOLERANCE,
+    comparisonMethod: EXACT_AGGREGATE_COMPARISON_METHOD,
+    matchedComparisons,
     methodologyLabel,
     baselineResultCount: filteredBaseline.length,
     approachResultCount: filteredApproach.length,
+  };
+}
+
+function compareAggregateResultEquivalence(producedResult, referenceResult, absoluteTolerance = EXACT_AGGREGATE_ABSOLUTE_TOLERANCE) {
+  const producedFinite = Number.isFinite(producedResult);
+  const referenceFinite = Number.isFinite(referenceResult);
+  const rawAbsoluteError = producedFinite && referenceFinite
+    ? Math.abs(producedResult - referenceResult)
+    : null;
+
+  return {
+    referenceResult,
+    producedResult,
+    rawAbsoluteError,
+    exactAgreement: producedFinite
+      && referenceFinite
+      && Number.isFinite(rawAbsoluteError)
+      && rawAbsoluteError <= absoluteTolerance,
+    comparisonTolerance: absoluteTolerance,
+    comparisonMethod: EXACT_AGGREGATE_COMPARISON_METHOD,
   };
 }
 
@@ -1512,5 +1567,8 @@ if (require.main === module) {
 } else {
   module.exports = {
     compareResults,
+    compareAggregateResultEquivalence,
+    EXACT_AGGREGATE_ABSOLUTE_TOLERANCE,
+    EXACT_AGGREGATE_COMPARISON_METHOD,
   };
 }

@@ -3,12 +3,23 @@
 /**
  * Generate Custom Stream Patterns for Experimentation
  *
- * Patterns:
+ * Representative patterns:
  * 1. Low Variability: μ=-23.0, σ=0.25
  * 2. Step Pattern: v1=-23.0, v2=-15.0, t_step=60s
  * 3. Spike Pattern: v_base=-23.0, v_spike=-5.0, Δt=1.25s
  * 4. Low Freq. Oscillation: μ=-23.0, A=5.0, f=0.05Hz
  * 5. High Freq. Oscillation: μ=-23.0, A=3.0, f=0.5Hz
+ *
+ * Stress patterns:
+ * 6. spike_boundary_short
+ * 7. spike_boundary_medium
+ * 8. spike_asymmetric_long
+ * 9. late_burst
+ * 10. multiple_bursts
+ * 11. step_misaligned_45
+ * 12. step_misaligned_75
+ * 13. linear_ramp
+ * 14. asymmetric_activity
  *
  * Duration: 2 minutes (120 seconds)
  * Sampling Rate: 4 Hz (250ms interval)
@@ -23,6 +34,7 @@ const DURATION_SECONDS = 120;
 const SAMPLING_RATE_HZ = 4;
 const INTERVAL_MS = 1000 / SAMPLING_RATE_HZ;
 const TOTAL_POINTS = DURATION_SECONDS * SAMPLING_RATE_HZ;
+const LAST_TIMESTAMP_MS = (TOTAL_POINTS - 1) * INTERVAL_MS;
 
 // Pattern configurations
 const PATTERNS = {
@@ -51,16 +63,186 @@ const PATTERNS = {
     description: "High Frequency Oscillation",
     params: { mu: -23.0, A: 3.0, f: 0.5 },
   },
+  spike_boundary_short: {
+    name: "spike_boundary_short",
+    description: "Spike Boundary Short",
+    params: { baseline: -23.0, spike: -5.0, start: 59, duration: 4 },
+  },
+  spike_boundary_medium: {
+    name: "spike_boundary_medium",
+    description: "Spike Boundary Medium",
+    params: { baseline: -23.0, spike: -5.0, start: 55, duration: 10 },
+  },
+  spike_asymmetric_long: {
+    name: "spike_asymmetric_long",
+    description: "Spike Asymmetric Long",
+    params: { baseline: -23.0, spike: -5.0, start: 50, duration: 20 },
+  },
+  late_burst: {
+    name: "late_burst",
+    description: "Late Burst",
+    params: { baseline: -23.0, burst: -5.0, start: 85, duration: 20 },
+  },
+  multiple_bursts: {
+    name: "multiple_bursts",
+    description: "Multiple Bursts",
+    params: {
+      baseline: -23.0,
+      burst: -5.0,
+      bursts: [
+        { start: 25, duration: 10 },
+        { start: 85, duration: 10 },
+      ],
+    },
+  },
+  step_misaligned_45: {
+    name: "step_misaligned_45",
+    description: "Step Misaligned 45",
+    params: { v1: -23.0, v2: -15.0, t_step: 45 },
+  },
+  step_misaligned_75: {
+    name: "step_misaligned_75",
+    description: "Step Misaligned 75",
+    params: { v1: -23.0, v2: -15.0, t_step: 75 },
+  },
+  linear_ramp: {
+    name: "linear_ramp",
+    description: "Linear Ramp",
+    params: { start_value: -23.0, end_value: -11.0 },
+  },
+  asymmetric_activity: {
+    name: "asymmetric_activity",
+    description: "Asymmetric Activity",
+    params: {
+      segments: [
+        { start: 0, end: 40, value: -23.0 },
+        { start: 40, end: 55, value: -8.0 },
+        { start: 55, end: 95, value: -23.0 },
+        { start: 95, end: 120, value: -15.0 },
+      ],
+    },
+  },
 };
+
+const REPRESENTATIVE_PATTERN_ORDER = [
+  "low_variability",
+  "step_pattern",
+  "spike_pattern",
+  "low_freq_oscillation",
+  "high_freq_oscillation",
+];
+
+const STRESS_PATTERN_ORDER = [
+  "spike_boundary_short",
+  "spike_boundary_medium",
+  "spike_asymmetric_long",
+  "late_burst",
+  "multiple_bursts",
+  "step_misaligned_45",
+  "step_misaligned_75",
+  "linear_ramp",
+  "asymmetric_activity",
+];
+
+const ALL_PATTERN_ORDER = [
+  ...REPRESENTATIVE_PATTERN_ORDER,
+  ...STRESS_PATTERN_ORDER,
+];
+
+function parseArgs(argv) {
+  const args = {
+    seed: null,
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = argv[index + 1];
+
+    if (arg === "--seed") {
+      if (!next) {
+        throw new Error("--seed requires a value");
+      }
+      args.seed = normalizeSeed(next);
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      printHelp();
+      process.exit(0);
+    }
+
+    throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  return args;
+}
+
+function printHelp() {
+  console.log(`Usage: node scripts/generate-custom-patterns.js [options]
+
+Options:
+  --seed <n>   Fixed seed for reproducible low-variability generation
+  --help       Show this help
+`);
+}
+
+function normalizeSeed(value) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid seed: ${value}`);
+  }
+  return parsed >>> 0;
+}
+
+function createSeededRandom(seed) {
+  let state = seed >>> 0;
+  return function seededRandom() {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function createRandomSource(seed) {
+  if (!Number.isFinite(seed)) {
+    return {
+      seed: null,
+      source: "math_random",
+      next: () => Math.random(),
+    };
+  }
+
+  return {
+    seed,
+    source: "seeded_mulberry32",
+    next: createSeededRandom(seed),
+  };
+}
+
+function buildTimeSeries(valueFn) {
+  const data = [];
+  for (let index = 0; index < TOTAL_POINTS; index += 1) {
+    const timestamp = index * INTERVAL_MS;
+    const tSeconds = timestamp / 1000;
+    data.push({ timestamp, value: valueFn({ index, timestamp, tSeconds }) });
+  }
+  return data;
+}
+
+function isWithinInterval(tSeconds, start, duration) {
+  return tSeconds >= start && tSeconds < (start + duration);
+}
 
 /**
  * Box-Muller transform for generating normally distributed random numbers
  */
-function gaussianRandom(mean = 0, stdDev = 1) {
+function gaussianRandom(mean = 0, stdDev = 1, randomFn = Math.random) {
   let u1 = 0,
     u2 = 0;
-  while (u1 === 0) u1 = Math.random();
-  while (u2 === 0) u2 = Math.random();
+  while (u1 === 0) u1 = randomFn();
+  while (u2 === 0) u2 = randomFn();
 
   const z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
   return z0 * stdDev + mean;
@@ -70,17 +252,9 @@ function gaussianRandom(mean = 0, stdDev = 1) {
  * Generate Low Variability Pattern
  * Gaussian noise around mean: v(t) = N(μ, σ²)
  */
-function generateLowVariability(params) {
+function generateLowVariability(params, randomFn = Math.random) {
   const { mu, sigma } = params;
-  const data = [];
-
-  for (let i = 0; i < TOTAL_POINTS; i++) {
-    const timestamp = i * INTERVAL_MS;
-    const value = gaussianRandom(mu, sigma);
-    data.push({ timestamp, value });
-  }
-
-  return data;
+  return buildTimeSeries(() => gaussianRandom(mu, sigma, randomFn));
 }
 
 /**
@@ -89,16 +263,7 @@ function generateLowVariability(params) {
  */
 function generateStepPattern(params) {
   const { v1, v2, t_step } = params;
-  const data = [];
-
-  for (let i = 0; i < TOTAL_POINTS; i++) {
-    const timestamp = i * INTERVAL_MS;
-    const t_seconds = timestamp / 1000;
-    const value = t_seconds < t_step ? v1 : v2;
-    data.push({ timestamp, value });
-  }
-
-  return data;
+  return buildTimeSeries(({ tSeconds }) => (tSeconds < t_step ? v1 : v2));
 }
 
 /**
@@ -107,19 +272,11 @@ function generateStepPattern(params) {
  */
 function generateSpikePattern(params) {
   const { v_base, v_spike, delta_t } = params;
-  const data = [];
   const t_center = DURATION_SECONDS / 2; // Spike at 60 seconds
   const half_delta = delta_t / 2;
-
-  for (let i = 0; i < TOTAL_POINTS; i++) {
-    const timestamp = i * INTERVAL_MS;
-    const t_seconds = timestamp / 1000;
-    const inSpikeWindow = Math.abs(t_seconds - t_center) < half_delta;
-    const value = inSpikeWindow ? v_spike : v_base;
-    data.push({ timestamp, value });
-  }
-
-  return data;
+  return buildTimeSeries(({ tSeconds }) => (
+    Math.abs(tSeconds - t_center) < half_delta ? v_spike : v_base
+  ));
 }
 
 /**
@@ -128,16 +285,7 @@ function generateSpikePattern(params) {
  */
 function generateLowFreqOscillation(params) {
   const { mu, A, f } = params;
-  const data = [];
-
-  for (let i = 0; i < TOTAL_POINTS; i++) {
-    const timestamp = i * INTERVAL_MS;
-    const t_seconds = timestamp / 1000;
-    const value = mu + A * Math.sin(2 * Math.PI * f * t_seconds);
-    data.push({ timestamp, value });
-  }
-
-  return data;
+  return buildTimeSeries(({ tSeconds }) => mu + A * Math.sin(2 * Math.PI * f * tSeconds));
 }
 
 /**
@@ -146,16 +294,44 @@ function generateLowFreqOscillation(params) {
  */
 function generateHighFreqOscillation(params) {
   const { mu, A, f } = params;
-  const data = [];
+  return buildTimeSeries(({ tSeconds }) => mu + A * Math.sin(2 * Math.PI * f * tSeconds));
+}
 
-  for (let i = 0; i < TOTAL_POINTS; i++) {
-    const timestamp = i * INTERVAL_MS;
-    const t_seconds = timestamp / 1000;
-    const value = mu + A * Math.sin(2 * Math.PI * f * t_seconds);
-    data.push({ timestamp, value });
-  }
+function generateTimedBurstPattern(params) {
+  const { baseline, spike, burst, start, duration } = params;
+  const eventValue = spike ?? burst;
+  return buildTimeSeries(({ tSeconds }) => (
+    isWithinInterval(tSeconds, start, duration) ? eventValue : baseline
+  ));
+}
 
-  return data;
+function generateMultipleBurstsPattern(params) {
+  const { baseline, burst, bursts } = params;
+  return buildTimeSeries(({ tSeconds }) => (
+    bursts.some(({ start, duration }) => isWithinInterval(tSeconds, start, duration))
+      ? burst
+      : baseline
+  ));
+}
+
+function generateLinearRampPattern(params) {
+  const { start_value, end_value } = params;
+  const denominator = LAST_TIMESTAMP_MS === 0 ? 1 : LAST_TIMESTAMP_MS;
+  return buildTimeSeries(({ timestamp }) => {
+    const progress = timestamp / denominator;
+    return start_value + ((end_value - start_value) * progress);
+  });
+}
+
+function generateSegmentPattern(params) {
+  const { segments } = params;
+  return buildTimeSeries(({ tSeconds }) => {
+    const segment = segments.find(({ start, end }) => tSeconds >= start && tSeconds < end);
+    if (!segment) {
+      throw new Error(`No segment configured for t=${tSeconds}`);
+    }
+    return segment.value;
+  });
 }
 
 /**
@@ -205,7 +381,7 @@ function toNTriples(data, sensorType) {
 /**
  * Save pattern data to file
  */
-function savePattern(patternName, data) {
+function savePattern(patternName, data, generationConfig = {}) {
   const baseDir = path.join(
     "src",
     "streamer",
@@ -237,6 +413,8 @@ function savePattern(patternName, data) {
     duration_seconds: DURATION_SECONDS,
     sampling_rate_hz: SAMPLING_RATE_HZ,
     total_points: TOTAL_POINTS,
+    random_seed: generationConfig.seed ?? null,
+    random_source: generationConfig.source || "math_random",
     generated_at: new Date().toISOString(),
   };
   fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
@@ -275,7 +453,10 @@ function printStatistics(patternName, data) {
 /**
  * Generate all patterns
  */
-function generateAllPatterns() {
+function generateAllPatterns(options = {}) {
+  const generationConfig = createRandomSource(
+    Number.isFinite(options.seed) ? options.seed : null,
+  );
   console.log("=".repeat(80));
   console.log("GENERATING CUSTOM STREAM PATTERNS");
   console.log("=".repeat(80));
@@ -284,52 +465,125 @@ function generateAllPatterns() {
     `Sampling Rate: ${SAMPLING_RATE_HZ} Hz (${INTERVAL_MS}ms interval)`,
   );
   console.log(`Total Points: ${TOTAL_POINTS}`);
+  console.log(
+    `Random source: ${generationConfig.source}${generationConfig.seed !== null ? ` (seed=${generationConfig.seed})` : ""}`,
+  );
   console.log("=".repeat(80));
 
-  // 1. Low Variability
-  console.log("\n1. Low Variability (μ=-23.0, σ=0.25)");
-  const lowVar = generateLowVariability(PATTERNS.low_variability.params);
-  printStatistics("low_variability", lowVar);
-  savePattern("low_variability", lowVar);
+  const patternPlans = [
+    {
+      ordinal: 1,
+      title: "Low Variability (μ=-23.0, σ=0.25)",
+      key: "low_variability",
+      generator: () => generateLowVariability(PATTERNS.low_variability.params, generationConfig.next),
+    },
+    {
+      ordinal: 2,
+      title: "Step Pattern (v1=-23.0, v2=-15.0, t_step=60s)",
+      key: "step_pattern",
+      generator: () => generateStepPattern(PATTERNS.step_pattern.params),
+    },
+    {
+      ordinal: 3,
+      title: "Spike Pattern (v_base=-23.0, v_spike=-5.0, Δt=1.25s)",
+      key: "spike_pattern",
+      generator: () => generateSpikePattern(PATTERNS.spike_pattern.params),
+    },
+    {
+      ordinal: 4,
+      title: "Low Frequency Oscillation (μ=-23.0, A=5.0, f=0.05Hz)",
+      key: "low_freq_oscillation",
+      generator: () => generateLowFreqOscillation(PATTERNS.low_freq_oscillation.params),
+    },
+    {
+      ordinal: 5,
+      title: "High Frequency Oscillation (μ=-23.0, A=3.0, f=0.5Hz)",
+      key: "high_freq_oscillation",
+      generator: () => generateHighFreqOscillation(PATTERNS.high_freq_oscillation.params),
+    },
+    {
+      ordinal: 6,
+      title: "Spike Boundary Short (baseline=-23.0, spike=-5.0, start=59s, duration=4s)",
+      key: "spike_boundary_short",
+      generator: () => generateTimedBurstPattern(PATTERNS.spike_boundary_short.params),
+    },
+    {
+      ordinal: 7,
+      title: "Spike Boundary Medium (baseline=-23.0, spike=-5.0, start=55s, duration=10s)",
+      key: "spike_boundary_medium",
+      generator: () => generateTimedBurstPattern(PATTERNS.spike_boundary_medium.params),
+    },
+    {
+      ordinal: 8,
+      title: "Spike Asymmetric Long (baseline=-23.0, spike=-5.0, start=50s, duration=20s)",
+      key: "spike_asymmetric_long",
+      generator: () => generateTimedBurstPattern(PATTERNS.spike_asymmetric_long.params),
+    },
+    {
+      ordinal: 9,
+      title: "Late Burst (baseline=-23.0, burst=-5.0, start=85s, duration=20s)",
+      key: "late_burst",
+      generator: () => generateTimedBurstPattern(PATTERNS.late_burst.params),
+    },
+    {
+      ordinal: 10,
+      title: "Multiple Bursts (baseline=-23.0, burst=-5.0, 25-35s and 85-95s)",
+      key: "multiple_bursts",
+      generator: () => generateMultipleBurstsPattern(PATTERNS.multiple_bursts.params),
+    },
+    {
+      ordinal: 11,
+      title: "Step Misaligned 45 (v1=-23.0, v2=-15.0, t_step=45s)",
+      key: "step_misaligned_45",
+      generator: () => generateStepPattern(PATTERNS.step_misaligned_45.params),
+    },
+    {
+      ordinal: 12,
+      title: "Step Misaligned 75 (v1=-23.0, v2=-15.0, t_step=75s)",
+      key: "step_misaligned_75",
+      generator: () => generateStepPattern(PATTERNS.step_misaligned_75.params),
+    },
+    {
+      ordinal: 13,
+      title: "Linear Ramp (start=-23.0, end=-11.0, full 120s)",
+      key: "linear_ramp",
+      generator: () => generateLinearRampPattern(PATTERNS.linear_ramp.params),
+    },
+    {
+      ordinal: 14,
+      title: "Asymmetric Activity (0-40:-23, 40-55:-8, 55-95:-23, 95-120:-15)",
+      key: "asymmetric_activity",
+      generator: () => generateSegmentPattern(PATTERNS.asymmetric_activity.params),
+    },
+  ];
 
-  // 2. Step Pattern
-  console.log("\n2. Step Pattern (v1=-23.0, v2=-15.0, t_step=60s)");
-  const step = generateStepPattern(PATTERNS.step_pattern.params);
-  printStatistics("step_pattern", step);
-  savePattern("step_pattern", step);
-
-  // 3. Spike Pattern
-  console.log("\n3. Spike Pattern (v_base=-23.0, v_spike=-5.0, Δt=1.25s)");
-  const spike = generateSpikePattern(PATTERNS.spike_pattern.params);
-  printStatistics("spike_pattern", spike);
-  savePattern("spike_pattern", spike);
-
-  // 4. Low Frequency Oscillation
-  console.log("\n4. Low Frequency Oscillation (μ=-23.0, A=5.0, f=0.05Hz)");
-  const lowFreq = generateLowFreqOscillation(
-    PATTERNS.low_freq_oscillation.params,
-  );
-  printStatistics("low_freq_oscillation", lowFreq);
-  savePattern("low_freq_oscillation", lowFreq);
-
-  // 5. High Frequency Oscillation
-  console.log("\n5. High Frequency Oscillation (μ=-23.0, A=3.0, f=0.5Hz)");
-  const highFreq = generateHighFreqOscillation(
-    PATTERNS.high_freq_oscillation.params,
-  );
-  printStatistics("high_freq_oscillation", highFreq);
-  savePattern("high_freq_oscillation", highFreq);
+  for (const plan of patternPlans) {
+    console.log(`\n${plan.ordinal}. ${plan.title}`);
+    const data = plan.generator();
+    printStatistics(plan.key, data);
+    savePattern(plan.key, data, generationConfig);
+  }
 
   console.log("\n" + "=".repeat(80));
   console.log("✓ ALL PATTERNS GENERATED SUCCESSFULLY");
   console.log("=".repeat(80));
   console.log("\nData saved to: src/streamer/data/custom_patterns/");
-  console.log("\nPattern Summary:");
+  console.log("\nRepresentative Pattern Summary:");
   console.log("  1. low_variability       - Gaussian noise around mean");
   console.log("  2. step_pattern          - Step change at 60s");
   console.log("  3. spike_pattern         - Brief spike at center");
   console.log("  4. low_freq_oscillation  - Slow sinusoidal (0.05 Hz)");
   console.log("  5. high_freq_oscillation - Fast sinusoidal (0.5 Hz)");
+  console.log("\nStress Pattern Summary:");
+  console.log("  6. spike_boundary_short  - 59-63s short spike");
+  console.log("  7. spike_boundary_medium - 55-65s boundary-spanning spike");
+  console.log("  8. spike_asymmetric_long - 50-70s long asymmetric spike");
+  console.log("  9. late_burst            - 85-105s late burst");
+  console.log(" 10. multiple_bursts       - 25-35s and 85-95s bursts");
+  console.log(" 11. step_misaligned_45    - Step at 45s");
+  console.log(" 12. step_misaligned_75    - Step at 75s");
+  console.log(" 13. linear_ramp           - Full-duration linear increase");
+  console.log(" 14. asymmetric_activity   - Two uneven elevated activity regions");
   console.log("\nNext steps:");
   console.log(
     "  node experiments/pattern-analysis/run-custom-patterns-comparison.js",
@@ -339,14 +593,34 @@ function generateAllPatterns() {
 
 // Run generator
 if (require.main === module) {
-  generateAllPatterns();
+  const cliArgs = parseArgs(process.argv.slice(2));
+  generateAllPatterns(cliArgs);
 }
 
 module.exports = {
+  createRandomSource,
+  createSeededRandom,
+  normalizeSeed,
+  parseArgs,
+  gaussianRandom,
+  generateAllPatterns,
   generateLowVariability,
   generateStepPattern,
   generateSpikePattern,
   generateLowFreqOscillation,
   generateHighFreqOscillation,
+  generateTimedBurstPattern,
+  generateMultipleBurstsPattern,
+  generateLinearRampPattern,
+  generateSegmentPattern,
   PATTERNS,
+  REPRESENTATIVE_PATTERN_ORDER,
+  STRESS_PATTERN_ORDER,
+  ALL_PATTERN_ORDER,
+  DURATION_SECONDS,
+  SAMPLING_RATE_HZ,
+  INTERVAL_MS,
+  TOTAL_POINTS,
+  LAST_TIMESTAMP_MS,
+  isWithinInterval,
 };

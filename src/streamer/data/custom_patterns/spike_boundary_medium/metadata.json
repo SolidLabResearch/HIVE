@@ -1,0 +1,16 @@
+{
+  "pattern": "spike_boundary_medium",
+  "description": "Spike Boundary Medium",
+  "parameters": {
+    "baseline": -23,
+    "spike": -5,
+    "start": 55,
+    "duration": 10
+  },
+  "duration_seconds": 120,
+  "sampling_rate_hz": 4,
+  "total_points": 480,
+  "random_seed": 20260716,
+  "random_source": "seeded_mulberry32",
+  "generated_at": "2026-07-17T07:15:56.858Z"
+}
