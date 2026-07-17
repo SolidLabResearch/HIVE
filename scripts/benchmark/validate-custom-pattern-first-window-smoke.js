@@ -43,6 +43,8 @@ const FILES = {
   },
 };
 
+const EXECUTION_SUMMARY_FILE = "custom_pattern_comparison_summary.json";
+
 function parseArgs(argv) {
   const args = {
     inputRoot: path.resolve(process.cwd(), "logs/custom-pattern-comparison"),
@@ -202,6 +204,16 @@ function parseNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function findConfiguredTimeoutMs(executionSummary, approach, pattern, iteration) {
+  const results = Array.isArray(executionSummary?.results) ? executionSummary.results : [];
+  const match = results.find((result) =>
+    result?.approach === approach
+      && result?.pattern === pattern
+      && Number(result?.iteration) === iteration,
+  );
+  return parseNumber(match?.configuredTimeoutMs);
+}
+
 function resolveIterationDir(inputRoot, approach, pattern, iteration) {
   const baseDir = path.join(inputRoot, approach, pattern, `iteration${iteration}`);
   if (!exists(baseDir)) {
@@ -295,7 +307,7 @@ function readApproximationCompleteness(runDir, windowNumber) {
   };
 }
 
-function readApproachRow(runDir, approach) {
+function readApproachRow(runDir, approach, options = {}) {
   const resultsRows = readCsvRows(path.join(runDir, FILES[approach].results));
   const latencyRows = readCsvRows(path.join(runDir, FILES[approach].latency));
   const resourceSummary = readJson(path.join(runDir, "resource_summary.json")) || {};
@@ -313,6 +325,14 @@ function readApproachRow(runDir, approach) {
   const eventWindowEnd = parseNumber(latencyRow?.window_data_close_time)
     ?? parseNumber(latencyRow?.window_end)
     ?? parseNumber(resultRow?.window_end);
+  const configuredTimeoutMs =
+    parseNumber(attemptMetadata.configuredTimeoutMs)
+    ?? findConfiguredTimeoutMs(
+      options.executionSummary,
+      options.approach ?? approach,
+      options.pattern,
+      options.iteration,
+    );
 
   let semanticWindowCloseAt = null;
   if (
@@ -328,6 +348,24 @@ function readApproachRow(runDir, approach) {
     Number.isFinite(windowNumber)
   ) {
     semanticWindowCloseAt = firstRawInputPublishedAt + outputWindowRange + ((windowNumber - 1) * outputWindowStep);
+  }
+
+  let semanticWindowCloseToResultMs = null;
+  let latencyMetricSource = null;
+
+  if (approach === "fetching") {
+    const directLatencyFromWindowCloseMs = parseNumber(latencyRow?.latency_from_window_close_ms);
+    const wallClockWindowDataCloseTime = parseNumber(latencyRow?.window_data_close_time);
+    if (Number.isFinite(directLatencyFromWindowCloseMs)) {
+      semanticWindowCloseToResultMs = directLatencyFromWindowCloseMs;
+      latencyMetricSource = "fetching_latency_log";
+    } else if (Number.isFinite(resultEmittedAt) && Number.isFinite(wallClockWindowDataCloseTime)) {
+      semanticWindowCloseToResultMs = resultEmittedAt - wallClockWindowDataCloseTime;
+      latencyMetricSource = "fetching_latency_log";
+    }
+  } else if (Number.isFinite(semanticWindowCloseAt) && Number.isFinite(resultEmittedAt)) {
+    semanticWindowCloseToResultMs = resultEmittedAt - semanticWindowCloseAt;
+    latencyMetricSource = "semantic_window_metadata";
   }
 
   let completeness;
@@ -352,12 +390,11 @@ function readApproachRow(runDir, approach) {
     resourceSummary,
     capSummary,
     attemptMetadata,
+    configuredTimeoutMs,
     firstRawInputPublishedAt,
     semanticWindowCloseAt,
-    semanticWindowCloseToResultMs:
-      Number.isFinite(semanticWindowCloseAt) && Number.isFinite(resultEmittedAt)
-        ? resultEmittedAt - semanticWindowCloseAt
-        : null,
+    semanticWindowCloseToResultMs,
+    latencyMetricSource,
     windowNumber: Number.isFinite(windowNumber) ? windowNumber : null,
     windowStart: parseNumber(resultRow?.window_start) ?? parseNumber(latencyRow?.window_start),
     windowEnd: parseNumber(resultRow?.window_end) ?? parseNumber(latencyRow?.window_end),
@@ -377,6 +414,7 @@ function validatePattern(inputRoot, pattern, iteration) {
   const perApproach = {};
   const warnings = [];
   const failures = [];
+  const executionSummary = readJson(path.join(inputRoot, EXECUTION_SUMMARY_FILE));
 
   for (const approach of DEFAULT_APPROACHES) {
     const runDir = resolveIterationDir(inputRoot, approach, pattern, iteration);
@@ -384,7 +422,12 @@ function validatePattern(inputRoot, pattern, iteration) {
       failures.push(`${approach}: missing iteration directory`);
       continue;
     }
-    perApproach[approach] = readApproachRow(runDir, approach);
+    perApproach[approach] = readApproachRow(runDir, approach, {
+      approach,
+      pattern,
+      iteration,
+      executionSummary,
+    });
   }
 
   const fetching = perApproach.fetching;
@@ -417,7 +460,18 @@ function validatePattern(inputRoot, pattern, iteration) {
       failures.push(`${approach}: peak RSS missing`);
     }
     if (!Number.isFinite(row.semanticWindowCloseToResultMs)) {
-      warnings.push(`${approach}: semantic window-close latency could not be reconstructed`);
+      failures.push(`${approach}: semantic window-close latency missing or invalid`);
+    } else if (row.semanticWindowCloseToResultMs < 0) {
+      failures.push(`${approach}: semantic window-close latency is negative`);
+    } else if (!Number.isFinite(row.configuredTimeoutMs)) {
+      failures.push(`${approach}: configured pattern timeout missing`);
+    } else if (row.semanticWindowCloseToResultMs > row.configuredTimeoutMs) {
+      failures.push(
+        `${approach}: semantic window-close latency exceeds configured timeout (${row.semanticWindowCloseToResultMs} > ${row.configuredTimeoutMs})`,
+      );
+    }
+    if (!row.latencyMetricSource) {
+      failures.push(`${approach}: latency metric source missing`);
     }
     if (row.capSummary?.emittedFinalWindowCount !== 1) {
       warnings.push(`${approach}: emittedFinalWindowCount=${row.capSummary?.emittedFinalWindowCount ?? "missing"}`);
@@ -541,6 +595,7 @@ function buildTableRows(patternResults, approaches) {
         Approach: approach,
         "Complete window": row?.completeWindow === true ? "yes" : "no",
         "Window-close latency (ms)": formatNumber(row?.semanticWindowCloseToResultMs, 3),
+        "Latency source": row?.latencyMetricSource ?? "",
         "Average CPU (%)": formatNumber(row?.averageCpuPct, 3),
         "Peak RSS (MiB)": formatNumber(row?.peakRssMb, 3),
         Result: formatNumber(row?.resultValue, 12),
@@ -566,6 +621,7 @@ function writeCsv(filePath, rows) {
     "Approach",
     "Complete window",
     "Window-close latency (ms)",
+    "Latency source",
     "Average CPU (%)",
     "Peak RSS (MiB)",
     "Result",
@@ -588,12 +644,12 @@ function renderMarkdown(summary) {
     `Approaches: \`${summary.approaches.join(",")}\``,
     "",
     "| Pattern | Approach | Complete window | Window-close latency (ms) | Average CPU (%) | Peak RSS (MiB) | Result | Exact vs Fetching | Absolute error |",
-    "| ------- | -------- | --------------: | ------------------------: | --------------: | -------------: | -----: | ----------------: | -------------: |",
+    "| ------- | -------- | --------------: | ------------------------: | -------------- | --------------: | -------------: | -----: | ----------------: | -------------: |",
   ];
 
   for (const row of summary.tableRows) {
     lines.push(
-      `| ${row.Pattern} | ${row.Approach} | ${row["Complete window"]} | ${row["Window-close latency (ms)"]} | ${row["Average CPU (%)"]} | ${row["Peak RSS (MiB)"]} | ${row.Result} | ${row["Exact vs Fetching"]} | ${row["Absolute error"]} |`,
+      `| ${row.Pattern} | ${row.Approach} | ${row["Complete window"]} | ${row["Window-close latency (ms)"]} | ${row["Latency source"]} | ${row["Average CPU (%)"]} | ${row["Peak RSS (MiB)"]} | ${row.Result} | ${row["Exact vs Fetching"]} | ${row["Absolute error"]} |`,
     );
   }
 

@@ -80,6 +80,28 @@ function writeApproachRun(rootDir, pattern, approach, options = {}) {
   );
 
   if (approach === "fetching") {
+    const fetchingLatencyRow = {
+      window_number: "1",
+      query_registered_at: "0",
+      first_data_received_at: "1000",
+      expected_window_close: "121000",
+      last_obs_received_at: "121499",
+      result_emitted_at: "121500",
+      delay_past_expected_close_ms: "500",
+      delay_past_data_start_ms: "0",
+      delay_past_last_obs_ms: "1",
+      window_semantics: "trailing",
+      logical_trigger_time: "121000",
+      window_start: "1000",
+      window_end: "121000",
+      window_data_close_time: "121000",
+      latency_from_logical_trigger_ms: "500",
+      latency_from_window_close_ms: "500",
+      metadata_source: "direct",
+      result_value: String(options.resultValue ?? -23),
+      ...(options.fetchingLatencyRow || {}),
+    };
+
     writeCsv(
       path.join(runDir, latencyFile),
       [
@@ -103,24 +125,7 @@ function writeApproachRun(rootDir, pattern, approach, options = {}) {
         "result_value",
       ],
       [{
-        window_number: "1",
-        query_registered_at: "0",
-        first_data_received_at: "1000",
-        expected_window_close: "121000",
-        last_obs_received_at: "121499",
-        result_emitted_at: "121500",
-        delay_past_expected_close_ms: "500",
-        delay_past_data_start_ms: "0",
-        delay_past_last_obs_ms: "1",
-        window_semantics: "trailing",
-        logical_trigger_time: "121000",
-        window_start: "1000",
-        window_end: "121000",
-        window_data_close_time: "121000",
-        latency_from_logical_trigger_ms: "500",
-        latency_from_window_close_ms: "500",
-        metadata_source: "direct",
-        result_value: String(options.resultValue ?? -23),
+        ...fetchingLatencyRow,
       }],
     );
 
@@ -350,6 +355,7 @@ function writeApproachRun(rootDir, pattern, approach, options = {}) {
     benchmark_event_time_anchor: 1000,
     output_window_range: 120000,
     output_window_step: 60000,
+    configuredTimeoutMs: options.configuredTimeoutMs ?? 300000,
   });
 
   writeNdjson(path.join(runDir, "mqtt_traffic.ndjson"), [
@@ -411,6 +417,10 @@ describe("custom-pattern first-window smoke validator", () => {
 
       expect(summary.status).toBe("pass");
       expect(summary.failures).toEqual([]);
+      expect(summary.patternResults[0].perApproach.fetching.semanticWindowCloseToResultMs).toBe(500);
+      expect(summary.patternResults[0].perApproach.fetching.latencyMetricSource).toBe("fetching_latency_log");
+      expect(summary.patternResults[0].perApproach.approximation.latencyMetricSource).toBe("semantic_window_metadata");
+      expect(summary.tableRows[0]["Latency source"]).toBe("fetching_latency_log");
       expect(summary.patternResults[0].perApproach.fetching.absoluteError).toBe(0);
       expect(summary.patternResults[0].perApproach.chunked.absoluteError).toBe(0);
       expect(summary.patternResults[0].perApproach.chunked.exactAgreement).toBe(true);
@@ -465,6 +475,125 @@ describe("custom-pattern first-window smoke validator", () => {
 
       expect(summary.status).toBe("fail");
       expect(summary.failures).toContain("step_pattern: chunked result is not exactly equal to fetching");
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("uses precomputed fetching latency even when window_end is event-time", () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "custom-pattern-smoke-fetching-direct-"));
+
+    try {
+      writeApproachRun(rootDir, "spike_pattern", "fetching", {
+        resultValue: -23,
+        fetchingLatencyRow: {
+          result_emitted_at: "1784310435297",
+          window_end: "1716454224620",
+          window_data_close_time: "1784310432409",
+          latency_from_window_close_ms: "2888",
+        },
+      });
+      writeApproachRun(rootDir, "spike_pattern", "approximation", { resultValue: -22.95 });
+      writeApproachRun(rootDir, "spike_pattern", "chunked", { resultValue: -23 });
+
+      const summary = summarizeSmokeValidation({
+        inputRoot: rootDir,
+        outputDir: path.join(rootDir, "analysis"),
+        patterns: ["spike_pattern"],
+        approaches: ["fetching", "approximation", "chunked"],
+        iterations: [1],
+      });
+
+      expect(summary.status).toBe("pass");
+      expect(summary.patternResults[0].perApproach.fetching.semanticWindowCloseToResultMs).toBe(2888);
+      expect(summary.patternResults[0].perApproach.fetching.latencyMetricSource).toBe("fetching_latency_log");
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects negative fetching latency", () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "custom-pattern-smoke-fetching-negative-"));
+
+    try {
+      writeApproachRun(rootDir, "late_burst", "fetching", {
+        fetchingLatencyRow: {
+          latency_from_window_close_ms: "-5",
+        },
+      });
+      writeApproachRun(rootDir, "late_burst", "approximation", { resultValue: -22.9 });
+      writeApproachRun(rootDir, "late_burst", "chunked", { resultValue: -23 });
+
+      const summary = summarizeSmokeValidation({
+        inputRoot: rootDir,
+        outputDir: path.join(rootDir, "analysis"),
+        patterns: ["late_burst"],
+        approaches: ["fetching", "approximation", "chunked"],
+        iterations: [1],
+      });
+
+      expect(summary.status).toBe("fail");
+      expect(summary.failures).toContain("late_burst: fetching: semantic window-close latency is negative");
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects missing fetching latency when neither direct nor fallback values are usable", () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "custom-pattern-smoke-fetching-missing-"));
+
+    try {
+      writeApproachRun(rootDir, "multiple_bursts", "fetching", {
+        fetchingLatencyRow: {
+          result_emitted_at: "",
+          window_data_close_time: "",
+          latency_from_window_close_ms: "",
+        },
+      });
+      writeApproachRun(rootDir, "multiple_bursts", "approximation", { resultValue: -22.9 });
+      writeApproachRun(rootDir, "multiple_bursts", "chunked", { resultValue: -23 });
+
+      const summary = summarizeSmokeValidation({
+        inputRoot: rootDir,
+        outputDir: path.join(rootDir, "analysis"),
+        patterns: ["multiple_bursts"],
+        approaches: ["fetching", "approximation", "chunked"],
+        iterations: [1],
+      });
+
+      expect(summary.status).toBe("fail");
+      expect(summary.failures).toContain("multiple_bursts: fetching: semantic window-close latency missing or invalid");
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back to result_emitted_at minus window_data_close_time for fetching latency", () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "custom-pattern-smoke-fetching-fallback-"));
+
+    try {
+      writeApproachRun(rootDir, "linear_ramp", "fetching", {
+        fetchingLatencyRow: {
+          result_emitted_at: "1784310435297",
+          window_data_close_time: "1784310432409",
+          latency_from_window_close_ms: "",
+          window_end: "1716454224620",
+        },
+      });
+      writeApproachRun(rootDir, "linear_ramp", "approximation", { resultValue: -22.9 });
+      writeApproachRun(rootDir, "linear_ramp", "chunked", { resultValue: -23 });
+
+      const summary = summarizeSmokeValidation({
+        inputRoot: rootDir,
+        outputDir: path.join(rootDir, "analysis"),
+        patterns: ["linear_ramp"],
+        approaches: ["fetching", "approximation", "chunked"],
+        iterations: [1],
+      });
+
+      expect(summary.status).toBe("pass");
+      expect(summary.patternResults[0].perApproach.fetching.semanticWindowCloseToResultMs).toBe(2888);
+      expect(summary.patternResults[0].perApproach.fetching.latencyMetricSource).toBe("fetching_latency_log");
     } finally {
       fs.rmSync(rootDir, { recursive: true, force: true });
     }
