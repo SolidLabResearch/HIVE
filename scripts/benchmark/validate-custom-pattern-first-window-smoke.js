@@ -3,8 +3,10 @@
 const fs = require("fs");
 const path = require("path");
 const {
+  calculateRegistrationAnchoredLatencies,
   compareResults,
   compareAggregateResultEquivalence,
+  REGISTRATION_ANCHORED_LATENCY_SOURCE,
 } = require("../../analysis/accuracy/accuracy-comparison-custom-patterns.js");
 
 const DEFAULT_PATTERNS = [
@@ -208,6 +210,70 @@ function parseNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function isPresent(value) {
+  return value !== null && value !== undefined && value !== "";
+}
+
+function readRawNumericField(row, fieldName) {
+  if (!row || !Object.prototype.hasOwnProperty.call(row, fieldName)) {
+    return { present: false, value: null, rawValue: undefined };
+  }
+  const rawValue = row[fieldName];
+  return {
+    present: isPresent(rawValue),
+    value: parseNumber(rawValue),
+    rawValue,
+  };
+}
+
+function collectLatencyValidationFailures(latencyRow, outputWindowRangeMs, outputWindowStepMs) {
+  const failures = [];
+  const queryRegisteredAtField = readRawNumericField(latencyRow, "query_registered_at");
+  const resultEmittedAtField = readRawNumericField(latencyRow, "result_emitted_at");
+  const windowNumberField = readRawNumericField(latencyRow, "window_number");
+
+  if (!queryRegisteredAtField.present) {
+    failures.push("missing query registration timestamp");
+  } else if (!Number.isFinite(queryRegisteredAtField.value)) {
+    failures.push("non-numerical query registration timestamp");
+  }
+
+  if (!resultEmittedAtField.present) {
+    failures.push("missing result-emission timestamp");
+  } else if (!Number.isFinite(resultEmittedAtField.value)) {
+    failures.push("non-numerical result-emission timestamp");
+  }
+
+  if (!windowNumberField.present) {
+    failures.push("invalid window number");
+  } else if (!Number.isFinite(windowNumberField.value) || !Number.isInteger(windowNumberField.value) || windowNumberField.value < 1) {
+    failures.push("invalid window number");
+  }
+
+  if (!Number.isFinite(outputWindowRangeMs) || outputWindowRangeMs <= 0) {
+    failures.push("missing or invalid range");
+  }
+  if (!Number.isFinite(outputWindowStepMs) || outputWindowStepMs <= 0) {
+    failures.push("missing or invalid step");
+  }
+
+  return failures;
+}
+
+function validateLatencyConsistency(row, fieldName, expectedValue, failures, label) {
+  const field = readRawNumericField(row, fieldName);
+  if (!field.present) {
+    return;
+  }
+  if (!Number.isFinite(field.value)) {
+    failures.push(`non-numerical ${label}`);
+    return;
+  }
+  if (Math.abs(field.value - expectedValue) > 1) {
+    failures.push(`${label} mismatch greater than 1 ms`);
+  }
+}
+
 function findConfiguredTimeoutMs(executionSummary, approach, pattern, iteration) {
   const results = Array.isArray(executionSummary?.results) ? executionSummary.results : [];
   const match = results.find((result) =>
@@ -317,18 +383,11 @@ function readApproachRow(runDir, approach, options = {}) {
   const resourceSummary = readJson(path.join(runDir, "resource_summary.json")) || {};
   const capSummary = readJson(path.join(runDir, "benchmark_window_cap_summary.json"));
   const attemptMetadata = readJson(path.join(runDir, "attempt_metadata.json")) || {};
-  const firstRawInputPublishedAt = readFirstRawInputPublishTime(runDir);
-
   const resultRow = resultsRows[0] || null;
   const windowNumber = Number.parseInt(resultRow?.window_number || latencyRows[0]?.window_number || "", 10);
   const latencyRow = latencyRows.find((row) => Number.parseInt(row.window_number, 10) === windowNumber) || latencyRows[0] || null;
-  const benchmarkEventTimeAnchor = parseNumber(attemptMetadata.benchmark_event_time_anchor);
   const outputWindowRange = parseNumber(attemptMetadata.output_window_range);
   const outputWindowStep = parseNumber(attemptMetadata.output_window_step);
-  const resultEmittedAt = parseNumber(latencyRow?.result_emitted_at) ?? parseNumber(resultRow?.timestamp);
-  const eventWindowEnd = parseNumber(latencyRow?.window_data_close_time)
-    ?? parseNumber(latencyRow?.window_end)
-    ?? parseNumber(resultRow?.window_end);
   const configuredTimeoutMs =
     parseNumber(attemptMetadata.configuredTimeoutMs)
     ?? findConfiguredTimeoutMs(
@@ -337,42 +396,74 @@ function readApproachRow(runDir, approach, options = {}) {
       options.pattern,
       options.iteration,
     );
+  const validationFailures = collectLatencyValidationFailures(latencyRow, outputWindowRange, outputWindowStep);
+  const queryRegisteredAt = parseNumber(latencyRow?.query_registered_at);
+  const resultEmittedAt = parseNumber(latencyRow?.result_emitted_at);
+  const normalizedWindowNumber = Number.isFinite(windowNumber) ? windowNumber : parseNumber(latencyRow?.window_number);
 
-  let semanticWindowCloseAt = null;
+  let latencyMetrics = null;
   if (
-    Number.isFinite(firstRawInputPublishedAt) &&
-    Number.isFinite(benchmarkEventTimeAnchor) &&
-    Number.isFinite(eventWindowEnd)
-  ) {
-    semanticWindowCloseAt = firstRawInputPublishedAt + (eventWindowEnd - benchmarkEventTimeAnchor);
-  } else if (
-    Number.isFinite(firstRawInputPublishedAt) &&
+    validationFailures.length === 0 &&
+    Number.isFinite(queryRegisteredAt) &&
+    Number.isFinite(resultEmittedAt) &&
+    Number.isFinite(normalizedWindowNumber) &&
     Number.isFinite(outputWindowRange) &&
-    Number.isFinite(outputWindowStep) &&
-    Number.isFinite(windowNumber)
+    Number.isFinite(outputWindowStep)
   ) {
-    semanticWindowCloseAt = firstRawInputPublishedAt + outputWindowRange + ((windowNumber - 1) * outputWindowStep);
-  }
+    latencyMetrics = calculateRegistrationAnchoredLatencies({
+      queryRegisteredAt,
+      resultEmittedAt,
+      windowNumber: normalizedWindowNumber,
+      outputWindowRangeMs: outputWindowRange,
+      outputWindowStepMs: outputWindowStep,
+    });
 
-  let semanticWindowCloseToResultMs = null;
-  let latencyMetricSource = null;
-
-  if (approach === "fetching") {
-    const directLatencyFromWindowCloseMs = parseNumber(latencyRow?.latency_from_window_close_ms);
-    const wallClockWindowDataCloseTime = parseNumber(latencyRow?.window_data_close_time);
-    if (Number.isFinite(directLatencyFromWindowCloseMs)) {
-      semanticWindowCloseToResultMs = directLatencyFromWindowCloseMs;
-      latencyMetricSource = "fetching_latency_log";
-      semanticWindowCloseAt = Number.isFinite(wallClockWindowDataCloseTime) ? wallClockWindowDataCloseTime : null;
-    } else if (Number.isFinite(resultEmittedAt) && Number.isFinite(wallClockWindowDataCloseTime)) {
-      semanticWindowCloseToResultMs = resultEmittedAt - wallClockWindowDataCloseTime;
-      latencyMetricSource = "fetching_latency_log";
-      semanticWindowCloseAt = wallClockWindowDataCloseTime;
+    if (!Number.isFinite(latencyMetrics.queryToFirstResultMs) || Number.isNaN(latencyMetrics.queryToFirstResultMs)) {
+      validationFailures.push("NaN or infinite value");
     }
-  } else if (Number.isFinite(semanticWindowCloseAt) && Number.isFinite(resultEmittedAt)) {
-    semanticWindowCloseToResultMs = resultEmittedAt - semanticWindowCloseAt;
-    latencyMetricSource = "semantic_window_metadata";
+    if (!Number.isFinite(latencyMetrics.postWindowCloseLatencyMs) || Number.isNaN(latencyMetrics.postWindowCloseLatencyMs)) {
+      validationFailures.push("NaN or infinite value");
+    }
+    if (resultEmittedAt < queryRegisteredAt) {
+      validationFailures.push("result emitted before query registration");
+    }
+    if (latencyMetrics.queryToFirstResultMs < 0) {
+      validationFailures.push("negative query-to-first-result latency");
+    }
+    if (latencyMetrics.postWindowCloseLatencyMs < 0) {
+      validationFailures.push("negative post-window-close latency");
+    }
+
+    validateLatencyConsistency(
+      latencyRow,
+      "elapsed_since_registration_ms",
+      latencyMetrics.queryToFirstResultMs,
+      validationFailures,
+      "elapsed_since_registration_ms",
+    );
+    validateLatencyConsistency(
+      latencyRow,
+      "delay_past_expected_close_ms",
+      latencyMetrics.postWindowCloseLatencyMs,
+      validationFailures,
+      "delay_past_expected_close_ms",
+    );
+    if (approach === "fetching") {
+      validateLatencyConsistency(
+        latencyRow,
+        "latency_from_window_close_ms",
+        latencyMetrics.postWindowCloseLatencyMs,
+        validationFailures,
+        "latency_from_window_close_ms",
+      );
+    }
   }
+
+  const dataAlignedWindowCloseAt = parseNumber(latencyRow?.window_data_close_time);
+  const dataAlignedWindowCloseLatencyMs =
+    Number.isFinite(dataAlignedWindowCloseAt) && Number.isFinite(resultEmittedAt)
+      ? resultEmittedAt - dataAlignedWindowCloseAt
+      : null;
 
   let completeness;
   if (approach === "fetching") {
@@ -397,15 +488,20 @@ function readApproachRow(runDir, approach, options = {}) {
     capSummary,
     attemptMetadata,
     configuredTimeoutMs,
-    firstRawInputPublishedAt,
-    semanticWindowCloseAt,
-    semanticWindowCloseToResultMs,
-    latencyMetricSource,
+    latencyValidationFailures: validationFailures,
     windowNumber: Number.isFinite(windowNumber) ? windowNumber : null,
     windowStart: parseNumber(resultRow?.window_start) ?? parseNumber(latencyRow?.window_start),
     windowEnd: parseNumber(resultRow?.window_end) ?? parseNumber(latencyRow?.window_end),
     resultValue: parseNumber(resultRow?.result_value),
     resultEmittedAt,
+    queryRegisteredAt,
+    outputWindowRangeMs: outputWindowRange,
+    outputWindowStepMs: outputWindowStep,
+    registrationAnchoredWindowCloseAt: latencyMetrics?.registrationAnchoredWindowCloseAt ?? null,
+    queryToFirstResultMs: latencyMetrics?.queryToFirstResultMs ?? null,
+    postWindowCloseLatencyMs: latencyMetrics?.postWindowCloseLatencyMs ?? null,
+    latencyMetricSource: latencyMetrics?.latencyMetricSource ?? null,
+    dataAlignedWindowCloseLatencyMs,
     completeWindow:
       capSummary?.stoppedAfterTargetWindows === true
       && Number(capSummary?.emittedFinalWindowCount) >= 1
@@ -465,18 +561,22 @@ function validatePattern(inputRoot, pattern, iteration, approaches) {
     if (!Number.isFinite(row.peakRssMb)) {
       failures.push(`${approach}: peak RSS missing`);
     }
-    if (!Number.isFinite(row.semanticWindowCloseToResultMs)) {
-      failures.push(`${approach}: semantic window-close latency missing or invalid`);
-    } else if (row.semanticWindowCloseToResultMs < 0) {
-      failures.push(`${approach}: semantic window-close latency is negative`);
+    for (const validationFailure of row.latencyValidationFailures || []) {
+      failures.push(`${approach}: ${validationFailure}`);
+    }
+    if (!Number.isFinite(row.queryToFirstResultMs)) {
+      failures.push(`${approach}: query-to-first-result latency missing or invalid`);
+    }
+    if (!Number.isFinite(row.postWindowCloseLatencyMs)) {
+      failures.push(`${approach}: post-window-close latency missing or invalid`);
     } else if (!Number.isFinite(row.configuredTimeoutMs)) {
       failures.push(`${approach}: configured pattern timeout missing`);
-    } else if (row.semanticWindowCloseToResultMs > row.configuredTimeoutMs) {
+    } else if (row.postWindowCloseLatencyMs > row.configuredTimeoutMs) {
       failures.push(
-        `${approach}: semantic window-close latency exceeds configured timeout (${row.semanticWindowCloseToResultMs} > ${row.configuredTimeoutMs})`,
+        `${approach}: post-window-close latency exceeds configured timeout (${row.postWindowCloseLatencyMs} > ${row.configuredTimeoutMs})`,
       );
     }
-    if (!row.latencyMetricSource) {
+    if (row.latencyMetricSource !== REGISTRATION_ANCHORED_LATENCY_SOURCE) {
       failures.push(`${approach}: latency metric source missing`);
     }
     if (row.capSummary?.emittedFinalWindowCount !== 1) {
@@ -601,7 +701,8 @@ function buildTableRows(patternResults, approaches) {
         Iteration: patternResult.iteration,
         Approach: approach,
         "Complete window": row?.completeWindow === true ? "yes" : "no",
-        "Window-close latency (ms)": formatNumber(row?.semanticWindowCloseToResultMs, 3),
+        "Query-to-first-result latency (ms)": formatNumber(row?.queryToFirstResultMs, 3),
+        "Post-window-close latency (ms)": formatNumber(row?.postWindowCloseLatencyMs, 3),
         "Latency source": row?.latencyMetricSource ?? "",
         "Average CPU (%)": formatNumber(row?.averageCpuPct, 3),
         "Peak RSS (MiB)": formatNumber(row?.peakRssMb, 3),
@@ -653,11 +754,10 @@ function buildAggregatedRows(patternResults, approaches, iterations) {
         Pattern: pattern,
         Approach: approach,
         "Complete windows": `${completeWindowCount}/${iterationCount}`,
-        "Median window-close latency (ms)": formatNumber(median(perApproachRows.map((row) => row.semanticWindowCloseToResultMs)), 3),
+        "Median query-to-first-result latency (ms)": formatNumber(median(perApproachRows.map((row) => row.queryToFirstResultMs)), 3),
+        "Median post-window-close latency (ms)": formatNumber(median(perApproachRows.map((row) => row.postWindowCloseLatencyMs)), 3),
         "Median average CPU (%)": formatNumber(median(perApproachRows.map((row) => row.averageCpuPct)), 3),
         "Median peak RSS (MiB)": formatNumber(median(perApproachRows.map((row) => row.peakRssMb)), 3),
-        "Median result": formatNumber(median(perApproachRows.map((row) => row.resultValue)), 12),
-        "Median absolute error": formatNumber(median(perApproachRows.map((row) => row.absoluteError)), 12),
         "Exact vs Fetching": `${exactAgreementCount}/${iterationCount}`,
         MAE: formatNumber(
           perApproachRows.length > 0
@@ -682,7 +782,8 @@ function writeCsv(filePath, rows) {
     "Iteration",
     "Approach",
     "Complete window",
-    "Window-close latency (ms)",
+    "Query-to-first-result latency (ms)",
+    "Post-window-close latency (ms)",
     "Latency source",
     "Average CPU (%)",
     "Peak RSS (MiB)",
@@ -702,7 +803,8 @@ function writeAggregatedCsv(filePath, rows) {
     "Pattern",
     "Approach",
     "Complete windows",
-    "Median window-close latency (ms)",
+    "Median query-to-first-result latency (ms)",
+    "Median post-window-close latency (ms)",
     "Median average CPU (%)",
     "Median peak RSS (MiB)",
     "Exact vs Fetching",
@@ -726,25 +828,25 @@ function renderMarkdown(summary) {
     "",
     "## Per-Iteration Results",
     "",
-    "| Pattern | Iteration | Approach | Complete window | Window-close latency (ms) | Latency source | Average CPU (%) | Peak RSS (MiB) | Result | Exact vs Fetching | Absolute error |",
-    "| ------- | --------: | -------- | --------------: | ------------------------: | -------------- | ---------------: | -------------: | -----: | ----------------: | -------------: |",
+    "| Pattern | Iteration | Approach | Complete window | Query-to-first-result latency (ms) | Post-window-close latency (ms) | Latency source | Average CPU (%) | Peak RSS (MiB) | Result | Exact vs Fetching | Absolute error |",
+    "| ------- | --------: | -------- | --------------: | ----------------------------------: | ------------------------------: | -------------- | ---------------: | -------------: | -----: | ----------------: | -------------: |",
   ];
 
   for (const row of summary.tableRows) {
     lines.push(
-      `| ${row.Pattern} | ${row.Iteration} | ${row.Approach} | ${row["Complete window"]} | ${row["Window-close latency (ms)"]} | ${row["Latency source"]} | ${row["Average CPU (%)"]} | ${row["Peak RSS (MiB)"]} | ${row.Result} | ${row["Exact vs Fetching"]} | ${row["Absolute error"]} |`,
+      `| ${row.Pattern} | ${row.Iteration} | ${row.Approach} | ${row["Complete window"]} | ${row["Query-to-first-result latency (ms)"]} | ${row["Post-window-close latency (ms)"]} | ${row["Latency source"]} | ${row["Average CPU (%)"]} | ${row["Peak RSS (MiB)"]} | ${row.Result} | ${row["Exact vs Fetching"]} | ${row["Absolute error"]} |`,
     );
   }
 
   lines.push("");
   lines.push("## Aggregated Summary");
   lines.push("");
-  lines.push("| Pattern | Approach | Complete windows | Median window-close latency (ms) | Median average CPU (%) | Median peak RSS (MiB) | Exact vs Fetching | MAE |");
-  lines.push("| ------- | -------- | ----------------: | --------------------------------: | ---------------------: | --------------------: | ----------------: | --: |");
+  lines.push("| Pattern | Approach | Complete windows | Median query-to-first-result latency (ms) | Median post-window-close latency (ms) | Median average CPU (%) | Median peak RSS (MiB) | Exact vs Fetching | MAE |");
+  lines.push("| ------- | -------- | ----------------: | -----------------------------------------: | -------------------------------------: | ---------------------: | --------------------: | ----------------: | --: |");
 
   for (const row of summary.aggregatedTableRows) {
     lines.push(
-      `| ${row.Pattern} | ${row.Approach} | ${row["Complete windows"]} | ${row["Median window-close latency (ms)"]} | ${row["Median average CPU (%)"]} | ${row["Median peak RSS (MiB)"]} | ${row["Exact vs Fetching"]} | ${row.MAE} |`,
+      `| ${row.Pattern} | ${row.Approach} | ${row["Complete windows"]} | ${row["Median query-to-first-result latency (ms)"]} | ${row["Median post-window-close latency (ms)"]} | ${row["Median average CPU (%)"]} | ${row["Median peak RSS (MiB)"]} | ${row["Exact vs Fetching"]} | ${row.MAE} |`,
     );
   }
 
@@ -838,4 +940,5 @@ module.exports = {
   renderMarkdown,
   summarizeSmokeValidation,
   validatePattern,
+  collectLatencyValidationFailures,
 };

@@ -4,6 +4,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { finalizeMqttTrafficArtifacts } = require('../../dist/util/mqttTraffic');
+const {
+  calculateRegistrationAnchoredLatencies,
+  REGISTRATION_ANCHORED_LATENCY_SOURCE,
+} = require('../../analysis/accuracy/accuracy-comparison-custom-patterns.js');
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const ANALYSIS_DIR = path.join(REPO_ROOT, 'analysis');
@@ -357,6 +361,18 @@ function normalizeFetchingRows(latencyRows) {
       expectedWindowClose,
       resultEmittedAt,
     });
+    const registrationAnchoredLatencies =
+      Number.isFinite(queryRegisteredAt) &&
+      Number.isFinite(resultEmittedAt) &&
+      Number.isFinite(windowNumber)
+        ? calculateRegistrationAnchoredLatencies({
+            queryRegisteredAt,
+            resultEmittedAt,
+            windowNumber,
+            outputWindowRangeMs: BENCHMARK_WINDOW_RANGE_MS,
+            outputWindowStepMs: BENCHMARK_WINDOW_STEP_MS,
+          })
+        : null;
     return {
       approach: 'fetching',
       windowNumber,
@@ -365,9 +381,11 @@ function normalizeFetchingRows(latencyRows) {
       expectedWindowClose,
       lastObservedAt,
       resultEmittedAt,
-      registrationToResultMs: Number.isFinite(queryRegisteredAt) && Number.isFinite(resultEmittedAt)
-        ? resultEmittedAt - queryRegisteredAt
-        : null,
+      registrationAnchoredWindowCloseAt: registrationAnchoredLatencies?.registrationAnchoredWindowCloseAt ?? null,
+      queryToFirstResultMs: registrationAnchoredLatencies?.queryToFirstResultMs ?? null,
+      postWindowCloseLatencyMs: registrationAnchoredLatencies?.postWindowCloseLatencyMs ?? null,
+      latencyMetricSource: registrationAnchoredLatencies?.latencyMetricSource ?? null,
+      registrationToResultMs: registrationAnchoredLatencies?.queryToFirstResultMs ?? null,
       dataStartToResultMs: Number.isFinite(firstDataReceivedAt) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - firstDataReceivedAt
         : null,
@@ -377,9 +395,7 @@ function normalizeFetchingRows(latencyRows) {
       postWindowDelayMs: Number.isFinite(expectedWindowClose) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - expectedWindowClose
         : null,
-      expectedWindowCloseToResultMs: Number.isFinite(expectedWindowClose) && Number.isFinite(resultEmittedAt)
-        ? resultEmittedAt - expectedWindowClose
-        : null,
+      expectedWindowCloseToResultMs: registrationAnchoredLatencies?.postWindowCloseLatencyMs ?? null,
       postProcessingDelayMs: Number.isFinite(lastObservedAt) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - lastObservedAt
         : null,
@@ -413,6 +429,18 @@ function normalizeApproximationRows(latencyRows) {
       expectedWindowClose,
       resultEmittedAt,
     });
+    const registrationAnchoredLatencies =
+      Number.isFinite(queryRegisteredAt) &&
+      Number.isFinite(resultEmittedAt) &&
+      Number.isFinite(windowNumber)
+        ? calculateRegistrationAnchoredLatencies({
+            queryRegisteredAt,
+            resultEmittedAt,
+            windowNumber,
+            outputWindowRangeMs: BENCHMARK_WINDOW_RANGE_MS,
+            outputWindowStepMs: BENCHMARK_WINDOW_STEP_MS,
+          })
+        : null;
     return {
       approach: 'approximation',
       windowNumber,
@@ -421,9 +449,11 @@ function normalizeApproximationRows(latencyRows) {
       expectedWindowClose,
       lastObservedAt,
       resultEmittedAt,
-      registrationToResultMs: Number.isFinite(queryRegisteredAt) && Number.isFinite(resultEmittedAt)
-        ? resultEmittedAt - queryRegisteredAt
-        : null,
+      registrationAnchoredWindowCloseAt: registrationAnchoredLatencies?.registrationAnchoredWindowCloseAt ?? null,
+      queryToFirstResultMs: registrationAnchoredLatencies?.queryToFirstResultMs ?? null,
+      postWindowCloseLatencyMs: registrationAnchoredLatencies?.postWindowCloseLatencyMs ?? null,
+      latencyMetricSource: registrationAnchoredLatencies?.latencyMetricSource ?? null,
+      registrationToResultMs: registrationAnchoredLatencies?.queryToFirstResultMs ?? null,
       dataStartToResultMs: Number.isFinite(firstDataReceivedAt) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - firstDataReceivedAt
         : null,
@@ -433,9 +463,7 @@ function normalizeApproximationRows(latencyRows) {
       postWindowDelayMs: Number.isFinite(expectedWindowClose) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - expectedWindowClose
         : null,
-      expectedWindowCloseToResultMs: Number.isFinite(expectedWindowClose) && Number.isFinite(resultEmittedAt)
-        ? resultEmittedAt - expectedWindowClose
-        : null,
+      expectedWindowCloseToResultMs: registrationAnchoredLatencies?.postWindowCloseLatencyMs ?? null,
       postProcessingDelayMs: Number.isFinite(lastObservedAt) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - lastObservedAt
         : null,
@@ -469,6 +497,18 @@ function normalizeChunkedRows(latencyRows) {
       expectedWindowClose,
       resultEmittedAt,
     });
+    const registrationAnchoredLatencies =
+      Number.isFinite(queryRegisteredAt) &&
+      Number.isFinite(resultEmittedAt) &&
+      Number.isFinite(windowNumber)
+        ? calculateRegistrationAnchoredLatencies({
+            queryRegisteredAt,
+            resultEmittedAt,
+            windowNumber,
+            outputWindowRangeMs: BENCHMARK_WINDOW_RANGE_MS,
+            outputWindowStepMs: BENCHMARK_WINDOW_STEP_MS,
+          })
+        : null;
     return {
       approach: 'chunked',
       windowNumber,
@@ -477,9 +517,11 @@ function normalizeChunkedRows(latencyRows) {
       expectedWindowClose,
       lastObservedAt,
       resultEmittedAt,
-      registrationToResultMs: Number.isFinite(queryRegisteredAt) && Number.isFinite(resultEmittedAt)
-        ? resultEmittedAt - queryRegisteredAt
-        : null,
+      registrationAnchoredWindowCloseAt: registrationAnchoredLatencies?.registrationAnchoredWindowCloseAt ?? null,
+      queryToFirstResultMs: registrationAnchoredLatencies?.queryToFirstResultMs ?? null,
+      postWindowCloseLatencyMs: registrationAnchoredLatencies?.postWindowCloseLatencyMs ?? null,
+      latencyMetricSource: registrationAnchoredLatencies?.latencyMetricSource ?? null,
+      registrationToResultMs: registrationAnchoredLatencies?.queryToFirstResultMs ?? null,
       dataStartToResultMs: Number.isFinite(firstDataReceivedAt) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - firstDataReceivedAt
         : null,
@@ -489,9 +531,7 @@ function normalizeChunkedRows(latencyRows) {
       postWindowDelayMs: Number.isFinite(expectedWindowClose) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - expectedWindowClose
         : null,
-      expectedWindowCloseToResultMs: Number.isFinite(expectedWindowClose) && Number.isFinite(resultEmittedAt)
-        ? resultEmittedAt - expectedWindowClose
-        : null,
+      expectedWindowCloseToResultMs: registrationAnchoredLatencies?.postWindowCloseLatencyMs ?? null,
       postProcessingDelayMs: Number.isFinite(lastObservedAt) && Number.isFinite(resultEmittedAt)
         ? resultEmittedAt - lastObservedAt
         : null,

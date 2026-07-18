@@ -50,6 +50,31 @@ const SMOKE_REQUIRED_APPROACHES = ["fetching", "approximation"];
 const SMOKE_OPTIONAL_APPROACHES = ["chunked", "naive_distributed"];
 const EXACT_AGGREGATE_ABSOLUTE_TOLERANCE = 1e-12;
 const EXACT_AGGREGATE_COMPARISON_METHOD = "absolute_tolerance";
+const REGISTRATION_ANCHORED_LATENCY_SOURCE = "registration_anchored";
+
+function calculateRegistrationAnchoredLatencies({
+  queryRegisteredAt,
+  resultEmittedAt,
+  windowNumber,
+  outputWindowRangeMs,
+  outputWindowStepMs,
+}) {
+  const registrationAnchoredWindowCloseAt =
+    queryRegisteredAt
+    + outputWindowRangeMs
+    + ((windowNumber - 1) * outputWindowStepMs);
+  const queryToFirstResultMs = resultEmittedAt - queryRegisteredAt;
+  const postWindowCloseLatencyMs = resultEmittedAt - registrationAnchoredWindowCloseAt;
+
+  return {
+    queryRegisteredAt,
+    resultEmittedAt,
+    registrationAnchoredWindowCloseAt,
+    queryToFirstResultMs,
+    postWindowCloseLatencyMs,
+    latencyMetricSource: REGISTRATION_ANCHORED_LATENCY_SOURCE,
+  };
+}
 
 function parseSelectionList(value, allowedValues) {
   if (!value) {
@@ -1566,9 +1591,11 @@ if (require.main === module) {
   }
 } else {
   module.exports = {
+    calculateRegistrationAnchoredLatencies,
     compareResults,
     compareAggregateResultEquivalence,
     EXACT_AGGREGATE_ABSOLUTE_TOLERANCE,
     EXACT_AGGREGATE_COMPARISON_METHOD,
+    REGISTRATION_ANCHORED_LATENCY_SOURCE,
   };
 }
