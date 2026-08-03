@@ -30,7 +30,8 @@ describe('BeeKeeper', () => {
                 'SELECT * WHERE {}',
                 'output-topic',
                 'approximation-approach',
-                undefined
+                undefined,
+                undefined,
             );
         });
 
@@ -41,7 +42,8 @@ describe('BeeKeeper', () => {
                 'SELECT * WHERE {}',
                 'output-topic',
                 'chunked-approach',
-                subQueries
+                subQueries,
+                undefined,
             );
         });
 
