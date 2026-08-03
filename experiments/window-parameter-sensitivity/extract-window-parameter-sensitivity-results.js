@@ -26,7 +26,7 @@ Required:
 
 Optional:
   --patterns <list>        Default: low_variability
-  --approaches <list>      Default: fetching,chunked
+  --approaches <list>      Default: fetching,approximation,chunked
   --target-source <name>   Optional filter for query-target-scaling
   --ranges <list>          Filter for experiment 2
   --chunk-sizes <list>     Filter for experiment 3
@@ -267,7 +267,11 @@ function safeDivide(numerator, denominator) {
 function getLatencyFilePath(approach, runDir) {
   return path.join(
     runDir,
-    approach === "fetching" ? "fetching_latency_log.csv" : "chunked_latency_log.csv",
+    approach === "fetching"
+      ? "fetching_latency_log.csv"
+      : approach === "approximation"
+        ? "approximation_latency_log.csv"
+        : "chunked_latency_log.csv",
   );
 }
 

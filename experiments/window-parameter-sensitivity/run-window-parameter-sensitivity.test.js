@@ -2,7 +2,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { classifyBoundedSuccess } = require("./run-window-parameter-sensitivity");
+const {
+  classifyBoundedSuccess,
+  verifyExpectedOutputFiles,
+} = require("./run-window-parameter-sensitivity");
 
 describe("window-parameter-sensitivity bounded success classification", () => {
   test("treats target-window cap summary with emitted results as bounded success", () => {
@@ -72,6 +75,27 @@ describe("window-parameter-sensitivity bounded success classification", () => {
       expect(result.boundedSuccess).toBe(true);
       expect(result.reason).toBe("bounded_smoke_windows_emitted");
       expect(result.fileCheck).toMatchObject({
+        valid: true,
+        emittedCount: 1,
+      });
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("verifies approximation outputs via approximation latency logs", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "window-param-approx-"));
+
+    try {
+      fs.writeFileSync(
+        path.join(tempRoot, "approximation_latency_log.csv"),
+        [
+          "window_number,result_value,expected_window_close,result_emitted_at",
+          "1,42,0,0",
+        ].join("\n"),
+      );
+
+      expect(verifyExpectedOutputFiles("approximation", tempRoot)).toMatchObject({
         valid: true,
         emittedCount: 1,
       });

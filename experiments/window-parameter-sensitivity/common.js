@@ -1,4 +1,4 @@
-const DEFAULT_APPROACHES = ["fetching", "chunked"];
+const DEFAULT_APPROACHES = ["fetching", "approximation", "chunked"];
 const DEFAULT_PATTERNS = ["low_variability"];
 const DEFAULT_AGGREGATION_FUNCTION = "AVG";
 const DEFAULT_REPLAY_DURATION_SECONDS = 900;

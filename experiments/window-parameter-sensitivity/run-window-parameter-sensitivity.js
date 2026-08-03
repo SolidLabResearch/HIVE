@@ -439,6 +439,7 @@ function buildProfileAggregate(logDir, metadata = {}) {
 function getApproachScript(approach) {
   const mapping = {
     fetching: "dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js",
+    approximation: "dist/approaches/StreamingQueryApproximationApproachOrchestrator.js",
     chunked: "dist/approaches/StreamingQueryChunkedApproachOrchestrator.js",
   };
 
@@ -452,6 +453,9 @@ function getApproachScript(approach) {
 function getRequiredResultFiles(approach) {
   if (approach === "fetching") {
     return ["fetching_latency_log.csv"];
+  }
+  if (approach === "approximation") {
+    return ["approximation_latency_log.csv"];
   }
   if (approach === "chunked") {
     return [
@@ -478,7 +482,11 @@ function verifyExpectedOutputFiles(approach, logDir) {
 
   const latencyFilePath = path.join(
     logDir,
-    approach === "fetching" ? "fetching_latency_log.csv" : "chunked_latency_log.csv",
+    approach === "fetching"
+      ? "fetching_latency_log.csv"
+      : approach === "approximation"
+        ? "approximation_latency_log.csv"
+        : "chunked_latency_log.csv",
   );
   const content = fs.readFileSync(latencyFilePath, "utf8").trim();
   const lines = content.split(/\r?\n/).filter(Boolean);
@@ -789,7 +797,7 @@ Common options:
   --replay-duration-seconds <n>              Default: 900
   --timeout-ms <n>                           Default: replay duration + 180000
   --patterns <list>                          Default: low_variability
-  --approaches <list>                        Default: fetching,chunked
+  --approaches <list>                        Default: fetching,approximation,chunked
   --aggregation <name>                       Default: AVG
   --superquery-step-seconds <n>              Default: 60
   --log-root <path>                          Default: logs/window-parameter-sensitivity
