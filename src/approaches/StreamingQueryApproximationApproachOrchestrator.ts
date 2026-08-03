@@ -1,4 +1,5 @@
 import fs from "fs";
+import path from "path";
 import mqtt from "mqtt";
 import { Orchestrator } from "../orchestrator/Orchestrator";
 import { CSVLogger } from "../util/logger/CSVLogger";
@@ -26,7 +27,12 @@ async function StreamingQueryApproximationApproachOrchestrator() {
     process.env.HIVE_PROCESS_ROLE =
         process.env.HIVE_PROCESS_ROLE || "approximation_orchestrator";
     resourceTraceSnapshot("startup", "approximation orchestrator boot");
-    const logger = new CSVLogger('approximation_approach_log.csv');
+    const consumerIdx = process.env.K_SCALING_CONSUMER_INDEX
+        ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}`
+        : "";
+    const logRoot = process.env.LOG_PATH || ".";
+    fs.mkdirSync(logRoot, { recursive: true });
+    const logger = new CSVLogger(path.join(logRoot, `approximation_approach_log${consumerIdx}.csv`));
     const orchestrator = new Orchestrator("ApproximationApproachOperator");
     const aggregationFunction = getConfiguredAggregation();
     const subWindowRange = getSubWindowRange();
@@ -222,7 +228,18 @@ function startResourceUsageLogging(filePath = 'approximation_approach_resource_u
     timer.unref?.();
 }
 
-startResourceUsageLogging('approximation_approach_resource_usage.csv', 100);
+const approximationConsumerIdx = process.env.K_SCALING_CONSUMER_INDEX
+    ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}`
+    : "";
+const approximationLogRoot = process.env.LOG_PATH || ".";
+fs.mkdirSync(approximationLogRoot, { recursive: true });
+startResourceUsageLogging(
+    path.join(
+        approximationLogRoot,
+        `approximation_approach_resource_usage${approximationConsumerIdx}.csv`,
+    ),
+    100,
+);
 StreamingQueryApproximationApproachOrchestrator().catch(error => {
     console.error("Error in orchestrator:", error);
 });

@@ -74,7 +74,11 @@ type ApproximationWindowMessage = {
  *
  */
 export class ApproximationApproachOperator implements IStreamQueryOperator {
-  private logger: CSVLogger = new CSVLogger("approximation_approach_log.csv");
+  private readonly consumerIdx: string =
+    process.env.K_SCALING_CONSUMER_INDEX
+      ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}`
+      : "";
+  private logger: CSVLogger = new CSVLogger(this.resolveLogFilePath("approximation_approach_log.csv"));
   private readonly debugEnabled: boolean = isApproximationDebugEnabled();
   private subQueries: string[] = [];
   private outputQuery: string = "";
@@ -125,7 +129,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     | "other" = "other";
   private benchmarkWindowSummaryPath: string = path.join(
     process.env.LOG_PATH || ".",
-    "benchmark_window_cap_summary.json",
+    this.withConsumerSuffix("benchmark_window_cap_summary.json"),
   );
 
   /**
@@ -146,6 +150,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       this.queryRegisteredTime,
       this.windowRange,
       this.windowSlide,
+      this.resolveLogFilePath("approximation_latency_log.csv"),
     );
     this.diagnosticsWriter.updateTimeAnchors({
       runtimeReplayStartWallClockTime: this.runtimeReplayStartWallClockTime,
@@ -243,6 +248,21 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     } catch (error) {
       console.error("Error writing benchmark window summary:", error);
     }
+  }
+
+  private withConsumerSuffix(fileName: string): string {
+    if (!this.consumerIdx) {
+      return fileName;
+    }
+    const ext = path.extname(fileName);
+    const base = ext ? fileName.slice(0, -ext.length) : fileName;
+    return `${base}${this.consumerIdx}${ext}`;
+  }
+
+  private resolveLogFilePath(fileName: string): string {
+    const logRoot = process.env.LOG_PATH || ".";
+    const resolvedName = this.withConsumerSuffix(fileName);
+    return path.join(logRoot, resolvedName);
   }
 
   /**

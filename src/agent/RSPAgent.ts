@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { hash_string_md5, turtleStringToStore } from "../util/Util";
 import {
     buildBenchmarkTopicName,
+    getBenchmarkTopicPrefix,
     isApproximationDebugEnabled,
     useCompactReusableResultPayload,
 } from "../util/runtimeConfig";
@@ -135,7 +136,11 @@ export class RSPAgent {
             profileCount("mqtt_clients_created");
             const rsp_stream_object = this.rsp_engine.getStream(stream_name);
             const rawTopic = new URL(stream_name).pathname.replace(/^\/+/, "");
-            const topic = rawTopic.startsWith("bench/")
+            const benchmarkPrefix = getBenchmarkTopicPrefix();
+            const normalizedPrefix = benchmarkPrefix.replace(/^\/+|\/+$/g, "");
+            const topic = rawTopic.startsWith("bench/") ||
+              (normalizedPrefix !== "" &&
+                (rawTopic === normalizedPrefix || rawTopic.startsWith(`${normalizedPrefix}/`)))
               ? rawTopic
               : buildBenchmarkTopicName(rawTopic);
 

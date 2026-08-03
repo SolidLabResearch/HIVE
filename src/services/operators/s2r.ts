@@ -137,6 +137,7 @@ export class CSPARQLWindow {
     emitter: EventEmitter; // The event emitter for the window
     name: string; // The name of the window
     private current_watermark: number; // To track the current watermark of the window
+    private watermarkStallWarningCount: number; // Rate-limit repeated non-increasing watermark warnings
     public max_delay: number; // The maximum delay allowed for a observation to be considered in the window
     public pending_triggers: Set<WindowInstance>; // Tracking windows that have pending triggers
     /**
@@ -159,6 +160,7 @@ export class CSPARQLWindow {
         this.logger = new Logger(log_level, LOG_CONFIG.classes_to_log, LOG_CONFIG.destination as unknown as LogDestination);
         this.time = start_time;
         this.current_watermark = start_time;
+        this.watermarkStallWarningCount = 0;
         this.t0 = start_time;
         this.active_windows = new Map<WindowInstance, QuadContainer>();
         this.emitter = new EventEmitter();
@@ -346,7 +348,10 @@ export class CSPARQLWindow {
             this.logger.info(`Watermark is increasing ${this.current_watermark} and time ${this.time}`, `CSPARQLWindow`);
         }
         else {
-            console.error("Watermark is not increasing");
+            this.watermarkStallWarningCount += 1;
+            if (this.watermarkStallWarningCount === 1 || this.watermarkStallWarningCount % 500 === 0) {
+                console.warn(`Watermark is not increasing (count=${this.watermarkStallWarningCount}, current=${this.current_watermark}, candidate=${new_time})`);
+            }
         }
     }
 

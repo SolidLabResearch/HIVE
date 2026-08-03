@@ -130,6 +130,7 @@ var CSPARQLWindow = /** @class */ (function () {
         this.logger = new Logger_1.Logger(log_level, LOG_CONFIG.classes_to_log, LOG_CONFIG.destination);
         this.time = start_time;
         this.current_watermark = start_time;
+        this.watermarkStallWarningCount = 0;
         this.t0 = start_time;
         this.active_windows = new Map();
         this.emitter = new events_1.EventEmitter();
@@ -315,7 +316,10 @@ var CSPARQLWindow = /** @class */ (function () {
             this.logger.info("Watermark is increasing ".concat(this.current_watermark, " and time ").concat(this.time), "CSPARQLWindow");
         }
         else {
-            console.error("Watermark is not increasing");
+            this.watermarkStallWarningCount += 1;
+            if (this.watermarkStallWarningCount === 1 || this.watermarkStallWarningCount % 500 === 0) {
+                console.warn("Watermark is not increasing (count=".concat(this.watermarkStallWarningCount, ", current=").concat(this.current_watermark, ", candidate=").concat(new_time, ")"));
+            }
         }
     };
     /**
