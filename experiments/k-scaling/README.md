@@ -1,5 +1,7 @@
 # K-Scaling / Reuse-Density Benchmark
 
+Paper-facing matrices, methodology, and the 2026-08 three-experiment evaluation contract now live in [`docs/experiments/2026-08-scalability-evaluation.md`](../../docs/experiments/2026-08-scalability-evaluation.md). This README describes the benchmark family, but the paper run should use the standardized `K = 1,2,4,8,32` three-approach setup and the dedicated wrappers in this folder.
+
 This experiment measures how resource consumption and window-adjusted latency scale as the number of compatible consumers ($K$) increases. It compares two evaluation approaches:
 1. **Fetching**: Each superquery evaluates/fetches required stream data directly (meaning evaluation work scales linearly with $K$).
 2. **Chunked**: Compatible queries are evaluated through shared chunk states, where window results are reconstructed from completed chunk coverage.

@@ -1,5 +1,10 @@
 # Window-Parameter Sensitivity Benchmarks
 
+The current paper-facing contract for S2 and S3 lives in [`docs/experiments/2026-08-scalability-evaluation.md`](../../docs/experiments/2026-08-scalability-evaluation.md). This README still describes the reusable benchmark family, but paper runs should use the standardized 3-iteration local smoke and 35-iteration server matrices via:
+
+- `experiments/window-parameter-sensitivity/run-window-parameter-local-smoke.js`
+- `experiments/window-parameter-sensitivity/run-window-parameter-paper.js`
+
 This folder adds controlled chunk-state reconstruction benchmarks on top of the existing HIVE runner/orchestrator pattern. These experiments reuse the current `fetching` and `chunked` approach implementations, the shared finite-replay publisher, the shared process-cleanup flow, and the existing profiling counters.
 
 ## Experiment 2: Superquery Range Scaling
