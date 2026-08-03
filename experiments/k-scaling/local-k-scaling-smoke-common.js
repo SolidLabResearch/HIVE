@@ -255,17 +255,20 @@ function readProcessTreeMetrics(logDir) {
     cpuSeconds: toNumber(row.tree_cpu_seconds),
     totalCpuPct: toNumber(row.total_cpu_pct),
     rssBytes: toNumber(row.tree_rss_bytes),
+    processCount: toNumber(row.process_count),
   }));
   const cpuSamples = rows.map((row) => row.totalCpuPct).filter(Number.isFinite);
   const peakRssMb = rows
     .map((row) => (Number.isFinite(row.rssBytes) ? row.rssBytes / (1024 * 1024) : null))
     .filter(Number.isFinite);
+  const processCounts = rows.map((row) => row.processCount).filter(Number.isFinite);
   const finalCpuSeconds = rows.length > 0 ? rows[rows.length - 1].cpuSeconds : null;
 
   return {
     csvPath,
     averageCpuPct: median(cpuSamples),
     peakRssMb: peakRssMb.length > 0 ? Math.max(...peakRssMb) : null,
+    peakProcessCount: processCounts.length > 0 ? Math.max(...processCounts) : null,
     cpuSeconds: Number.isFinite(finalCpuSeconds) ? finalCpuSeconds : null,
     sampleCount: rows.length,
   };
