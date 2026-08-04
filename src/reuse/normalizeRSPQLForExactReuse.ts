@@ -13,26 +13,22 @@ export function normalizeRSPQLForExactReuse(query: string): string {
     .replace(/(^|[\t ])#.*$/gm, "$1")
     .trim();
 
-  const lines = withoutComments
+  const prefixEntries: Array<{ label: string; iri: string }> = [];
+  const bodyWithoutPrefixes = withoutComments.replace(
+    /PREFIX\s+([A-Za-z][\w-]*:)\s*<([^>]+)>/gi,
+    (_match, label: string, iri: string) => {
+      prefixEntries.push({
+        label: label.toLowerCase(),
+        iri,
+      });
+      return " ";
+    },
+  );
+
+  const bodyLines = bodyWithoutPrefixes
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-
-  const prefixEntries: Array<{ label: string; iri: string }> = [];
-  const bodyLines: string[] = [];
-
-  for (const line of lines) {
-    const prefixMatch = line.match(/^PREFIX\s+([A-Za-z][\w-]*:)\s*<([^>]+)>$/i);
-    if (prefixMatch) {
-      prefixEntries.push({
-        label: prefixMatch[1].toLowerCase(),
-        iri: prefixMatch[2],
-      });
-      continue;
-    }
-
-    bodyLines.push(line);
-  }
 
   const normalizedPrefixes = prefixEntries
     .sort((a, b) =>
