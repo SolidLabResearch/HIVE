@@ -4,6 +4,7 @@ import path from "path";
 import { getCanonicalRSPQLQueryHash } from "../reuse/normalizeRSPQLForExactReuse";
 
 export type ActiveFinalQuerySource = "chunked-reconstruction";
+export type ApproximationQuerySource = "shared-approximation";
 
 export type HierarchicalDeliveryEvent = {
   scenario_id: string;
@@ -63,6 +64,39 @@ export type RegistryEntry = {
   createdAt: number;
 };
 
+export type ApproximationReuseConfig = {
+  completedWindowMode: boolean;
+  earlyTriggerMode: boolean;
+  policy: string;
+  rate: number | null;
+  samplingParameters: Record<string, unknown>;
+  errorConfiguration: Record<string, unknown>;
+};
+
+export type ApproximationReuseSummary = {
+  experiment: "Experiment 3: Increasing Number of Same Superqueries";
+  approach: "approximation";
+  scenario_id: string;
+  canonical_query_id: string;
+  source: ApproximationQuerySource;
+  uniqueApproximationQueryCount: number;
+  approximationWorkerCount: number;
+  approximationExecutionCount: number;
+  cacheEntries: number;
+  subscribers: number;
+  reuseHits: number;
+  deliveries: number;
+  comparableResults: number;
+  expectedConsumers: number;
+  allConsumersDelivered: boolean;
+  targetWindowCount: number;
+  emittedFinalWindowCount: number;
+  stoppedAfterTargetWindows: boolean;
+  stopReason: "target_window_count_reached" | "other";
+  aggregateWrittenAt: string;
+  approximationConfiguration: ApproximationReuseConfig;
+};
+
 export function canonicalizeHierarchicalFinalQuery(query: string): {
   canonicalQueryId: string;
   normalizedQuery: string;
@@ -70,6 +104,27 @@ export function canonicalizeHierarchicalFinalQuery(query: string): {
   const { canonicalQueryHash, normalizedQuery } = getCanonicalRSPQLQueryHash(query);
   return {
     canonicalQueryId: canonicalQueryHash,
+    normalizedQuery,
+  };
+}
+
+export function canonicalizeApproximationQuery(
+  query: string,
+  approximationConfiguration: ApproximationReuseConfig,
+): {
+  canonicalQueryId: string;
+  normalizedQuery: string;
+} {
+  const { canonicalQueryHash, normalizedQuery } = getCanonicalRSPQLQueryHash(query);
+  const configHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(approximationConfiguration))
+    .digest("hex");
+  return {
+    canonicalQueryId: crypto
+      .createHash("sha256")
+      .update(`${canonicalQueryHash}:${configHash}`)
+      .digest("hex"),
     normalizedQuery,
   };
 }
@@ -137,6 +192,50 @@ export function validateHierarchicalSummaryShape(
   }
   if (!summary.scenario_id) {
     failures.push("scenario_id missing");
+  }
+  return failures;
+}
+
+export function validateApproximationReuseSummaryShape(
+  summary: Partial<ApproximationReuseSummary> | null,
+  expectedK: number,
+): string[] {
+  const failures: string[] = [];
+  if (!summary) {
+    return ["approximation reuse summary missing"];
+  }
+  const expectedReuseHits = Math.max(0, expectedK - 1);
+  const checks: Array<[keyof ApproximationReuseSummary, unknown]> = [
+    ["source", "shared-approximation"],
+    ["uniqueApproximationQueryCount", 1],
+    ["approximationWorkerCount", 1],
+    ["approximationExecutionCount", 1],
+    ["cacheEntries", 1],
+    ["subscribers", expectedK],
+    ["reuseHits", expectedReuseHits],
+    ["deliveries", expectedK],
+    ["comparableResults", expectedK],
+    ["expectedConsumers", expectedK],
+    ["emittedFinalWindowCount", 1],
+    ["stoppedAfterTargetWindows", true],
+    ["stopReason", "target_window_count_reached"],
+  ];
+  for (const [field, expected] of checks) {
+    if ((summary as Record<string, unknown>)[field] !== expected) {
+      failures.push(`${String(field)}=${(summary as Record<string, unknown>)[field]}, expected ${expected}`);
+    }
+  }
+  if (summary.allConsumersDelivered !== true) {
+    failures.push("allConsumersDelivered=false, expected true");
+  }
+  if (!summary.canonical_query_id) {
+    failures.push("canonical_query_id missing");
+  }
+  if (!summary.scenario_id) {
+    failures.push("scenario_id missing");
+  }
+  if (!summary.approximationConfiguration) {
+    failures.push("approximationConfiguration missing");
   }
   return failures;
 }
