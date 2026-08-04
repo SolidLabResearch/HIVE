@@ -204,6 +204,28 @@ function collectRepoState() {
   };
 }
 
+function collectDependencyState() {
+  const rspJsPath = path.resolve(REPO_ROOT, "..", "RSP-JS");
+  const response = {
+    rspJsPath,
+    rspJsRevision: null,
+    rspJsStatusShort: null,
+    rspJsSpecifier: "file:../RSP-JS",
+    containmentCheckerVersion: "2.7.0",
+  };
+
+  if (fs.existsSync(rspJsPath)) {
+    try {
+      response.rspJsRevision = runCommand("git rev-parse HEAD", rspJsPath);
+      response.rspJsStatusShort = runCommand("git status --short || true", rspJsPath);
+    } catch (error) {
+      response.rspJsStatusShort = `unavailable: ${error.message}`;
+    }
+  }
+
+  return response;
+}
+
 function buildResultRoot(resumeRoot) {
   if (resumeRoot) {
     return resumeRoot;
@@ -232,6 +254,8 @@ function buildScenarioManifest({
   kValue,
   iteration,
   replayAnchor,
+  repoState,
+  dependencyState,
 }) {
   return {
     scenario_id: buildScenarioKey(kValue, iteration),
@@ -244,6 +268,24 @@ function buildScenarioManifest({
     window_step_ms: OUTPUT_WINDOW_STEP_MS,
     aggregation: "AVG",
     target_streams: ["wearableX", "smartphoneX"],
+    publisher_configuration: {
+      finite_replay: true,
+      target_windows: TARGET_WINDOWS,
+      required_replay_duration_seconds: REQUIRED_REPLAY_DURATION_SECONDS,
+      topic_prefix_template: [
+        "s1-equivalent-query-exact-final",
+        "<approach>",
+        `K${kValue}`,
+        `iteration${iteration}`,
+      ].join("/"),
+      control_port: CONTROL_PORT,
+    },
+    commit: repoState?.commit ?? null,
+    branch: repoState?.branch ?? null,
+    dependency_revision: dependencyState?.rspJsRevision ?? null,
+    dependency_status_short: dependencyState?.rspJsStatusShort ?? null,
+    dependency_specifier: dependencyState?.rspJsSpecifier ?? null,
+    containment_checker_version: dependencyState?.containmentCheckerVersion ?? null,
     created_at: new Date().toISOString(),
   };
 }
@@ -254,6 +296,8 @@ function ensureScenarioManifest({
   iteration,
   replayAnchor,
   allowCreate,
+  repoState = null,
+  dependencyState = null,
 }) {
   const manifestPath = buildScenarioManifestPath(resultRoot, kValue, iteration);
   if (fs.existsSync(manifestPath)) {
@@ -263,7 +307,13 @@ function ensureScenarioManifest({
     return null;
   }
   ensureDir(path.dirname(manifestPath));
-  const manifest = buildScenarioManifest({ kValue, iteration, replayAnchor });
+  const manifest = buildScenarioManifest({
+    kValue,
+    iteration,
+    replayAnchor,
+    repoState,
+    dependencyState,
+  });
   writeJson(manifestPath, manifest);
   return manifest;
 }
@@ -633,6 +683,8 @@ function buildExecutionPlan({
   iterations,
   replayAnchors,
   allowCreateManifests = false,
+  repoState = null,
+  dependencyState = null,
 }) {
   const matrix = buildCombinationMatrix({ approaches, kValues, iterations });
   const categoryBuckets = {
@@ -650,6 +702,8 @@ function buildExecutionPlan({
         iteration,
         replayAnchor: replayAnchors[buildScenarioKey(kValue, iteration)],
         allowCreate: allowCreateManifests,
+        repoState,
+        dependencyState,
       });
       const scenarioState = collectScenarioAnchorState(resultRoot, kValue, iteration, approaches);
       if (!manifest && scenarioState.anchors.size > 0) {
@@ -975,6 +1029,7 @@ async function main() {
   }
 
   const repoState = collectRepoState();
+  const dependencyState = collectDependencyState();
   const matrix = buildCombinationMatrix({
     approaches: args.approaches,
     kValues: args.kValues,
@@ -988,6 +1043,8 @@ async function main() {
     iterations: args.iterations,
     replayAnchors,
     allowCreateManifests: !args.plan,
+    repoState,
+    dependencyState,
   }).filter((combo) => filteredIterations.includes(combo.iteration));
 
   if (args.plan) {

@@ -82,6 +82,9 @@ function validateExactFinalRun(runRoot, kValue, options = {}) {
   if (topology.cachedFinalResultCount !== 1) {
     failures.push(`cachedFinalResultCount=${topology.cachedFinalResultCount}, expected 1`);
   }
+  if (!Number.isFinite(topology.sharedQueryRegisteredAt)) {
+    failures.push("sharedQueryRegisteredAt missing from topology");
+  }
 
   if (deliveries.length !== kValue) {
     failures.push(`delivery records=${deliveries.length}, expected ${kValue}`);
@@ -119,6 +122,9 @@ function validateExactFinalRun(runRoot, kValue, options = {}) {
       "sharedExecutionId",
       "resultId",
       "resultValue",
+      "consumerQueryRegisteredAt",
+      "sharedQueryRegisteredAt",
+      "cacheEntryCreatedAt",
       "deliveryTimestamp",
       "sourceResultTimestamp",
       "K",
@@ -135,6 +141,20 @@ function validateExactFinalRun(runRoot, kValue, options = {}) {
       const actual = Number(entry.resultValue);
       if (!Number.isFinite(actual) || Math.abs(actual - expectedValue) > valueTolerance) {
         failures.push(`delivery value ${entry.resultValue} differs from expected ${expectedValue}`);
+      }
+    }
+  }
+
+  for (const cacheEntry of cacheEntries) {
+    for (const field of [
+      "sharedExecutionId",
+      "resultId",
+      "resultValue",
+      "sourceResultTimestamp",
+      "cachedAt",
+    ]) {
+      if (cacheEntry[field] === undefined || cacheEntry[field] === null || cacheEntry[field] === "") {
+        failures.push(`cache missing ${field}`);
       }
     }
   }

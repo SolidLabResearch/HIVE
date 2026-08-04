@@ -1136,6 +1136,19 @@ export class FetchingAllDataClientSide {
     return `${FETCHING_LATENCY_HEADER}${this.latencyRows.join("\n")}${this.latencyRows.length > 0 ? "\n" : ""}`;
   }
 
+  public getLatencySnapshot(): {
+    queryRegisteredAt: number;
+    firstDataReceivedAt: number | null;
+    lastObservationReceivedAt: number | null;
+  } {
+    return {
+      queryRegisteredAt: this.queryRegisteredTime,
+      firstDataReceivedAt: this.firstDataReceivedTime > 0 ? this.firstDataReceivedTime : null,
+      lastObservationReceivedAt:
+        this.lastObservationReceivedTime > 0 ? this.lastObservationReceivedTime : null,
+    };
+  }
+
   private async persistDurableArtifacts({
     windowNumber,
     windowFlags,

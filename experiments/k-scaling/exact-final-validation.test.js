@@ -23,12 +23,14 @@ function writeValidRun(root, K, options = {}) {
     deliveryEventCount: K,
     uniqueConsumerCount: K,
     cachedFinalResultCount: 1,
+    sharedQueryRegisteredAt: 900,
   });
   appendNdjson(path.join(root, "exact_final_result_cache.ndjson"), {
     sharedExecutionId,
     resultId,
     resultValue: value,
     sourceResultTimestamp: 1000,
+    cachedAt: 1001,
   });
   for (let index = 1; index <= K; index += 1) {
     appendNdjson(path.join(root, "exact_final_delivery_events.ndjson"), {
@@ -37,6 +39,9 @@ function writeValidRun(root, K, options = {}) {
       sharedExecutionId,
       resultId,
       resultValue: value,
+      consumerQueryRegisteredAt: 950 + index,
+      sharedQueryRegisteredAt: 900,
+      cacheEntryCreatedAt: 1001,
       deliveryTimestamp: 2000 + index,
       sourceResultTimestamp: 1000,
       K,

@@ -22,8 +22,13 @@ type DeliveryEvent = {
   sharedExecutionId: string;
   resultId: string;
   resultValue: number;
+  consumerQueryRegisteredAt: number;
+  sharedQueryRegisteredAt: number;
+  firstObservationReceivedAt: number | null;
+  lastRequiredObservationReceivedAt: number | null;
   deliveryTimestamp: number;
   sourceResultTimestamp: number;
+  cacheEntryCreatedAt: number;
   K: number;
   iteration: number | null;
   aggregation: AggregationFunction;
@@ -66,7 +71,7 @@ function appendNdjson(filePath: string, value: unknown): void {
 function writeCsvHeader(filePath: string): void {
   fs.writeFileSync(
     filePath,
-    "window_number,query_registered_at,source_result_timestamp,result_emitted_at,delay_past_expected_close_ms,window_start,window_end,window_duration_ms,coverage_complete,is_partial_window,is_comparable_window,result_value,consumer_id,subscription_id,shared_execution_id,result_id\n",
+    "window_number,consumer_query_registered_at,shared_query_registered_at,first_observation_received_at,last_required_observation_received_at,shared_result_created_at,cache_entry_created_at,consumer_result_delivered_at,fanout_delivery_latency_ms,last_observation_to_delivery_ms,semantic_window_close_to_delivery_ms,window_start,window_end,window_duration_ms,coverage_complete,is_partial_window,is_comparable_window,result_value,consumer_id,subscription_id,shared_execution_id,result_id\n",
   );
 }
 
@@ -87,12 +92,14 @@ class ExactFinalFanOut {
   private readonly subscriberClients: any[] = [];
   private readonly deliveredConsumers = new Set<string>();
   private readonly subscriptionIds = new Map<string, string>();
+  private readonly subscriberRegisteredAt = new Map<string, number>();
   private sharedClient: FetchingAllDataClientSide | null = null;
   private cachedResult: CachedFinalResult | null = null;
   private deliveryEvents: DeliveryEvent[] = [];
   private shuttingDown = false;
   private lastDeliveryTimestamp = 0;
   private sharedQueryExecutionCount = 0;
+  private sharedQueryRegisteredAt = 0;
 
   constructor(K: number, iteration: number | null, aggregation: AggregationFunction) {
     this.K = K;
@@ -194,6 +201,7 @@ WHERE {
                 reject(error);
                 return;
               }
+              this.subscriberRegisteredAt.set(consumerId, Date.now());
               resolve();
             });
           });
@@ -217,6 +225,7 @@ WHERE {
       this.sharedQueryExecutionCount = 1;
       profileCount("fresh_executions_started");
       profileCount("final_result_topics_created");
+      this.sharedQueryRegisteredAt = Date.now();
       this.sharedClient = new FetchingAllDataClientSide(
         this.buildSharedQuery(),
         this.sharedResultTopic,
@@ -316,8 +325,16 @@ WHERE {
       sharedExecutionId: this.sharedExecutionId,
       resultId,
       resultValue,
+      consumerQueryRegisteredAt:
+        this.subscriberRegisteredAt.get(consumerId) ?? this.sharedQueryRegisteredAt,
+      sharedQueryRegisteredAt: this.sharedQueryRegisteredAt,
+      firstObservationReceivedAt:
+        this.sharedClient?.getLatencySnapshot().firstDataReceivedAt ?? null,
+      lastRequiredObservationReceivedAt:
+        this.sharedClient?.getLatencySnapshot().lastObservationReceivedAt ?? null,
       deliveryTimestamp,
       sourceResultTimestamp,
+      cacheEntryCreatedAt: this.cachedResult?.cachedAt ?? Date.now(),
       K: this.K,
       iteration: this.iteration,
       aggregation: this.aggregation,
@@ -343,19 +360,33 @@ WHERE {
 
   private writeLatencyCsv(consumerIndex: number, event: DeliveryEvent): void {
     const latencyPath = path.join(this.logRoot, `exact_final_latency_log_consumer_${consumerIndex}.csv`);
-    const queryRegisteredAt = event.sourceResultTimestamp;
     const duration = event.windowStart !== null && event.windowEnd !== null
       ? event.windowEnd - event.windowStart
       : getOutputWindowRange();
-    const delayPastExpectedClose = event.deliveryTimestamp - event.sourceResultTimestamp;
+    const fanoutDeliveryLatencyMs = event.deliveryTimestamp - event.sourceResultTimestamp;
+    const lastObservationToDeliveryMs =
+      event.lastRequiredObservationReceivedAt !== null
+        ? event.deliveryTimestamp - event.lastRequiredObservationReceivedAt
+        : "";
+    const semanticWindowCloseToDeliveryMs =
+      event.windowEnd !== null &&
+      event.lastRequiredObservationReceivedAt !== null
+        ? event.deliveryTimestamp - event.lastRequiredObservationReceivedAt
+        : "";
     fs.appendFileSync(
       latencyPath,
       [
         event.windowNumber ?? "",
-        queryRegisteredAt,
+        event.consumerQueryRegisteredAt,
+        event.sharedQueryRegisteredAt,
+        event.firstObservationReceivedAt ?? "",
+        event.lastRequiredObservationReceivedAt ?? "",
         event.sourceResultTimestamp,
+        event.cacheEntryCreatedAt,
         event.deliveryTimestamp,
-        delayPastExpectedClose,
+        fanoutDeliveryLatencyMs,
+        lastObservationToDeliveryMs,
+        semanticWindowCloseToDeliveryMs,
         event.windowStart ?? "",
         event.windowEnd ?? "",
         duration,
@@ -388,6 +419,7 @@ WHERE {
           sharedExecutionId: this.sharedExecutionId,
           canonicalQueryHash: this.canonicalQueryHash,
           resultTopic: this.sharedResultTopic,
+          sharedQueryRegisteredAt: this.sharedQueryRegisteredAt,
           K: this.K,
           iteration: this.iteration,
           processId: process.pid,

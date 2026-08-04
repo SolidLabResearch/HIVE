@@ -327,6 +327,13 @@ describe("resume prioritization and scenario anchors", () => {
       iteration: 3,
       replayAnchor: "9000",
       allowCreate: true,
+      repoState: { commit: "abc123", branch: "chunk-state-reuse-design" },
+      dependencyState: {
+        rspJsRevision: "rsp123",
+        rspJsStatusShort: "",
+        rspJsSpecifier: "file:../RSP-JS",
+        containmentCheckerVersion: "2.7.0",
+      },
     });
 
     expect(manifest).toMatchObject({
@@ -334,6 +341,8 @@ describe("resume prioritization and scenario anchors", () => {
       replay_anchor: "9000",
       K: 8,
       iteration: 3,
+      commit: "abc123",
+      dependency_revision: "rsp123",
     });
 
     const reread = ensureScenarioManifest({
