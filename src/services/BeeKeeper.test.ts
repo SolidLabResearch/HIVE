@@ -32,6 +32,7 @@ describe('BeeKeeper', () => {
                 'approximation-approach',
                 undefined,
                 undefined,
+                undefined,
             );
         });
 
@@ -43,6 +44,7 @@ describe('BeeKeeper', () => {
                 'output-topic',
                 'chunked-approach',
                 subQueries,
+                undefined,
                 undefined,
             );
         });

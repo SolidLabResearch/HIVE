@@ -15,7 +15,18 @@ export class HiveQueryBee {
      * @param topic
      * @param queryHash
      */
-    constructor(query: string, topic: string, operator: string, subQueries?: string[], additionalEnv?: Record<string, string>) {
+    constructor(
+        query: string,
+        topic: string,
+        operator: string,
+        subQueries?: string[],
+        additionalEnv?: Record<string, string>,
+        callbacks?: {
+            onMessage?: (message: unknown) => void;
+            onExit?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
+            onError?: (error: Error) => void;
+        },
+    ) {
         const beeWorkerPath = path.resolve(__dirname, "BeeWorker.js");
 
         this.query = query;
@@ -39,11 +50,17 @@ export class HiveQueryBee {
 
         this.process.on("message", (msg) => {
             console.log(`Query: ${this.query}`, msg);
+            callbacks?.onMessage?.(msg);
         });
 
-        this.process.on("exit", () => {
+        this.process.on("error", (error) => {
+            callbacks?.onError?.(error);
+        });
+
+        this.process.on("exit", (code, signal) => {
             console.log(`Query: ${this.query} exited`);
-        })
+            callbacks?.onExit?.({ code, signal });
+        });
     }
 
 

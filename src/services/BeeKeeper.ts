@@ -30,10 +30,22 @@ export class BeeKeeper {
      * @param {string }r2s_topic - The topic to which the results will be published.
      * @returns {void} - No return value.
      */
-    public executeQuery(query: string, r2s_topic: string, operator: string, subQueries?: string[], additionalEnv?: Record<string, string>) {
+    public executeQuery(
+        query: string,
+        r2s_topic: string,
+        operator: string,
+        subQueries?: string[],
+        additionalEnv?: Record<string, string>,
+        callbacks?: {
+            onMessage?: (message: unknown) => void;
+            onExit?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
+            onError?: (error: Error) => void;
+        },
+    ) {
         const query_hash = hash_string_md5(query);
-        const worker = new HiveQueryBee(query, r2s_topic, operator, subQueries, additionalEnv);
+        const worker = new HiveQueryBee(query, r2s_topic, operator, subQueries, additionalEnv, callbacks);
         this.bees.set(query_hash, worker);
+        return worker;
     }    /**
      * Stop a query by terminating the corresponding HiveQueryBee worker.
      * The worker is identified by the unique hash generated

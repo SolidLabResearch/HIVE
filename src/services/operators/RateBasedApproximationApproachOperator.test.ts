@@ -114,6 +114,9 @@ describe('ApproximationApproachOperator', () => {
       STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE: '0',
       STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: '0',
     };
+    delete process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS;
+    delete process.env.LOG_PATH;
+    delete process.env.K_SCALING_CONSUMER_INDEX;
   });
 
   afterAll(() => {

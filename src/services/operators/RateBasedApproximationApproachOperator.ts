@@ -42,6 +42,12 @@ import {
   getLatestTopicValue,
   TopicWindowBuffers,
 } from "./approximation/ApproximationWindowBuffer";
+import {
+  appendApproximationTrace,
+  ApproximationConsumerSummary,
+  buildApproximationTracePath,
+  writeAtomicJson,
+} from "../../approaches/approximationKScalingArtifacts";
 
 /**
  * Configuration interface for inactivity detection
@@ -68,6 +74,19 @@ type ApproximationWindowMessage = {
   value: number;
   aggregationType: "SUM" | "AVG" | "COUNT" | "MIN" | "MAX";
   sourceTopic: string;
+};
+
+type FinalizedApproximationWindow = {
+  consumerIndex: number;
+  stateObjectId: string;
+  windowNumber: number;
+  windowStart: number;
+  windowEnd: number;
+  resultValue: number;
+  resultEmittedAt: number;
+  coverageComplete: boolean;
+  isPartialWindow: boolean;
+  isComparableWindow: boolean;
 };
 
 /**
@@ -131,6 +150,13 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     process.env.LOG_PATH || ".",
     this.withConsumerSuffix("benchmark_window_cap_summary.json"),
   );
+  private readonly tracePath: string = buildApproximationTracePath(
+    process.env.LOG_PATH || ".",
+  );
+  private finalizedWindowState: FinalizedApproximationWindow | null = null;
+  private cleanupPromise: Promise<void> | null = null;
+  private finalizePromise: Promise<void> | null = null;
+  private completionNotified: boolean = false;
 
   /**
    * The constructor class with optional inactivity configuration.
@@ -174,28 +200,137 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
     this.cleanupRegistered = true;
     process.once("exit", () => {
-      this.cleanup();
+      void this.cleanup();
     });
   }
 
-  public cleanup(): void {
-    profileSync("cleanup_time_ms", () => {
-      this.writeBenchmarkWindowSummary();
-      this.resultPublisher.cleanup();
-      for (const client of this.activeMqttClients.splice(0)) {
-        try {
-          client.end(true);
-        } catch (error) {
-          console.error("Failed to close approximation MQTT client:", error);
+  public async cleanup(): Promise<void> {
+    if (this.cleanupPromise) {
+      return this.cleanupPromise;
+    }
+    this.cleanupPromise = profileSync("cleanup_time_ms", () =>
+      Promise.resolve().then(() => {
+        this.writeBenchmarkWindowSummary();
+        this.resultPublisher.cleanup();
+        for (const client of this.activeMqttClients.splice(0)) {
+          try {
+            client.end(true);
+          } catch (error) {
+            console.error("Failed to close approximation MQTT client:", error);
+          }
         }
-      }
-      this.diagnosticsWriter.cleanup();
-    });
-    this.logger.log(
-      `Approximation message counters: ${JSON.stringify(this.messageCounters)}`,
+        this.diagnosticsWriter.cleanup();
+        this.logger.log(
+          `Approximation message counters: ${JSON.stringify(this.messageCounters)}`,
+        );
+        writeProfileArtifact();
+        writeStageProfileArtifact();
+      }),
     );
-    writeProfileArtifact();
-    writeStageProfileArtifact();
+    await this.cleanupPromise;
+  }
+
+  private trace(event: Parameters<typeof appendApproximationTrace>[1]["event"], detail?: Record<string, unknown>, targetPath?: string | null): void {
+    appendApproximationTrace(this.tracePath, {
+      consumerIndex:
+        this.finalizedWindowState?.consumerIndex ??
+        (Number(process.env.K_SCALING_CONSUMER_INDEX || "0") || null),
+      event,
+      targetPath: targetPath ?? null,
+      detail,
+    });
+  }
+
+  private async notifyCompletion(summaryPath: string, latencyPath: string): Promise<void> {
+    if (this.completionNotified) {
+      return;
+    }
+    this.completionNotified = true;
+    process.send?.({
+      type: "approximation_consumer_completion",
+      consumerIndex: Number(process.env.K_SCALING_CONSUMER_INDEX || "0"),
+      summaryPath,
+      latencyPath,
+      stateObjectId: this.finalizedWindowState?.stateObjectId ?? null,
+    });
+  }
+
+  private async writeConsumerSummary(): Promise<string> {
+    if (!this.finalizedWindowState) {
+      throw new Error("Approximation consumer finalized without window state");
+    }
+    const summaryPath = this.benchmarkWindowSummaryPath;
+    const summary: ApproximationConsumerSummary = {
+      summaryVersion: 1,
+      approach: "approximation",
+      consumerIndex: this.finalizedWindowState.consumerIndex,
+      stateObjectId: this.finalizedWindowState.stateObjectId,
+      queryRegisteredAt: this.queryRegisteredTime,
+      firstDataReceivedAt: this.firstDataReceivedTime,
+      emittedFinalWindowCount: this.finalizedWindowNumbers.length,
+      windowNumber: this.finalizedWindowState.windowNumber,
+      windowStart: this.finalizedWindowState.windowStart,
+      windowEnd: this.finalizedWindowState.windowEnd,
+      coverageComplete: this.finalizedWindowState.coverageComplete,
+      isPartialWindow: this.finalizedWindowState.isPartialWindow,
+      isComparableWindow: this.finalizedWindowState.isComparableWindow,
+      resultValue: this.finalizedWindowState.resultValue,
+      resultEmittedAt: this.finalizedWindowState.resultEmittedAt,
+      writeCompletedAt: new Date().toISOString(),
+      stopReason: this.benchmarkStopReason,
+      finalWindowNumbers: [...this.finalizedWindowNumbers],
+    };
+    await writeAtomicJson(summaryPath, summary);
+    this.trace("consumer_summary_write_completed", {
+      windowNumber: summary.windowNumber,
+      emittedFinalWindowCount: summary.emittedFinalWindowCount,
+    }, summaryPath);
+    return summaryPath;
+  }
+
+  private async finalizeDurableCompletion(): Promise<void> {
+    if (this.finalizePromise) {
+      return this.finalizePromise;
+    }
+    this.finalizePromise = (async () => {
+      if (!this.finalizedWindowState) {
+        throw new Error("Approximation consumer missing finalized window state");
+      }
+      const latencyPath = this.resolveLogFilePath("approximation_latency_log.csv");
+      this.trace("consumer_result_observed", {
+        windowNumber: this.finalizedWindowState.windowNumber,
+        windowStart: this.finalizedWindowState.windowStart,
+        windowEnd: this.finalizedWindowState.windowEnd,
+      });
+      this.writeBenchmarkWindowSummary();
+      this.trace("consumer_latency_write_started", {
+        windowNumber: this.finalizedWindowState.windowNumber,
+      }, latencyPath);
+      await this.diagnosticsWriter.flushToDisk();
+      this.trace("consumer_latency_write_completed", {
+        windowNumber: this.finalizedWindowState.windowNumber,
+      }, latencyPath);
+      const summaryPath = await this.writeConsumerSummary();
+      await this.notifyCompletion(summaryPath, latencyPath);
+      await this.cleanup();
+      this.requestProcessExit(0);
+    })().catch(async (error) => {
+      process.send?.({
+        type: "approximation_consumer_failure",
+        consumerIndex: Number(process.env.K_SCALING_CONSUMER_INDEX || "0"),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await this.cleanup();
+      this.requestProcessExit(1);
+    });
+    await this.finalizePromise;
+  }
+
+  private requestProcessExit(code: number): void {
+    if (process.env.JEST_WORKER_ID) {
+      return;
+    }
+    process.exit(code);
   }
 
   private recordFinalizedWindow(windowNumber: number): void {
@@ -213,16 +348,20 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       this.logger.log(
         `Benchmark target window reached: target=${this.benchmarkTargetWindowCount} finalWindows=${this.finalizedWindowNumbers.join(",")}`,
       );
-      this.writeBenchmarkWindowSummary();
-      setTimeout(() => {
-        this.cleanup();
-        process.exit(0);
-      }, 50);
+      void this.finalizeDurableCompletion();
     }
   }
 
   private writeBenchmarkWindowSummary(): void {
     if (this.benchmarkTargetWindowCount === null) {
+      return;
+    }
+
+    if (
+      this.finalizedWindowState &&
+      this.benchmarkTargetWindowReached &&
+      fs.existsSync(this.benchmarkWindowSummaryPath)
+    ) {
       return;
     }
 
@@ -833,6 +972,18 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   });
                   profileCount("mqtt_messages_published");
                   profileCount("emitted_results");
+                  this.finalizedWindowState = {
+                    consumerIndex: Number(process.env.K_SCALING_CONSUMER_INDEX || "0"),
+                    stateObjectId: `${this.sessionId}-window-${currentOutputWindowNumber}`,
+                    windowNumber: currentOutputWindowNumber,
+                    windowStart,
+                    windowEnd,
+                    resultValue: unifiedResult,
+                    resultEmittedAt,
+                    coverageComplete: true,
+                    isPartialWindow: false,
+                    isComparableWindow: true,
+                  };
                   this.recordFinalizedWindow(currentOutputWindowNumber);
                 }
               },

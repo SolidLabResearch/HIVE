@@ -1,15 +1,3 @@
-const writeMock = jest.fn();
-const endMock = jest.fn();
-
-jest.mock("fs", () => ({
-  ...jest.requireActual("fs"),
-  existsSync: jest.fn().mockReturnValue(false),
-  createWriteStream: jest.fn().mockReturnValue({
-    write: writeMock,
-    end: endMock,
-  }),
-}));
-
 import { ApproximationDiagnosticsWriter } from "./ApproximationDiagnosticsWriter";
 
 describe("ApproximationDiagnosticsWriter", () => {
@@ -56,7 +44,7 @@ describe("ApproximationDiagnosticsWriter", () => {
       },
     );
 
-    const dataLine = writeMock.mock.calls[1][0] as string;
+    const dataLine = (writer as any).latencyRows[0] as string;
     expect(dataLine).toContain(",domain_mismatch,");
     expect(dataLine).toContain(",1756123025256,,1782236914575,");
     expect(dataLine).not.toContain("26105071228");
@@ -96,7 +84,7 @@ describe("ApproximationDiagnosticsWriter", () => {
       },
     );
 
-    const dataLine = writeMock.mock.calls[1][0] as string;
+    const dataLine = (writer as any).latencyRows[0] as string;
     expect(dataLine).toContain(",1782236911119,");
     expect(dataLine).toContain(",3456,wall_clock_mapped,");
 
@@ -132,7 +120,7 @@ describe("ApproximationDiagnosticsWriter", () => {
       },
     )).not.toThrow();
 
-    const dataLine = writeMock.mock.calls[1][0] as string;
+    const dataLine = (writer as any).latencyRows[0] as string;
     expect(dataLine).toContain(",domain_mismatch,");
     expect(dataLine).toContain(",,domain_mismatch,");
     expect(errorSpy).toHaveBeenCalledWith(
