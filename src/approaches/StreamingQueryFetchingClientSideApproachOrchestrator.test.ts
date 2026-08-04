@@ -1,4 +1,6 @@
 import { EventEmitter } from "events";
+import os from "os";
+import path from "path";
 
 type MockMqttClient = {
   handlers: Record<string, Function>;
@@ -12,6 +14,8 @@ type MockMqttClient = {
 
 const mqttClients: MockMqttClient[] = [];
 let lastRStreamEmitter: EventEmitter | null = null;
+let logRoot: string;
+const createdOperators: FetchingAllDataClientSide[] = [];
 
 function createMockMqttClient(): MockMqttClient {
   const handlers: Record<string, Function> = {};
@@ -142,7 +146,7 @@ function configureEnv(overrides: Record<string, string>) {
     WEARABLE_FREQUENCY: "10",
     OUTPUT_WINDOW_RANGE: "120000",
     OUTPUT_WINDOW_STEP: "60000",
-    LOG_PATH: "/tmp",
+    LOG_PATH: logRoot,
     ...overrides,
   };
 }
@@ -154,11 +158,14 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
   beforeEach(() => {
     jest.clearAllMocks();
     mqttClients.length = 0;
+    createdOperators.length = 0;
     lastRStreamEmitter = null;
     Date.now = jest.fn(() => 1782246735560);
+    logRoot = jest.requireActual("fs").mkdtempSync(path.join(os.tmpdir(), "fetching-client-test-"));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await Promise.all(createdOperators.map((operator) => operator.cleanup()));
     process.env = originalEnv;
     Date.now = originalNow;
   });
@@ -170,8 +177,29 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
       "mqtt://localhost:1883/result",
       "AVG",
     );
+    createdOperators.push(operator);
     expect(lastRStreamEmitter).toBeTruthy();
     return operator;
+  }
+
+  async function waitForCondition(
+    predicate: () => boolean,
+    attempts = 50,
+  ) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (predicate()) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  async function waitForAsyncProcessing(predicate?: () => boolean) {
+    if (predicate) {
+      await waitForCondition(predicate);
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
   }
 
   function primeCompleteWindow(operator: FetchingAllDataClientSide) {
@@ -195,7 +223,7 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     instance.queryRegisteredTime = 1782246364099;
   }
 
-  test("deterministic benchmark mode bypasses cadence filtering for complete aligned windows", () => {
+  test("deterministic benchmark mode bypasses cadence filtering for complete aligned windows", async () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_FETCHING_DISABLE_CADENCE_FILTER: "0",
@@ -204,6 +232,7 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
 
     const timingSpy = jest.spyOn(operator as any, "isWithinExpectedWindowTiming");
     lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject());
+    await waitForAsyncProcessing(() => mqttClients.length === 1);
 
     expect(timingSpy).not.toHaveBeenCalled();
     expect((operator as any).acceptedCompleteWindowCount).toBe(1);
@@ -213,7 +242,7 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     expect(mqttClients[0].publish).toHaveBeenCalledTimes(1);
   });
 
-  test("legacy mode still applies cadence filtering", () => {
+  test("legacy mode still applies cadence filtering", async () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "0",
       STREAMING_QUERY_HIVE_FETCHING_DISABLE_CADENCE_FILTER: "0",
@@ -222,6 +251,7 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
 
     const timingSpy = jest.spyOn(operator as any, "isWithinExpectedWindowTiming").mockReturnValue(false);
     lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject());
+    await waitForAsyncProcessing(() => (operator as any).filteredDueToTimingCount === 1);
 
     expect(timingSpy).toHaveBeenCalledTimes(1);
     expect((operator as any).acceptedCompleteWindowCount).toBe(0);
@@ -229,7 +259,7 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     expect(mqttClients).toHaveLength(0);
   });
 
-  test("incomplete windows are still suppressed in deterministic mode", () => {
+  test("incomplete windows are still suppressed in deterministic mode", async () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_FETCHING_DISABLE_CADENCE_FILTER: "0",
@@ -245,13 +275,14 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     });
 
     lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject(1800));
+    await waitForAsyncProcessing(() => (operator as any).logicalWindowCandidates.size === 1);
 
     expect((operator as any).acceptedCompleteWindowCount).toBe(0);
     expect((operator as any).filteredDueToTimingCount).toBe(0);
     expect(mqttClients).toHaveLength(0);
   });
 
-  test("startup-first-emitted mode suppresses partial startup rows before full range coverage", () => {
+  test("startup-first-emitted mode suppresses partial startup rows before full range coverage", async () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE: "1",
@@ -260,14 +291,15 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     });
     primeCompleteWindow(operator);
     lastRStreamEmitter?.emit("RStream", buildPartialRStreamObject());
+    await waitForAsyncProcessing(() => (operator as any).logicalWindowCandidates.size === 1);
 
     expect((operator as any).acceptedCompleteWindowCount).toBe(0);
     expect((operator as any).windowCount).toBe(0);
-    expect((operator as any).finalizedWindowNumbers).toEqual([]);
+    expect((operator as any).artifactState.finalizedWindowNumbers).toEqual([]);
     expect(mqttClients).toHaveLength(0);
   });
 
-  test("startup-first-emitted mode counts the first settled complete 120-second window", () => {
+  test("startup-first-emitted mode counts the first settled complete 120-second window", async () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_FETCHING_STARTUP_FIRST_EMITTED_MODE: "1",
@@ -277,16 +309,17 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     primeCompleteWindow(operator);
 
     lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject(2400, 1));
+    await waitForAsyncProcessing(() => mqttClients.length === 1);
 
     expect((operator as any).acceptedCompleteWindowCount).toBe(1);
     expect((operator as any).windowCount).toBe(1);
-    expect((operator as any).finalizedWindowNumbers).toEqual([1]);
+    expect((operator as any).artifactState.finalizedWindowNumbers).toEqual([1]);
     expect(mqttClients).toHaveLength(1);
     mqttClients[0].emit("connect");
     expect(mqttClients[0].publish).toHaveBeenCalledTimes(1);
   });
 
-  test("duplicate windows are still suppressed in deterministic mode", () => {
+  test("duplicate windows are still suppressed in deterministic mode", async () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_FETCHING_DISABLE_CADENCE_FILTER: "0",
@@ -296,6 +329,7 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     const key = `${WINDOW_START}:${WINDOW_END}`;
     (operator as any).emittedLogicalWindows.add(key);
     lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject());
+    await waitForAsyncProcessing(() => (operator as any).acceptedCompleteWindowCount === 0);
 
     expect((operator as any).acceptedCompleteWindowCount).toBe(0);
     expect(mqttClients).toHaveLength(0);
@@ -306,9 +340,6 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: "3",
     });
-    const scheduleSpy = jest
-      .spyOn(operator as any, "scheduleBenchmarkShutdown")
-      .mockImplementation(() => undefined);
     const recordSpy = jest.spyOn(operator as any, "recordFinalizedWindow");
 
     (operator as any).recordFinalizedWindow(1);
@@ -316,28 +347,24 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     (operator as any).recordFinalizedWindow(3);
 
     expect(recordSpy).toHaveBeenCalledTimes(3);
-    expect(scheduleSpy).toHaveBeenCalledTimes(1);
-    expect((operator as any).finalizedWindowNumbers).toEqual([1, 2, 3]);
-    expect((operator as any).benchmarkTargetWindowReached).toBe(true);
-    expect((operator as any).benchmarkStopReason).toBe("target_window_count_reached");
+    expect((operator as any).artifactState.finalizedWindowNumbers).toEqual([1, 2, 3]);
+    expect((operator as any).artifactState.benchmarkTargetWindowReached).toBe(true);
+    expect((operator as any).artifactState.benchmarkStopReason).toBe("target_window_count_reached");
   });
 
-  test("benchmark target window cap suppresses complete windows beyond the cap", () => {
+  test("benchmark target window cap suppresses complete windows beyond the cap", async () => {
     const operator = createOperator({
       STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
       STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: "3",
     });
     primeCompleteWindow(operator);
     (operator as any).acceptedCompleteWindowCount = 3;
-    const scheduleSpy = jest
-      .spyOn(operator as any, "scheduleBenchmarkShutdown")
-      .mockImplementation(() => undefined);
 
     lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject());
+    await waitForAsyncProcessing(() => (operator as any).artifactState.benchmarkTargetWindowReached === true);
 
     expect((operator as any).acceptedCompleteWindowCount).toBe(3);
-    expect(scheduleSpy).toHaveBeenCalledTimes(1);
-    expect((operator as any).benchmarkTargetWindowReached).toBe(true);
+    expect((operator as any).artifactState.benchmarkTargetWindowReached).toBe(true);
     expect(mqttClients).toHaveLength(0);
   });
 });

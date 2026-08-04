@@ -21,7 +21,9 @@ const {
   TARGET_WINDOWS,
   buildCheckpointKey,
   buildCombinationMatrix,
+  buildScenarioKey,
   countConsumerLatencyFiles,
+  createScenarioReplayAnchors,
   extractAllConsumerWindows,
   extractRepresentativeWindow,
   median,
@@ -37,6 +39,16 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const DEFAULT_TIMEOUT_MS = 6 * 60 * 1000;
 const REQUIRED_REPLAY_DURATION_SECONDS = 185;
 const CONTROL_PORT = 8080;
+const STARTUP_READY_TIMEOUT_MS = 30 * 1000;
+const TARGET_REACHED_SETTLE_TIMEOUT_MS = 15 * 1000;
+const ARTIFACT_SETTLE_TIMEOUT_MS = 5 * 1000;
+const POLL_INTERVAL_MS = 250;
+const ATTEMPT_STATES = {
+  VALID: "VALID",
+  INVALID: "INVALID",
+  PARTIAL: "PARTIAL",
+  MISSING: "MISSING",
+};
 const APPROACHES = {
   fetching: {
     orchestrator: "dist/approaches/StreamingQueryFetchingKScalingOrchestrator.js",
@@ -74,6 +86,10 @@ function parseArgs(argv) {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     resumeRoot: null,
     stopOnInvalid: true,
+    plan: false,
+    onlyApproaches: null,
+    onlyKValues: null,
+    onlyIterations: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -100,6 +116,24 @@ function parseArgs(argv) {
         args.resumeRoot = path.resolve(REPO_ROOT, next || "");
         index += 1;
         break;
+      case "--only-approach":
+        args.onlyApproaches = parseApproachSelection(next, []);
+        index += 1;
+        break;
+      case "--only-k":
+        args.onlyKValues = parseKScalingSelection(next, []);
+        index += 1;
+        break;
+      case "--only-iteration":
+        args.onlyIterations = String(next || "")
+          .split(",")
+          .map((value) => Number.parseInt(value.trim(), 10))
+          .filter((value) => Number.isFinite(value) && value > 0);
+        index += 1;
+        break;
+      case "--plan":
+        args.plan = true;
+        break;
       case "--no-stop-on-invalid":
         args.stopOnInvalid = false;
         break;
@@ -124,6 +158,21 @@ function parseArgs(argv) {
       throw new Error(`Unsupported approach: ${approach}`);
     }
   }
+  if (args.onlyApproaches) {
+    args.approaches = args.approaches.filter((approach) => args.onlyApproaches.includes(approach));
+  }
+  if (args.onlyKValues) {
+    args.kValues = args.kValues.filter((kValue) => args.onlyKValues.includes(kValue));
+  }
+  if (args.onlyIterations) {
+    args.onlyIterations = [...new Set(args.onlyIterations)].sort((left, right) => left - right);
+  }
+  if (args.approaches.length === 0) {
+    throw new Error("No approaches selected after filters");
+  }
+  if (args.kValues.length === 0) {
+    throw new Error("No K values selected after filters");
+  }
   return args;
 }
 
@@ -136,6 +185,10 @@ Options:
   --iterations <n>       Iterations per K/approach (default: 3)
   --timeout-ms <n>       Per-run timeout in milliseconds
   --resume-root <path>   Existing result root to resume
+  --only-approach <list> Restrict execution to one or more approaches
+  --only-k <list>        Restrict execution to one or more K values
+  --only-iteration <n>   Restrict execution to one or more iterations
+  --plan                 Print the ordered execution plan without running
   --no-stop-on-invalid   Continue after a structurally invalid result
 `);
 }
@@ -167,12 +220,80 @@ function buildRunRoot(resultRoot, approach, kValue, iteration) {
   return path.join(resultRoot, "raw", approach, `K${kValue}`, `iteration${iteration}`);
 }
 
-function buildReplayAnchor(kValue, iteration) {
-  const explicit = process.env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR;
-  if (explicit && explicit.trim()) {
-    return explicit.trim();
+function buildScenarioRoot(resultRoot, kValue, iteration) {
+  return path.join(resultRoot, "scenarios", `K${kValue}`, `iteration${iteration}`);
+}
+
+function buildScenarioManifestPath(resultRoot, kValue, iteration) {
+  return path.join(buildScenarioRoot(resultRoot, kValue, iteration), "scenario-manifest.json");
+}
+
+function buildScenarioManifest({
+  kValue,
+  iteration,
+  replayAnchor,
+}) {
+  return {
+    scenario_id: buildScenarioKey(kValue, iteration),
+    K: kValue,
+    iteration,
+    replay_anchor: replayAnchor,
+    fixture: "custom_patterns/low_variability",
+    seed: null,
+    window_range_ms: OUTPUT_WINDOW_RANGE_MS,
+    window_step_ms: OUTPUT_WINDOW_STEP_MS,
+    aggregation: "AVG",
+    target_streams: ["wearableX", "smartphoneX"],
+    created_at: new Date().toISOString(),
+  };
+}
+
+function ensureScenarioManifest({
+  resultRoot,
+  kValue,
+  iteration,
+  replayAnchor,
+  allowCreate,
+}) {
+  const manifestPath = buildScenarioManifestPath(resultRoot, kValue, iteration);
+  if (fs.existsSync(manifestPath)) {
+    return readJson(manifestPath);
   }
-  return String(Date.now());
+  if (!allowCreate) {
+    return null;
+  }
+  ensureDir(path.dirname(manifestPath));
+  const manifest = buildScenarioManifest({ kValue, iteration, replayAnchor });
+  writeJson(manifestPath, manifest);
+  return manifest;
+}
+
+function isCompleteRunMetadata(metadata, { approach, kValue, iteration, replayAnchor }) {
+  if (!metadata || typeof metadata !== "object") {
+    return false;
+  }
+  return metadata.approach === approach &&
+    metadata.kValue === kValue &&
+    metadata.iteration === iteration &&
+    metadata.replayAnchor === replayAnchor &&
+    metadata.environment &&
+    metadata.environment.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR === replayAnchor &&
+    metadata.environment.K_SCALING_K === String(kValue);
+}
+
+function archiveAttemptDirectory(runRoot, stateLabel) {
+  if (!fs.existsSync(runRoot)) {
+    return null;
+  }
+  const suffix = `${stateLabel.toLowerCase()}-${sanitizeTimestamp(new Date())}`;
+  let archivedPath = `${runRoot}.${suffix}`;
+  let counter = 1;
+  while (fs.existsSync(archivedPath)) {
+    archivedPath = `${runRoot}.${suffix}-${counter}`;
+    counter += 1;
+  }
+  fs.renameSync(runRoot, archivedPath);
+  return archivedPath;
 }
 
 function buildRunEnv({ approach, kValue, iteration, runRoot, timeoutMs, replayAnchor }) {
@@ -228,6 +349,29 @@ function hasSuccessfulTargetWindowCapSummary(summary) {
     Number.isFinite(summary?.targetWindowCount) &&
     Number.isFinite(summary?.emittedFinalWindowCount) &&
     summary.emittedFinalWindowCount >= summary.targetWindowCount;
+}
+
+function hasCompleteScenarioMetadata({
+  resultRoot,
+  approach,
+  kValue,
+  iteration,
+}) {
+  const manifest = readJson(buildScenarioManifestPath(resultRoot, kValue, iteration));
+  const runRoot = buildRunRoot(resultRoot, approach, kValue, iteration);
+  const metadata = readJson(path.join(runRoot, "run_metadata.json"));
+  if (!manifest) {
+    return { ok: false, reason: "scenario manifest missing" };
+  }
+  if (!isCompleteRunMetadata(metadata, {
+    approach,
+    kValue,
+    iteration,
+    replayAnchor: manifest.replay_anchor,
+  })) {
+    return { ok: false, reason: "run metadata incomplete or anchor mismatch" };
+  }
+  return { ok: true, manifest, metadata };
 }
 
 function isBoundedTargetStopExitAcceptable(code, signal, targetReached) {
@@ -301,9 +445,259 @@ function writeCheckpoint(resultRoot, approach, kValue, iteration, payload) {
   writeJson(path.join(resultRoot, "checkpoints", `${buildCheckpointKey(approach, kValue, iteration)}.json`), payload);
 }
 
+function buildStartupReadyPath(runRoot) {
+  return path.join(runRoot, "startup_ready.json");
+}
+
+async function waitForFile(filePath, timeoutMs) {
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) < timeoutMs) {
+    if (fs.existsSync(filePath)) {
+      return true;
+    }
+    await delay(POLL_INTERVAL_MS);
+  }
+  return fs.existsSync(filePath);
+}
+
+async function waitForStructuralValidation({
+  runRoot,
+  approach,
+  kValue,
+  timeoutMs,
+  requireTargetSummary = false,
+  validateRunImpl = validateRun,
+  readSummaryImpl = (summaryPath) => readJson(summaryPath),
+  delayImpl = delay,
+  pollIntervalMs = POLL_INTERVAL_MS,
+}) {
+  const startedAt = Date.now();
+  const summaryPath = path.join(runRoot, "benchmark_window_cap_summary.json");
+  let validation = validateRunImpl({ runRoot, approach, kValue });
+  let benchmarkSummary = readSummaryImpl(summaryPath);
+  while ((Date.now() - startedAt) < timeoutMs) {
+    const targetReached = hasSuccessfulTargetWindowCapSummary(benchmarkSummary);
+    if (validation.ok && (!requireTargetSummary || targetReached)) {
+      return { ok: true, validation, benchmarkSummary };
+    }
+    await delayImpl(pollIntervalMs);
+    validation = validateRunImpl({ runRoot, approach, kValue });
+    benchmarkSummary = readSummaryImpl(summaryPath);
+  }
+  return { ok: false, validation, benchmarkSummary };
+}
+
+function shouldRequireStartupBarrier(approach) {
+  return approach === "fetching" || approach === "exact-final";
+}
+
+function shouldTerminateBoundedRun({
+  validationOk,
+  targetReachedAt,
+  now,
+  settleTimeoutMs = TARGET_REACHED_SETTLE_TIMEOUT_MS,
+}) {
+  if (validationOk) {
+    return true;
+  }
+  if (!Number.isFinite(targetReachedAt) || !Number.isFinite(now)) {
+    return false;
+  }
+  return (now - targetReachedAt) >= settleTimeoutMs;
+}
+
+async function resolveReusableExecution(resultRoot, approach, kValue, iteration) {
+  const checkpoint = readCheckpoint(resultRoot, approach, kValue, iteration);
+  if (checkpoint?.success) {
+    return checkpoint;
+  }
+
+  const runRoot = buildRunRoot(resultRoot, approach, kValue, iteration);
+  if (!fs.existsSync(runRoot)) {
+    return null;
+  }
+
+  const validation = validateRun({ runRoot, approach, kValue });
+  const metadataState = hasCompleteScenarioMetadata({
+    resultRoot,
+    approach,
+    kValue,
+    iteration,
+  });
+  if (!validation.ok || !metadataState.ok) {
+    return null;
+  }
+
+  const repairedCheckpoint = {
+    success: true,
+    reason: "resume_revalidated",
+    validation,
+    endTime: new Date().toISOString(),
+    runRoot,
+    processTree: validation.processTree,
+    replayAnchor:
+      readJson(path.join(runRoot, "run_metadata.json"))?.replayAnchor ?? null,
+  };
+  writeCheckpoint(resultRoot, approach, kValue, iteration, repairedCheckpoint);
+  return repairedCheckpoint;
+}
+
+function classifyExistingExecution(resultRoot, approach, kValue, iteration) {
+  const checkpoint = readCheckpoint(resultRoot, approach, kValue, iteration);
+  const runRoot = buildRunRoot(resultRoot, approach, kValue, iteration);
+  const execResultPath = path.join(runRoot, "execution_result.json");
+  const hasRunDir = fs.existsSync(runRoot);
+  const execResult = readJson(execResultPath);
+  const metadataState = hasCompleteScenarioMetadata({
+    resultRoot,
+    approach,
+    kValue,
+    iteration,
+  });
+
+  if (!hasRunDir && !checkpoint) {
+    return { state: ATTEMPT_STATES.MISSING, checkpoint: null, reason: "attempt directory missing" };
+  }
+
+  if (execResult) {
+    const validationOk = execResult.validation?.ok === true;
+    const success = execResult.success === true;
+    if (success && validationOk && metadataState.ok) {
+      return { state: ATTEMPT_STATES.VALID, checkpoint: checkpoint || execResult, reason: null };
+    }
+    return {
+      state: ATTEMPT_STATES.INVALID,
+      checkpoint: checkpoint || execResult,
+      reason: metadataState.ok ? "execution result reports failure or invalid validation" : metadataState.reason,
+    };
+  }
+
+  if (checkpoint && checkpoint.success === true) {
+    return {
+      state: ATTEMPT_STATES.INVALID,
+      checkpoint,
+      reason: "successful checkpoint missing validated execution result",
+    };
+  }
+
+  if (checkpoint) {
+    return {
+      state: ATTEMPT_STATES.INVALID,
+      checkpoint,
+      reason: "failed checkpoint present",
+    };
+  }
+
+  return {
+    state: ATTEMPT_STATES.PARTIAL,
+    checkpoint: null,
+    reason: "attempt directory exists without validated execution result",
+  };
+}
+
+function collectScenarioAnchorState(resultRoot, kValue, iteration, approaches) {
+  const manifest = readJson(buildScenarioManifestPath(resultRoot, kValue, iteration));
+  const anchors = new Map();
+  for (const approach of approaches) {
+    const metadata = readJson(path.join(
+      buildRunRoot(resultRoot, approach, kValue, iteration),
+      "run_metadata.json",
+    ));
+    if (metadata?.replayAnchor) {
+      anchors.set(approach, metadata.replayAnchor);
+    }
+  }
+  const distinctAnchors = [...new Set(anchors.values())];
+  const conflict =
+    (manifest?.replay_anchor && distinctAnchors.some((anchor) => anchor !== manifest.replay_anchor)) ||
+    distinctAnchors.length > 1;
+  return {
+    manifest,
+    anchors,
+    conflict,
+    reason: conflict ? "scenario anchor conflict detected" : null,
+  };
+}
+
+function buildExecutionPlan({
+  resultRoot,
+  approaches,
+  kValues,
+  iterations,
+  replayAnchors,
+  allowCreateManifests = false,
+}) {
+  const matrix = buildCombinationMatrix({ approaches, kValues, iterations });
+  const categoryBuckets = {
+    [ATTEMPT_STATES.INVALID]: [],
+    [ATTEMPT_STATES.PARTIAL]: [],
+    [ATTEMPT_STATES.MISSING]: [],
+  };
+
+  const invalidatedScenarios = new Map();
+  for (const kValue of kValues) {
+    for (let iteration = 1; iteration <= iterations; iteration += 1) {
+      const manifest = ensureScenarioManifest({
+        resultRoot,
+        kValue,
+        iteration,
+        replayAnchor: replayAnchors[buildScenarioKey(kValue, iteration)],
+        allowCreate: allowCreateManifests,
+      });
+      const scenarioState = collectScenarioAnchorState(resultRoot, kValue, iteration, approaches);
+      if (!manifest && scenarioState.anchors.size > 0) {
+        invalidatedScenarios.set(buildScenarioKey(kValue, iteration), "scenario manifest missing for existing attempts");
+      } else if (scenarioState.conflict) {
+        invalidatedScenarios.set(buildScenarioKey(kValue, iteration), scenarioState.reason);
+      }
+    }
+  }
+
+  for (const combo of matrix) {
+    const scenarioKey = buildScenarioKey(combo.kValue, combo.iteration);
+    if (invalidatedScenarios.has(scenarioKey)) {
+      categoryBuckets[ATTEMPT_STATES.INVALID].push({
+        ...combo,
+        state: ATTEMPT_STATES.INVALID,
+        reason: invalidatedScenarios.get(scenarioKey),
+      });
+      continue;
+    }
+
+    const classification = classifyExistingExecution(
+      resultRoot,
+      combo.approach,
+      combo.kValue,
+      combo.iteration,
+    );
+    if (classification.state === ATTEMPT_STATES.VALID) {
+      continue;
+    }
+    categoryBuckets[classification.state].push({
+      ...combo,
+      state: classification.state,
+      reason: classification.reason,
+    });
+  }
+
+  return [
+    ...categoryBuckets[ATTEMPT_STATES.INVALID],
+    ...categoryBuckets[ATTEMPT_STATES.PARTIAL],
+    ...categoryBuckets[ATTEMPT_STATES.MISSING],
+  ];
+}
+
 async function runSingleExecution({ resultRoot, approach, kValue, iteration, timeoutMs, replayAnchor }) {
   const runRoot = buildRunRoot(resultRoot, approach, kValue, iteration);
-  fs.rmSync(runRoot, { recursive: true, force: true });
+  const priorClassification = classifyExistingExecution(resultRoot, approach, kValue, iteration);
+  let archivedAttemptPath = null;
+  if (priorClassification.state === ATTEMPT_STATES.INVALID) {
+    archivedAttemptPath = archiveAttemptDirectory(runRoot, "failed");
+  } else if (priorClassification.state === ATTEMPT_STATES.PARTIAL) {
+    archivedAttemptPath = archiveAttemptDirectory(runRoot, "partial");
+  } else {
+    fs.rmSync(runRoot, { recursive: true, force: true });
+  }
   ensureDir(runRoot);
   await cleanupStaleBenchmarkProcesses({ logger: console.log, quiescenceMs: 1000 });
 
@@ -318,6 +712,7 @@ async function runSingleExecution({ resultRoot, approach, kValue, iteration, tim
     runRoot,
     timeoutMs,
     replayAnchor,
+    archivedAttemptPath,
     environment: {
       STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR,
       STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX: env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX,
@@ -416,6 +811,7 @@ async function runSingleExecution({ resultRoot, approach, kValue, iteration, tim
     let publisherClosed = false;
     let orchestratorClose = { code: null, signal: null };
     let publisherClose = { code: null, signal: null };
+    let targetReachedAt = null;
     let targetReachedTerminationStarted = false;
 
     const maybeComplete = async (reason = "completed") => {
@@ -423,8 +819,14 @@ async function runSingleExecution({ resultRoot, approach, kValue, iteration, tim
         return;
       }
       writeProcessTreeArtifacts();
-      const validation = validateRun({ runRoot, approach, kValue });
-      const benchmarkSummary = readJson(path.join(runRoot, "benchmark_window_cap_summary.json"));
+      const settledValidation = await waitForStructuralValidation({
+        runRoot,
+        approach,
+        kValue,
+        timeoutMs: ARTIFACT_SETTLE_TIMEOUT_MS,
+      });
+      const validation = settledValidation.validation;
+      const benchmarkSummary = settledValidation.benchmarkSummary;
       const targetReached = hasSuccessfulTargetWindowCapSummary(benchmarkSummary);
       const result = {
         success:
@@ -453,7 +855,7 @@ async function runSingleExecution({ resultRoot, approach, kValue, iteration, tim
       void maybeComplete("orchestrator_error");
     });
 
-    publisherStartHandle = setTimeout(() => {
+    const spawnPublisher = () => {
       publisher = spawn("node", ["dist/streamer/src/publish.js"], {
         cwd: REPO_ROOT,
         env: { ...env, HIVE_PROCESS_ROLE: "benchmark_publisher" },
@@ -472,11 +874,25 @@ async function runSingleExecution({ resultRoot, approach, kValue, iteration, tim
       });
 
       targetReachedPollHandle = setInterval(() => {
-        if (targetReachedTerminationStarted || finalized) {
+        if (finalized) {
           return;
         }
         const summary = readJson(path.join(runRoot, "benchmark_window_cap_summary.json"));
         if (!hasSuccessfulTargetWindowCapSummary(summary)) {
+          return;
+        }
+        if (targetReachedAt === null) {
+          targetReachedAt = Date.now();
+        }
+        if (targetReachedTerminationStarted) {
+          return;
+        }
+        const validation = validateRun({ runRoot, approach, kValue });
+        if (!shouldTerminateBoundedRun({
+          validationOk: validation.ok,
+          targetReachedAt,
+          now: Date.now(),
+        })) {
           return;
         }
         targetReachedTerminationStarted = true;
@@ -486,8 +902,29 @@ async function runSingleExecution({ resultRoot, approach, kValue, iteration, tim
         ]).catch((error) => {
           console.error(`[target-stop] failed to terminate bounded run cleanly: ${error.message}`);
         });
-      }, 500);
-    }, 2500);
+      }, POLL_INTERVAL_MS);
+    };
+
+    publisherStartHandle = setTimeout(() => {
+      void (async () => {
+        if (shouldRequireStartupBarrier(approach)) {
+          const ready = await waitForFile(buildStartupReadyPath(runRoot), STARTUP_READY_TIMEOUT_MS);
+          if (!ready) {
+            resolve(finish({
+              success: false,
+              error: `startup readiness barrier timed out after ${STARTUP_READY_TIMEOUT_MS}ms`,
+              reason: "startup_ready_timeout",
+              endTime: new Date().toISOString(),
+              runRoot,
+            }));
+            return;
+          }
+        }
+        if (!finalized) {
+          spawnPublisher();
+        }
+      })();
+    }, shouldRequireStartupBarrier(approach) ? 0 : 2500);
 
     timeoutHandle = setTimeout(() => {
       resolve(finish({
@@ -507,15 +944,27 @@ async function runSingleExecution({ resultRoot, approach, kValue, iteration, tim
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const resultRoot = buildResultRoot(args.resumeRoot);
-  ensureDir(resultRoot);
-  ensureDir(path.join(resultRoot, "raw"));
-  ensureDir(path.join(resultRoot, "checkpoints"));
 
-  const replayAnchors = {};
-  for (const kValue of args.kValues) {
-    for (let iteration = 1; iteration <= args.iterations; iteration += 1) {
-      replayAnchors[`K${kValue}-iteration${iteration}`] = buildReplayAnchor(kValue, iteration);
-    }
+  const baseAnchorMs = Number.parseInt(
+    process.env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR || "",
+    10,
+  );
+  const replayAnchors = createScenarioReplayAnchors({
+    kValues: args.kValues,
+    iterations: args.iterations,
+    baseAnchorMs: Number.isFinite(baseAnchorMs) ? baseAnchorMs : Date.now(),
+  });
+
+  const filteredIterations = args.onlyIterations || Array.from(
+    { length: args.iterations },
+    (_, index) => index + 1,
+  );
+
+  if (!args.plan) {
+    ensureDir(resultRoot);
+    ensureDir(path.join(resultRoot, "raw"));
+    ensureDir(path.join(resultRoot, "checkpoints"));
+    ensureDir(path.join(resultRoot, "scenarios"));
   }
 
   const repoState = collectRepoState();
@@ -524,6 +973,26 @@ async function main() {
     kValues: args.kValues,
     iterations: args.iterations,
   });
+  const filteredMatrix = matrix.filter((combo) => filteredIterations.includes(combo.iteration));
+  const plan = buildExecutionPlan({
+    resultRoot,
+    approaches: args.approaches,
+    kValues: args.kValues,
+    iterations: args.iterations,
+    replayAnchors,
+    allowCreateManifests: !args.plan,
+  }).filter((combo) => filteredIterations.includes(combo.iteration));
+
+  if (args.plan) {
+    console.log(`Plan for ${resultRoot}`);
+    for (const combo of plan) {
+      console.log(
+        `${combo.state} K${combo.kValue} iteration${combo.iteration} ${combo.approach}${combo.reason ? ` :: ${combo.reason}` : ""}`,
+      );
+    }
+    return;
+  }
+
   writeJson(path.join(resultRoot, "repo_state.json"), repoState);
   writeJson(path.join(resultRoot, "experiment_config.json"), {
     repoRoot: REPO_ROOT,
@@ -532,6 +1001,7 @@ async function main() {
     kValues: args.kValues,
     approaches: args.approaches,
     iterations: args.iterations,
+    selectedIterations: filteredIterations,
     replayAnchors,
     targetWindows: TARGET_WINDOWS,
     outputWindowRangeMs: OUTPUT_WINDOW_RANGE_MS,
@@ -541,19 +1011,25 @@ async function main() {
     aggregation: "AVG",
     inputStreams: ["wearableX", "smartphoneX"],
     deterministicReplay: true,
-    totalExecutions: matrix.length,
+    totalExecutions: filteredMatrix.length,
+    plannedExecutions: plan.length,
     resourceSamplingIntervalMs: 100,
     resourceScope: "orchestrator-rooted process tree; publisher and MQTT broker excluded",
   });
 
-  console.log(`${matrix.length} total executions`);
-  for (const combo of matrix) {
-    const checkpoint = readCheckpoint(resultRoot, combo.approach, combo.kValue, combo.iteration);
-    if (checkpoint?.success) {
-      console.log(`[resume-skip] approach=${combo.approach} K=${combo.kValue} iteration=${combo.iteration} result_path=${checkpoint.runRoot}`);
+  console.log(`${filteredMatrix.length} total executions`);
+  for (const combo of plan) {
+    const reusableExecution = await resolveReusableExecution(
+      resultRoot,
+      combo.approach,
+      combo.kValue,
+      combo.iteration,
+    );
+    if (reusableExecution?.success) {
+      console.log(`[resume-skip] approach=${combo.approach} K=${combo.kValue} iteration=${combo.iteration} result_path=${reusableExecution.runRoot}`);
       continue;
     }
-    const replayAnchor = replayAnchors[`K${combo.kValue}-iteration${combo.iteration}`];
+    const replayAnchor = replayAnchors[buildScenarioKey(combo.kValue, combo.iteration)];
     const result = await runSingleExecution({
       resultRoot,
       approach: combo.approach,
@@ -581,6 +1057,13 @@ if (require.main === module) {
 }
 
 module.exports = {
+  ATTEMPT_STATES,
+  buildExecutionPlan,
   buildRunEnv,
+  classifyExistingExecution,
+  collectScenarioAnchorState,
+  ensureScenarioManifest,
+  shouldTerminateBoundedRun,
   validateRun,
+  waitForStructuralValidation,
 };

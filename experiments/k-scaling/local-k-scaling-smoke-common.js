@@ -16,6 +16,7 @@ const DEFAULT_APPROACHES = ["fetching", "approximation", "chunked"];
 const DEFAULT_ITERATIONS = 3;
 const LATENCY_TOLERANCE_MS = 1;
 const FLOAT_TOLERANCE = 1e-9;
+const DEFAULT_SCENARIO_ANCHOR_SPACING_MS = 5 * 60 * 1000;
 
 const APPROACH_CONFIG = {
   fetching: {
@@ -314,11 +315,15 @@ function buildCheckpointKey(approach, kValue, iteration) {
   return `${approach}-K${kValue}-iteration${iteration}`;
 }
 
+function buildScenarioKey(kValue, iteration) {
+  return `K${kValue}-iteration${iteration}`;
+}
+
 function buildCombinationMatrix({ approaches, kValues, iterations }) {
   const combinations = [];
-  for (const approach of approaches) {
-    for (const kValue of kValues) {
-      for (let iteration = 1; iteration <= iterations; iteration += 1) {
+  for (const kValue of kValues) {
+    for (let iteration = 1; iteration <= iterations; iteration += 1) {
+      for (const approach of approaches) {
         combinations.push({ approach, kValue, iteration });
       }
     }
@@ -326,9 +331,29 @@ function buildCombinationMatrix({ approaches, kValues, iterations }) {
   return combinations;
 }
 
+function createScenarioReplayAnchors({
+  kValues,
+  iterations,
+  baseAnchorMs = Date.now(),
+  spacingMs = DEFAULT_SCENARIO_ANCHOR_SPACING_MS,
+}) {
+  const anchors = {};
+  let scenarioIndex = 0;
+  for (const kValue of kValues) {
+    for (let iteration = 1; iteration <= iterations; iteration += 1) {
+      anchors[buildScenarioKey(kValue, iteration)] = String(
+        baseAnchorMs + (scenarioIndex * spacingMs),
+      );
+      scenarioIndex += 1;
+    }
+  }
+  return anchors;
+}
+
 module.exports = {
   APPROACH_CONFIG,
   DEFAULT_APPROACHES,
+  DEFAULT_SCENARIO_ANCHOR_SPACING_MS,
   DEFAULT_ITERATIONS,
   DEFAULT_K_VALUES,
   FLOAT_TOLERANCE,
@@ -341,8 +366,10 @@ module.exports = {
   TARGET_WINDOWS,
   buildCheckpointKey,
   buildCombinationMatrix,
+  buildScenarioKey,
   compareAgainstFetching,
   countConsumerLatencyFiles,
+  createScenarioReplayAnchors,
   extractAllConsumerWindows,
   extractRepresentativeWindow,
   getExpectedBenchmarkSummaryCount,

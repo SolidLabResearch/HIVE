@@ -3,8 +3,10 @@ const {
   APPROACH_CONFIG,
   buildCheckpointKey,
   buildCombinationMatrix,
+  buildScenarioKey,
   compareAgainstFetching,
   countConsumerLatencyFiles,
+  createScenarioReplayAnchors,
   extractAllConsumerWindows,
   extractRepresentativeWindow,
   getExpectedBenchmarkSummaryCount,
@@ -63,13 +65,35 @@ describe("local-k-scaling-smoke-common", () => {
 
   test("builds checkpoint keys and matrix sizes", () => {
     expect(buildCheckpointKey("chunked", 32, 3)).toBe("chunked-K32-iteration3");
-    expect(
-      buildCombinationMatrix({
-        approaches: ["fetching", "approximation", "chunked"],
-        kValues: [1, 2, 4, 8, 32],
-        iterations: 3,
-      }),
-    ).toHaveLength(45);
+    const matrix = buildCombinationMatrix({
+      approaches: ["fetching", "approximation", "chunked"],
+      kValues: [1, 2, 4, 8, 32],
+      iterations: 3,
+    });
+    expect(matrix).toHaveLength(45);
+    expect(matrix.slice(0, 6)).toEqual([
+      { approach: "fetching", kValue: 1, iteration: 1 },
+      { approach: "approximation", kValue: 1, iteration: 1 },
+      { approach: "chunked", kValue: 1, iteration: 1 },
+      { approach: "fetching", kValue: 1, iteration: 2 },
+      { approach: "approximation", kValue: 1, iteration: 2 },
+      { approach: "chunked", kValue: 1, iteration: 2 },
+    ]);
+  });
+
+  test("creates one replay anchor per K/iteration scenario", () => {
+    const anchors = createScenarioReplayAnchors({
+      kValues: [1, 32],
+      iterations: 2,
+      baseAnchorMs: 1000,
+      spacingMs: 10,
+    });
+    expect(anchors).toEqual({
+      [buildScenarioKey(1, 1)]: "1000",
+      [buildScenarioKey(1, 2)]: "1010",
+      [buildScenarioKey(32, 1)]: "1020",
+      [buildScenarioKey(32, 2)]: "1030",
+    });
   });
 
   test("median handles odd and empty arrays", () => {

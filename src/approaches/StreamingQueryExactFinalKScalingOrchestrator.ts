@@ -83,6 +83,7 @@ class ExactFinalFanOut {
   private readonly cachePath: string;
   private readonly topologyPath: string;
   private readonly summaryPath: string;
+  private readonly readyPath: string;
   private readonly subscriberClients: any[] = [];
   private readonly deliveredConsumers = new Set<string>();
   private readonly subscriptionIds = new Map<string, string>();
@@ -115,6 +116,7 @@ class ExactFinalFanOut {
     this.cachePath = path.join(this.logRoot, "exact_final_result_cache.ndjson");
     this.topologyPath = path.join(this.logRoot, "exact_final_topology.json");
     this.summaryPath = path.join(this.logRoot, "benchmark_window_cap_summary.json");
+    this.readyPath = path.join(this.logRoot, "startup_ready.json");
 
     fs.writeFileSync(this.deliveryPath, "");
     fs.writeFileSync(this.cachePath, "");
@@ -131,7 +133,8 @@ class ExactFinalFanOut {
     console.log(`SHARED_RESULT_TOPIC = ${this.sharedResultTopic}`);
 
     await this.startSubscribers();
-    this.startSharedExecution();
+    await this.startSharedExecution();
+    this.writeReadySignal();
     this.installShutdownHooks();
   }
 
@@ -204,7 +207,7 @@ WHERE {
     this.writeTopology();
   }
 
-  private startSharedExecution(): void {
+  private async startSharedExecution(): Promise<void> {
     const originalTargetWindows = process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS;
     delete process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS;
     const originalResultTopic = process.env.RESULT_TOPIC;
@@ -220,7 +223,7 @@ WHERE {
         this.aggregation,
         "shared",
       );
-      this.sharedClient.process_streams();
+      await this.sharedClient.process_streams();
     } finally {
       if (originalTargetWindows === undefined) {
         delete process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS;
@@ -234,6 +237,18 @@ WHERE {
       }
     }
     this.writeTopology();
+  }
+
+  private writeReadySignal(): void {
+    fs.writeFileSync(
+      this.readyPath,
+      `${JSON.stringify({
+        approach: "exact-final",
+        kValue: this.K,
+        readySubscriberCount: this.subscriptionIds.size,
+        readyAt: new Date().toISOString(),
+      }, null, 2)}\n`,
+    );
   }
 
   private recordDelivery(

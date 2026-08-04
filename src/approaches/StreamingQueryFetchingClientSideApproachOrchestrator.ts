@@ -1,4 +1,4 @@
-import { EventEmitter } from "events";
+import { EventEmitter, once } from "events";
 import fs from "fs";
 import path from "path";
 import { RDFStream, RSPEngine, RSPQLParser } from "rsp-js";
@@ -28,6 +28,15 @@ import {
 import { recordPublishedMqttMessage } from "../util/mqttTraffic";
 import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
 import { resourceTraceSnapshot } from "../util/resourceTrace";
+import {
+  appendFetchingArtifactTrace,
+  buildFetchingArtifactTracePath,
+  buildFetchingConsumerSummaryPath,
+  FetchingConsumerSummary,
+  FetchingTraceEvent,
+  writeAtomicFile,
+  writeFetchingConsumerSummaryAtomic,
+} from "./fetchingKScalingArtifacts";
 const N3 = require("n3");
 const mqtt = require("mqtt");
 const { DataFactory } = N3;
@@ -65,6 +74,33 @@ type StreamObservation = {
   value: number;
 };
 
+const BENCHMARK_REPLAY_QUIESCENCE_MS = 1000;
+const BENCHMARK_REPLAY_SETTLE_TIMEOUT_MS = 5000;
+const BENCHMARK_REPLAY_POLL_INTERVAL_MS = 50;
+const FETCHING_LATENCY_HEADER =
+  "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,window_semantics,logical_trigger_time,window_start,window_end,window_duration_ms,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,coverage_complete,is_partial_window,is_comparable_window,metadata_source,result_value\n";
+
+type FetchingArtifactState = {
+  stateObjectId: string;
+  finalizedWindowNumbers: number[];
+  benchmarkTargetWindowReached: boolean;
+  benchmarkStopReason:
+    | "target_window_count_reached"
+    | "finite_replay_duration_reached"
+    | "other";
+};
+
+type FetchingLifecycleHooks = {
+  onReady?: (payload: { consumerIndex: number | null; stateObjectId: string }) => void;
+  onDurableArtifacts?: (payload: {
+    consumerIndex: number | null;
+    stateObjectId: string;
+    windowNumber: number;
+    summaryPath: string;
+    latencyPath: string;
+  }) => void;
+};
+
 /**
  *
  */
@@ -75,7 +111,6 @@ export class FetchingAllDataClientSide {
   public rsp_engine: RSPEngine;
   public rstream_emitter: EventEmitter;
   private logStream!: fs.WriteStream;
-  private latencyLogStream!: fs.WriteStream;
   private windowStreamMap: { [key: string]: string } = {
     "mqtt://localhost:1883/wearableX": "https://rsp.jsw1",
     "mqtt://localhost:1883/smartphoneX": "https://rsp.jsw1",
@@ -120,24 +155,31 @@ export class FetchingAllDataClientSide {
   private filteredDueToTimingCount: number = 0;
   private acceptedCompleteWindowCount: number = 0;
   private benchmarkReplayComplete: boolean = false;
-  private benchmarkShutdownInitiated: boolean = false;
   private benchmarkTargetWindowCount: number | null =
     getBenchmarkTargetWindowCount();
-  private finalizedWindowNumbers: number[] = [];
-  private benchmarkTargetWindowReached: boolean = false;
-  private benchmarkStopReason:
-    | "target_window_count_reached"
-    | "finite_replay_duration_reached"
-    | "other" = "other";
   private benchmarkControlTopic: string = buildBenchmarkTopicName("__benchmark_control__");
-  private benchmarkWindowSummaryPath: string = path.join(
-    process.env.LOG_PATH || ".",
-    "benchmark_window_cap_summary.json",
-  );
   private mqttClients: any[] = [];
   private resourceUsageInterval: NodeJS.Timeout | null = null;
+  private resourceUsageLogStream: fs.WriteStream | null = null;
   private cleanupRegistered: boolean = false;
+  private cleanupPromise: Promise<void> | null = null;
   private consumerIdx: string;
+  private consumerIndex: number | null;
+  private readonly logRoot: string;
+  private readonly latencyLogPath: string;
+  private readonly consumerSummaryPath: string;
+  private readonly tracePath: string;
+  private readonly artifactTracingEnabled: boolean;
+  private readonly artifactState: FetchingArtifactState;
+  private traceSequence: number = 0;
+  private latencyRows: string[] = [];
+  private durableSummaryWritten = false;
+  private completionPromise: Promise<void>;
+  private resolveCompletion!: () => void;
+  private rejectCompletion!: (error: Error) => void;
+  private completionSettled = false;
+  private replayDrainStarted = false;
+  private readonly lifecycleHooks: FetchingLifecycleHooks;
 
   /**
    *
@@ -149,10 +191,14 @@ export class FetchingAllDataClientSide {
     r2s_topic: string,
     aggregationFunction: AggregationFunction,
     consumerIndex?: string | number,
+    lifecycleHooks: FetchingLifecycleHooks = {},
   ) {
     process.env.HIVE_PROCESS_ROLE =
       process.env.HIVE_PROCESS_ROLE || "fetching_orchestrator";
     this.consumerIdx = consumerIndex ? `_consumer_${consumerIndex}` : (process.env.K_SCALING_CONSUMER_INDEX ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}` : "");
+    this.consumerIndex = consumerIndex === undefined
+      ? (process.env.K_SCALING_CONSUMER_INDEX ? Number.parseInt(process.env.K_SCALING_CONSUMER_INDEX, 10) : null)
+      : Number.parseInt(String(consumerIndex), 10);
     this.query = query;
     this.r2s_topic = r2s_topic;
     this.aggregationFunction = aggregationFunction;
@@ -174,6 +220,30 @@ export class FetchingAllDataClientSide {
     );
     this.timingFilterBypassedReason = this.deriveTimingFilterBypassedReason();
     this.timingFilterEnabled = this.timingFilterBypassedReason === null;
+    this.logRoot = process.env.LOG_PATH || ".";
+    this.latencyLogPath = path.join(
+      this.logRoot,
+      `fetching_latency_log${this.consumerIdx}.csv`,
+    );
+    this.consumerSummaryPath = buildFetchingConsumerSummaryPath(
+      this.logRoot,
+      this.consumerIndex ?? 0,
+    );
+    this.tracePath = buildFetchingArtifactTracePath(this.logRoot);
+    this.artifactTracingEnabled = ["1", "true", "yes", "on"].includes(
+      (process.env.STREAMING_QUERY_HIVE_FETCHING_ARTIFACT_TRACE || "").trim().toLowerCase(),
+    );
+    this.lifecycleHooks = lifecycleHooks;
+    this.artifactState = {
+      stateObjectId: `${process.pid}:${this.consumerIndex ?? "standalone"}:${Date.now()}`,
+      finalizedWindowNumbers: [],
+      benchmarkTargetWindowReached: false,
+      benchmarkStopReason: "other",
+    };
+    this.completionPromise = new Promise<void>((resolve, reject) => {
+      this.resolveCompletion = resolve;
+      this.rejectCompletion = reject;
+    });
 
     // Initialize CSV logging for this approach
     this.initializeLogging();
@@ -192,24 +262,15 @@ export class FetchingAllDataClientSide {
    * Initialize CSV logging for this approach
    */
   private initializeLogging() {
-    const logRoot = process.env.LOG_PATH || ".";
-    fs.mkdirSync(logRoot, { recursive: true });
+    fs.mkdirSync(this.logRoot, { recursive: true });
     const consumerIdx = this.consumerIdx;
 
-    const logFilePath = path.join(logRoot, `fetching_client_side_log${consumerIdx}.csv`);
+    const logFilePath = path.join(this.logRoot, `fetching_client_side_log${consumerIdx}.csv`);
     this.logStream = fs.createWriteStream(logFilePath, { flags: "w" });
     this.logStream.write("timestamp,message\n");
+    this.latencyRows = [];
 
-    // Initialize latency log
-    const latencyLogFilePath = path.join(logRoot, `fetching_latency_log${consumerIdx}.csv`);
-    this.latencyLogStream = fs.createWriteStream(latencyLogFilePath, {
-      flags: "w",
-    });
-    this.latencyLogStream.write(
-      "window_number,query_registered_at,first_data_received_at,expected_window_close,last_obs_received_at,result_emitted_at,delay_past_expected_close_ms,delay_past_data_start_ms,delay_past_last_obs_ms,window_semantics,logical_trigger_time,window_start,window_end,window_duration_ms,window_data_close_time,latency_from_logical_trigger_ms,latency_from_window_close_ms,coverage_complete,is_partial_window,is_comparable_window,metadata_source,result_value\n",
-    );
-
-    const diagnosticsLogFilePath = path.join(logRoot, `fetching_window_diagnostics${consumerIdx}.csv`);
+    const diagnosticsLogFilePath = path.join(this.logRoot, `fetching_window_diagnostics${consumerIdx}.csv`);
     this.diagnosticsLogStream = fs.createWriteStream(diagnosticsLogFilePath, {
       flags: "w",
     });
@@ -356,6 +417,50 @@ export class FetchingAllDataClientSide {
     });
   }
 
+  public awaitCompletion(): Promise<void> {
+    return this.completionPromise;
+  }
+
+  private settleCompletion(error?: Error): void {
+    if (this.completionSettled) {
+      return;
+    }
+    this.completionSettled = true;
+    if (error) {
+      this.rejectCompletion(error);
+      return;
+    }
+    this.resolveCompletion();
+  }
+
+  private traceArtifactEvent(
+    event: FetchingTraceEvent,
+    details: Partial<Omit<FetchingConsumerSummary, "summaryVersion">> & {
+      windowNumber?: number | null;
+      finalWindowCount?: number | null;
+      coverageComplete?: boolean | null;
+      comparable?: boolean | null;
+      targetPath?: string | null;
+    } = {},
+  ): void {
+    if (!this.artifactTracingEnabled) {
+      return;
+    }
+    appendFetchingArtifactTrace(this.tracePath, {
+      sequence: ++this.traceSequence,
+      timestamp: Date.now(),
+      pid: process.pid,
+      consumerIndex: this.consumerIndex,
+      event,
+      windowNumber: details.windowNumber ?? null,
+      finalWindowCount: details.finalWindowCount ?? this.artifactState.finalizedWindowNumbers.length,
+      coverageComplete: details.coverageComplete ?? null,
+      comparable: details.comparable ?? null,
+      targetPath: details.targetPath ?? null,
+      stateObjectId: this.artifactState.stateObjectId,
+    });
+  }
+
   /**
    * Log latency measurement with multiple metrics
    */
@@ -367,7 +472,7 @@ export class FetchingAllDataClientSide {
     value: string,
     metadata: ReturnType<typeof buildBenchmarkWindowMetadata>,
     windowFlags: ComparableWindowFlags,
-  ) {
+  ): string {
     // Metric 1: Delay past the expected close time
     const latencyFromQueryReg = resultTime - expectedWindowClose;
 
@@ -382,11 +487,7 @@ export class FetchingAllDataClientSide {
     // Metric 3: Time from last observation received to result emitted (processing latency)
     const latencyFromLastObs = resultTime - lastObsReceivedAt;
 
-    if (this.latencyLogStream) {
-      this.latencyLogStream.write(
-        `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastObsReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastObs},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${windowFlags.windowDurationMs ?? ""},${metadata.windowDataCloseTime ?? ""},${metadata.latencyFromLogicalTriggerMs ?? ""},${metadata.latencyFromWindowCloseMs ?? ""},${windowFlags.coverageComplete},${windowFlags.isPartialWindow},${windowFlags.isComparableWindow},${metadata.metadataSource},${value}\n`,
-      );
-    }
+    const row = `${windowNumber},${this.queryRegisteredTime},${this.firstDataReceivedTime},${expectedWindowClose},${lastObsReceivedAt},${resultTime},${latencyFromQueryReg},${latencyFromDataStart},${latencyFromLastObs},${metadata.windowSemantics},${metadata.logicalTriggerTime ?? ""},${metadata.windowStart ?? ""},${metadata.windowEnd ?? ""},${windowFlags.windowDurationMs ?? ""},${metadata.windowDataCloseTime ?? ""},${metadata.latencyFromLogicalTriggerMs ?? ""},${metadata.latencyFromWindowCloseMs ?? ""},${windowFlags.coverageComplete},${windowFlags.isPartialWindow},${windowFlags.isComparableWindow},${metadata.metadataSource},${value}`;
     console.log(`LATENCY: Window ${windowNumber}:`);
     console.log(
       `  - Delay past expected close: ${latencyFromQueryReg}ms (expected close: ${expectedWindowClose}, result: ${resultTime})`,
@@ -398,6 +499,7 @@ export class FetchingAllDataClientSide {
       `  - Processing time (last obs to result): ${latencyFromLastObs}ms`,
     );
     console.log(`  - Value: ${value}`);
+    return row;
   }
 
   /**
@@ -431,6 +533,7 @@ export class FetchingAllDataClientSide {
   process_streams() {
     const streams = this.returnStreams();
     console.log("Processing streams:", streams);
+    const readinessPromises: Array<Promise<void>> = [];
     for (const stream of streams) {
       const stream_name = stream.stream_name;
       const mqtt_broker = this.returnMQTTBroker(stream_name);
@@ -444,26 +547,52 @@ export class FetchingAllDataClientSide {
       profileCount("mqtt_clients_created");
       const rsp_stream_object = this.rsp_engine.getStream(stream_name);
       const topic = new URL(stream_name).pathname.slice(1);
-
-      rsp_client.on("connect", () => {
-        console.log(`Connected to MQTT broker at ${mqtt_broker}`);
-        rsp_client.subscribe(topic, { qos: 1 }, (err: any) => {
-          if (err) {
-            console.error(`Failed to subscribe to topic ${topic}:`, err);
-          } else {
-            console.log(`Subscribed to topic ${topic} with QoS 1`);
+      readinessPromises.push(new Promise<void>((resolve, reject) => {
+        let streamSubscribed = false;
+        let controlSubscribed = !this.benchmarkFiniteReplayMode;
+        let resolved = false;
+        const markReady = () => {
+          if (resolved || !streamSubscribed || !controlSubscribed) {
+            return;
+          }
+          resolved = true;
+          resolve();
+        };
+        rsp_client.once("error", (error: any) => {
+          if (!resolved) {
+            reject(error);
           }
         });
-        if (this.benchmarkFiniteReplayMode) {
-          rsp_client.subscribe(this.benchmarkControlTopic, { qos: 1 }, (err: any) => {
+        rsp_client.on("connect", () => {
+          console.log(`Connected to MQTT broker at ${mqtt_broker}`);
+          rsp_client.subscribe(topic, { qos: 1 }, (err: any) => {
             if (err) {
-              console.error(`Failed to subscribe to benchmark control topic ${this.benchmarkControlTopic}:`, err);
+              console.error(`Failed to subscribe to topic ${topic}:`, err);
+              if (!resolved) {
+                reject(err);
+              }
             } else {
-              console.log(`Subscribed to benchmark control topic ${this.benchmarkControlTopic} with QoS 1`);
+              console.log(`Subscribed to topic ${topic} with QoS 1`);
+              streamSubscribed = true;
+              markReady();
             }
           });
-        }
-      });
+          if (this.benchmarkFiniteReplayMode) {
+            rsp_client.subscribe(this.benchmarkControlTopic, { qos: 1 }, (err: any) => {
+              if (err) {
+                console.error(`Failed to subscribe to benchmark control topic ${this.benchmarkControlTopic}:`, err);
+                if (!resolved) {
+                  reject(err);
+                }
+              } else {
+                console.log(`Subscribed to benchmark control topic ${this.benchmarkControlTopic} with QoS 1`);
+                controlSubscribed = true;
+                markReady();
+              }
+            });
+          }
+        });
+      }));
 
       rsp_client.on("message", async (topic: any, message: any) => {
         if (this.benchmarkFiniteReplayMode && topic === this.benchmarkControlTopic) {
@@ -473,22 +602,23 @@ export class FetchingAllDataClientSide {
               this.benchmarkReplayComplete = true;
               if (
                 this.benchmarkTargetWindowCount !== null &&
-                !this.benchmarkTargetWindowReached
+                !this.artifactState.benchmarkTargetWindowReached
               ) {
-                this.benchmarkStopReason = "finite_replay_duration_reached";
-                this.writeBenchmarkWindowSummary();
+                this.artifactState.benchmarkStopReason = "finite_replay_duration_reached";
               }
               this.log(
                 `Finite replay complete signal received: ${JSON.stringify({
                   topic: this.benchmarkControlTopic,
                   source: parsed?.source ?? null,
+                  stateObjectId: this.artifactState.stateObjectId,
                 })}`,
               );
-              this.flushPendingFinalizedWindows();
-              this.scheduleBenchmarkShutdown();
+              this.traceArtifactEvent("shutdown_requested");
+              void this.handleFiniteReplayCompletion();
             }
           } catch (error) {
             console.error("Error parsing benchmark control message:", error);
+            this.settleCompletion(error instanceof Error ? error : new Error(String(error)));
           }
           return;
         }
@@ -555,6 +685,16 @@ export class FetchingAllDataClientSide {
         }
       });
     }
+    return Promise.all(readinessPromises).then(() => {
+      this.log("mqtt_subscription_ready");
+      this.lifecycleHooks.onReady?.({
+        consumerIndex: this.consumerIndex,
+        stateObjectId: this.artifactState.stateObjectId,
+      });
+      resourceTraceSnapshot("after_mqtt_subscriptions_ready", "fetching subscriptions ready", {
+        streamCount: streams.length,
+      });
+    });
   }
 
   private isContaminatedTimestamp(timestamp: number, streamName: string): boolean {
@@ -811,67 +951,83 @@ export class FetchingAllDataClientSide {
     }
   }
 
-  private scheduleBenchmarkShutdown(): void {
-    if (this.benchmarkShutdownInitiated) {
+  private countPendingLogicalWindows(): number {
+    return Array.from(this.logicalWindowCandidates.values()).filter((candidate) => (
+      candidate.logicalWindow &&
+      !this.emittedLogicalWindows.has(candidate.logicalWindow.key)
+    )).length;
+  }
+
+  private async handleFiniteReplayCompletion(): Promise<void> {
+    if (this.replayDrainStarted) {
       return;
     }
-
-    this.benchmarkShutdownInitiated = true;
-    setTimeout(() => {
-      try {
-        this.cleanup();
-      } finally {
-        process.exit(0);
+    this.replayDrainStarted = true;
+    try {
+      await this.waitForReplayDrain();
+      if (!this.completionSettled) {
+        this.settleCompletion(new Error(
+          `Fetching consumer ${this.consumerIndex ?? "standalone"} did not durably finalize a complete comparable window before replay completion`,
+        ));
       }
-    }, 50);
+    } catch (error) {
+      this.settleCompletion(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private async waitForReplayDrain(): Promise<void> {
+    const startedAt = Date.now();
+
+    while ((Date.now() - startedAt) < BENCHMARK_REPLAY_SETTLE_TIMEOUT_MS) {
+      const sinceLastObservation = this.lastObservationReceivedTime === 0
+        ? Number.POSITIVE_INFINITY
+        : Date.now() - this.lastObservationReceivedTime;
+      if (sinceLastObservation >= BENCHMARK_REPLAY_QUIESCENCE_MS) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, BENCHMARK_REPLAY_POLL_INTERVAL_MS));
+    }
+
+    this.flushPendingFinalizedWindows();
+
+    const flushStartedAt = Date.now();
+    while ((Date.now() - flushStartedAt) < BENCHMARK_REPLAY_SETTLE_TIMEOUT_MS) {
+      if (this.countPendingLogicalWindows() === 0) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, BENCHMARK_REPLAY_POLL_INTERVAL_MS));
+      this.flushPendingFinalizedWindows();
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, BENCHMARK_REPLAY_POLL_INTERVAL_MS));
+  }
+
+  private async closeWritableStream(
+    stream: fs.WriteStream | null | undefined,
+  ): Promise<void> {
+    if (!stream || stream.destroyed) {
+      return;
+    }
+    const finishPromise = once(stream, "finish").catch(() => undefined);
+    stream.end();
+    await finishPromise;
   }
 
   private recordFinalizedWindow(windowNumber: number): void {
-    if (!this.finalizedWindowNumbers.includes(windowNumber)) {
-      this.finalizedWindowNumbers.push(windowNumber);
-      this.finalizedWindowNumbers.sort((left, right) => left - right);
+    if (!this.artifactState.finalizedWindowNumbers.includes(windowNumber)) {
+      this.artifactState.finalizedWindowNumbers.push(windowNumber);
+      this.artifactState.finalizedWindowNumbers.sort((left, right) => left - right);
     }
 
     if (
       this.benchmarkTargetWindowCount !== null &&
-      this.finalizedWindowNumbers.length >= this.benchmarkTargetWindowCount
+      this.artifactState.finalizedWindowNumbers.length >= this.benchmarkTargetWindowCount
     ) {
-      this.benchmarkTargetWindowReached = true;
-      this.benchmarkStopReason = "target_window_count_reached";
+      this.artifactState.benchmarkTargetWindowReached = true;
+      this.artifactState.benchmarkStopReason = "target_window_count_reached";
       this.log(
-        `Benchmark target window reached: target=${this.benchmarkTargetWindowCount} finalWindows=${this.finalizedWindowNumbers.join(",")}`,
+        `Benchmark target window reached: target=${this.benchmarkTargetWindowCount} finalWindows=${this.artifactState.finalizedWindowNumbers.join(",")} stateObjectId=${this.artifactState.stateObjectId}`,
       );
-      this.writeBenchmarkWindowSummary();
-      this.scheduleBenchmarkShutdown();
-    }
-  }
-
-  private writeBenchmarkWindowSummary(): void {
-    if (this.benchmarkTargetWindowCount === null) {
-      return;
-    }
-
-    try {
-      fs.mkdirSync(path.dirname(this.benchmarkWindowSummaryPath), {
-        recursive: true,
-      });
-      fs.writeFileSync(
-        this.benchmarkWindowSummaryPath,
-        JSON.stringify(
-          {
-            targetWindowCount: this.benchmarkTargetWindowCount,
-            emittedFinalWindowCount: this.finalizedWindowNumbers.length,
-            finalWindowNumbers: this.finalizedWindowNumbers,
-            stoppedAfterTargetWindows: this.benchmarkTargetWindowReached,
-            stopReason: this.benchmarkStopReason,
-            approach: "fetching",
-          },
-          null,
-          2,
-        ),
-      );
-    } catch (error) {
-      console.error("Error writing benchmark window summary:", error);
     }
   }
 
@@ -976,6 +1132,95 @@ export class FetchingAllDataClientSide {
     };
   }
 
+  private buildLatencyCsvContent(): string {
+    return `${FETCHING_LATENCY_HEADER}${this.latencyRows.join("\n")}${this.latencyRows.length > 0 ? "\n" : ""}`;
+  }
+
+  private async persistDurableArtifacts({
+    windowNumber,
+    windowFlags,
+    latencyRow,
+    resultValue,
+    resultEmittedAt,
+    logicalWindow,
+  }: {
+    windowNumber: number;
+    windowFlags: ComparableWindowFlags;
+    latencyRow: string;
+    resultValue: number;
+    resultEmittedAt: number;
+    logicalWindow: DerivedLogicalWindow;
+  }): Promise<void> {
+    this.traceArtifactEvent("final_window_counter_incremented", {
+      windowNumber,
+      finalWindowCount: this.artifactState.finalizedWindowNumbers.length,
+      coverageComplete: windowFlags.coverageComplete,
+      comparable: windowFlags.isComparableWindow,
+      targetPath: this.latencyLogPath,
+    });
+
+    this.latencyRows.push(latencyRow);
+    this.traceArtifactEvent("latency_write_started", {
+      windowNumber,
+      coverageComplete: windowFlags.coverageComplete,
+      comparable: windowFlags.isComparableWindow,
+      targetPath: this.latencyLogPath,
+    });
+    const writeCompletedAt = new Date().toISOString();
+    const summary: FetchingConsumerSummary = {
+      summaryVersion: 1,
+      consumerIndex: this.consumerIndex ?? 0,
+      stateObjectId: this.artifactState.stateObjectId,
+      queryRegisteredAt: this.queryRegisteredTime,
+      firstDataReceivedAt: this.firstDataReceivedTime,
+      emittedFinalWindowCount: this.artifactState.finalizedWindowNumbers.length,
+      windowNumber,
+      windowStart: logicalWindow.start,
+      windowEnd: logicalWindow.end,
+      coverageComplete: windowFlags.coverageComplete,
+      isPartialWindow: windowFlags.isPartialWindow,
+      isComparableWindow: windowFlags.isComparableWindow,
+      resultValue,
+      resultEmittedAt,
+      writeCompletedAt,
+      stoppedAfterTargetWindows: this.artifactState.benchmarkTargetWindowReached,
+      stopReason: this.artifactState.benchmarkStopReason,
+      finalWindowNumbers: [...this.artifactState.finalizedWindowNumbers],
+    };
+    await writeAtomicFile(this.latencyLogPath, this.buildLatencyCsvContent());
+    this.traceArtifactEvent("latency_write_completed", {
+      windowNumber,
+      coverageComplete: windowFlags.coverageComplete,
+      comparable: windowFlags.isComparableWindow,
+      targetPath: this.latencyLogPath,
+    });
+    this.traceArtifactEvent("consumer_summary_write_started", {
+      windowNumber,
+      coverageComplete: windowFlags.coverageComplete,
+      comparable: windowFlags.isComparableWindow,
+      targetPath: this.consumerSummaryPath,
+    });
+    await writeFetchingConsumerSummaryAtomic(this.consumerSummaryPath, summary);
+    this.traceArtifactEvent("consumer_summary_write_completed", {
+      windowNumber,
+      coverageComplete: windowFlags.coverageComplete,
+      comparable: windowFlags.isComparableWindow,
+      targetPath: this.consumerSummaryPath,
+    });
+    this.durableSummaryWritten = true;
+    this.log(
+      `Benchmark artifacts durable: consumer=${this.consumerIndex ?? "standalone"} window=${windowNumber} stateObjectId=${this.artifactState.stateObjectId}`,
+    );
+    this.lifecycleHooks.onDurableArtifacts?.({
+      consumerIndex: this.consumerIndex,
+      stateObjectId: this.artifactState.stateObjectId,
+      windowNumber,
+      summaryPath: this.consumerSummaryPath,
+      latencyPath: this.latencyLogPath,
+    });
+    this.settleCompletion();
+  }
+
   /**
    *
    */
@@ -988,7 +1233,7 @@ export class FetchingAllDataClientSide {
     this.rstream_emitter.on("error", (err: any) => {
       console.error("Error in RStream emitter:", err);
     });
-    this.rstream_emitter.on("RStream", (object: any) => {
+    this.rstream_emitter.on("RStream", async (object: any) => {
       console.log("DEBUG: RStream event received:", JSON.stringify(object));
       if (!object || !object.bindings) {
         console.error("Received invalid RStream object:", object);
@@ -1141,6 +1386,11 @@ export class FetchingAllDataClientSide {
         }
 
         const benchmarkWindowNumber = this.deriveBenchmarkWindowNumber(logicalWindow);
+        this.traceArtifactEvent("candidate_received", {
+          windowNumber: benchmarkWindowNumber ?? undefined,
+          coverageComplete: completeness.isSettled,
+          comparable: completeness.isSettled,
+        });
 
         if (this.startupFirstEmittedMode) {
           if (!Number.isFinite(benchmarkWindowNumber ?? NaN)) {
@@ -1167,6 +1417,11 @@ export class FetchingAllDataClientSide {
               "duplicate_after_first_emitted_acceptance",
               data,
             );
+            this.traceArtifactEvent("candidate_suppressed", {
+              windowNumber: benchmarkWindowNumber ?? undefined,
+              coverageComplete: false,
+              comparable: false,
+            });
             continue;
           }
 
@@ -1184,6 +1439,11 @@ export class FetchingAllDataClientSide {
               "waiting_for_all_streams_to_progress_past_window_end",
               data,
             );
+            this.traceArtifactEvent("candidate_suppressed", {
+              windowNumber: benchmarkWindowNumber ?? undefined,
+              coverageComplete: false,
+              comparable: false,
+            });
             continue;
           }
 
@@ -1226,10 +1486,13 @@ export class FetchingAllDataClientSide {
               "target_window_count_reached",
               data,
             );
-            this.benchmarkTargetWindowReached = true;
-            this.benchmarkStopReason = "target_window_count_reached";
-            this.writeBenchmarkWindowSummary();
-            this.scheduleBenchmarkShutdown();
+            this.artifactState.benchmarkTargetWindowReached = true;
+            this.artifactState.benchmarkStopReason = "target_window_count_reached";
+            this.traceArtifactEvent("candidate_suppressed", {
+              windowNumber: benchmarkWindowNumber ?? undefined,
+              coverageComplete: true,
+              comparable: true,
+            });
             continue;
           }
 
@@ -1270,6 +1533,11 @@ export class FetchingAllDataClientSide {
           this.windowCount = Math.max(this.windowCount, benchmarkWindowNumber as number);
           this.emittedLogicalWindows.add(logicalWindow.key);
           this.recordFinalizedWindow(benchmarkWindowNumber as number);
+          this.traceArtifactEvent("complete_window_finalized", {
+            windowNumber: benchmarkWindowNumber as number,
+            coverageComplete: true,
+            comparable: true,
+          });
 
           const resultEmittedAt = currentTimestamp;
           const expectedWindowClose = this.getExpectedWindowCloseTime(
@@ -1285,7 +1553,7 @@ export class FetchingAllDataClientSide {
             logicalWindow,
             settledCompleteness.isSettled,
           );
-          this.logLatency(
+          const latencyRow = this.logLatency(
             benchmarkWindowNumber as number,
             expectedWindowClose,
             this.lastObservationReceivedTime,
@@ -1294,6 +1562,14 @@ export class FetchingAllDataClientSide {
             centeredWindowMetadata,
             windowFlags,
           );
+          await this.persistDurableArtifacts({
+            windowNumber: benchmarkWindowNumber as number,
+            windowFlags,
+            latencyRow,
+            resultValue: startupNumericValue,
+            resultEmittedAt,
+            logicalWindow,
+          });
           this.writeWindowDiagnostics(
             benchmarkWindowNumber as number,
             logicalWindow,
@@ -1426,6 +1702,11 @@ export class FetchingAllDataClientSide {
             "waiting_for_all_streams_to_progress_past_window_end",
             data,
           );
+          this.traceArtifactEvent("candidate_suppressed", {
+            windowNumber: benchmarkWindowNumber ?? undefined,
+            coverageComplete: false,
+            comparable: false,
+          });
           this.log(
             `Delayed because incomplete: ${JSON.stringify({
               logicalWindowKey: logicalWindow.key,
@@ -1458,6 +1739,11 @@ export class FetchingAllDataClientSide {
             settledCompleteness.reason,
             data,
           );
+          this.traceArtifactEvent("candidate_suppressed", {
+            windowNumber: benchmarkWindowNumber ?? undefined,
+            coverageComplete: false,
+            comparable: false,
+          });
           this.log(
             `Delayed because incomplete: ${JSON.stringify({
               logicalWindowKey: logicalWindow.key,
@@ -1490,6 +1776,11 @@ export class FetchingAllDataClientSide {
               eventCount: settledAggregate.eventCount,
             })}`,
           );
+          this.traceArtifactEvent("candidate_suppressed", {
+            windowNumber: benchmarkWindowNumber ?? undefined,
+            coverageComplete: true,
+            comparable: true,
+          });
           continue;
         }
 
@@ -1517,10 +1808,13 @@ export class FetchingAllDataClientSide {
               acceptedCompleteWindowCount: this.acceptedCompleteWindowCount,
             })}`,
           );
-          this.benchmarkTargetWindowReached = true;
-          this.benchmarkStopReason = "target_window_count_reached";
-          this.writeBenchmarkWindowSummary();
-          this.scheduleBenchmarkShutdown();
+          this.artifactState.benchmarkTargetWindowReached = true;
+          this.artifactState.benchmarkStopReason = "target_window_count_reached";
+          this.traceArtifactEvent("candidate_suppressed", {
+            windowNumber: benchmarkWindowNumber ?? undefined,
+            coverageComplete: true,
+            comparable: true,
+          });
           continue;
         }
 
@@ -1574,6 +1868,11 @@ export class FetchingAllDataClientSide {
         this.acceptedCompleteWindowCount++;
         this.emittedLogicalWindows.add(logicalWindow.key);
         this.recordFinalizedWindow(this.windowCount);
+        this.traceArtifactEvent("complete_window_finalized", {
+          windowNumber: this.windowCount,
+          coverageComplete: true,
+          comparable: true,
+        });
         const resultEmittedAt = Date.now();
         const expectedWindowClose = this.getExpectedWindowCloseTime(
           this.windowCount,
@@ -1588,7 +1887,7 @@ export class FetchingAllDataClientSide {
           logicalWindow,
           settledCompleteness.isSettled,
         );
-        this.logLatency(
+        const latencyRow = this.logLatency(
           this.windowCount,
           expectedWindowClose,
           this.lastObservationReceivedTime,
@@ -1597,6 +1896,14 @@ export class FetchingAllDataClientSide {
           centeredWindowMetadata,
           windowFlags,
         );
+        await this.persistDurableArtifacts({
+          windowNumber: this.windowCount,
+          windowFlags,
+          latencyRow,
+          resultValue: numericValue,
+          resultEmittedAt,
+          logicalWindow,
+        });
         this.writeWindowDiagnostics(
           this.windowCount,
           logicalWindow,
@@ -1742,22 +2049,19 @@ export class FetchingAllDataClientSide {
   /**
    * Clean up resources
    */
-  public cleanup() {
-    profileSync("cleanup_time_ms", () => {
-      this.writeBenchmarkWindowSummary();
+  public async cleanup(): Promise<void> {
+    if (this.cleanupPromise) {
+      return this.cleanupPromise;
+    }
+
+    this.cleanupPromise = profileSync("cleanup_time_ms", () => {
       if (this.resourceUsageInterval) {
         clearInterval(this.resourceUsageInterval);
         this.resourceUsageInterval = null;
       }
-      if (this.logStream) {
-        this.logStream.end();
-      }
-      if (this.latencyLogStream) {
-        this.latencyLogStream.end();
-      }
-      if (this.diagnosticsLogStream) {
-        this.diagnosticsLogStream.end();
-      }
+      this.traceArtifactEvent("stream_end_started", {
+        targetPath: this.consumerSummaryPath,
+      });
       for (const client of this.mqttClients.splice(0)) {
         try {
           client.end(true);
@@ -1765,7 +2069,17 @@ export class FetchingAllDataClientSide {
           console.error("Failed to clean up fetching MQTT client:", error);
         }
       }
+      return Promise.all([
+        this.closeWritableStream(this.logStream),
+        this.closeWritableStream(this.diagnosticsLogStream),
+        this.closeWritableStream(this.resourceUsageLogStream),
+      ]).then(() => {
+        this.traceArtifactEvent("stream_end_completed", {
+          targetPath: this.consumerSummaryPath,
+        });
+      });
     });
+    await this.cleanupPromise;
     writeProfileArtifact();
   }
 
@@ -1784,9 +2098,9 @@ export class FetchingAllDataClientSide {
     const targetPath = path.join(logRoot, filePath.replace(".csv", `${consumerIdx}.csv`));
 
     const writeHeader = !fs.existsSync(targetPath);
-    const logStream = fs.createWriteStream(targetPath, { flags: "a" });
+    this.resourceUsageLogStream = fs.createWriteStream(targetPath, { flags: "a" });
     if (writeHeader) {
-      logStream.write(
+      this.resourceUsageLogStream.write(
         "timestamp,cpu_user,cpu_system,rss,heapTotal,heapUsed,heapUsedMB,external\n",
       );
     }
@@ -1805,7 +2119,7 @@ export class FetchingAllDataClientSide {
           (mem.heapUsed / 1024 / 1024).toFixed(2),
         mem.external,
       ].join(",") + "\n";
-      logStream.write(line);
+      this.resourceUsageLogStream?.write(line);
     }, intervalMs);
     this.resourceUsageInterval.unref?.();
   }
@@ -1817,7 +2131,7 @@ export class FetchingAllDataClientSide {
 
     this.cleanupRegistered = true;
     process.once("exit", () => {
-      this.cleanup();
+      void this.cleanup();
     });
   }
 }
@@ -1847,21 +2161,25 @@ async function clientSideProcessing() {
   );
 
   // Add cleanup handlers
-  process.on("exit", () => client.cleanup());
+  process.on("exit", () => {
+    void client.cleanup();
+  });
   process.on("SIGINT", () => {
     client.log("Process interrupted, cleaning up...");
-    client.cleanup();
-    process.exit(0);
+    void client.cleanup().finally(() => process.exit(0));
   });
   process.on("SIGTERM", () => {
     client.log("Process terminated, cleaning up...");
-    client.cleanup();
-    process.exit(0);
+    void client.cleanup().finally(() => process.exit(0));
   });
 
-  client.process_streams();
+  await client.process_streams();
+  await client.awaitCompletion();
+  await client.cleanup();
 }
 
-clientSideProcessing().catch((error) => {
-  console.error("Error during client-side processing:", error);
-});
+if (require.main === module) {
+  clientSideProcessing().catch((error) => {
+    console.error("Error during client-side processing:", error);
+  });
+}
