@@ -7,6 +7,7 @@ const {
   classifyExistingExecution,
   collectScenarioAnchorState,
   ensureScenarioManifest,
+  shouldStopAfterFailedResult,
   shouldTerminateBoundedRun,
   waitForStructuralValidation,
 } = require("./run-equivalent-query-exact-final-local-smoke");
@@ -98,6 +99,33 @@ function writeAttempt(resultRoot, {
 }
 
 describe("run-equivalent-query-exact-final-local-smoke bounded settling", () => {
+  test("stops on failed executions even when structural validation is unavailable", () => {
+    expect(
+      shouldStopAfterFailedResult(
+        { success: false, reason: "timeout" },
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      shouldStopAfterFailedResult(
+        { success: false, validation: { ok: false, failures: ["invalid"] } },
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      shouldStopAfterFailedResult(
+        { success: true, validation: { ok: true, failures: [] } },
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      shouldStopAfterFailedResult(
+        { success: false, reason: "timeout" },
+        false,
+      ),
+    ).toBe(false);
+  });
+
   test("waits for a delayed consumer before bounded teardown", () => {
     const targetReachedAt = 1000;
     expect(

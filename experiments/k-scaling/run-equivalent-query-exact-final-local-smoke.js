@@ -506,6 +506,13 @@ function shouldTerminateBoundedRun({
   return (now - targetReachedAt) >= settleTimeoutMs;
 }
 
+function shouldStopAfterFailedResult(result, stopOnInvalid) {
+  if (!stopOnInvalid || result?.success !== false) {
+    return false;
+  }
+  return true;
+}
+
 async function resolveReusableExecution(resultRoot, approach, kValue, iteration) {
   const checkpoint = readCheckpoint(resultRoot, approach, kValue, iteration);
   if (checkpoint?.success) {
@@ -1038,9 +1045,12 @@ async function main() {
       timeoutMs: args.timeoutMs,
       replayAnchor,
     });
-    if (!result.success && args.stopOnInvalid && result.validation && !result.validation.ok) {
+    if (shouldStopAfterFailedResult(result, args.stopOnInvalid)) {
+      const failureDetails = result.validation?.failures?.length
+        ? result.validation.failures.join("; ")
+        : (result.error || result.reason || "execution failed");
       throw new Error(
-        `Stopping on structurally invalid result for ${combo.approach} K=${combo.kValue} iteration=${combo.iteration}: ${result.validation.failures.join("; ")}`,
+        `Stopping on failed result for ${combo.approach} K=${combo.kValue} iteration=${combo.iteration}: ${failureDetails}`,
       );
     }
     await delay(1500);
@@ -1063,6 +1073,7 @@ module.exports = {
   classifyExistingExecution,
   collectScenarioAnchorState,
   ensureScenarioManifest,
+  shouldStopAfterFailedResult,
   shouldTerminateBoundedRun,
   validateRun,
   waitForStructuralValidation,
