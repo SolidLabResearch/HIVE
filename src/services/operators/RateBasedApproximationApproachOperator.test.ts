@@ -83,6 +83,14 @@ FROM NAMED WINDOW :wout ON STREAM :streamOut [RANGE 120000 STEP 60000]
 WHERE { WINDOW :wout { ?sensor :value ?v } }
 `;
 
+const OUTPUT_QUERY_180 = `
+PREFIX : <https://rsp.js/>
+REGISTER RStream <output> AS
+SELECT (AVG(?v) AS ?avg)
+FROM NAMED WINDOW :wout ON STREAM :streamOut [RANGE 180000 STEP 60000]
+WHERE { WINDOW :wout { ?sensor :value ?v } }
+`;
+
 const SUBQUERY_A = `
 PREFIX : <https://rsp.js/>
 REGISTER RStream <output> AS
@@ -345,6 +353,82 @@ WHERE { WINDOW :w2 { ?sensor :value ?v } }
       { start: 60000, end: 180000 },
       { start: 120000, end: 240000 },
     ]);
+  });
+
+  test('completed-window mode publishes a 180-second comparable payload with 180-second logical bounds', async () => {
+    process.env.RESULT_TOPIC = 'shared/approximation-q180/results';
+    const { client } = await startOperatorWithOutputQuery(OUTPUT_QUERY_180);
+
+    client.emit('message', TOPIC_A, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-a',
+      source_topic: 'stream1',
+      aggregationType: 'AVG',
+      value: 10,
+      window_start: 0,
+      window_end: 60000,
+      window_data_close_time: 60000,
+    })));
+    client.emit('message', TOPIC_B, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-b',
+      source_topic: 'stream2',
+      aggregationType: 'AVG',
+      value: 20,
+      window_start: 0,
+      window_end: 60000,
+      window_data_close_time: 60000,
+    })));
+    client.emit('message', TOPIC_A, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-a',
+      source_topic: 'stream1',
+      aggregationType: 'AVG',
+      value: 30,
+      window_start: 60000,
+      window_end: 120000,
+      window_data_close_time: 120000,
+    })));
+    client.emit('message', TOPIC_B, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-b',
+      source_topic: 'stream2',
+      aggregationType: 'AVG',
+      value: 40,
+      window_start: 60000,
+      window_end: 120000,
+      window_data_close_time: 120000,
+    })));
+    client.emit('message', TOPIC_A, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-a',
+      source_topic: 'stream1',
+      aggregationType: 'AVG',
+      value: 50,
+      window_start: 120000,
+      window_end: 180000,
+      window_data_close_time: 180000,
+    })));
+    client.emit('message', TOPIC_B, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-b',
+      source_topic: 'stream2',
+      aggregationType: 'AVG',
+      value: 60,
+      window_start: 120000,
+      window_end: 180000,
+      window_data_close_time: 180000,
+    })));
+
+    expect(client.publish).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(client.publish.mock.calls[0][1]);
+    expect(payload.windowStart).toBe(0);
+    expect(payload.windowEnd).toBe(180000);
+    expect(payload.windowDurationMs).toBe(180000);
+    expect(payload.rangeMs).toBe(180000);
+    expect(payload.stepMs).toBe(60000);
+    expect(payload.isComparableWindow).toBe(true);
+    expect(payload.coverageComplete).toBe(true);
   });
 
   test('falls back to query-text window extraction for production-style final queries', async () => {

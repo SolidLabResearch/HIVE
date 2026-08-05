@@ -323,6 +323,7 @@ export class QueryExecutionDispatcher {
       {
         RESULT_TOPIC: sharedOutputTopic,
         BENCHMARK_APPROACH: request.approach,
+        EXECUTION_ID: executionId,
       },
       {
         onMessage: (message) => {

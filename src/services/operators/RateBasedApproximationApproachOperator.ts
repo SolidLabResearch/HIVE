@@ -163,6 +163,8 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private cleanupPromise: Promise<void> | null = null;
   private finalizePromise: Promise<void> | null = null;
   private completionNotified: boolean = false;
+  private readonly executionId: string | null =
+    (process.env.EXECUTION_ID || "").trim() || null;
 
   /**
    * The constructor class with optional inactivity configuration.
@@ -980,10 +982,13 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                     currentOutputWindowNumber,
                     {},
                     {
+                      executionId: this.executionId,
                       windowSemantics: alignedWindowMetadata.windowSemantics,
                       logicalTriggerTime: alignedWindowMetadata.logicalTriggerTime,
                       windowStart: alignedWindowMetadata.windowStart,
                       windowEnd: alignedWindowMetadata.windowEnd,
+                      rangeMs: this.windowRange,
+                      stepMs: this.windowSlide,
                       windowDataCloseTime: alignedWindowMetadata.windowDataCloseTime,
                       resultEmittedAt: alignedWindowMetadata.resultEmittedAt,
                       latencyFromLogicalTriggerMs:
@@ -1537,11 +1542,14 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                     unifiedResult,
                     this.windowCount,
                     {
+                      executionId: this.executionId,
                       windowSemantics: centeredWindowMetadata.windowSemantics,
                       logicalTriggerTime:
                         centeredWindowMetadata.logicalTriggerTime,
                       windowStart: centeredWindowMetadata.windowStart,
                       windowEnd: centeredWindowMetadata.windowEnd,
+                      rangeMs: this.windowRange,
+                      stepMs: this.windowSlide,
                       windowDataCloseTime:
                         centeredWindowMetadata.windowDataCloseTime,
                       resultEmittedAt: centeredWindowMetadata.resultEmittedAt,

@@ -385,6 +385,61 @@ function normalizeDelivery(approach, registration, parsed) {
   };
 }
 
+function evaluateComparableDelivery(registration, parsed) {
+  if (parsed.isComparableWindow !== true) {
+    return {
+      accepted: false,
+      reason: "isComparableWindow=false",
+    };
+  }
+
+  if (registration.executionId && parsed.raw?.executionId && parsed.raw.executionId !== registration.executionId) {
+    return {
+      accepted: false,
+      reason: "executionId_mismatch",
+    };
+  }
+
+  if (
+    Number.isFinite(registration.expectedWindowStart) &&
+    parsed.windowStart !== registration.expectedWindowStart
+  ) {
+    return {
+      accepted: false,
+      reason: "windowStart_mismatch",
+    };
+  }
+
+  if (
+    Number.isFinite(registration.expectedWindowEnd) &&
+    parsed.windowEnd !== registration.expectedWindowEnd
+  ) {
+    return {
+      accepted: false,
+      reason: "windowEnd_mismatch",
+    };
+  }
+
+  if (Number.isFinite(registration.rangeMs) && parsed.rangeMs !== null && parsed.rangeMs !== registration.rangeMs) {
+    return {
+      accepted: false,
+      reason: "rangeMs_mismatch",
+    };
+  }
+
+  if (Number.isFinite(registration.stepMs) && parsed.stepMs !== null && parsed.stepMs !== registration.stepMs) {
+    return {
+      accepted: false,
+      reason: "stepMs_mismatch",
+    };
+  }
+
+  return {
+    accepted: true,
+    reason: "accepted",
+  };
+}
+
 async function waitForServerLog(filePath, timeoutMs = STARTUP_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -450,6 +505,7 @@ async function subscribeConsumers({ registrations, deliveryPath }) {
   const clients = [];
   const comparableByLabel = new Map();
   const allDeliveries = [];
+  const deliveryDecisions = [];
   await Promise.all(
     registrations.map((registration) => new Promise((resolve, reject) => {
       const client = mqtt.connect("mqtt://localhost:1883", {
@@ -476,9 +532,22 @@ async function subscribeConsumers({ registrations, deliveryPath }) {
         }
         const parsed = parseResultPayload(payloadBuffer.toString("utf8"));
         const delivery = normalizeDelivery("unknown", registration, parsed);
+        const decision = evaluateComparableDelivery(registration, parsed);
         allDeliveries.push(delivery);
         appendNdjson(deliveryPath, delivery);
-        if (parsed.isComparableWindow && !comparableByLabel.has(registration.queryLabel)) {
+        deliveryDecisions.push({
+          queryLabel: registration.queryLabel,
+          executionId: registration.executionId,
+          outputTopic: registration.outputTopic,
+          windowStart: delivery.windowStart,
+          windowEnd: delivery.windowEnd,
+          rangeMs: parsed.rangeMs,
+          stepMs: parsed.stepMs,
+          isComparableWindow: parsed.isComparableWindow,
+          accepted: decision.accepted,
+          reason: decision.reason,
+        });
+        if (decision.accepted && !comparableByLabel.has(registration.queryLabel)) {
           comparableByLabel.set(registration.queryLabel, delivery);
         }
       });
@@ -530,6 +599,9 @@ async function subscribeConsumers({ registrations, deliveryPath }) {
           // ignore cleanup errors
         }
       }
+    },
+    getDeliveryDecisions() {
+      return [...deliveryDecisions];
     },
   };
 }
@@ -746,6 +818,9 @@ async function runApproach({
           querySpec,
         }),
       );
+      registration.expectedWindowStart = replayAnchor;
+      registration.expectedWindowEnd = replayAnchor + querySpec.rangeMs;
+      registration.stepMs = FINAL_STEP_MS;
       appendNdjson(registrationPath, registration);
       registrations.push(registration);
     }
@@ -810,6 +885,7 @@ async function runApproach({
         consumersSubscribed: true,
         replayStartedAfterReadiness: true,
       },
+      deliveryDecisions: subscribers.getDeliveryDecisions(),
     };
     writeJson(path.join(runRoot, "approach_summary.json"), summary);
     return summary;
@@ -975,7 +1051,20 @@ async function main() {
   }, null, 2));
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack || error.message : String(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  ALL_APPROACHES,
+  FINAL_QUERIES,
+  FINAL_STEP_MS,
+  buildWindowPlan,
+  evaluateComparableDelivery,
+  normalizeDelivery,
+  parseArgs,
+  parseResultPayload,
+};
