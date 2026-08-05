@@ -161,12 +161,32 @@ export type ChunkProcessingState = {
   chunkCoverageByWindow: Map<string, ChunkCoverageState>;
   completedChunkGroups: Map<string, CompletedChunkGroupState>;
   orderedCompletedChunkGroups: CompletedChunkGroupState[];
+  finalWindowCoverageById: Map<string, FinalWindowCoverageState>;
   readyChunkGroupIds: string[];
   readyChunkGroupSet: Set<string>;
   nextComparableWindowStartIndex: number;
+  nextComparableWindowStartMs: number | null;
   expectedSubqueryIds: string[];
   outputAggregationFunction: AggregationFunction;
   chunksPerComparableWindow: number;
   chunkGroupsPerOutputStep: number;
+  chunkWindowWidthMs: number;
+  alignmentOriginMs: number | null;
   comparableOutputCadenceOnly: boolean;
+};
+
+export type FinalWindowCoverageSnapshot = {
+  finalWindowStart: number;
+  finalWindowEnd: number;
+  expectedChunkKeys: string[];
+  receivedChunkKeys: string[];
+  missingChunkKeys: string[];
+  duplicateChunkKeys: string[];
+  coverageComplete: boolean;
+  completionReason?: string;
+};
+
+export type FinalWindowCoverageState = FinalWindowCoverageSnapshot & {
+  finalWindowId: string;
+  emitted: boolean;
 };

@@ -202,6 +202,33 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             // Only output query params → GCD([10, 2]) = 2
             expect(gcd).toBe(2);
         });
+
+        test('preserves reusable subquery range while rewriting chunk step', () => {
+            const reusableSubQuery = `
+PREFIX : <https://rsp.js/>
+REGISTER RStream <output> AS
+SELECT (AVG(?v) AS ?avgTemp)
+FROM NAMED WINDOW :w1 ON STREAM :stream1 [RANGE 60000 STEP 30000]
+WHERE { WINDOW :w1 { ?sensor :value ?v } }
+`;
+            const finalQuery = `
+PREFIX : <https://rsp.js/>
+REGISTER RStream <output> AS
+SELECT (AVG(?v) AS ?avgTemp)
+FROM NAMED WINDOW :w1 ON STREAM :stream1 [RANGE 120000 STEP 60000]
+WHERE { WINDOW :w1 { ?sensor :value ?v } }
+`;
+
+            operator.addSubQuery(reusableSubQuery);
+            operator.setOutputQuery(finalQuery);
+
+            const plan = (operator as any).buildChunkPlan();
+            expect(plan.chunkSize).toBe(30000);
+            expect(plan.chunkWindowWidthMs).toBe(60000);
+            expect(plan.rewrittenQueries).toHaveLength(1);
+            expect(plan.rewrittenQueries[0]).toContain('RANGE 60000 STEP 30000');
+            expect(plan.rewrittenQueries[0]).not.toContain('RANGE 30000 STEP 30000');
+        });
     });
 
     describe('detectAggregationFunction', () => {
@@ -584,18 +611,109 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                 rdfPayload: '<smartphone> <https://saref.etsi.org/core/hasValue> "1.03"^^<http://www.w3.org/2001/XMLSchema#double> .',
             }, expectedSubqueryIds);
 
-            expect(wearable.chunkGroupId).toBe('q1:1000:31000');
-            expect(smartphone.chunkGroupId).toBe('q1:1000:31000');
+            expect(wearable.chunkGroupId).toBe('1000:31000');
+            expect(smartphone.chunkGroupId).toBe('1000:31000');
             expect(smartphone.isComplete).toBe(true);
             expect(chunksByWindow.size).toBe(1);
         });
 
-        test('prints first 5 chunkGroupIds for 1Hz and 16Hz with deterministic event-time windows', () => {
+        test('should complete one logical chunk group across different producer query ids', () => {
+            const chunksByWindow = new Map();
+            const expectedSubqueryIds = ['wearable', 'smartphone'];
+
+            const wearable = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'producer-a',
+                subqueryId: 'wearable',
+                window: {
+                    windowName: 'mqtt://localhost:1883/wearableX',
+                    start: 1000,
+                    end: 31000,
+                    range: 30000,
+                    step: 30000,
+                    semantics: '[start,end)' as const,
+                },
+                chunkId: 'wearable-chunk',
+                value: -26.0,
+                count: 481,
+                rdfPayload: '<wearable> <https://saref.etsi.org/core/hasValue> "-26.0"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+
+            const smartphone = operator.collectChunkByWindow(chunksByWindow, {
+                queryId: 'producer-b',
+                subqueryId: 'smartphone',
+                window: {
+                    windowName: 'mqtt://localhost:1883/smartphoneX',
+                    start: 1000,
+                    end: 31000,
+                    range: 30000,
+                    step: 30000,
+                    semantics: '[start,end)' as const,
+                },
+                chunkId: 'smartphone-chunk',
+                value: 1.03,
+                count: 481,
+                rdfPayload: '<smartphone> <https://saref.etsi.org/core/hasValue> "1.03"^^<http://www.w3.org/2001/XMLSchema#double> .',
+            }, expectedSubqueryIds);
+
+            expect(wearable.chunkGroupId).toBe('1000:31000');
+            expect(smartphone.chunkGroupId).toBe('1000:31000');
+            expect(smartphone.isComplete).toBe(true);
+            expect(chunksByWindow.size).toBe(1);
+        });
+
+        test('normalizes small cross-stream window skew onto the shared chunk-step boundary', () => {
+            const wearablePayload = JSON.stringify({
+                queryId: 'shared-session',
+                subqueryId: 'wearable',
+                window: {
+                    windowName: 'mqtt://localhost:1883/wearableX',
+                    start: 1785921059503,
+                    end: 1785921060753,
+                    range: 1250,
+                    step: 1250,
+                    alignmentOriginMs: 1785921058753,
+                    semantics: '[start,end)',
+                    logicalTriggerTime: 1785921060753,
+                    windowDataCloseTime: 1785921060753,
+                },
+                value: 1,
+                count: 1,
+            });
+            const smartphonePayload = JSON.stringify({
+                queryId: 'shared-session',
+                subqueryId: 'smartphone',
+                window: {
+                    windowName: 'mqtt://localhost:1883/smartphoneX',
+                    start: 1785921059493,
+                    end: 1785921060743,
+                    range: 1250,
+                    step: 1250,
+                    alignmentOriginMs: 1785921058753,
+                    semantics: '[start,end)',
+                    logicalTriggerTime: 1785921060743,
+                    windowDataCloseTime: 1785921060743,
+                },
+                value: 2,
+                count: 1,
+            });
+
+            const wearable = (operator as any).normalizeChunkPayload(wearablePayload);
+            const smartphone = (operator as any).normalizeChunkPayload(smartphonePayload);
+
+            expect(wearable.window.start).toBe(smartphone.window.start);
+            expect(wearable.window.end).toBe(smartphone.window.end);
+            expect(wearable.window.start).toBe(1785921058753);
+            expect(wearable.window.end).toBe(1785921060003);
+            expect(wearable.chunkId).toBe(`1785921058753:1785921058753:1785921060003:wearable`);
+            expect(smartphone.chunkId).toBe(`1785921058753:1785921058753:1785921060003:smartphone`);
+        });
+
+        test('prints first 5 anchor-relative chunkGroupIds for 1Hz and 16Hz with deterministic event-time windows', () => {
             const queryId = 'bench-q';
             const windowName = 'https://rsp.js/w1';
             const range = 60000;
             const step = 30000;
-            const benchmarkStart = Date.parse('2026-01-01T00:00:00.000Z');
+            const benchmarkStart = Date.parse('2026-01-01T00:00:01.763Z');
 
             const buildChunkGroupIds = (rateHz: number): string[] => {
                 const intervalMs = Math.floor(1000 / rateHz);
@@ -604,8 +722,8 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                 let t = benchmarkStart;
 
                 while (ids.length < 5) {
-                    const end = Math.floor(t / step) * step;
-                    const start = end - range;
+                    const start = benchmarkStart + Math.floor((t - benchmarkStart) / step) * step;
+                    const end = start + range;
                     if (end > benchmarkStart && (ids.length === 0 || ids[ids.length - 1] !== `${queryId}:${windowName}:${start}:${end}`)) {
                         ids.push(`${queryId}:${windowName}:${start}:${end}`);
                     }
@@ -669,13 +787,17 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             chunkCoverageByWindow,
             completedChunkGroups: new Map(),
             orderedCompletedChunkGroups: [],
+            finalWindowCoverageById: new Map(),
             readyChunkGroupIds: Array.from(chunksByWindow.keys()),
             readyChunkGroupSet: new Set(chunksByWindow.keys()),
             nextComparableWindowStartIndex: 0,
+            nextComparableWindowStartMs: null,
             expectedSubqueryIds,
             outputAggregationFunction: 'SUM',
             chunksPerComparableWindow: 1,
             chunkGroupsPerOutputStep: 1,
+            chunkWindowWidthMs: 1000,
+            alignmentOriginMs: null,
             comparableOutputCadenceOnly,
         });
 
@@ -1338,13 +1460,17 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                 chunkCoverageByWindow,
                 completedChunkGroups: new Map(),
                 orderedCompletedChunkGroups: [],
+                finalWindowCoverageById: new Map(),
                 readyChunkGroupIds: [chunkGroupId],
                 readyChunkGroupSet: new Set([chunkGroupId]),
                 nextComparableWindowStartIndex: 0,
+                nextComparableWindowStartMs: null,
                 expectedSubqueryIds,
                 outputAggregationFunction: 'SUM' as const,
                 chunksPerComparableWindow: 1,
                 chunkGroupsPerOutputStep: 1,
+                chunkWindowWidthMs: 1000,
+                alignmentOriginMs: null,
                 comparableOutputCadenceOnly: false
             };
 
@@ -1557,6 +1683,8 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                     range: 1000,
                     step: 1000,
                     semantics: '[start,end)',
+                    logicalTriggerTime: 2000,
+                    windowDataCloseTime: 2000,
                 },
                 aggregateFunction: 'AVG',
                 avg: 12.5,
@@ -1578,8 +1706,10 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
                     range: 1000,
                     step: 1000,
                     semantics: '[start,end)',
+                    logicalTriggerTime: 2000,
+                    windowDataCloseTime: 2000,
                 },
-                chunkId: 'q1:1000:2000:subA',
+                chunkId: '1000:2000:subA',
                 reuseClassKey: undefined,
                 sourceStreamId: undefined,
                 sourceTopic: undefined,
@@ -1604,6 +1734,39 @@ describe('StreamingQueryChunkAggregatorOperator', () => {
             expect((operator as any).isContaminatedTimestamp(2001, 'topic/a')).toBe(true);
             expect((operator as any).isContaminatedTimestamp(1500, 'topic/a')).toBe(false);
             expect((operator as any).rejectedContaminatedTimestampCount).toBe(2);
+        });
+
+        test('overlapping chunk is accepted when close time is inside the benchmark domain', () => {
+            (operator as any).timestampDomainMin = 1785924223543;
+            (operator as any).timestampDomainMax = 1785924408543;
+
+            const normalized = (operator as any).normalizeChunkPayload(JSON.stringify({
+                queryId: 'q1',
+                subqueryId: 'subA',
+                window: {
+                    windowName: 'https://rsp.js/w1',
+                    start: 1785924193543,
+                    end: 1785924253543,
+                    range: 60000,
+                    step: 30000,
+                    semantics: '[start,end)',
+                    logicalTriggerTime: 1785924253793,
+                    windowDataCloseTime: 1785924253543,
+                },
+                aggregateFunction: 'AVG',
+                avg: 12.5,
+                count: 4,
+                state: {
+                    count: 4,
+                    sum: 50,
+                },
+            }));
+
+            const chunkTimestamp = Number.isFinite(normalized.window.logicalTriggerTime)
+                ? normalized.window.logicalTriggerTime
+                : normalized.window.end;
+
+            expect((operator as any).isContaminatedTimestamp(chunkTimestamp, 'topic/a')).toBe(false);
         });
     });
 

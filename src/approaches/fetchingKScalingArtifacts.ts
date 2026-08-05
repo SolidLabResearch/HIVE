@@ -19,6 +19,21 @@ export type FetchingTraceEvent =
   | "stream_end_completed"
   | "process_exit_requested";
 
+export type FetchingPipelineTraceEvent =
+  | "fetching_execution_created"
+  | "stream_subscribed"
+  | "raw_event_received"
+  | "event_timestamp_extracted"
+  | "event_timestamp_rejected"
+  | "rstream_result_received"
+  | "window_bounds_derived"
+  | "window_bounds_rejected"
+  | "candidate_accepted"
+  | "candidate_rejected"
+  | "exact_result_computed"
+  | "final_result_published"
+  | "consumer_result_received";
+
 export type FetchingArtifactTraceRecord = {
   sequence: number;
   timestamp: number;
@@ -89,6 +104,10 @@ export function buildFetchingArtifactTracePath(logRoot: string): string {
   return path.join(logRoot, "fetching_artifact_write_trace.ndjson");
 }
 
+export function buildFetchingPipelineTracePath(logRoot: string): string {
+  return path.join(logRoot, "fetching_pipeline_trace.ndjson");
+}
+
 export async function writeAtomicFile(
   targetPath: string,
   content: string,
@@ -115,6 +134,14 @@ export async function writeAtomicJson(
 export function appendFetchingArtifactTrace(
   tracePath: string,
   record: FetchingArtifactTraceRecord,
+): void {
+  fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+  fs.appendFileSync(tracePath, `${JSON.stringify(record)}\n`);
+}
+
+export function appendFetchingPipelineTrace(
+  tracePath: string,
+  record: Record<string, unknown>,
 ): void {
   fs.mkdirSync(path.dirname(tracePath), { recursive: true });
   fs.appendFileSync(tracePath, `${JSON.stringify(record)}\n`);

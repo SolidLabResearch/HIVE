@@ -30,7 +30,9 @@ import { profileCount, profileSync, writeProfileArtifact } from "../util/profili
 import { resourceTraceSnapshot } from "../util/resourceTrace";
 import {
   appendFetchingArtifactTrace,
+  appendFetchingPipelineTrace,
   buildFetchingArtifactTracePath,
+  buildFetchingPipelineTracePath,
   buildFetchingConsumerSummaryPath,
   FetchingConsumerSummary,
   FetchingTraceEvent,
@@ -169,6 +171,7 @@ export class FetchingAllDataClientSide {
   private readonly latencyLogPath: string;
   private readonly consumerSummaryPath: string;
   private readonly tracePath: string;
+  private readonly pipelineTracePath: string;
   private readonly artifactTracingEnabled: boolean;
   private readonly artifactState: FetchingArtifactState;
   private traceSequence: number = 0;
@@ -230,6 +233,7 @@ export class FetchingAllDataClientSide {
       this.consumerIndex ?? 0,
     );
     this.tracePath = buildFetchingArtifactTracePath(this.logRoot);
+    this.pipelineTracePath = buildFetchingPipelineTracePath(this.logRoot);
     this.artifactTracingEnabled = ["1", "true", "yes", "on"].includes(
       (process.env.STREAMING_QUERY_HIVE_FETCHING_ARTIFACT_TRACE || "").trim().toLowerCase(),
     );
@@ -247,6 +251,10 @@ export class FetchingAllDataClientSide {
 
     // Initialize CSV logging for this approach
     this.initializeLogging();
+    this.tracePipelineEvent("fetching_execution_created", {
+      finalOutputTopic: this.r2s_topic,
+      replayAnchor: this.benchmarkEventTimeAnchor,
+    });
     this.log("fetching_query_registered");
     this.log(
       `Benchmark target window cap ${this.benchmarkTargetWindowCount !== null ? `enabled target=${this.benchmarkTargetWindowCount}` : "disabled"}`,
@@ -461,6 +469,24 @@ export class FetchingAllDataClientSide {
     });
   }
 
+  private tracePipelineEvent(
+    eventType: string,
+    details: Record<string, unknown> = {},
+  ): void {
+    appendFetchingPipelineTrace(this.pipelineTracePath, {
+      scenarioId: process.env.BENCHMARK_SCENARIO_ID || null,
+      executionId: this.sessionId,
+      consumerId: this.consumerIndex ?? "standalone",
+      finalOutputTopic: this.r2s_topic,
+      windowRangeMs: this.windowRange,
+      windowStepMs: this.expectedWindowInterval,
+      replayAnchor: this.benchmarkEventTimeAnchor,
+      timestamp: Date.now(),
+      eventType,
+      ...details,
+    });
+  }
+
   /**
    * Log latency measurement with multiple metrics
    */
@@ -573,6 +599,9 @@ export class FetchingAllDataClientSide {
               }
             } else {
               console.log(`Subscribed to topic ${topic} with QoS 1`);
+              this.tracePipelineEvent("stream_subscribed", {
+                streamTopic: topic,
+              });
               streamSubscribed = true;
               markReady();
             }
@@ -626,6 +655,10 @@ export class FetchingAllDataClientSide {
         try {
           const message_string = message.toString();
           profileCount("mqtt_messages_received");
+          this.tracePipelineEvent("raw_event_received", {
+            streamTopic: topic,
+            payloadBytes: Buffer.byteLength(message_string, "utf8"),
+          });
 
           // Track when data is received for latency calculations
           const now = Date.now();
@@ -646,8 +679,19 @@ export class FetchingAllDataClientSide {
           )[0].object.value;
           const timestamp_epoch = Date.parse(timestamp);
           if (this.isContaminatedTimestamp(timestamp_epoch, stream_name)) {
+            this.tracePipelineEvent("event_timestamp_rejected", {
+              streamTopic: topic,
+              rawTimestampField: timestamp,
+              parsedEventTimestamp: timestamp_epoch,
+              candidateReason: "contaminated_timestamp",
+            });
             return;
           }
+          this.tracePipelineEvent("event_timestamp_extracted", {
+            streamTopic: topic,
+            rawTimestampField: timestamp,
+            parsedEventTimestamp: timestamp_epoch,
+          });
           const value = latest_event_store.getQuads(
             null,
             DataFactory.namedNode("https://saref.etsi.org/core/hasValue"),
@@ -1248,6 +1292,12 @@ export class FetchingAllDataClientSide {
     });
     this.rstream_emitter.on("RStream", async (object: any) => {
       console.log("DEBUG: RStream event received:", JSON.stringify(object));
+      this.tracePipelineEvent("rstream_result_received", {
+        payloadSummary: {
+          hasWindow: Boolean(object?.window),
+          bindingCount: Array.isArray(object?.bindings) ? object.bindings.length : 0,
+        },
+      });
       if (!object || !object.bindings) {
         console.error("Received invalid RStream object:", object);
         return;
@@ -1339,6 +1389,24 @@ export class FetchingAllDataClientSide {
           firstEventTimestamp,
           lastEventTimestamp,
         );
+        if (logicalWindow) {
+          this.tracePipelineEvent("window_bounds_derived", {
+            logicalWindowStart: logicalWindow.start,
+            logicalWindowEnd: logicalWindow.end,
+            rawTimestampField: {
+              firstEventTimestamp,
+              lastEventTimestamp,
+            },
+          });
+        } else {
+          this.tracePipelineEvent("window_bounds_rejected", {
+            rawTimestampField: {
+              firstEventTimestamp,
+              lastEventTimestamp,
+            },
+            candidateReason: "missing_or_invalid_logical_window_bounds",
+          });
+        }
         const completeness = this.assessWindowCompleteness(logicalWindow, eventCount);
 
         this.log(
@@ -1358,6 +1426,13 @@ export class FetchingAllDataClientSide {
         );
 
         if (!logicalWindow) {
+          this.tracePipelineEvent("candidate_rejected", {
+            candidateReason: completeness.reason,
+            rawTimestampField: {
+              firstEventTimestamp,
+              lastEventTimestamp,
+            },
+          });
           this.log(
             `Delayed because incomplete: ${JSON.stringify({
               reason: completeness.reason,
@@ -1439,6 +1514,11 @@ export class FetchingAllDataClientSide {
           }
 
           if (!this.canFinalizeLogicalWindow(logicalWindow.end)) {
+            this.tracePipelineEvent("candidate_rejected", {
+              logicalWindowStart: logicalWindow.start,
+              logicalWindowEnd: logicalWindow.end,
+              candidateReason: "waiting_for_all_streams_to_progress_past_window_end",
+            });
             this.writeWindowDiagnostics(
               "",
               logicalWindow,
@@ -1466,6 +1546,11 @@ export class FetchingAllDataClientSide {
             settledAggregate.eventCount,
           );
           if (!settledCompleteness.isSettled) {
+            this.tracePipelineEvent("candidate_rejected", {
+              logicalWindowStart: logicalWindow.start,
+              logicalWindowEnd: logicalWindow.end,
+              candidateReason: settledCompleteness.reason,
+            });
             this.writeWindowDiagnostics(
               "",
               logicalWindow,
@@ -1543,6 +1628,11 @@ export class FetchingAllDataClientSide {
           }
 
           this.acceptedCompleteWindowCount++;
+          this.tracePipelineEvent("candidate_accepted", {
+            logicalWindowStart: logicalWindow.start,
+            logicalWindowEnd: logicalWindow.end,
+            eventCount: settledAggregate.eventCount,
+          });
           this.windowCount = Math.max(this.windowCount, benchmarkWindowNumber as number);
           this.emittedLogicalWindows.add(logicalWindow.key);
           this.recordFinalizedWindow(benchmarkWindowNumber as number);
@@ -1620,6 +1710,12 @@ export class FetchingAllDataClientSide {
               accepted_complete_window_count: this.acceptedCompleteWindowCount,
             })}`,
           );
+          this.tracePipelineEvent("exact_result_computed", {
+            logicalWindowStart: logicalWindow.start,
+            logicalWindowEnd: logicalWindow.end,
+            eventCount: settledAggregate.eventCount,
+            resultValue: startupNumericValue,
+          });
 
           const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
           const aggregation_object_string = useBenchmarkPayload
@@ -1693,6 +1789,12 @@ export class FetchingAllDataClientSide {
                   this.log(
                     `Successfully published result: ${data}, publish latency: ${publishEndTime - publishStartTime}ms`,
                   );
+                  this.tracePipelineEvent("final_result_published", {
+                    logicalWindowStart: logicalWindow.start,
+                    logicalWindowEnd: logicalWindow.end,
+                    resultValue: startupNumericValue,
+                    finalOutputTopic: this.r2s_topic,
+                  });
                 }
                 pubClient.end();
               },
@@ -1702,6 +1804,11 @@ export class FetchingAllDataClientSide {
         }
 
         if (!this.canFinalizeLogicalWindow(logicalWindow.end)) {
+          this.tracePipelineEvent("candidate_rejected", {
+            logicalWindowStart: logicalWindow.start,
+            logicalWindowEnd: logicalWindow.end,
+            candidateReason: "waiting_for_all_streams_to_progress_past_window_end",
+          });
           this.writeWindowDiagnostics(
             "",
             logicalWindow,
@@ -1739,6 +1846,11 @@ export class FetchingAllDataClientSide {
         );
 
         if (!settledCompleteness.isSettled) {
+          this.tracePipelineEvent("candidate_rejected", {
+            logicalWindowStart: logicalWindow.start,
+            logicalWindowEnd: logicalWindow.end,
+            candidateReason: settledCompleteness.reason,
+          });
           this.writeWindowDiagnostics(
             "",
             logicalWindow,
@@ -1834,6 +1946,11 @@ export class FetchingAllDataClientSide {
         // Apply timing filter only in legacy/live mode. Deterministic benchmark
         // mode finalizes based on window completeness and logical window keys.
         if (this.timingFilterEnabled && !this.isWithinExpectedWindowTiming(currentTimestamp)) {
+          this.tracePipelineEvent("candidate_rejected", {
+            logicalWindowStart: logicalWindow.start,
+            logicalWindowEnd: logicalWindow.end,
+            candidateReason: "filtered_due_to_timing",
+          });
           this.filteredDueToTimingCount += 1;
           this.writeWindowDiagnostics(
             "",
@@ -1879,6 +1996,11 @@ export class FetchingAllDataClientSide {
         // Calculate and log latency with multiple metrics
         this.windowCount++;
         this.acceptedCompleteWindowCount++;
+        this.tracePipelineEvent("candidate_accepted", {
+          logicalWindowStart: logicalWindow.start,
+          logicalWindowEnd: logicalWindow.end,
+          eventCount: settledAggregate.eventCount,
+        });
         this.emittedLogicalWindows.add(logicalWindow.key);
         this.recordFinalizedWindow(this.windowCount);
         this.traceArtifactEvent("complete_window_finalized", {
@@ -1954,6 +2076,12 @@ export class FetchingAllDataClientSide {
             accepted_complete_window_count: this.acceptedCompleteWindowCount,
           })}`,
         );
+        this.tracePipelineEvent("exact_result_computed", {
+          logicalWindowStart: logicalWindow.start,
+          logicalWindowEnd: logicalWindow.end,
+          eventCount: settledAggregate.eventCount,
+          resultValue: numericValue,
+        });
 
         // Debug: print the full binding object
         // console.log("DEBUG: RStream binding:", binding);
@@ -2037,6 +2165,12 @@ export class FetchingAllDataClientSide {
                 this.log(
                   `Successfully published result: ${data}, publish latency: ${publishEndTime - publishStartTime}ms`,
                 );
+                this.tracePipelineEvent("final_result_published", {
+                  logicalWindowStart: logicalWindow.start,
+                  logicalWindowEnd: logicalWindow.end,
+                  resultValue: numericValue,
+                  finalOutputTopic: this.r2s_topic,
+                });
               }
               pubClient.end();
             },
