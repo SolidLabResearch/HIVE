@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { spawn, execSync } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -40,6 +41,12 @@ const DEFAULT_K_VALUES = [1, 2, 4, 8, 32];
 const DEFAULT_APPROACHES = ["fetching", "approximation", "chunked"];
 const DEFAULT_ITERATIONS = 1;
 const DEFAULT_ADVERSARIAL_K_VALUES = [3, 5, 11];
+const BUILD_MANIFEST_NAME = "production-build-manifest.json";
+const SERVER_EXECUTABLE_PATH = path.join(REPO_ROOT, "dist", "startHTTPServer.js");
+
+function sha256(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
 
 function parseArgs(argv) {
   const args = {
@@ -50,6 +57,7 @@ function parseArgs(argv) {
     timeoutMs: DELIVERY_TIMEOUT_MS,
     baseAnchorMs: null,
     skipAdversarial: false,
+    skipMainMatrix: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -84,6 +92,9 @@ function parseArgs(argv) {
         break;
       case "--skip-adversarial":
         args.skipAdversarial = true;
+        break;
+      case "--skip-main-matrix":
+        args.skipMainMatrix = true;
         break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
@@ -124,6 +135,122 @@ function buildResultRoot() {
     "paper-benchmarks",
     `experiment3-production-same-superqueries-1x-local-${sanitizeTimestamp(new Date())}`,
   );
+}
+
+function getSourceFilesForBuildGuard() {
+  const candidates = runCommand(
+    'rg --files src experiments/superquery-scaling package.json tsconfig.json 2>/dev/null || true',
+  )
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => path.join(REPO_ROOT, entry))
+    .filter((entry) => fs.existsSync(entry));
+  return candidates;
+}
+
+function getLatestSourceMtimeMs() {
+  const files = getSourceFilesForBuildGuard();
+  return files.reduce((latest, filePath) => {
+    const stat = fs.statSync(filePath);
+    return Math.max(latest, stat.mtimeMs);
+  }, 0);
+}
+
+function writeBuildManifest(manifest) {
+  const manifestPath = path.join(REPO_ROOT, "dist", BUILD_MANIFEST_NAME);
+  writeJson(manifestPath, manifest);
+  return manifestPath;
+}
+
+function readBuildManifest() {
+  const manifestPath = path.join(REPO_ROOT, "dist", BUILD_MANIFEST_NAME);
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(`Missing build manifest: ${manifestPath}`);
+  }
+  return {
+    manifestPath,
+    manifest: JSON.parse(fs.readFileSync(manifestPath, "utf8")),
+  };
+}
+
+function buildRepoStateSnapshot() {
+  const branch = runCommand("git branch --show-current");
+  const commit = runCommand("git rev-parse HEAD");
+  const statusShort = runCommand("git status --short || true");
+  const dirty = statusShort.trim().length > 0;
+  return {
+    branch,
+    commit,
+    statusShort,
+    dirty,
+    diffHash: sha256(statusShort),
+  };
+}
+
+function ensureFreshProductionBuild(resultRoot) {
+  const repoState = buildRepoStateSnapshot();
+  const buildStartedAt = new Date().toISOString();
+  const latestSourceMtimeMsBeforeBuild = getLatestSourceMtimeMs();
+  execSync("npm run build", {
+    cwd: REPO_ROOT,
+    stdio: "inherit",
+  });
+  const buildCompletedAt = new Date().toISOString();
+  if (!fs.existsSync(SERVER_EXECUTABLE_PATH)) {
+    throw new Error(`Missing server executable after build: ${SERVER_EXECUTABLE_PATH}`);
+  }
+  const manifest = {
+    commit: repoState.commit,
+    branch: repoState.branch,
+    dirty: repoState.dirty,
+    statusShort: repoState.statusShort,
+    diffHash: repoState.diffHash,
+    buildStartedAt,
+    buildCompletedAt,
+    serverExecutable: SERVER_EXECUTABLE_PATH,
+    sourceFingerprint: sha256(
+      JSON.stringify({
+        commit: repoState.commit,
+        diffHash: repoState.diffHash,
+        latestSourceMtimeMsBeforeBuild,
+      }),
+    ),
+    latestSourceMtimeMsBeforeBuild,
+  };
+  const manifestPath = writeBuildManifest(manifest);
+  writeJson(path.join(resultRoot, "build_identity.json"), {
+    ...manifest,
+    manifestPath,
+  });
+  return {
+    repoState,
+    buildManifestPath: manifestPath,
+    buildManifest: manifest,
+  };
+}
+
+function verifyBuildManifestOrThrow(expectedManifest) {
+  if (!fs.existsSync(path.join(REPO_ROOT, "dist"))) {
+    throw new Error("dist directory is missing");
+  }
+  const { manifestPath, manifest } = readBuildManifest();
+  const latestSourceMtimeMs = getLatestSourceMtimeMs();
+  const buildCompletedMs = Date.parse(manifest.buildCompletedAt || "");
+  if (!Number.isFinite(buildCompletedMs)) {
+    throw new Error(`Invalid buildCompletedAt in manifest: ${manifestPath}`);
+  }
+  if (buildCompletedMs < latestSourceMtimeMs) {
+    throw new Error(
+      `Build manifest predates source changes: build=${manifest.buildCompletedAt} latestSourceMtimeMs=${latestSourceMtimeMs}`,
+    );
+  }
+  if (expectedManifest && manifest.sourceFingerprint !== expectedManifest.sourceFingerprint) {
+    throw new Error(
+      `Runtime build fingerprint mismatch: expected=${expectedManifest.sourceFingerprint} actual=${manifest.sourceFingerprint}`,
+    );
+  }
+  return { manifestPath, manifest };
 }
 
 function buildRunRoot(resultRoot, scenarioClass, approach, kValue, iteration) {
@@ -193,6 +320,7 @@ function buildQuery({
   outputIri,
   outputAlias = "avgValue",
   approach = "approximation",
+  aggregationFunction = "AVG",
   windowRangeMs = OUTPUT_WINDOW_RANGE_MS,
   windowStepMs = OUTPUT_WINDOW_STEP_MS,
   includeWearable = true,
@@ -253,8 +381,8 @@ function buildQuery({
   ];
   const selectClause =
     approach === "fetching"
-      ? buildOutputSelectClause("AVG")
-      : `(AVG(${vValue}) AS ?${outputAlias})`;
+      ? buildOutputSelectClause(aggregationFunction)
+      : `(${aggregationFunction}(${vValue}) AS ?${outputAlias})`;
   return `
 ${comment}
 ${prefixLines.join("\n")}
@@ -265,6 +393,65 @@ WHERE {
   ${unions.join(" UNION ")}
 }
 `.trim();
+}
+
+function defaultApproximationConfig(overrides = {}) {
+  return {
+    policy: "rate-based-completed-window",
+    completedWindowMode: true,
+    earlyTriggerMode: false,
+    ...overrides,
+  };
+}
+
+function buildRegistrationBody({
+  approach,
+  topicPrefix,
+  consumerIndex,
+  variantMode = false,
+  approximationConfig,
+  queryOverrides = {},
+}) {
+  const outputIri = `consumer-${consumerIndex}-output-topic`;
+  return {
+    id: `${approach}-query-${consumerIndex}`,
+    consumer_id: `${approach}-consumer-${consumerIndex}`,
+    approach,
+    rspql_query: variantMode
+      ? buildEquivalentVariant(topicPrefix, outputIri, consumerIndex)
+      : buildQuery({
+          approach,
+          prefix: topicPrefix,
+          outputIri,
+          ...queryOverrides,
+        }),
+    r2s_topic: outputIri,
+    data_topic: outputIri,
+    approximation_config: approximationConfig,
+  };
+}
+
+async function postRegistration(port, requestBody) {
+  const requestStartedAt = Date.now();
+  const response = await fetch(`http://localhost:${port}/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+  const payload = await response.json();
+  return {
+    consumerId: requestBody.consumer_id,
+    requestStartedAt,
+    responseReceivedAt: Date.now(),
+    status: response.status,
+    requestBody,
+    responseBody: payload,
+    executionId: payload.executionId,
+    outputTopic: payload.outputTopic,
+    reuseHit: payload.reuseHit,
+    executionCreated: payload.executionCreated,
+    reuseDecision: payload.reuseDecision,
+  };
 }
 
 function buildEquivalentVariant(prefix, outputIri, consumerIndex) {
@@ -311,6 +498,48 @@ function buildEquivalentVariant(prefix, outputIri, consumerIndex) {
   }
 }
 
+function buildOneWayContainmentPair(prefix) {
+  const narrower = `
+PREFIX mqtt_broker: <mqtt://localhost:1883/>
+PREFIX saref: <https://saref.etsi.org/core/>
+PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
+PREFIX rspjs: <https://rsp.js>
+REGISTER RStream <one-way-narrower> AS
+SELECT (COUNT(?value) AS ?resultValue)
+FROM NAMED WINDOW <mqtt://localhost:1883/${prefix}/wearableX> ON STREAM mqtt_broker:${prefix}/wearableX [RANGE 120000 STEP 60000]
+FROM NAMED WINDOW <mqtt://localhost:1883/${prefix}/smartphoneX> ON STREAM mqtt_broker:${prefix}/smartphoneX [RANGE 120000 STEP 60000]
+WHERE {
+  WINDOW <mqtt://localhost:1883/${prefix}/wearableX> {
+    ?s1 saref:hasValue ?value .
+    ?s1 saref:hasTimestamp ?ts .
+    ?s1 saref:relatesToProperty dahccsensors:wearableX .
+  }
+  WINDOW <mqtt://localhost:1883/${prefix}/smartphoneX> {
+    ?s2 saref:hasValue ?value .
+    ?s2 saref:hasTimestamp ?ts .
+    ?s2 saref:relatesToProperty dahccsensors:smartphoneX .
+  }
+}
+`.trim();
+  const broader = `
+PREFIX mqtt_broker: <mqtt://localhost:1883/>
+PREFIX saref: <https://saref.etsi.org/core/>
+PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
+PREFIX rspjs: <https://rsp.js>
+REGISTER RStream <one-way-broader> AS
+SELECT (COUNT(?value) AS ?resultValue)
+FROM NAMED WINDOW <mqtt://localhost:1883/${prefix}/wearableX> ON STREAM mqtt_broker:${prefix}/wearableX [RANGE 120000 STEP 60000]
+WHERE {
+  WINDOW <mqtt://localhost:1883/${prefix}/wearableX> {
+    ?s1 saref:hasValue ?value .
+    ?s1 saref:hasTimestamp ?ts .
+    ?s1 saref:relatesToProperty dahccsensors:wearableX .
+  }
+}
+`.trim();
+  return { narrower, broader };
+}
+
 function parseResultPayload(payloadText) {
   let parsed;
   try {
@@ -352,6 +581,37 @@ function parseResultPayload(payloadText) {
       Number.isFinite(Number(parsed.timestamp))
         ? Number(parsed.timestamp)
         : null,
+  };
+}
+
+function readFetchingComparableSummary(runRoot) {
+  const summaryPath = path.join(
+    runRoot,
+    "benchmark_window_cap_summary_consumer_0.json",
+  );
+  if (!fs.existsSync(summaryPath)) {
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+}
+
+function enrichFetchingDeliveries(runRoot, firstDeliveries, allDeliveries) {
+  const summary = readFetchingComparableSummary(runRoot);
+  if (!summary || !Number.isFinite(summary.resultValue)) {
+    return { firstDeliveries, allDeliveries };
+  }
+  const enrich = (entry) => ({
+    ...entry,
+    windowStart: summary.windowStart,
+    windowEnd: summary.windowEnd,
+    resultValue: summary.resultValue,
+    sourcePublicationTimestamp: summary.resultEmittedAt,
+    payload: entry.payload,
+    fetchingSummary: summary,
+  });
+  return {
+    firstDeliveries: firstDeliveries.map(enrich),
+    allDeliveries: allDeliveries.map(enrich),
   };
 }
 
@@ -471,6 +731,7 @@ function buildScenarioEnv({
   runRoot,
   replayAnchor,
   scenarioId,
+  targetWindows = TARGET_WINDOWS,
 }) {
   const replayEnv = createBenchmarkReplayRunEnv(process.env);
   const benchmarkMinTimestamp = Number.parseInt(replayAnchor, 10);
@@ -494,7 +755,7 @@ function buildScenarioEnv({
     BENCHMARK_ITERATION: String(iteration),
     STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX: topicPrefix,
     STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: "1",
-    STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: String(TARGET_WINDOWS),
+    STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: String(targetWindows),
     STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: String(
       REQUIRED_REPLAY_DURATION_SECONDS,
     ),
@@ -527,46 +788,14 @@ async function registerConsumers({
 }) {
   const registrations = [];
   for (let consumerIndex = 1; consumerIndex <= kValue; consumerIndex += 1) {
-    const consumerId = `${approach}-consumer-${consumerIndex}`;
-    const requestBody = {
-      id: `${approach}-query-${consumerIndex}`,
-      consumer_id: consumerId,
+    const requestBody = buildRegistrationBody({
       approach,
-      rspql_query: variantMode
-        ? buildEquivalentVariant(
-            topicPrefix,
-            `consumer-${consumerIndex}-output-topic`,
-            consumerIndex,
-          )
-        : buildQuery({
-            approach,
-            prefix: topicPrefix,
-            outputIri: `consumer-${consumerIndex}-output-topic`,
-          }),
-      r2s_topic: `consumer-${consumerIndex}-output-topic`,
-      data_topic: `consumer-${consumerIndex}-output-topic`,
-      approximation_config: approximationConfig,
-    };
-    const requestStartedAt = Date.now();
-    const response = await fetch(`http://localhost:${port}/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
+      topicPrefix,
+      consumerIndex,
+      variantMode,
+      approximationConfig,
     });
-    const payload = await response.json();
-    const registration = {
-      consumerId,
-      requestStartedAt,
-      responseReceivedAt: Date.now(),
-      status: response.status,
-      requestBody,
-      responseBody: payload,
-      executionId: payload.executionId,
-      outputTopic: payload.outputTopic,
-      reuseHit: payload.reuseHit,
-      executionCreated: payload.executionCreated,
-      reuseDecision: payload.reuseDecision,
-    };
+    const registration = await postRegistration(port, requestBody);
     appendNdjson(registrationPath, registration);
     registrations.push(registration);
   }
@@ -705,6 +934,7 @@ async function runMainCell({
   let publisher = null;
   let subscribers = null;
   try {
+    const runtimeBuild = verifyBuildManifestOrThrow();
     await waitForServerLog(serverOutPath);
     await waitForRegisterReady(CONTROL_PORT);
 
@@ -751,7 +981,13 @@ async function runMainCell({
       ],
     });
 
-    const { firstDeliveries, allDeliveries } = await subscribers.waitForAll(deliveryTimeoutMs);
+    const deliveries = await subscribers.waitForAll(deliveryTimeoutMs);
+    const {
+      firstDeliveries,
+      allDeliveries,
+    } = approach === "fetching"
+      ? enrichFetchingDeliveries(runRoot, deliveries.firstDeliveries, deliveries.allDeliveries)
+      : deliveries;
     await terminateChildProcessTree(publisher, {
       logger: () => undefined,
       termWaitMs: 3_000,
@@ -782,6 +1018,7 @@ async function runMainCell({
       registrations,
       firstDeliveries,
       allDeliveries,
+      runtimeBuild,
       processMetrics,
       mqttSummary,
       runtimeSummary,
@@ -893,6 +1130,10 @@ async function runAdversarialValidations(resultRoot) {
           topicPrefix: env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX,
           registrationPath: path.join(runRoot, "registration_events.ndjson"),
           variantMode: true,
+          approximationConfig:
+            approach === "approximation"
+              ? defaultApproximationConfig()
+              : undefined,
         });
         subscribers = await subscribeConsumers({
           registrations,
@@ -957,16 +1198,25 @@ async function runAdversarialValidations(resultRoot) {
       await waitForRegisterReady(CONTROL_PORT);
       const topicPrefix = env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX;
       const requests = Array.from({ length: 10 }, (_, index) => ({
+        ...buildRegistrationBody({
+          approach,
+          topicPrefix,
+          consumerIndex: index + 1,
+          variantMode: true,
+          approximationConfig:
+            approach === "approximation"
+              ? defaultApproximationConfig()
+              : undefined,
+        }),
         id: `${approach}-concurrent-query-${index + 1}`,
         consumer_id: `${approach}-concurrent-consumer-${index + 1}`,
-        approach,
+        r2s_topic: `concurrent-consumer-${index + 1}-output-topic`,
+        data_topic: `concurrent-consumer-${index + 1}-output-topic`,
         rspql_query: buildEquivalentVariant(
           topicPrefix,
           `concurrent-consumer-${index + 1}-output-topic`,
           index + 1,
         ),
-        r2s_topic: `concurrent-consumer-${index + 1}-output-topic`,
-        data_topic: `concurrent-consumer-${index + 1}-output-topic`,
       }));
       const responses = await Promise.all(
         requests.map((body) =>
@@ -1024,27 +1274,382 @@ async function runAdversarialValidations(resultRoot) {
   };
 }
 
+async function runLateSubscriberValidation(resultRoot, approach) {
+  const runRoot = buildRunRoot(resultRoot, `late-subscriber-${approach}`, approach, 2, 1);
+  ensureDir(runRoot);
+  const replayAnchor = `${Date.now() + 3 * 60 * 60 * 1000}`;
+  const env = buildScenarioEnv({
+    approach,
+    kValue: 2,
+    iteration: 1,
+    runRoot,
+    replayAnchor,
+    scenarioId: `${approach}-late-subscriber`,
+    targetWindows: 2,
+  });
+  await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  const server = spawn("node", [SERVER_EXECUTABLE_PATH], {
+    cwd: REPO_ROOT,
+    env,
+    detached: true,
+    stdio: [
+      "ignore",
+      fs.openSync(path.join(runRoot, "server.stdout.log"), "a"),
+      fs.openSync(path.join(runRoot, "server.stderr.log"), "a"),
+    ],
+  });
+  let subscribers = null;
+  let publisher = null;
+  try {
+    verifyBuildManifestOrThrow();
+    await waitForServerLog(path.join(runRoot, "server.stdout.log"));
+    await waitForRegisterReady(CONTROL_PORT);
+    const firstRegs = await registerConsumers({
+      approach,
+      kValue: 1,
+      port: CONTROL_PORT,
+      topicPrefix: env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX,
+      registrationPath: path.join(runRoot, "registration_events.ndjson"),
+      approximationConfig:
+        approach === "approximation"
+          ? defaultApproximationConfig()
+          : undefined,
+    });
+    subscribers = await subscribeConsumers({
+      registrations: firstRegs,
+      expectedCount: 1,
+      deliveryPath: path.join(runRoot, "consumer_delivery_events.ndjson"),
+    });
+    publisher = spawn("node", [path.join(REPO_ROOT, "dist", "streamer", "src", "publish.js")], {
+      cwd: REPO_ROOT,
+      env,
+      detached: true,
+      stdio: [
+        "ignore",
+        fs.openSync(path.join(runRoot, "publisher.stdout.log"), "a"),
+        fs.openSync(path.join(runRoot, "publisher.stderr.log"), "a"),
+      ],
+    });
+    const firstDelivery = await subscribers.waitForAll(DELIVERY_TIMEOUT_MS);
+    const lateRegistration = await postRegistration(
+      CONTROL_PORT,
+      buildRegistrationBody({
+        approach,
+        topicPrefix: env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX,
+        consumerIndex: 2,
+        approximationConfig:
+          approach === "approximation"
+            ? defaultApproximationConfig()
+            : undefined,
+      }),
+    );
+    appendNdjson(path.join(runRoot, "registration_events.ndjson"), lateRegistration);
+    const lateSubscribers = await subscribeConsumers({
+      registrations: [lateRegistration],
+      expectedCount: 1,
+      deliveryPath: path.join(runRoot, "consumer_delivery_events.ndjson"),
+    });
+    const lateDelivery = await lateSubscribers.waitForAll(DELIVERY_TIMEOUT_MS);
+    await lateSubscribers.close();
+    return {
+      approach,
+      firstExecutionId: firstRegs[0].executionId,
+      secondExecutionId: lateRegistration.executionId,
+      sameExecution: firstRegs[0].executionId === lateRegistration.executionId,
+      sameTopic: firstRegs[0].outputTopic === lateRegistration.outputTopic,
+      lateDeliveryCount: lateDelivery.firstDeliveries.length,
+      firstDeliveryCount: firstDelivery.firstDeliveries.length,
+    };
+  } finally {
+    await subscribers?.close().catch?.(() => undefined);
+    if (publisher) {
+      await terminateChildProcessTree(publisher, { logger: () => undefined, termWaitMs: 1_000, killWaitMs: 1_000 });
+    }
+    await terminateChildProcessTree(server, { logger: () => undefined, termWaitMs: 1_000, killWaitMs: 1_000 });
+    await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  }
+}
+
+async function runColdRestartValidation(resultRoot, approach) {
+  const runRoot = buildRunRoot(resultRoot, `cold-restart-${approach}`, approach, 1, 1);
+  ensureDir(runRoot);
+  const replayAnchor = `${Date.now() + 4 * 60 * 60 * 1000}`;
+  const env = buildScenarioEnv({
+    approach,
+    kValue: 1,
+    iteration: 1,
+    runRoot,
+    replayAnchor,
+    scenarioId: `${approach}-cold-restart`,
+  });
+  const startServer = () =>
+    spawn("node", [SERVER_EXECUTABLE_PATH], {
+      cwd: REPO_ROOT,
+      env,
+      detached: true,
+      stdio: [
+        "ignore",
+        fs.openSync(path.join(runRoot, "server.stdout.log"), "a"),
+        fs.openSync(path.join(runRoot, "server.stderr.log"), "a"),
+      ],
+    });
+  await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  let server = startServer();
+  try {
+    verifyBuildManifestOrThrow();
+    await waitForServerLog(path.join(runRoot, "server.stdout.log"));
+    await waitForRegisterReady(CONTROL_PORT);
+    const first = await registerConsumers({
+      approach,
+      kValue: 1,
+      port: CONTROL_PORT,
+      topicPrefix: env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX,
+      registrationPath: path.join(runRoot, "registration_events.ndjson"),
+      approximationConfig:
+        approach === "approximation"
+          ? defaultApproximationConfig()
+          : undefined,
+    });
+    await terminateChildProcessTree(server, { logger: () => undefined, termWaitMs: 1_000, killWaitMs: 1_000 });
+    await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+    server = startServer();
+    await waitForServerLog(path.join(runRoot, "server.stdout.log"));
+    await waitForRegisterReady(CONTROL_PORT);
+    const second = await registerConsumers({
+      approach,
+      kValue: 1,
+      port: CONTROL_PORT,
+      topicPrefix: env.STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX,
+      registrationPath: path.join(runRoot, "registration_events.ndjson"),
+      approximationConfig:
+        approach === "approximation"
+          ? defaultApproximationConfig()
+          : undefined,
+    });
+    return {
+      approach,
+      firstExecutionId: first[0].executionId,
+      secondExecutionId: second[0].executionId,
+      reusedStaleExecution: first[0].executionId === second[0].executionId,
+      secondExecutionCreated: second[0].executionCreated,
+      secondReuseHit: second[0].reuseHit,
+    };
+  } finally {
+    await terminateChildProcessTree(server, { logger: () => undefined, termWaitMs: 1_000, killWaitMs: 1_000 });
+    await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  }
+}
+
+async function runNegativeControl(resultRoot, label, firstBody, secondBody) {
+  const runRoot = buildRunRoot(resultRoot, `negative-${label}`, firstBody.approach, 2, 1);
+  ensureDir(runRoot);
+  const replayAnchor = `${Date.now() + 5 * 60 * 60 * 1000}`;
+  const env = buildScenarioEnv({
+    approach: firstBody.approach,
+    kValue: 2,
+    iteration: 1,
+    runRoot,
+    replayAnchor,
+    scenarioId: `negative-${label}`,
+  });
+  await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  const server = spawn("node", [SERVER_EXECUTABLE_PATH], {
+    cwd: REPO_ROOT,
+    env,
+    detached: true,
+    stdio: [
+      "ignore",
+      fs.openSync(path.join(runRoot, "server.stdout.log"), "a"),
+      fs.openSync(path.join(runRoot, "server.stderr.log"), "a"),
+    ],
+  });
+  try {
+    verifyBuildManifestOrThrow();
+    await waitForServerLog(path.join(runRoot, "server.stdout.log"));
+    await waitForRegisterReady(CONTROL_PORT);
+    const responses = [];
+    for (const body of [firstBody, secondBody]) {
+      const response = await fetch(`http://localhost:${CONTROL_PORT}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      responses.push(await response.json());
+    }
+    return {
+      label,
+      firstExecutionId: responses[0].executionId,
+      secondExecutionId: responses[1].executionId,
+      secondReuseHit: responses[1].reuseHit,
+      secondExecutionCreated: responses[1].executionCreated,
+      forwardContained: responses[1].reuseDecision?.forwardContained ?? null,
+      reverseContained: responses[1].reuseDecision?.reverseContained ?? null,
+      mutuallyContained: responses[1].reuseDecision?.mutuallyContained ?? null,
+    };
+  } finally {
+    await terminateChildProcessTree(server, { logger: () => undefined, termWaitMs: 1_000, killWaitMs: 1_000 });
+    await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const resultRoot = buildResultRoot();
   ensureDir(resultRoot);
 
+  const buildIdentity = ensureFreshProductionBuild(resultRoot);
   const repoState = {
-    branch: runCommand("git branch --show-current"),
-    commit: runCommand("git rev-parse HEAD"),
-    statusShort: runCommand("git status --short || true"),
+    ...buildIdentity.repoState,
     createdAt: new Date().toISOString(),
   };
   writeJson(path.join(resultRoot, "repo_state.json"), repoState);
 
-  const mainMatrix = await runMainMatrix(args, resultRoot);
+  const mainMatrix = args.skipMainMatrix
+    ? { anchors: {}, cells: [] }
+    : await runMainMatrix(args, resultRoot);
   const adversarial = args.skipAdversarial
     ? null
     : await runAdversarialValidations(resultRoot);
+  const lateSubscriber = args.skipAdversarial
+    ? null
+    : {
+        approximation: await runLateSubscriberValidation(resultRoot, "approximation"),
+        chunked: await runLateSubscriberValidation(resultRoot, "chunked"),
+      };
+  const coldRestart = args.skipAdversarial
+    ? null
+    : {
+        approximation: await runColdRestartValidation(resultRoot, "approximation"),
+        chunked: await runColdRestartValidation(resultRoot, "chunked"),
+      };
+
+  const negativeControls = args.skipAdversarial
+    ? null
+    : await (async () => {
+        const prefix = "production-experiment3/negative-control";
+        const { narrower: oneWayNarrower, broader: oneWayBroader } =
+          buildOneWayContainmentPair(prefix);
+        const approxBase = {
+          id: "negative-approx-base",
+          consumer_id: "negative-approx-base",
+          approach: "approximation",
+          rspql_query: buildQuery({ approach: "approximation", prefix, outputIri: "base-output" }),
+          r2s_topic: "base-output",
+          data_topic: "base-output",
+          approximation_config: defaultApproximationConfig(),
+        };
+        const approxDifferentPolicy = {
+          ...approxBase,
+          id: "negative-approx-different-policy",
+          consumer_id: "negative-approx-different-policy",
+          approximation_config: defaultApproximationConfig({
+            policy: "different-policy",
+          }),
+        };
+        const approxDifferentRate = {
+          ...approxBase,
+          id: "negative-approx-different-rate",
+          consumer_id: "negative-approx-different-rate",
+          approximation_config: {
+            ...defaultApproximationConfig(),
+            rate: 0.5,
+          },
+        };
+        const chunkBase = {
+          id: "negative-chunk-base",
+          consumer_id: "negative-chunk-base",
+          approach: "chunked",
+          rspql_query: buildQuery({ approach: "chunked", prefix, outputIri: "base-output" }),
+          r2s_topic: "base-output",
+          data_topic: "base-output",
+        };
+        const chunkDifferentRange = {
+          ...chunkBase,
+          id: "negative-chunk-range",
+          consumer_id: "negative-chunk-range",
+          rspql_query: buildQuery({
+            approach: "chunked",
+            prefix,
+            outputIri: "different-range-output",
+            windowRangeMs: OUTPUT_WINDOW_RANGE_MS + 60000,
+          }),
+          r2s_topic: "different-range-output",
+          data_topic: "different-range-output",
+        };
+        const chunkDifferentStep = {
+          ...chunkBase,
+          id: "negative-chunk-step",
+          consumer_id: "negative-chunk-step",
+          rspql_query: buildQuery({
+            approach: "chunked",
+            prefix,
+            outputIri: "different-step-output",
+            windowStepMs: OUTPUT_WINDOW_STEP_MS / 2,
+          }),
+          r2s_topic: "different-step-output",
+          data_topic: "different-step-output",
+        };
+        const chunkDifferentStream = {
+          ...chunkBase,
+          id: "negative-chunk-stream",
+          consumer_id: "negative-chunk-stream",
+          rspql_query: buildQuery({
+            approach: "chunked",
+            prefix,
+            outputIri: "different-stream-output",
+            includeSmartphone: false,
+          }),
+          r2s_topic: "different-stream-output",
+          data_topic: "different-stream-output",
+        };
+        const chunkDifferentAggregation = {
+          ...chunkBase,
+          id: "negative-chunk-aggregation",
+          consumer_id: "negative-chunk-aggregation",
+          rspql_query: buildQuery({
+            approach: "chunked",
+            prefix,
+            outputIri: "different-aggregation-output",
+            aggregationFunction: "SUM",
+          }),
+          r2s_topic: "different-aggregation-output",
+          data_topic: "different-aggregation-output",
+        };
+        const oneWayBroad = {
+          id: "negative-one-way-broad",
+          consumer_id: "negative-one-way-broad",
+          approach: "chunked",
+          rspql_query: oneWayBroader,
+          r2s_topic: "one-way-broad-output",
+          data_topic: "one-way-broad-output",
+        };
+        const oneWayNarrow = {
+          id: "negative-one-way-narrow",
+          consumer_id: "negative-one-way-narrow",
+          approach: "chunked",
+          rspql_query: oneWayNarrower,
+          r2s_topic: "one-way-narrow-output",
+          data_topic: "one-way-narrow-output",
+        };
+        return [
+          await runNegativeControl(resultRoot, "different-approximation-policy", approxBase, approxDifferentPolicy),
+          await runNegativeControl(resultRoot, "different-approximation-rate", approxBase, approxDifferentRate),
+          await runNegativeControl(resultRoot, "different-range", chunkBase, chunkDifferentRange),
+          await runNegativeControl(resultRoot, "different-step", chunkBase, chunkDifferentStep),
+          await runNegativeControl(resultRoot, "different-aggregation", chunkBase, chunkDifferentAggregation),
+          await runNegativeControl(resultRoot, "different-stream", chunkBase, chunkDifferentStream),
+          await runNegativeControl(resultRoot, "one-way-containment", oneWayBroad, oneWayNarrow),
+        ];
+      })();
 
   const summary = {
     resultRoot,
     repoState,
+    buildIdentity: {
+      manifestPath: buildIdentity.buildManifestPath,
+      manifest: buildIdentity.buildManifest,
+      serverExecutable: SERVER_EXECUTABLE_PATH,
+    },
     mainMatrix: mainMatrix.cells.map((cell) => ({
       approach: cell.approach,
       kValue: cell.kValue,
@@ -1065,6 +1670,9 @@ async function main() {
       correctness: cell.correctness,
     })),
     adversarial,
+    lateSubscriber,
+    coldRestart,
+    negativeControls,
   };
   writeJson(path.join(resultRoot, "production_experiment3_summary.json"), summary);
   console.log(JSON.stringify(summary, null, 2));
