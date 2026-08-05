@@ -65,7 +65,15 @@ function buildExecutionId(
 ): string {
   const digest = crypto
     .createHash("sha256")
-    .update([approach, canonicalQueryId, approximationConfigHash ?? ""].join(":"))
+    .update(
+      [
+        approach,
+        canonicalQueryId,
+        approximationConfigHash ?? "",
+        Date.now().toString(),
+        crypto.randomBytes(8).toString("hex"),
+      ].join(":"),
+    )
     .digest("hex");
   return `${approach}_${digest.slice(0, 16)}`;
 }

@@ -117,6 +117,56 @@ describe("QueryExecutionDispatcher", () => {
     );
   });
 
+  test("creates distinct reusable execution ids for fresh approximation runtimes", async () => {
+    const worker = new FakeWorker();
+    const producerManager = new FakeProducerManager();
+    const beeKeeper = {
+      executeQuery: jest.fn().mockImplementation(
+        (
+          _query: string,
+          _topic: string,
+          _operator: string,
+          _subQueries: string[],
+          _env: Record<string, string>,
+          callbacks: {
+            onExit?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
+            onError?: (error: Error) => void;
+          },
+        ) => {
+          worker.callbacks = callbacks;
+          return worker;
+        },
+      ),
+    };
+    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any);
+    const request = {
+      approach: "approximation" as const,
+      canonicalQueryId: "canonical-query",
+      query: `
+PREFIX mqtt_broker: <mqtt://localhost:1883/>
+PREFIX saref: <https://saref.etsi.org/core/>
+PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
+REGISTER RStream <output> AS
+SELECT (AVG(?value) AS ?avgValue)
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
+WHERE {
+  WINDOW <mqtt://localhost:1883/wearableX> {
+    ?s saref:hasValue ?value .
+    ?s saref:hasTimestamp ?ts .
+    ?s saref:relatesToProperty dahccsensors:wearableX .
+  }
+}
+`,
+      requestedOutputTopic: "consumer-topic",
+    };
+
+    const firstHandle = await dispatcher.createExecution(request);
+    const secondHandle = await dispatcher.createExecution(request);
+
+    expect(firstHandle.executionId).not.toBe(secondHandle.executionId);
+    expect(firstHandle.sharedOutputTopic).not.toBe(secondHandle.sharedOutputTopic);
+  });
+
   test("marks runtime handle failed and notifies listener when active worker exits", async () => {
     const worker = new FakeWorker();
     const producerManager = new FakeProducerManager();
