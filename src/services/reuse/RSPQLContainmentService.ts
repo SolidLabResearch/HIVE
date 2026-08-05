@@ -72,6 +72,13 @@ function hashValue(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+function stripLineComments(query: string): string {
+  return query
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+}
+
 function canonicalizeRegisterTarget(query: string): string {
   return query.replace(
     /REGISTER\s+(RSTREAM|ISTREAM|DSTREAM)\s+<[^>]+>\s+AS/i,
@@ -111,7 +118,9 @@ function canonicalizeVariables(query: string): string {
 }
 
 function normalizeQueryForChecker(query: string): string {
-  return canonicalizeVariables(expandPrefixes(canonicalizeRegisterTarget(query)));
+  return canonicalizeVariables(
+    expandPrefixes(canonicalizeRegisterTarget(stripLineComments(query))),
+  );
 }
 
 function inferFailureKind(error: unknown): ContainmentFailureReason {

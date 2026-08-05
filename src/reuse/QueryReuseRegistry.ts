@@ -1,5 +1,4 @@
 import crypto from "crypto";
-import { RSPQLParser } from "rspql-containment-checker";
 import {
   ContainmentResult,
   EquivalenceResult,
@@ -108,10 +107,7 @@ type ResolveReusableRuntimeResult = ResolveRegistrationResult & {
 type CandidateSummary = {
   aggregationFamily: string;
   queryForm: string;
-  inputStreams: string[];
   outputMode: string;
-  projectionArity: number;
-  windowCount: number;
 };
 
 class KeyedLock {
@@ -162,8 +158,6 @@ function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-const signatureParser = new RSPQLParser();
-
 function detectQueryForm(query: string): string {
   if (/\bCONSTRUCT\b/i.test(query)) {
     return "CONSTRUCT";
@@ -175,17 +169,6 @@ function detectQueryForm(query: string): string {
     return "DESCRIBE";
   }
   return /\bSELECT\b/i.test(query) ? "SELECT" : "UNKNOWN";
-}
-
-function detectProjectionArity(query: string): number {
-  const selectMatch = query.match(/\bSELECT\b([\s\S]*?)\bFROM\b/i);
-  if (!selectMatch) {
-    return 0;
-  }
-  return selectMatch[1]
-    .split(/\s+/)
-    .filter((token) => token.startsWith("?") || token.includes("AS"))
-    .length;
 }
 
 function detectAggregationFamily(query: string): string {
@@ -202,14 +185,10 @@ function detectOutputMode(query: string): string {
 
 function buildCandidateSummary(query: string): CandidateSummary {
   const stripped = stripConsumerOutputTarget(query);
-  const parsed = signatureParser.parse(stripped);
   return {
     aggregationFamily: detectAggregationFamily(stripped),
     queryForm: detectQueryForm(stripped),
-    inputStreams: parsed.s2r.map((entry) => entry.stream_name).sort(),
     outputMode: detectOutputMode(stripped),
-    projectionArity: detectProjectionArity(stripped),
-    windowCount: parsed.s2r.length,
   };
 }
 
@@ -221,12 +200,36 @@ function buildCandidateSignature(
   return JSON.stringify({
     aggregationFamily: summary.aggregationFamily,
     queryForm: summary.queryForm,
-    inputStreams: summary.inputStreams,
     outputMode: summary.outputMode,
-    projectionArity: summary.projectionArity,
-    windowCount: summary.windowCount,
     approximationConfigHash: approximationConfigHash ?? null,
   });
+}
+
+type CandidateEvaluation = {
+  candidateQueryIdsInspected: string[];
+  bestObserved?: EquivalenceResult;
+  matchedEntry?: FinalResultEntry;
+};
+
+function choosePreferredEquivalence(
+  current: EquivalenceResult | undefined,
+  candidate: EquivalenceResult,
+): EquivalenceResult {
+  if (!current) {
+    return candidate;
+  }
+  const currentScore =
+    Number(current.equivalent) * 4 +
+    Number(current.forward.contained || current.reverse.contained) * 2 +
+    Number(current.supported);
+  const candidateScore =
+    Number(candidate.equivalent) * 4 +
+    Number(candidate.forward.contained || candidate.reverse.contained) * 2 +
+    Number(candidate.supported);
+  if (candidateScore !== currentScore) {
+    return candidateScore > currentScore ? candidate : current;
+  }
+  return candidate.durationMs <= current.durationMs ? candidate : current;
 }
 
 function buildQueryId(query: string): string {
@@ -239,6 +242,19 @@ export function buildCanonicalQueryId(query: string): string {
 
 function cacheHitFromEquivalence(equivalence: EquivalenceResult): boolean {
   return equivalence.forward.cacheHit && equivalence.reverse.cacheHit;
+}
+
+function buildMissDecisionEvidence(equivalence?: EquivalenceResult) {
+  return {
+    forwardContained: equivalence?.forward.contained ?? false,
+    reverseContained: equivalence?.reverse.contained ?? false,
+    mutuallyContained: equivalence?.equivalent ?? false,
+    supported: equivalence?.supported ?? false,
+    cacheHit: equivalence ? cacheHitFromEquivalence(equivalence) : false,
+    containmentDurationMs: equivalence
+      ? equivalence.forward.durationMs + equivalence.reverse.durationMs
+      : 0,
+  };
 }
 
 export class QueryReuseRegistry {
@@ -257,30 +273,23 @@ export class QueryReuseRegistry {
     const startedAt = Date.now();
     const signature = buildCandidateSignature(query, approximationConfigHash);
     const candidates = this.finalResults.get(signature) ?? [];
-    const candidateQueryIdsInspected: string[] = [];
-
-    for (const candidate of candidates) {
-      candidateQueryIdsInspected.push(candidate.queryId);
-      const equivalence = await this.containmentService.checkEquivalence(
-        query,
-        candidate.originalQuery,
-      );
-      if (
-        equivalence.equivalent &&
-        candidate.approximationConfigHash === approximationConfigHash
-      ) {
-        return {
-          mode: "final_result_reuse",
-          queryId: candidate.queryId,
-          executionId: candidate.executionId,
-          resultTopic: candidate.resultTopic,
-          ownerQueryId: candidate.ownerQueryId,
-          candidateQueryIdsInspected,
-          equivalence,
-          cacheHit: cacheHitFromEquivalence(equivalence),
-          lookupDurationMs: Date.now() - startedAt,
-        };
-      }
+    const evaluation = await this.evaluateCandidates(
+      query,
+      candidates,
+      (candidate) => candidate.approximationConfigHash === approximationConfigHash,
+    );
+    if (evaluation.matchedEntry && evaluation.bestObserved) {
+      return {
+        mode: "final_result_reuse",
+        queryId: evaluation.matchedEntry.queryId,
+        executionId: evaluation.matchedEntry.executionId,
+        resultTopic: evaluation.matchedEntry.resultTopic,
+        ownerQueryId: evaluation.matchedEntry.ownerQueryId,
+        candidateQueryIdsInspected: evaluation.candidateQueryIdsInspected,
+        equivalence: evaluation.bestObserved,
+        cacheHit: cacheHitFromEquivalence(evaluation.bestObserved),
+        lookupDurationMs: Date.now() - startedAt,
+      };
     }
 
     return undefined;
@@ -295,14 +304,18 @@ export class QueryReuseRegistry {
     );
     return this.lock.runExclusive(signature, async () => {
       const lookupStartedAt = Date.now();
-      const hit = await this.findExactFinalResult(
+      const candidates = this.finalResults.get(signature) ?? [];
+      const evaluation = await this.evaluateCandidates(
         params.query,
-        params.approximationConfigHash,
+        candidates,
+        (candidate) => candidate.approximationConfigHash === params.approximationConfigHash,
       );
-      if (hit) {
-        const entry = this.getEntryById(hit.queryId);
+      if (evaluation.matchedEntry && evaluation.bestObserved) {
+        const entry = this.getEntryById(evaluation.matchedEntry.queryId);
         if (!entry) {
-          throw new Error(`Active final-result entry disappeared for queryId=${hit.queryId}`);
+          throw new Error(
+            `Active final-result entry disappeared for queryId=${evaluation.matchedEntry.queryId}`,
+          );
         }
         entry.registeredConsumers.add(params.consumerId);
         return {
@@ -311,18 +324,19 @@ export class QueryReuseRegistry {
             consumerId: params.consumerId,
             incomingQueryId: buildQueryId(params.query),
             matchedActiveQueryId: entry.queryId,
-            candidateQueryIdsInspected: hit.candidateQueryIdsInspected,
-            forwardContained: hit.equivalence.forward.contained,
-            reverseContained: hit.equivalence.reverse.contained,
-            mutuallyContained: hit.equivalence.equivalent,
-            supported: hit.equivalence.supported,
+            candidateQueryIdsInspected: evaluation.candidateQueryIdsInspected,
+            forwardContained: evaluation.bestObserved.forward.contained,
+            reverseContained: evaluation.bestObserved.reverse.contained,
+            mutuallyContained: evaluation.bestObserved.equivalent,
+            supported: evaluation.bestObserved.supported,
             reuseHit: true,
             executionId: entry.executionId,
             resultTopic: entry.resultTopic,
-            cacheHit: hit.cacheHit,
-            lookupDurationMs: hit.lookupDurationMs,
+            cacheHit: cacheHitFromEquivalence(evaluation.bestObserved),
+            lookupDurationMs: Date.now() - lookupStartedAt,
             containmentDurationMs:
-              hit.equivalence.forward.durationMs + hit.equivalence.reverse.durationMs,
+              evaluation.bestObserved.forward.durationMs +
+              evaluation.bestObserved.reverse.durationMs,
             timestamp: Date.now(),
           },
         };
@@ -351,17 +365,12 @@ export class QueryReuseRegistry {
         decision: {
           consumerId: params.consumerId,
           incomingQueryId: entry.queryId,
-          candidateQueryIdsInspected: entries.slice(0, -1).map((candidate) => candidate.queryId),
-          forwardContained: false,
-          reverseContained: false,
-          mutuallyContained: false,
-          supported: false,
+          candidateQueryIdsInspected: evaluation.candidateQueryIdsInspected,
+          ...buildMissDecisionEvidence(evaluation.bestObserved),
           reuseHit: false,
           executionId: entry.executionId,
           resultTopic: entry.resultTopic,
-          cacheHit: false,
           lookupDurationMs: Date.now() - lookupStartedAt,
-          containmentDurationMs: 0,
           timestamp: Date.now(),
         },
       };
@@ -377,32 +386,38 @@ export class QueryReuseRegistry {
     );
     return this.lock.runExclusive(signature, async () => {
       const lookupStartedAt = Date.now();
-      const hit = await this.findReusableRuntimeHit(
+      const candidates = this.finalResults.get(signature) ?? [];
+      const evaluation = await this.evaluateCandidates(
         params.query,
-        params.approximationConfigHash,
+        candidates,
+        (candidate) =>
+          Boolean(candidate.runtimeHandle) &&
+          (candidate.state === "starting" || candidate.state === "active") &&
+          candidate.approximationConfigHash === params.approximationConfigHash,
       );
-      if (hit) {
-        hit.entry.registeredConsumers.add(params.consumerId);
-        hit.entry.lastActivityAt = Date.now();
+      if (evaluation.matchedEntry && evaluation.bestObserved) {
+        evaluation.matchedEntry.registeredConsumers.add(params.consumerId);
+        evaluation.matchedEntry.lastActivityAt = Date.now();
         return {
-          entry: hit.entry,
+          entry: evaluation.matchedEntry,
           executionCreated: false,
           decision: {
             consumerId: params.consumerId,
             incomingQueryId: buildQueryId(params.query),
-            matchedActiveQueryId: hit.entry.queryId,
-            candidateQueryIdsInspected: hit.candidateQueryIdsInspected,
-            forwardContained: hit.equivalence.forward.contained,
-            reverseContained: hit.equivalence.reverse.contained,
-            mutuallyContained: hit.equivalence.equivalent,
-            supported: hit.equivalence.supported,
+            matchedActiveQueryId: evaluation.matchedEntry.queryId,
+            candidateQueryIdsInspected: evaluation.candidateQueryIdsInspected,
+            forwardContained: evaluation.bestObserved.forward.contained,
+            reverseContained: evaluation.bestObserved.reverse.contained,
+            mutuallyContained: evaluation.bestObserved.equivalent,
+            supported: evaluation.bestObserved.supported,
             reuseHit: true,
-            executionId: hit.entry.executionId,
-            resultTopic: hit.entry.resultTopic,
-            cacheHit: cacheHitFromEquivalence(hit.equivalence),
+            executionId: evaluation.matchedEntry.executionId,
+            resultTopic: evaluation.matchedEntry.resultTopic,
+            cacheHit: cacheHitFromEquivalence(evaluation.bestObserved),
             lookupDurationMs: Date.now() - lookupStartedAt,
             containmentDurationMs:
-              hit.equivalence.forward.durationMs + hit.equivalence.reverse.durationMs,
+              evaluation.bestObserved.forward.durationMs +
+              evaluation.bestObserved.reverse.durationMs,
             timestamp: Date.now(),
           },
         };
@@ -436,17 +451,12 @@ export class QueryReuseRegistry {
         decision: {
           consumerId: params.consumerId,
           incomingQueryId: entry.queryId,
-          candidateQueryIdsInspected: entries.slice(0, -1).map((candidate) => candidate.queryId),
-          forwardContained: false,
-          reverseContained: false,
-          mutuallyContained: false,
-          supported: false,
+          candidateQueryIdsInspected: evaluation.candidateQueryIdsInspected,
+          ...buildMissDecisionEvidence(evaluation.bestObserved),
           reuseHit: false,
           executionId: entry.executionId,
           resultTopic: entry.resultTopic,
-          cacheHit: false,
           lookupDurationMs: Date.now() - lookupStartedAt,
-          containmentDurationMs: 0,
           timestamp: Date.now(),
         },
       };
@@ -514,26 +524,17 @@ export class QueryReuseRegistry {
     }
   }
 
-  private async findReusableRuntimeHit(
+  private async evaluateCandidates(
     query: string,
-    approximationConfigHash?: string,
-  ): Promise<
-    | {
-        entry: FinalResultEntry;
-        candidateQueryIdsInspected: string[];
-        equivalence: EquivalenceResult;
-      }
-    | undefined
-  > {
-    const signature = buildCandidateSignature(query, approximationConfigHash);
-    const candidates = this.finalResults.get(signature) ?? [];
+    candidates: FinalResultEntry[],
+    candidateFilter: (candidate: FinalResultEntry) => boolean,
+  ): Promise<CandidateEvaluation> {
     const candidateQueryIdsInspected: string[] = [];
+    let bestObserved: EquivalenceResult | undefined;
+    let matchedEntry: FinalResultEntry | undefined;
 
     for (const candidate of candidates) {
-      if (!candidate.runtimeHandle) {
-        continue;
-      }
-      if (candidate.state !== "starting" && candidate.state !== "active") {
+      if (!candidateFilter(candidate)) {
         continue;
       }
       candidateQueryIdsInspected.push(candidate.queryId);
@@ -541,19 +542,19 @@ export class QueryReuseRegistry {
         query,
         candidate.originalQuery,
       );
-      if (
-        equivalence.equivalent &&
-        candidate.approximationConfigHash === approximationConfigHash
-      ) {
-        return {
-          entry: candidate,
-          candidateQueryIdsInspected,
-          equivalence,
-        };
+      bestObserved = choosePreferredEquivalence(bestObserved, equivalence);
+      if (equivalence.equivalent) {
+        matchedEntry = candidate;
+        bestObserved = equivalence;
+        break;
       }
     }
 
-    return undefined;
+    return {
+      candidateQueryIdsInspected,
+      bestObserved,
+      matchedEntry,
+    };
   }
 
   static buildApproximationConfigHash(config: unknown): string {

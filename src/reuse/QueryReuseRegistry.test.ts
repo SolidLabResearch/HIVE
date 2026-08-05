@@ -133,6 +133,17 @@ describe("RSPQLContainmentService", () => {
     expect(result.equivalent).toBe(true);
   });
 
+  test("accepts comment-only query variants", async () => {
+    const first = buildQuery();
+    const second = `# consumer specific comment\n${buildQuery({ output: "consumer-2-output" })}`;
+
+    const result = await service.checkEquivalence(first, second);
+
+    expect(result.equivalent).toBe(true);
+    expect(result.forward.contained).toBe(true);
+    expect(result.reverse.contained).toBe(true);
+  });
+
   test("rejects different window semantics", async () => {
     const baseline = buildQuery({ range: 120000, step: 60000 });
     const differentRange = buildQuery({ range: 180000, step: 60000 });
@@ -380,6 +391,59 @@ WHERE {
 
     expect(secondDecision.decision.reuseHit).toBe(false);
     expect(secondDecision.entry.executionId).toBe("execution-2");
+    expect(secondDecision.decision.forwardContained).toBe(true);
+    expect(secondDecision.decision.reverseContained).toBe(false);
+    expect(secondDecision.decision.mutuallyContained).toBe(false);
+    expect(secondDecision.decision.supported).toBe(false);
+  });
+
+  test("reuses runtime registrations across comment-only variants", async () => {
+    const registry = new QueryReuseRegistry(new RSPQLContainmentService());
+    const first = buildQuery({ output: "consumer-1-output" });
+    const second = `# consumer specific comment\n${buildQuery({ output: "consumer-2-output" })}`;
+    const createExecution = jest
+      .fn()
+      .mockResolvedValueOnce({
+        executionId: "execution-1",
+        approach: "approximation" as const,
+        canonicalQueryId: "canonical-query",
+        sharedOutputTopic: "shared/execution-1",
+        workerIds: ["worker-1"],
+        state: "active" as const,
+        stop: async () => undefined,
+      })
+      .mockResolvedValueOnce({
+        executionId: "execution-2",
+        approach: "approximation" as const,
+        canonicalQueryId: "canonical-query",
+        sharedOutputTopic: "shared/execution-2",
+        workerIds: ["worker-2"],
+        state: "active" as const,
+        stop: async () => undefined,
+      });
+
+    const firstDecision = await registry.resolveReusableRuntimeRegistration({
+      approach: "approximation",
+      query: first,
+      resultTopic: "ignored-1",
+      ownerQueryId: "query-1",
+      consumerId: "consumer-1",
+      createExecution,
+    });
+    const secondDecision = await registry.resolveReusableRuntimeRegistration({
+      approach: "approximation",
+      query: second,
+      resultTopic: "ignored-2",
+      ownerQueryId: "query-2",
+      consumerId: "consumer-2",
+      createExecution,
+    });
+
+    expect(firstDecision.executionCreated).toBe(true);
+    expect(secondDecision.executionCreated).toBe(false);
+    expect(secondDecision.decision.reuseHit).toBe(true);
+    expect(secondDecision.entry.executionId).toBe("execution-1");
+    expect(createExecution).toHaveBeenCalledTimes(1);
   });
 
   test("separates approximation executions when configs differ", async () => {

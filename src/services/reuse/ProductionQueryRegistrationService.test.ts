@@ -25,6 +25,30 @@ WHERE {
 `;
 }
 
+function buildVariantQuery(
+  output: string,
+  variant: "base" | "comment" | "aliases" | "alpha" = "base",
+): string {
+  const base = buildQuery(output);
+  switch (variant) {
+    case "comment":
+      return `# consumer specific comment\n${base}`;
+    case "aliases":
+      return base
+        .replace("PREFIX mqtt_broker:", "PREFIX mb:")
+        .replace(/mqtt_broker:/g, "mb:")
+        .replace("PREFIX saref:", "PREFIX sf:")
+        .replace(/saref:/g, "sf:");
+    case "alpha":
+      return base
+        .replace(/\?s\b/g, "?obs")
+        .replace(/\?value\b/g, "?reading")
+        .replace(/\?ts\b/g, "?timestamp");
+    default:
+      return base;
+  }
+}
+
 class FakeDispatcher {
   public calls: Array<{ approach: string; canonicalQueryId: string; requestedOutputTopic?: string }> = [];
   public createdHandles: ActiveExecutionHandle[] = [];
@@ -111,6 +135,36 @@ describe("ProductionQueryRegistrationService", () => {
 
     expect(dispatcher.calls).toHaveLength(1);
     expect(results.filter((result) => result.reuseHit)).toHaveLength(9);
+    expect(new Set(results.map((result) => result.executionId)).size).toBe(1);
+  });
+
+  test("serializes concurrent textual variants to one runtime execution", async () => {
+    const dispatcher = new FakeDispatcher();
+    const service = new ProductionQueryRegistrationService(
+      new QueryReuseRegistry(new RSPQLContainmentService()),
+      dispatcher as unknown as QueryExecutionDispatcher,
+    );
+    const variants: Array<"base" | "comment" | "aliases" | "alpha"> = [
+      "base",
+      "comment",
+      "aliases",
+      "alpha",
+    ];
+
+    const results = await Promise.all(
+      variants.map((variant, index) =>
+        service.register({
+          approach: "approximation",
+          query: buildVariantQuery(`consumer-${index + 1}-output`, variant),
+          requestedOutputTopic: `consumer-topic-${index + 1}`,
+          ownerQueryId: `query-${index + 1}`,
+          consumerId: `consumer-${index + 1}`,
+        }),
+      ),
+    );
+
+    expect(dispatcher.calls).toHaveLength(1);
+    expect(results.filter((result) => result.reuseHit)).toHaveLength(3);
     expect(new Set(results.map((result) => result.executionId)).size).toBe(1);
   });
 
