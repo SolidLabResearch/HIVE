@@ -212,11 +212,11 @@ WHERE {
     `;
 
     if (exactFinalReuseEnabled) {
-      const exactHit = queryReuseRegistry.findExactFinalResult(registeredQuery);
+      const exactHit = await queryReuseRegistry.findExactFinalResult(registeredQuery);
 
       if (exactHit) {
         queryReuseRegistry.registerConsumer({
-          canonicalQueryHash: exactHit.canonicalQueryHash,
+          queryId: exactHit.queryId,
           consumerId,
         });
         profileCount("exact_final_result_reuse_hits");
@@ -228,7 +228,7 @@ WHERE {
         logReuseDecision({
           consumerId,
           reuseMode: "final_result_reuse",
-          canonicalQueryHash: exactHit.canonicalQueryHash,
+          canonicalQueryHash: exactHit.queryId,
           resultTopic: exactHit.resultTopic,
           ownerQueryId: exactHit.ownerQueryId,
         });

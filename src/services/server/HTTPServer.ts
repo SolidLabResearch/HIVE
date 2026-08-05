@@ -1,6 +1,7 @@
 import { createServer, Server, ServerResponse, IncomingMessage } from "http";
 import { GETHandler } from "./GETHandler";
 import { POSTHandler } from "./POSTHandler";
+import { QueryReuseDecisionEvent } from "../../reuse/QueryReuseRegistry";
 
 export type RSPAgentQuery = {
     id: string,
@@ -13,7 +14,10 @@ export type RSPAgentQuery = {
     source_topic?: string,
     source_stream_id?: string,
     original_window_range?: number,
-    original_window_step?: number
+    original_window_step?: number,
+    reuse_decision?: QueryReuseDecisionEvent,
+    execution_id?: string,
+    shared_result_topic?: string,
 }
 
 export const RSPAgentQueryRecord: Record<string, RSPAgentQuery> = {};

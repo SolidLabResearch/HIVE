@@ -1,11 +1,14 @@
 import { ServerResponse, IncomingMessage } from "http";
 import { RSPAgentQuery } from "./HTTPServer";
+import { QueryReuseRegistry } from "../../reuse/QueryReuseRegistry";
 
 
 /**
  *
  */
 export class POSTHandler {
+    private static readonly queryReuseRegistry = new QueryReuseRegistry();
+
     /**
      *
      * @param request
@@ -78,14 +81,34 @@ export class POSTHandler {
             return;
         }
 
-        rspAgentRecord[parsedBody.id] = parsedBody;
+        const decision = await this.queryReuseRegistry.resolveFinalResultRegistration({
+            query: parsedBody.rspql_query,
+            resultTopic: parsedBody.r2s_topic,
+            ownerQueryId: parsedBody.id,
+            consumerId: parsedBody.consumer_id || parsedBody.id,
+            executionId: parsedBody.execution_id || parsedBody.id,
+            approximationConfigHash:
+                parsedBody.approximation_config_hash ||
+                (parsedBody.approximation_config
+                    ? QueryReuseRegistry.buildApproximationConfigHash(parsedBody.approximation_config)
+                    : undefined),
+        });
+
+        rspAgentRecord[parsedBody.id] = {
+            ...parsedBody,
+            execution_id: decision.entry.executionId,
+            shared_result_topic: decision.entry.resultTopic,
+            reuse_decision: decision.decision,
+        };
 
         response.writeHead(200);
 
         response.end(JSON.stringify({
             message: 'Registered',
+            executionId: decision.entry.executionId,
+            outputTopic: decision.entry.resultTopic,
+            reuseDecision: decision.decision,
         }));
         return;
     }
 }
-
