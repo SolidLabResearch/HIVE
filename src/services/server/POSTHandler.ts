@@ -1,13 +1,20 @@
 import { ServerResponse, IncomingMessage } from "http";
 import { RSPAgentQuery } from "./HTTPServer";
 import { QueryReuseRegistry } from "../../reuse/QueryReuseRegistry";
+import { ProductionQueryRegistrationService } from "../reuse/ProductionQueryRegistrationService";
 
 
 /**
  *
  */
 export class POSTHandler {
-    private static readonly queryReuseRegistry = new QueryReuseRegistry();
+    private static registrationService = new ProductionQueryRegistrationService(
+        new QueryReuseRegistry(),
+    );
+
+    public static setRegistrationService(service: ProductionQueryRegistrationService): void {
+        this.registrationService = service;
+    }
 
     /**
      *
@@ -81,12 +88,21 @@ export class POSTHandler {
             return;
         }
 
-        const decision = await this.queryReuseRegistry.resolveFinalResultRegistration({
+        const approach = parsedBody.approach;
+        if (approach !== "fetching" && approach !== "approximation" && approach !== "chunked") {
+            response.writeHead(400);
+            response.end(JSON.stringify({
+                error: "Missing or invalid approach",
+            }));
+            return;
+        }
+
+        const registration = await this.registrationService.register({
+            approach,
             query: parsedBody.rspql_query,
-            resultTopic: parsedBody.r2s_topic,
+            requestedOutputTopic: parsedBody.r2s_topic,
             ownerQueryId: parsedBody.id,
             consumerId: parsedBody.consumer_id || parsedBody.id,
-            executionId: parsedBody.execution_id || parsedBody.id,
             approximationConfigHash:
                 parsedBody.approximation_config_hash ||
                 (parsedBody.approximation_config
@@ -96,18 +112,24 @@ export class POSTHandler {
 
         rspAgentRecord[parsedBody.id] = {
             ...parsedBody,
-            execution_id: decision.entry.executionId,
-            shared_result_topic: decision.entry.resultTopic,
-            reuse_decision: decision.decision,
+            execution_id: registration.executionId,
+            shared_result_topic: registration.sharedOutputTopic,
+            reuse_decision: registration.containmentDecision,
         };
 
         response.writeHead(200);
 
         response.end(JSON.stringify({
             message: 'Registered',
-            executionId: decision.entry.executionId,
-            outputTopic: decision.entry.resultTopic,
-            reuseDecision: decision.decision,
+            consumerId: registration.consumerId,
+            canonicalQueryId: registration.canonicalQueryId,
+            executionId: registration.executionId,
+            executionCreated: registration.executionCreated,
+            reuseHit: registration.reuseHit,
+            outputTopic: registration.sharedOutputTopic,
+            executionState: registration.executionState,
+            reuseDecision: registration.containmentDecision,
+            registrationTimestamp: registration.registrationTimestamp,
         }));
         return;
     }

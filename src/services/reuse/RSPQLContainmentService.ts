@@ -139,11 +139,6 @@ export function stripConsumerOutputTarget(query: string): string {
 }
 
 export class RSPQLContainmentService {
-  private readonly parser = new RSPQLParser();
-  private readonly specsWrapper = new SPeCSWrapper();
-  private readonly checker = new (ContainmentChecker as unknown as {
-    new (qc?: boolean, rename?: boolean): ContainmentChecker;
-  })(true, true);
   private readonly cache = new Map<string, CachedContainmentResult>();
   private readonly cacheMaxEntries: number;
 
@@ -275,10 +270,8 @@ export class RSPQLContainmentService {
         durationMs,
       };
     }
-    const [forward, reverse] = await Promise.all([
-      this.checkContainment(queryA, queryB),
-      this.checkContainment(queryB, queryA),
-    ]);
+    const forward = await this.checkContainment(queryA, queryB);
+    const reverse = await this.checkContainment(queryB, queryA);
     const durationMs = nowMs() - startedAt;
     profileTime("semantic_equivalence_lookup_duration_ms", durationMs);
     const sameFinalSemantics = this.haveSameFinalSemantics(parsedA, parsedB);
@@ -361,7 +354,7 @@ export class RSPQLContainmentService {
 
   private parseForChecker(query: string): ParsedCheckerQuery {
     const sanitizedQuery = normalizeQueryForChecker(query);
-    const parsed = this.parser.parse(sanitizedQuery);
+    const parsed = this.createParser().parse(sanitizedQuery);
     if (!parsed?.sparql) {
       throw new Error("Parsed queries do not contain valid SPARQL");
     }
@@ -407,12 +400,15 @@ export class RSPQLContainmentService {
   }
 
   private async runChecker(subQuery: string, superQuery: string): Promise<boolean> {
+    const checker = this.createChecker();
+    const parser = this.createParser();
+    const specsWrapper = this.createSPeCSWrapper();
     // The package-level checker is the public API. We still invoke the wrapper directly
     // to preserve timeout and ambiguous-result classification.
-    await this.checker.checkContainment(subQuery, superQuery);
-    const parsedSub = this.parser.parse(subQuery);
-    const parsedSuper = this.parser.parse(superQuery);
-    const specsResult = await this.specsWrapper.runSPeCS({
+    await checker.checkContainment(subQuery, superQuery);
+    const parsedSub = parser.parse(subQuery);
+    const parsedSuper = parser.parse(superQuery);
+    const specsResult = await specsWrapper.runSPeCS({
       subquery: parsedSub.sparql,
       superquery: parsedSuper.sparql,
       qc: "true",
@@ -451,5 +447,19 @@ export class RSPQLContainmentService {
       failureKind: inferFailureKind(error),
       checkerVersion: CHECKER_VERSION,
     };
+  }
+
+  private createParser(): RSPQLParser {
+    return new RSPQLParser();
+  }
+
+  private createChecker(): ContainmentChecker {
+    return new (ContainmentChecker as unknown as {
+      new (qc?: boolean, rename?: boolean): ContainmentChecker;
+    })(true, true);
+  }
+
+  private createSPeCSWrapper(): SPeCSWrapper {
+    return new SPeCSWrapper();
   }
 }

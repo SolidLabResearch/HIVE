@@ -37,11 +37,11 @@ export function getCachedParsedQuery<T = unknown>(parser: ParserLike, query: str
 export function getCachedChunkRewrite(
   rewriter: RewriteLike,
   query: string,
-  chunkSize: number,
+  cacheDiscriminator: number | string,
 ): string {
   const owner = rewriter as unknown as object;
   const bucket = getBucket(rewriteCaches, owner);
-  const cacheKey = `${chunkSize}::${query}`;
+  const cacheKey = `${cacheDiscriminator}::${query}`;
   const cached = bucket.get(cacheKey);
   if (cached !== undefined) {
     profileCount("query_rewrite_cache_hits");

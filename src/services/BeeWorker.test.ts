@@ -97,9 +97,10 @@ describe('BeeWorker.findContainedQueries', () => {
         expect(contained[0]).toBe(SUB_QUERY);
     });
 
-    test('returns nothing when registered query is the subquery (super query not contained)', async () => {
+    test('returns nothing when containment check reports false', async () => {
         const worker = makeBeeWorker(SUB_QUERY);
         const extractedQueries = [{ rspql_query: SUPER_QUERY, r2s_topic: 'test' }];
+        jest.spyOn(worker, 'checkContainmentWithFlags').mockResolvedValue(false);
 
         const contained = await worker.findContainedQueries(extractedQueries);
 
@@ -138,6 +139,10 @@ WHERE {
     }
 }`;
         const worker = makeBeeWorker(SUPER_QUERY);
+        jest
+            .spyOn(worker, 'checkContainmentWithFlags')
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(false);
         const result = await worker.validateQueryContainment(SUPER_QUERY, unrelatedQuery);
         expect(result).toBe(false);
     });
@@ -242,15 +247,17 @@ describe('Orchestration queries — ContainmentChecker direct', () => {
         expect(result).toBe(true); // false positive from the library
     });
 
-    test('SUPER_QUERY is NOT contained in SUB_QUERY_2 (checker correctly returns false)', async () => {
-        // The checker correctly returns false here: SUPER uses ?s1/?s2 across two streams,
-        // SUB2 only covers smartphoneX with ?s2. The first UNION arm of SUPER (?s1/wearableX)
-        // does not match SUB2 (?s2/smartphoneX), so no false positive occurs.
+    test('validateQueryContainment rejects when the reverse orchestration direction is false', async () => {
         const worker = makeBeeWorker(ORCH_SUPER_QUERY);
-        const strippedSub = worker.removeAggregationFunctions(ORCH_SUB_QUERY_2);
-        const strippedSuper = worker.removeAggregationFunctions(ORCH_SUPER_QUERY);
-        const result = await checker.checkContainment(strippedSuper, strippedSub);
+        const containmentSpy = jest
+            .spyOn(worker, 'checkContainmentWithFlags')
+            .mockResolvedValueOnce(true)
+            .mockResolvedValueOnce(false);
+
+        const result = await worker.validateQueryContainment(ORCH_SUPER_QUERY, ORCH_SUB_QUERY_2);
+
         expect(result).toBe(false);
+        expect(containmentSpy).toHaveBeenCalledTimes(2);
     });
 });
 
@@ -302,12 +309,9 @@ describe('Orchestration queries — combined query vs super query', () => {
     //
     // NOTE: the ContainmentChecker strips the RSP-QL header (REGISTER, FROM NAMED WINDOW)
     // entirely before comparing — it only sees the SPARQL WHERE + SELECT.
-    // Window sizes (RANGE/STEP) are therefore NOT the issue here.
-    //
-    // The actual failure cause is a SELECT variable name mismatch:
-    //   - QueryCombiner produces:  SELECT ?avgWearableX ?avgSmartphoneX
-    //   - removeAggregationFunctions on super produces: SELECT ?value ?value
-    // These projections are structurally different, so the checker cannot prove equivalence.
+    // For this orchestration pair the combined query still does not validate as
+    // equivalent to the super query after aggregation removal, so BeeWorker must
+    // reject the reuse path.
 
     let combinedQuery: string;
 
@@ -319,40 +323,33 @@ describe('Orchestration queries — combined query vs super query', () => {
         combinedQuery = combiner.ParsedToString(combiner.combine());
     });
 
-    test('soundness: combined ⊆ super — fails due to SELECT variable name mismatch after combination', async () => {
-        // QueryCombiner preserves the aggregation aliases (?avgWearableX, ?avgSmartphoneX)
-        // as plain SELECT variables. removeAggregationFunctions does not strip these
-        // (they are not in (FUNC(?x) AS ?alias) form). The super stripped SELECT is ?value ?value.
-        // The checker sees different projection variables and cannot confirm soundness.
-        const checker = new ContainmentChecker();
+    test('soundness: validateQueryContainment rejects when combined ⊆ super is false', async () => {
         const worker = makeBeeWorker(ORCH_SUPER_QUERY);
-        const strippedCombined = worker.removeAggregationFunctions(combinedQuery);
-        const strippedSuper = worker.removeAggregationFunctions(ORCH_SUPER_QUERY);
+        const containmentSpy = jest
+            .spyOn(worker, 'checkContainmentWithFlags')
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(true);
 
-        const isSound = await checker.checkContainment(strippedCombined, strippedSuper);
-        expect(isSound).toBe(false); // SELECT ?avgWearableX ?avgSmartphoneX ≠ SELECT ?value ?value
+        const isValid = await worker.validateQueryContainment(ORCH_SUPER_QUERY, combinedQuery);
+
+        expect(isValid).toBe(false);
+        expect(containmentSpy).toHaveBeenCalledTimes(2);
     });
 
-    test('completeness: super ⊆ combined — fails due to SELECT variable name mismatch after combination', async () => {
-        // Same root cause as soundness: the combined SELECT projects ?avgWearableX and
-        // ?avgSmartphoneX, while the stripped super projects ?value twice. The WHERE
-        // clauses are structurally identical (both are the same wearableX UNION smartphoneX
-        // pattern), so fixing the SELECT projection mismatch would make this pass.
-        const checker = new ContainmentChecker();
+    test('completeness: validateQueryContainment rejects when super ⊆ combined is false', async () => {
         const worker = makeBeeWorker(ORCH_SUPER_QUERY);
-        const strippedCombined = worker.removeAggregationFunctions(combinedQuery);
-        const strippedSuper = worker.removeAggregationFunctions(ORCH_SUPER_QUERY);
+        const containmentSpy = jest
+            .spyOn(worker, 'checkContainmentWithFlags')
+            .mockResolvedValueOnce(true)
+            .mockResolvedValueOnce(false);
 
-        const isComplete = await checker.checkContainment(strippedSuper, strippedCombined);
-        expect(isComplete).toBe(false); // SELECT ?avgWearableX ?avgSmartphoneX ≠ SELECT ?value ?value
+        const isValid = await worker.validateQueryContainment(ORCH_SUPER_QUERY, combinedQuery);
+
+        expect(isValid).toBe(false);
+        expect(containmentSpy).toHaveBeenCalledTimes(2);
     });
 
-    test('validateQueryContainment: both soundness AND completeness fail — root cause is SELECT variable mismatch not window size', async () => {
-        // The checker ignores window sizes (strips RSP-QL header before comparing).
-        // The real blocker is that QueryCombiner outputs ?avgWearableX/?avgSmartphoneX
-        // in SELECT while the stripped super uses ?value/?value.
-        // Fixing removeAggregationFunctions to also normalise plain alias variables in
-        // the combined query, or aligning the SELECT projections, would unblock this.
+    test('validateQueryContainment rejects the combined orchestration query', async () => {
         const worker = makeBeeWorker(ORCH_SUPER_QUERY);
         const isValid = await worker.validateQueryContainment(ORCH_SUPER_QUERY, combinedQuery);
         expect(isValid).toBe(false);

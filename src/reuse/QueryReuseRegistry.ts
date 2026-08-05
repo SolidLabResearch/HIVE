@@ -12,6 +12,28 @@ export type ReuseMode =
   | "final_result_reuse"
   | "chunk_state_reuse";
 
+export type ExecutionState =
+  | "reserved"
+  | "starting"
+  | "active"
+  | "failed"
+  | "stopping"
+  | "stopped";
+
+export type ReusableApproach = "approximation" | "chunked";
+
+export interface ActiveExecutionHandle {
+  executionId: string;
+  approach: "fetching" | ReusableApproach;
+  canonicalQueryId: string;
+  sharedOutputTopic: string;
+  workerIds: string[];
+  producerIds?: string[];
+  producerTopics?: string[];
+  state: ExecutionState;
+  stop(): Promise<void>;
+}
+
 export type QueryReuseDecisionEvent = {
   consumerId: string;
   incomingQueryId: string;
@@ -42,6 +64,10 @@ export type FinalResultEntry = {
   registeredConsumers: Set<string>;
   createdAt: number;
   approximationConfigHash?: string;
+  approach?: ReusableApproach;
+  state?: ExecutionState;
+  runtimeHandle?: ActiveExecutionHandle;
+  lastActivityAt?: number;
 };
 
 export type FinalResultReuseHit = {
@@ -68,6 +94,15 @@ type ResolveRegistrationParams = {
 type ResolveRegistrationResult = {
   entry: FinalResultEntry;
   decision: QueryReuseDecisionEvent;
+};
+
+type ResolveReusableRuntimeParams = ResolveRegistrationParams & {
+  approach: ReusableApproach;
+  createExecution: (canonicalQueryId: string) => Promise<ActiveExecutionHandle>;
+};
+
+type ResolveReusableRuntimeResult = ResolveRegistrationResult & {
+  executionCreated: boolean;
 };
 
 type CandidateSummary = {
@@ -196,6 +231,10 @@ function buildCandidateSignature(
 
 function buildQueryId(query: string): string {
   return hashValue(normalizeWhitespace(stripConsumerOutputTarget(query)));
+}
+
+export function buildCanonicalQueryId(query: string): string {
+  return buildQueryId(query);
 }
 
 function cacheHitFromEquivalence(equivalence: EquivalenceResult): boolean {
@@ -329,6 +368,91 @@ export class QueryReuseRegistry {
     });
   }
 
+  async resolveReusableRuntimeRegistration(
+    params: ResolveReusableRuntimeParams,
+  ): Promise<ResolveReusableRuntimeResult> {
+    const signature = buildCandidateSignature(
+      params.query,
+      params.approximationConfigHash,
+    );
+    return this.lock.runExclusive(signature, async () => {
+      const lookupStartedAt = Date.now();
+      const hit = await this.findReusableRuntimeHit(
+        params.query,
+        params.approximationConfigHash,
+      );
+      if (hit) {
+        hit.entry.registeredConsumers.add(params.consumerId);
+        hit.entry.lastActivityAt = Date.now();
+        return {
+          entry: hit.entry,
+          executionCreated: false,
+          decision: {
+            consumerId: params.consumerId,
+            incomingQueryId: buildQueryId(params.query),
+            matchedActiveQueryId: hit.entry.queryId,
+            candidateQueryIdsInspected: hit.candidateQueryIdsInspected,
+            forwardContained: hit.equivalence.forward.contained,
+            reverseContained: hit.equivalence.reverse.contained,
+            mutuallyContained: hit.equivalence.equivalent,
+            supported: hit.equivalence.supported,
+            reuseHit: true,
+            executionId: hit.entry.executionId,
+            resultTopic: hit.entry.resultTopic,
+            cacheHit: cacheHitFromEquivalence(hit.equivalence),
+            lookupDurationMs: Date.now() - lookupStartedAt,
+            containmentDurationMs:
+              hit.equivalence.forward.durationMs + hit.equivalence.reverse.durationMs,
+            timestamp: Date.now(),
+          },
+        };
+      }
+
+      const canonicalQueryId = buildQueryId(params.query);
+      const runtimeHandle = await params.createExecution(canonicalQueryId);
+      const entry: FinalResultEntry = {
+        queryId: canonicalQueryId,
+        executionId: runtimeHandle.executionId,
+        candidateSignature: signature,
+        checkerInputHash: this.containmentService.getNormalizedInputHash(params.query),
+        strippedQuery: stripConsumerOutputTarget(params.query),
+        originalQuery: params.query,
+        resultTopic: runtimeHandle.sharedOutputTopic,
+        ownerQueryId: params.ownerQueryId,
+        registeredConsumers: new Set([params.consumerId]),
+        createdAt: Date.now(),
+        approximationConfigHash: params.approximationConfigHash,
+        approach: params.approach,
+        state: runtimeHandle.state,
+        runtimeHandle,
+        lastActivityAt: Date.now(),
+      };
+      const entries = this.finalResults.get(signature) ?? [];
+      entries.push(entry);
+      this.finalResults.set(signature, entries);
+      return {
+        entry,
+        executionCreated: true,
+        decision: {
+          consumerId: params.consumerId,
+          incomingQueryId: entry.queryId,
+          candidateQueryIdsInspected: entries.slice(0, -1).map((candidate) => candidate.queryId),
+          forwardContained: false,
+          reverseContained: false,
+          mutuallyContained: false,
+          supported: false,
+          reuseHit: false,
+          executionId: entry.executionId,
+          resultTopic: entry.resultTopic,
+          cacheHit: false,
+          lookupDurationMs: Date.now() - lookupStartedAt,
+          containmentDurationMs: 0,
+          timestamp: Date.now(),
+        },
+      };
+    });
+  }
+
   registerFinalResult(params: {
     query: string;
     resultTopic: string;
@@ -377,6 +501,59 @@ export class QueryReuseRegistry {
 
   private getEntryById(queryId: string): FinalResultEntry | undefined {
     return this.getAllEntries().find((entry) => entry.queryId === queryId);
+  }
+
+  invalidateExecution(queryId: string): void {
+    for (const [signature, entries] of this.finalResults.entries()) {
+      const remaining = entries.filter((entry) => entry.queryId !== queryId);
+      if (remaining.length === 0) {
+        this.finalResults.delete(signature);
+      } else if (remaining.length !== entries.length) {
+        this.finalResults.set(signature, remaining);
+      }
+    }
+  }
+
+  private async findReusableRuntimeHit(
+    query: string,
+    approximationConfigHash?: string,
+  ): Promise<
+    | {
+        entry: FinalResultEntry;
+        candidateQueryIdsInspected: string[];
+        equivalence: EquivalenceResult;
+      }
+    | undefined
+  > {
+    const signature = buildCandidateSignature(query, approximationConfigHash);
+    const candidates = this.finalResults.get(signature) ?? [];
+    const candidateQueryIdsInspected: string[] = [];
+
+    for (const candidate of candidates) {
+      if (!candidate.runtimeHandle) {
+        continue;
+      }
+      if (candidate.state !== "starting" && candidate.state !== "active") {
+        continue;
+      }
+      candidateQueryIdsInspected.push(candidate.queryId);
+      const equivalence = await this.containmentService.checkEquivalence(
+        query,
+        candidate.originalQuery,
+      );
+      if (
+        equivalence.equivalent &&
+        candidate.approximationConfigHash === approximationConfigHash
+      ) {
+        return {
+          entry: candidate,
+          candidateQueryIdsInspected,
+          equivalence,
+        };
+      }
+    }
+
+    return undefined;
   }
 
   static buildApproximationConfigHash(config: unknown): string {

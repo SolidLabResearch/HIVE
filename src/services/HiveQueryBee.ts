@@ -77,4 +77,8 @@ export class HiveQueryBee {
     stop() {
         this.process.kill("SIGTERM");
     }
+
+    getPid(): number | undefined {
+        return this.process.pid;
+    }
 }

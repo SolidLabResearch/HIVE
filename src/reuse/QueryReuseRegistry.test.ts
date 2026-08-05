@@ -95,6 +95,11 @@ describe("RSPQLContainmentService", () => {
     service = new RSPQLContainmentService();
   });
 
+  afterEach(() => {
+    jest.restoreAllMocks();
+    jest.useRealTimers();
+  });
+
   test("treats output-target differences as semantically equivalent only through mutual containment", async () => {
     const first = buildQuery({ output: "consumer-1-output" });
     const second = buildQuery({ output: "consumer-2-output" });
@@ -138,7 +143,7 @@ describe("RSPQLContainmentService", () => {
     expect(result.supported).toBe(false);
   });
 
-  test("records one-way containment directly from the checker", async () => {
+  test("records one-way containment from directional checker outcomes", async () => {
     const first = `
 PREFIX ex: <http://example.org/>
 REGISTER RStream <output-a> AS
@@ -159,12 +164,17 @@ WHERE {
   WINDOW ex:w1 { ?x a ex:Person . }
 }
 `;
+    const spy = jest
+      .spyOn(service as any, "runChecker")
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
 
     const forward = await service.checkContainment(first, second);
     const reverse = await service.checkContainment(second, first);
 
     expect(forward.contained).toBe(true);
     expect(reverse.contained).toBe(false);
+    expect(spy).toHaveBeenCalledTimes(2);
   });
 
   test("fails closed for unsupported query features", async () => {
@@ -236,6 +246,11 @@ WHERE {
 });
 
 describe("QueryReuseRegistry", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+    jest.useRealTimers();
+  });
+
   test("reuses mutually contained final queries", async () => {
     const registry = new QueryReuseRegistry(new RSPQLContainmentService());
     const first = buildQuery({ output: "consumer-1-output" });
@@ -263,7 +278,31 @@ describe("QueryReuseRegistry", () => {
   });
 
   test("reuses equivalent queries across prefix alias renaming in stage-1 candidate lookup", async () => {
-    const registry = new QueryReuseRegistry(new RSPQLContainmentService());
+    const containmentService = {
+      getNormalizedInputHash: (query: string) => query.replace(/\s+/g, " ").trim(),
+      checkEquivalence: jest.fn().mockResolvedValue({
+        equivalent: true,
+        supported: true,
+        durationMs: 1,
+        forward: {
+          contained: true,
+          supported: true,
+          durationMs: 1,
+          cacheHit: false,
+          direction: "subquery_in_superquery" as const,
+          checkerVersion: "fake",
+        },
+        reverse: {
+          contained: true,
+          supported: true,
+          durationMs: 1,
+          cacheHit: false,
+          direction: "subquery_in_superquery" as const,
+          checkerVersion: "fake",
+        },
+      }),
+    };
+    const registry = new QueryReuseRegistry(containmentService as any);
     const first = buildQuery({ output: "consumer-1-output" });
     const second = buildQuery({
       output: "consumer-2-output",
@@ -295,16 +334,34 @@ describe("QueryReuseRegistry", () => {
       executionId: "execution-2",
     });
 
+    expect(secondDecision.decision.supported).toBe(true);
     expect(secondDecision.decision.reuseHit).toBe(true);
     expect(secondDecision.entry.executionId).toBe("execution-1");
+    expect(containmentService.checkEquivalence).toHaveBeenCalledTimes(1);
   });
 
   test("rejects final-result reuse for one-way containment", async () => {
     const registry = new QueryReuseRegistry(new RSPQLContainmentService());
-    const broader = buildQuery();
-    const narrower = buildQuery({
-      whereExtra: "?s saref:relatesToProperty <https://example.org/device/wearableX> .",
-    });
+    const broader = `
+PREFIX ex: <http://example.org/>
+REGISTER RStream <output-a> AS
+SELECT (COUNT(?x) AS ?count)
+FROM NAMED WINDOW ex:w1 ON STREAM ex:stream1 [RANGE 10 STEP 5]
+WHERE {
+  WINDOW ex:w1 { ?x a ex:Person . }
+}
+`;
+    const narrower = `
+PREFIX ex: <http://example.org/>
+REGISTER RStream <output-b> AS
+SELECT (COUNT(?x) AS ?count)
+FROM NAMED WINDOW ex:w1 ON STREAM ex:stream1 [RANGE 10 STEP 5]
+FROM NAMED WINDOW ex:w2 ON STREAM ex:stream2 [RANGE 10 STEP 5]
+WHERE {
+  WINDOW ex:w1 { ?x a ex:Person . }
+  WINDOW ex:w2 { ?x ex:hasAge ex:One . }
+}
+`;
 
     await registry.resolveFinalResultRegistration({
       query: broader,
