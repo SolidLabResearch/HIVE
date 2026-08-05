@@ -79,13 +79,22 @@ export class RSPAgent {
     private readonly step: number | null;
     private readonly debugStructuredReusableResults: boolean;
     private readonly compactReusableResultPayload: boolean;
+    private readonly registerQueryDefinitionOnInit: boolean;
+    private readonly onRuntimeError?: (error: Error) => void;
 
     /**
      *
      * @param query
      * @param r2s_topic
      */
-    constructor(query: string, r2s_topic: string) {
+    constructor(
+        query: string,
+        r2s_topic: string,
+        options: {
+            registerQueryDefinition?: boolean;
+            onRuntimeError?: (error: Error) => void;
+        } = {},
+    ) {
         this.query = query;
         this.r2s_topic = r2s_topic;
         this.queryId = hash_string_md5(query);
@@ -97,12 +106,17 @@ export class RSPAgent {
         this.step = Number(this.parsedQuery?.s2r?.[0]?.slide);
         this.debugStructuredReusableResults = isApproximationDebugEnabled();
         this.compactReusableResultPayload = useCompactReusableResultPayload();
+        this.registerQueryDefinitionOnInit =
+            options.registerQueryDefinition !== false;
+        this.onRuntimeError = options.onRuntimeError;
         this.rsp_engine = new RSPEngine(query);
         profileCount("rsp_engines_created");
         this.rstream_emitter = this.rsp_engine.register();
         this.http_server_location = "http://localhost:8080/";
         this.registerCleanupHook();
-        this.registerToQueryRegistry();
+        if (this.registerQueryDefinitionOnInit) {
+            this.registerToQueryRegistry();
+        }
         this.subscribeRStream();
 
 
@@ -128,7 +142,7 @@ export class RSPAgent {
      */
     public async process_streams() {
         const streams = this.returnStreams();
-        for (const stream of streams) {
+        await Promise.all(streams.map(async (stream) => {
             const stream_name = stream.stream_name;
             const mqtt_broker: string = this.returnMQTTBroker(stream_name);
             const rsp_client = mqtt.connect(mqtt_broker);
@@ -144,37 +158,80 @@ export class RSPAgent {
               ? rawTopic
               : buildBenchmarkTopicName(rawTopic);
 
-            rsp_client.on("connect", () => {
-                console.log(`Connected to MQTT broker at ${mqtt_broker}`);
+            await new Promise<void>((resolve, reject) => {
+                let settled = false;
 
-                rsp_client.subscribe(topic, (err: any) => {
-                    if (err) {
-                        console.error(`Failed to subscribe to stream ${stream_name}:`, err);
-                    } else {
-                        console.log(`Subscribed to stream ${topic}`);
+                const resolveOnce = () => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    resolve();
+                };
+
+                const rejectOnce = (error: Error) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    reject(error);
+                };
+
+                rsp_client.on("connect", () => {
+                    console.log(`Connected to MQTT broker at ${mqtt_broker}`);
+
+                    rsp_client.subscribe(topic, (err: any) => {
+                        if (err) {
+                            const subscriptionError =
+                                err instanceof Error
+                                    ? err
+                                    : new Error(
+                                          `Failed to subscribe to stream ${stream_name}: ${String(err)}`,
+                                      );
+                            console.error(
+                                `Failed to subscribe to stream ${stream_name}:`,
+                                subscriptionError,
+                            );
+                            this.onRuntimeError?.(subscriptionError);
+                            rejectOnce(subscriptionError);
+                        } else {
+                            console.log(`Subscribed to stream ${topic}`);
+                            resolveOnce();
+                        }
+                    });
+                });
+
+                rsp_client.on("message", async (topic: any, message: any) => {
+                    try {
+                        const message_string = message.toString();
+                        profileCount("mqtt_messages_received");
+                        const latest_event_store = await turtleStringToStore(message_string);
+                        const timestamp = latest_event_store.getQuads(null, DataFactory.namedNode("https://saref.etsi.org/core/hasTimestamp"), null, null)[0].object.value;
+                        const timestamp_epoch = Date.parse(timestamp);
+                        if (rsp_stream_object) {
+                            await this.add_event_store_to_rsp_engine(latest_event_store, [rsp_stream_object], timestamp_epoch);
+                        }
+                    } catch (error) {
+                        console.error(`Error processing message from stream ${stream_name}:`, error);
                     }
                 });
-            });
 
-            rsp_client.on("message", async (topic: any, message: any) => {
-                try {
-                    const message_string = message.toString();
-                    profileCount("mqtt_messages_received");
-                    const latest_event_store = await turtleStringToStore(message_string);
-                    const timestamp = latest_event_store.getQuads(null, DataFactory.namedNode("https://saref.etsi.org/core/hasTimestamp"), null, null)[0].object.value;
-                    const timestamp_epoch = Date.parse(timestamp);
-                    if (rsp_stream_object) {
-                        await this.add_event_store_to_rsp_engine(latest_event_store, [rsp_stream_object], timestamp_epoch);
-                    }
-                } catch (error) {
-                    console.error(`Error processing message from stream ${stream_name}:`, error);
-                }
+                rsp_client.on("error", (error: any) => {
+                    const runtimeError =
+                        error instanceof Error
+                            ? error
+                            : new Error(
+                                  `Error with MQTT client for stream ${stream_name}: ${String(error)}`,
+                              );
+                    console.error(
+                        `Error with MQTT client for stream ${stream_name}:`,
+                        runtimeError,
+                    );
+                    this.onRuntimeError?.(runtimeError);
+                    rejectOnce(runtimeError);
+                });
             });
-
-            rsp_client.on("error", (error: any) => {
-                console.error(`Error with MQTT client for stream ${stream_name}:`, error);
-            });
-        }
+        }));
     }
 
     /**
@@ -486,6 +543,14 @@ export class RSPAgent {
         });
         writeProfileArtifact();
         writeStageProfileArtifact();
+    }
+
+    public stop(): void {
+        this.cleanup();
+    }
+
+    public getPid(): number {
+        return process.pid;
     }
 
     public static async registerQueryDefinition(

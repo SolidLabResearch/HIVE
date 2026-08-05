@@ -173,6 +173,7 @@ describe('RSPQueryProcess', () => {
             expect(partial?.window.start).toBe(1782765091763);
             expect(partial?.window.end).toBe(1782765121763);
             expect(partial?.window.windowDataCloseTime).toBe(1782765121763);
+            expect(partial?.window.alignmentOriginMs).toBe(1782765001763);
         });
     });
 

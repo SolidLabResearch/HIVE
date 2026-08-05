@@ -8,6 +8,7 @@ import { getTimestampDomainMax, getTimestampDomainMin, useCleanMqttSessionsForBe
 import { profileCount, profileSync, writeProfileArtifact } from "../util/profiling";
 import { resourceTraceSnapshot } from "../util/resourceTrace";
 import { detectCompatibleChunkReuse } from '../util/chunkStateReuse';
+import { alignWindowBoundsToOrigin } from '../util/windowAlignment';
 const mqtt = require('mqtt');
 const { DataFactory } = require('n3');
 
@@ -112,6 +113,7 @@ export class RSPQueryProcess {
                 const mqtt_broker: string = `${stream_url.protocol}//${stream_url.hostname}:${stream_url.port}/`;
                 const rsp_client = mqtt.connect(mqtt_broker, {
                     clean: useCleanMqttSessionsForBenchmark(),
+                    clientId: `rsp-query-${this.subqueryId}-${Math.random().toString(16).slice(2, 10)}`,
                 });
                 this.mqttClients.push(rsp_client);
                 profileCount("mqtt_clients_created");
@@ -349,6 +351,7 @@ export class RSPQueryProcess {
                 end: windowBounds.end,
                 range,
                 step,
+                alignmentOriginMs: this.benchmarkEventTimeAnchor,
                 semantics: "[start,end)",
                 windowSemantics,
                 logicalTriggerTime,
@@ -447,11 +450,17 @@ export class RSPQueryProcess {
         }
 
         const windowIndex = Math.round((bounds.start - this.firstObservedWindowStart) / step);
-        const remappedStart = this.benchmarkEventTimeAnchor + (windowIndex * step);
-        return {
-            start: remappedStart,
-            end: remappedStart + range,
-        };
+        return alignWindowBoundsToOrigin(
+            {
+                start: this.benchmarkEventTimeAnchor + (windowIndex * step),
+                end: this.benchmarkEventTimeAnchor + (windowIndex * step) + range,
+            },
+            {
+                rangeMs: range,
+                stepMs: step,
+                alignmentOriginMs: this.benchmarkEventTimeAnchor,
+            },
+        );
     }
 
     public generate_aggregation_event(bindings: any, timestamp: number) {

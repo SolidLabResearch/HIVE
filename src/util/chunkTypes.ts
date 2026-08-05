@@ -4,6 +4,7 @@ export type WindowDescriptor = {
   end: number;
   range?: number;
   step?: number;
+  alignmentOriginMs?: number | null;
   semantics: "[start,end)";
   windowSemantics?: string;
   logicalTriggerTime?: number | null;

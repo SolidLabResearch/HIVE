@@ -245,4 +245,23 @@ describe("RSPAgent", () => {
     expect(payload.timestamp_to).toBeUndefined();
     expect(payload.window).toBeUndefined();
   });
+
+  test("raw producer mode does not register through HTTP", () => {
+    const query = `
+      PREFIX mqtt_broker: <mqtt://localhost:1883/>
+      PREFIX : <https://rsp.js/>
+      REGISTER RStream <output> AS
+      SELECT (AVG(?v) AS ?avgTemp)
+      FROM NAMED WINDOW :w1 ON STREAM mqtt_broker:wearable/temperature [RANGE 120000 STEP 60000]
+      WHERE {
+        WINDOW :w1 { ?sensor :value ?v }
+      }
+    `;
+
+    new RSPAgent(query, "chunked/test-hash", {
+      registerQueryDefinition: false,
+    });
+
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
 });

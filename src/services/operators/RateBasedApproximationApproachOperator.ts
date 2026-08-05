@@ -23,6 +23,7 @@ import { PartialChunkResult } from "../../util/chunkTypes";
 import { hash_string_md5 } from "../../util/Util";
 import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
 import { getCachedParsedQuery } from "../../util/queryCache";
+import { buildSubqueryRuntimeIdentity } from "../reuse/SubqueryRuntimeIdentity";
 import {
   endStageTimer,
   profileCount,
@@ -87,6 +88,11 @@ type FinalizedApproximationWindow = {
   coverageComplete: boolean;
   isPartialWindow: boolean;
   isComparableWindow: boolean;
+};
+
+type WindowParameters = {
+  width: number;
+  slide: number;
 };
 
 /**
@@ -469,8 +475,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     for (const topic of topics) {
       try {
         const parsed = getCachedParsedQuery<any>(this.parser, topic.rspql_query);
-
-        const width = parsed.s2r[0]?.width;
+        const width = this.extractWindowParameters(topic.rspql_query, parsed)?.width;
         const aggregationMatch = topic.rspql_query.match(
           OUTPUT_AGGREGATION_REGEX,
         );
@@ -491,6 +496,48 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     return topicWindowParameters;
   }
 
+  private extractWindowParameters(
+    query: string,
+    parsedQuery?: any,
+  ): WindowParameters | null {
+    const parsedWindow = parsedQuery?.s2r?.find(
+      (window: any) =>
+        Number.isFinite(window?.width) && Number.isFinite(window?.slide),
+    );
+    if (parsedWindow) {
+      return {
+        width: Number(parsedWindow.width),
+        slide: Number(parsedWindow.slide),
+      };
+    }
+
+    const matches = Array.from(
+      query.matchAll(
+        /FROM\s+NAMED\s+WINDOW\s+\S+\s+ON\s+STREAM\s+\S+\s+\[RANGE\s+(\d+)\s+STEP\s+(\d+)\]/gi,
+      ),
+    );
+    if (matches.length === 0) {
+      return null;
+    }
+
+    const windows = matches.map((match) => ({
+      width: Number.parseInt(match[1], 10),
+      slide: Number.parseInt(match[2], 10),
+    }));
+    const firstWindow = windows[0];
+    const mismatchedWindow = windows.find(
+      (window) =>
+        window.width !== firstWindow.width || window.slide !== firstWindow.slide,
+    );
+    if (mismatchedWindow) {
+      throw new Error(
+        "Unsupported output query shape: multiple window parameter sets detected",
+      );
+    }
+
+    return firstWindow;
+  }
+
   /**
    * The method does a GET request to the HTTP server to fetch the existing queries which are being executed
    * In the Query Network.
@@ -498,16 +545,15 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
    */
   async setMQTTTopicMap(): Promise<void> {
     // Prefer the active benchmark attempt subqueries passed in by BeeWorker.
-    // Their MQTT result topics are deterministic: chunked/<md5(query)>.
+    // Their MQTT result topics are derived from the shared subquery runtime identity.
     if (this.subQueries.length > 0) {
       this.queryMQTTTopicMap = new Map<string, string>();
       this.extractedQueries = this.subQueries.map((query) => {
-        const queryHash = hash_string_md5(query);
-        const r2sTopic = `chunked/${queryHash}`;
-        this.queryMQTTTopicMap.set(queryHash, r2sTopic);
+        const identity = buildSubqueryRuntimeIdentity(query);
+        this.queryMQTTTopicMap.set(identity.canonicalId, identity.outputTopic);
         return {
           rspql_query: query,
-          r2s_topic: r2sTopic,
+          r2s_topic: identity.outputTopic,
         };
       });
 
@@ -592,8 +638,15 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     const outputQueryParsed = getCachedParsedQuery<any>(this.parser, this.outputQuery);
     this.cachedOutputQuery = this.outputQuery;
     this.cachedOutputQueryParsed = outputQueryParsed;
-    const outputQueryWidth = outputQueryParsed.s2r[0].width;
-    const outputQuerySlide = outputQueryParsed.s2r[0].slide;
+    const outputWindowParameters = this.extractWindowParameters(
+      this.outputQuery,
+      outputQueryParsed,
+    );
+    if (!outputWindowParameters) {
+      throw new Error("Failed to extract output query window parameters.");
+    }
+    const outputQueryWidth = outputWindowParameters.width;
+    const outputQuerySlide = outputWindowParameters.slide;
     const resultTopic = getResultTopic("approximation/output");
     this.windowRange = outputQueryWidth;
     this.windowSlide = outputQuerySlide;

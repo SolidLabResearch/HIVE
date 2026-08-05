@@ -13,6 +13,7 @@ export function getOrCreatePublisherClient(
 
   const client = mqtt.connect(mqttBroker, {
     clean: useCleanMqttSessionsForBenchmark(),
+    clientId: `chunked-publisher-${Math.random().toString(16).slice(2, 10)}`,
   });
   activeMqttClients.push(client);
   profileCount("mqtt_clients_created");

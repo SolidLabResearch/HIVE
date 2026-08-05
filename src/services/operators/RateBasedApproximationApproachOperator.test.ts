@@ -73,7 +73,7 @@ import {
   getLatestTopicValue,
   TopicWindowBuffers,
 } from './approximation/ApproximationWindowBuffer';
-import { hash_string_md5 } from '../../util/Util';
+import { buildSubqueryRuntimeIdentity } from '../reuse/SubqueryRuntimeIdentity';
 
 const OUTPUT_QUERY = `
 PREFIX : <https://rsp.js/>
@@ -99,8 +99,33 @@ FROM NAMED WINDOW :w2 ON STREAM :stream2 [RANGE 120000 STEP 60000]
 WHERE { WINDOW :w2 { ?sensor :value ?v } }
 `;
 
-const TOPIC_A = `chunked/${hash_string_md5(SUBQUERY_A)}`;
-const TOPIC_B = `chunked/${hash_string_md5(SUBQUERY_B)}`;
+const TOPIC_A = buildSubqueryRuntimeIdentity(SUBQUERY_A).outputTopic;
+const TOPIC_B = buildSubqueryRuntimeIdentity(SUBQUERY_B).outputTopic;
+const PRODUCTION_STYLE_OUTPUT_QUERY = `
+PREFIX saref: <https://saref.etsi.org/core/>
+PREFIX om: <http://www.ontology-of-units-of-measure.org/resource/om-2/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX : <http://example.com/>
+PREFIX mqtt_broker: <http://example.com/mqtt/>
+PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
+REGISTER RStream <consumer-output-topic> AS
+SELECT (AVG(?value) AS ?avg)
+FROM NAMED WINDOW <wearableX> ON STREAM mqtt_broker:wearableX [RANGE 5000 STEP 2500]
+FROM NAMED WINDOW <smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 5000 STEP 2500]
+WHERE {
+  WINDOW <wearableX> {
+    ?obs saref:relatesToProperty dahccsensors:wearableX .
+    ?obs saref:hasValue ?wearableValue .
+    BIND(xsd:float(?wearableValue) AS ?w)
+  }
+  WINDOW <smartphoneX> {
+    ?obs saref:relatesToProperty dahccsensors:smartphoneX .
+    ?obs saref:hasValue ?smartphoneValue .
+    BIND(xsd:float(?smartphoneValue) AS ?s)
+  }
+  BIND((?w + ?s) / 2 AS ?value)
+}
+`;
 
 describe('ApproximationApproachOperator', () => {
   const originalEnv = process.env;
@@ -131,8 +156,28 @@ describe('ApproximationApproachOperator', () => {
     return operator;
   }
 
+  function createOperatorWithOutputQuery(
+    outputQuery: string,
+  ): ApproximationApproachOperator {
+    const operator = new ApproximationApproachOperator();
+    operator.addSubQuery(SUBQUERY_A);
+    operator.addSubQuery(SUBQUERY_B);
+    operator.addOutputQuery(outputQuery);
+    return operator;
+  }
+
   async function startOperator() {
     const operator = createOperator();
+    await operator.init();
+    await operator.handleAggregation();
+    const client = mqttClients[0];
+    expect(client).toBeDefined();
+    client.emit('connect');
+    return { operator, client };
+  }
+
+  async function startOperatorWithOutputQuery(outputQuery: string) {
+    const operator = createOperatorWithOutputQuery(outputQuery);
     await operator.init();
     await operator.handleAggregation();
     const client = mqttClients[0];
@@ -300,6 +345,41 @@ WHERE { WINDOW :w2 { ?sensor :value ?v } }
       { start: 60000, end: 180000 },
       { start: 120000, end: 240000 },
     ]);
+  });
+
+  test('falls back to query-text window extraction for production-style final queries', async () => {
+    process.env.RESULT_TOPIC = 'shared/approximation-test/results';
+    const { client } = await startOperatorWithOutputQuery(
+      PRODUCTION_STYLE_OUTPUT_QUERY,
+    );
+
+    client.emit('message', TOPIC_A, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-a',
+      source_topic: 'wearableX',
+      aggregationType: 'AVG',
+      value: 10,
+      window_start: 0,
+      window_end: 5000,
+      window_data_close_time: 5000,
+    })));
+    client.emit('message', TOPIC_B, Buffer.from(JSON.stringify({
+      message_format: 'structured_reusable_result',
+      source_query_id: 'subquery-b',
+      source_topic: 'smartphoneX',
+      aggregationType: 'AVG',
+      value: 20,
+      window_start: 0,
+      window_end: 5000,
+      window_data_close_time: 5000,
+    })));
+
+    expect(client.publish).toHaveBeenCalledWith(
+      'shared/approximation-test/results',
+      expect.any(String),
+      { qos: 1 },
+      expect.any(Function),
+    );
   });
 
   test('completed-window mode suppresses legacy messages that lack window metadata', async () => {
