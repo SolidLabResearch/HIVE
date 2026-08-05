@@ -71,6 +71,11 @@ type ComparableWindowFlags = {
   isComparableWindow: boolean;
 };
 
+type QueryWindowConfiguration = {
+  rangeMs: number;
+  stepMs: number;
+};
+
 type StreamObservation = {
   timestamp: number;
   value: number;
@@ -184,6 +189,26 @@ export class FetchingAllDataClientSide {
   private replayDrainStarted = false;
   private readonly lifecycleHooks: FetchingLifecycleHooks;
 
+  private deriveQueryWindowConfiguration(): QueryWindowConfiguration {
+    const parsedQuery = this.rspql_parser.parse(this.query) as {
+      s2r?: Array<{ width?: number; slide?: number }>;
+    };
+    const firstWindow = parsedQuery?.s2r?.[0];
+    const rangeMs = Number(firstWindow?.width);
+    const stepMs = Number(firstWindow?.slide);
+
+    return {
+      rangeMs:
+        Number.isFinite(rangeMs) && rangeMs > 0
+          ? rangeMs
+          : getOutputWindowRange(),
+      stepMs:
+        Number.isFinite(stepMs) && stepMs > 0
+          ? stepMs
+          : getOutputWindowStep(),
+    };
+  }
+
   /**
    *
    * @param query
@@ -207,13 +232,14 @@ export class FetchingAllDataClientSide {
     this.aggregationFunction = aggregationFunction;
     this.sessionId = getSessionId();
     this.rspql_parser = new RSPQLParser();
+    const queryWindowConfiguration = this.deriveQueryWindowConfiguration();
     this.rsp_engine = new RSPEngine(query);
     profileCount("rsp_engines_created");
     this.rstream_emitter = this.rsp_engine.register();
     this.startTime = 0; // Will be set when first result arrives
     this.queryRegisteredTime = Date.now(); // Track when query was registered
-    this.windowRange = getOutputWindowRange();
-    this.expectedWindowInterval = getOutputWindowStep();
+    this.windowRange = queryWindowConfiguration.rangeMs;
+    this.expectedWindowInterval = queryWindowConfiguration.stepMs;
     this.benchmarkEventTimeAnchor = getBenchmarkEventTimeAnchor();
     this.timestampDomainMin = getTimestampDomainMin();
     this.timestampDomainMax = getTimestampDomainMax();
@@ -1176,6 +1202,63 @@ export class FetchingAllDataClientSide {
     };
   }
 
+  private buildBenchmarkPayloadDetails(args: {
+    windowNumber: number;
+    numericValue: number;
+    logicalWindow: DerivedLogicalWindow;
+    windowBounds: { start: number; end: number } | null;
+    eventCount: number;
+    sumValue: number;
+    avgValue: number;
+    firstEventTimestamp: string | null;
+    lastEventTimestamp: string | null;
+    centeredWindowMetadata: ReturnType<typeof buildBenchmarkWindowMetadata>;
+    windowFlags: ComparableWindowFlags;
+  }) {
+    return buildBenchmarkResultPayload(
+      "fetching",
+      this.aggregationFunction,
+      this.sessionId,
+      args.numericValue,
+      args.windowNumber,
+      {
+        benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+        benchmarkWindowStart: args.logicalWindow.start,
+        benchmarkWindowEnd: args.logicalWindow.end,
+        rspWindowStart: args.windowBounds?.start ?? null,
+        rspWindowEnd: args.windowBounds?.end ?? null,
+        eventCount: args.eventCount,
+        sumValue: args.sumValue,
+        avgValue: args.avgValue,
+        count: args.eventCount,
+        sum: args.sumValue,
+        average: args.avgValue,
+        rangeMs: this.windowRange,
+        stepMs: this.expectedWindowInterval,
+        firstEventTimestamp: args.firstEventTimestamp,
+        lastEventTimestamp: args.lastEventTimestamp,
+        comparableWindow: args.windowFlags.isComparableWindow,
+        coverageComplete: args.windowFlags.coverageComplete,
+        isPartialWindow: args.windowFlags.isPartialWindow,
+        isComparableWindow: args.windowFlags.isComparableWindow,
+      },
+      {
+        windowSemantics: args.centeredWindowMetadata.windowSemantics,
+        logicalTriggerTime: args.centeredWindowMetadata.logicalTriggerTime,
+        windowStart: args.centeredWindowMetadata.windowStart,
+        windowEnd: args.centeredWindowMetadata.windowEnd,
+        windowDataCloseTime: args.centeredWindowMetadata.windowDataCloseTime,
+        resultEmittedAt: args.centeredWindowMetadata.resultEmittedAt,
+        latencyFromLogicalTriggerMs:
+          args.centeredWindowMetadata.latencyFromLogicalTriggerMs,
+        latencyFromWindowCloseMs:
+          args.centeredWindowMetadata.latencyFromWindowCloseMs,
+        windowDurationMs: args.windowFlags.windowDurationMs,
+        metadataSource: args.centeredWindowMetadata.metadataSource,
+      },
+    );
+  }
+
   private buildLatencyCsvContent(): string {
     return `${FETCHING_LATENCY_HEADER}${this.latencyRows.join("\n")}${this.latencyRows.length > 0 ? "\n" : ""}`;
   }
@@ -1720,38 +1803,19 @@ export class FetchingAllDataClientSide {
           const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
           const aggregation_object_string = useBenchmarkPayload
             ? JSON.stringify(
-                  buildBenchmarkResultPayload(
-                    "fetching",
-                    this.aggregationFunction,
-                    this.sessionId,
-                    startupNumericValue,
-                    benchmarkWindowNumber as number,
-                    {
-                      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                      benchmarkWindowStart: logicalWindow.start,
-                      benchmarkWindowEnd: logicalWindow.end,
-                      rspWindowStart: windowBounds?.start ?? null,
-                      rspWindowEnd: windowBounds?.end ?? null,
-                      eventCount: settledAggregate.eventCount,
-                      sumValue: settledAggregate.sumValue,
-                      avgValue: settledAggregate.avgValue,
-                      firstEventTimestamp: firstEventTimestamp || null,
-                      lastEventTimestamp: lastEventTimestamp || null,
-                      windowSemantics: centeredWindowMetadata.windowSemantics,
-                      logicalTriggerTime: centeredWindowMetadata.logicalTriggerTime,
-                      windowStart: centeredWindowMetadata.windowStart,
-                      windowEnd: centeredWindowMetadata.windowEnd,
-                      windowDataCloseTime: centeredWindowMetadata.windowDataCloseTime,
-                      resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
-                      latencyFromLogicalTriggerMs: centeredWindowMetadata.latencyFromLogicalTriggerMs,
-                      latencyFromWindowCloseMs: centeredWindowMetadata.latencyFromWindowCloseMs,
-                      windowDurationMs: windowFlags.windowDurationMs,
-                      coverageComplete: windowFlags.coverageComplete,
-                      isPartialWindow: windowFlags.isPartialWindow,
-                      isComparableWindow: windowFlags.isComparableWindow,
-                      metadataSource: centeredWindowMetadata.metadataSource,
-                    },
-                  ),
+                  this.buildBenchmarkPayloadDetails({
+                    windowNumber: benchmarkWindowNumber as number,
+                    numericValue: startupNumericValue,
+                    logicalWindow,
+                    windowBounds,
+                    eventCount: settledAggregate.eventCount,
+                    sumValue: settledAggregate.sumValue,
+                    avgValue: settledAggregate.avgValue,
+                    firstEventTimestamp: firstEventTimestamp || null,
+                    lastEventTimestamp: lastEventTimestamp || null,
+                    centeredWindowMetadata,
+                    windowFlags,
+                  }),
                 )
             : JSON.stringify(this.generate_aggregation_event(String(startupNumericValue)));
           this.log(`Generated aggregation event for result: ${data}`);
@@ -2089,38 +2153,19 @@ export class FetchingAllDataClientSide {
         const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
         const aggregation_object_string = useBenchmarkPayload
           ? JSON.stringify(
-                buildBenchmarkResultPayload(
-                  "fetching",
-                  this.aggregationFunction,
-                  this.sessionId,
+                this.buildBenchmarkPayloadDetails({
+                  windowNumber: this.windowCount,
                   numericValue,
-                  this.windowCount,
-                  {
-                    benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                    benchmarkWindowStart: logicalWindow.start,
-                    benchmarkWindowEnd: logicalWindow.end,
-                    rspWindowStart: windowBounds?.start ?? null,
-                    rspWindowEnd: windowBounds?.end ?? null,
-                    eventCount: settledAggregate.eventCount,
-                    sumValue: settledAggregate.sumValue,
-                    avgValue: settledAggregate.avgValue,
-                    firstEventTimestamp: firstEventTimestamp || null,
-                    lastEventTimestamp: lastEventTimestamp || null,
-                    windowSemantics: centeredWindowMetadata.windowSemantics,
-                    logicalTriggerTime: centeredWindowMetadata.logicalTriggerTime,
-                    windowStart: centeredWindowMetadata.windowStart,
-                    windowEnd: centeredWindowMetadata.windowEnd,
-                    windowDataCloseTime: centeredWindowMetadata.windowDataCloseTime,
-                    resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
-                    latencyFromLogicalTriggerMs: centeredWindowMetadata.latencyFromLogicalTriggerMs,
-                    latencyFromWindowCloseMs: centeredWindowMetadata.latencyFromWindowCloseMs,
-                    windowDurationMs: windowFlags.windowDurationMs,
-                    coverageComplete: windowFlags.coverageComplete,
-                    isPartialWindow: windowFlags.isPartialWindow,
-                    isComparableWindow: windowFlags.isComparableWindow,
-                    metadataSource: centeredWindowMetadata.metadataSource,
-                  },
-                ),
+                  logicalWindow,
+                  windowBounds,
+                  eventCount: settledAggregate.eventCount,
+                  sumValue: settledAggregate.sumValue,
+                  avgValue: settledAggregate.avgValue,
+                  firstEventTimestamp: firstEventTimestamp || null,
+                  lastEventTimestamp: lastEventTimestamp || null,
+                  centeredWindowMetadata,
+                  windowFlags,
+                }),
               )
           : JSON.stringify(this.generate_aggregation_event(valueStr));
         console.log(

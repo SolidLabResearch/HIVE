@@ -78,6 +78,13 @@ import {
   summarizeChunkGroup as summarizeChunkGroupPure,
   summarizeWindowRecomposition as summarizeWindowRecompositionPure,
 } from "./chunked/WindowRecomposer";
+
+type ChunkedBenchmarkWindowMetadata = ReturnType<
+  typeof buildBenchmarkWindowMetadata
+> & {
+  latencyFromLogicalTriggerMs: number | null;
+  latencyFromWindowCloseMs: number | null;
+};
 import {
   getOrCreatePublisherClient as getOrCreatePublisherClientPure,
   publishWithSharedClient as publishWithSharedClientPure,
@@ -1254,6 +1261,66 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     };
   }
 
+  private buildChunkedBenchmarkPayload(args: {
+    aggregationFunction: AggregationFunction;
+    resultValue: number;
+    windowNumber: number;
+    comparableDiagnostics?: ComparableWindowDiagnostics;
+    centeredWindowMetadata: ChunkedBenchmarkWindowMetadata;
+    coverageComplete: boolean;
+  }) {
+    const comparableWindow =
+      Boolean(args.comparableDiagnostics) && args.coverageComplete;
+
+    return buildBenchmarkResultPayload(
+      "chunked",
+      args.aggregationFunction,
+      this.sessionId,
+      args.resultValue,
+      args.windowNumber,
+      {
+        benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+        windowStart:
+          args.comparableDiagnostics?.externalWindowStart ??
+          args.centeredWindowMetadata.windowStart,
+        windowEnd:
+          args.comparableDiagnostics?.externalWindowEnd ??
+          args.centeredWindowMetadata.windowEnd,
+        recomposedCount: args.comparableDiagnostics?.recomposedCount ?? null,
+        recomposedSum: args.comparableDiagnostics?.recomposedSum ?? null,
+        recomposedAvg: args.comparableDiagnostics?.recomposedAvg ?? null,
+        eventCount: args.comparableDiagnostics?.recomposedCount ?? null,
+        sumValue: args.comparableDiagnostics?.recomposedSum ?? null,
+        avgValue:
+          args.comparableDiagnostics?.recomposedAvg ?? args.resultValue,
+        count: args.comparableDiagnostics?.recomposedCount ?? null,
+        sum: args.comparableDiagnostics?.recomposedSum ?? null,
+        average:
+          args.comparableDiagnostics?.recomposedAvg ?? args.resultValue,
+        rangeMs: this.windowRange,
+        stepMs: this.windowSlide,
+        internalChunkIds:
+          args.comparableDiagnostics?.internalChunkGroupIds ?? [],
+        internalChunks: args.comparableDiagnostics?.internalChunks ?? [],
+        coverageComplete: args.coverageComplete,
+        comparableWindow,
+        isPartialWindow: !comparableWindow,
+        isComparableWindow: comparableWindow,
+      },
+      {
+        windowSemantics: args.centeredWindowMetadata.windowSemantics,
+        logicalTriggerTime: args.centeredWindowMetadata.logicalTriggerTime,
+        windowStart: args.centeredWindowMetadata.windowStart,
+        windowEnd: args.centeredWindowMetadata.windowEnd,
+        windowDataCloseTime: args.centeredWindowMetadata.windowDataCloseTime,
+        resultEmittedAt: args.centeredWindowMetadata.resultEmittedAt,
+        latencyFromLogicalTriggerMs: null,
+        latencyFromWindowCloseMs: null,
+        metadataSource: args.centeredWindowMetadata.metadataSource,
+      },
+    );
+  }
+
   /**
    *
    */
@@ -1962,55 +2029,35 @@ For example, the allResults object might look like this:
         wallClockWindowClose !== null
           ? resultEmittedAt - wallClockWindowClose
           : null;
+      const coverageComplete = proofEntry?.coverageComplete ?? false;
       const payload = profileStageSync(
         "chunked.final_payload_json_stringify_ms",
         () =>
           profileSync("serialization_parsing_ms", () =>
             useBenchmarkPayload
               ? JSON.stringify(
-                  buildBenchmarkResultPayload(
-                    "chunked",
-                    detectAggregationFunction as AggregationFunction,
-                      this.sessionId,
-                      Number.parseFloat(resultValue),
-                      this.windowCount,
-                      comparableDiagnostics
-                        ? {
-                            benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                            windowStart: comparableDiagnostics.externalWindowStart,
-                            windowEnd: comparableDiagnostics.externalWindowEnd,
-                            recomposedCount: comparableDiagnostics.recomposedCount,
-                            recomposedSum: comparableDiagnostics.recomposedSum,
-                            recomposedAvg: comparableDiagnostics.recomposedAvg,
-                            internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
-                            internalChunks: comparableDiagnostics.internalChunks,
-                          }
-                        : {},
-                      {
-                        windowSemantics: centeredWindowMetadata.windowSemantics,
-                        logicalTriggerTime:
-                          centeredWindowMetadata.logicalTriggerTime,
-                        windowStart: centeredWindowMetadata.windowStart,
-                        windowEnd: centeredWindowMetadata.windowEnd,
-                        windowDataCloseTime:
-                          centeredWindowMetadata.windowDataCloseTime,
-                        resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
-                        latencyFromLogicalTriggerMs: null,
-                        latencyFromWindowCloseMs: null,
-                        metadataSource: centeredWindowMetadata.metadataSource,
-                        registrationAnchoredExpectedClose,
-                        eventTimeWindowStart: centeredWindowMetadata.windowStart,
-                        eventTimeWindowEnd: centeredWindowMetadata.windowEnd,
-                        eventTimeWindowClose:
-                          centeredWindowMetadata.windowDataCloseTime,
-                        wallClockWindowClose,
+                  this.buildChunkedBenchmarkPayload({
+                    aggregationFunction:
+                      detectAggregationFunction as AggregationFunction,
+                    resultValue: Number.parseFloat(resultValue),
+                    windowNumber: this.windowCount,
+                    comparableDiagnostics,
+                    centeredWindowMetadata: {
+                      ...centeredWindowMetadata,
+                      registrationAnchoredExpectedClose,
+                      eventTimeWindowStart: centeredWindowMetadata.windowStart,
+                      eventTimeWindowEnd: centeredWindowMetadata.windowEnd,
+                      eventTimeWindowClose:
+                        centeredWindowMetadata.windowDataCloseTime,
+                      wallClockWindowClose,
+                      wallClockCloseToResultMs,
+                      latencyDomainStatus,
+                      anchorAlignedWindowClose: wallClockWindowClose,
+                      anchorAlignedWindowCloseToResultMs:
                         wallClockCloseToResultMs,
-                        latencyDomainStatus,
-                        anchorAlignedWindowClose: wallClockWindowClose,
-                        anchorAlignedWindowCloseToResultMs:
-                          wallClockCloseToResultMs,
-                      },
-                    ),
+                    } as ChunkedBenchmarkWindowMetadata,
+                    coverageComplete,
+                  }),
                 )
               : outputQueryEvent,
           ),
@@ -2161,37 +2208,17 @@ For example, the allResults object might look like this:
         // Publish the output query event to the MQTT broker
         const resultTopic = getResultTopic("output");
         const useBenchmarkPayload = Boolean(process.env.RESULT_TOPIC);
+        const coverageComplete = proofEntry?.coverageComplete ?? false;
         const payload = useBenchmarkPayload
           ? JSON.stringify(
-              buildBenchmarkResultPayload(
-                "chunked",
-                detectAggregationFunction as AggregationFunction,
-                this.sessionId,
-                Number.parseFloat(resultValue),
-                this.windowCount,
-                comparableDiagnostics
-                  ? {
-                      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
-                      windowStart: comparableDiagnostics.externalWindowStart,
-                      windowEnd: comparableDiagnostics.externalWindowEnd,
-                      recomposedCount: comparableDiagnostics.recomposedCount,
-                      recomposedSum: comparableDiagnostics.recomposedSum,
-                      recomposedAvg: comparableDiagnostics.recomposedAvg,
-                      internalChunkIds: comparableDiagnostics.internalChunkGroupIds,
-                      internalChunks: comparableDiagnostics.internalChunks,
-                    }
-                  : {},
-                {
-                  windowSemantics: centeredWindowMetadata.windowSemantics,
-                  logicalTriggerTime: centeredWindowMetadata.logicalTriggerTime,
-                  windowStart: centeredWindowMetadata.windowStart,
-                  windowEnd: centeredWindowMetadata.windowEnd,
-                  windowDataCloseTime:
-                    centeredWindowMetadata.windowDataCloseTime,
-                  resultEmittedAt: centeredWindowMetadata.resultEmittedAt,
-                  latencyFromLogicalTriggerMs: null,
-                  latencyFromWindowCloseMs: null,
-                  metadataSource: centeredWindowMetadata.metadataSource,
+              this.buildChunkedBenchmarkPayload({
+                aggregationFunction:
+                  detectAggregationFunction as AggregationFunction,
+                resultValue: Number.parseFloat(resultValue),
+                windowNumber: this.windowCount,
+                comparableDiagnostics,
+                centeredWindowMetadata: {
+                  ...centeredWindowMetadata,
                   registrationAnchoredExpectedClose,
                   eventTimeWindowStart: centeredWindowMetadata.windowStart,
                   eventTimeWindowEnd: centeredWindowMetadata.windowEnd,
@@ -2203,8 +2230,9 @@ For example, the allResults object might look like this:
                   anchorAlignedWindowClose: wallClockWindowClose,
                   anchorAlignedWindowCloseToResultMs:
                     wallClockCloseToResultMs,
-                },
-              ),
+                } as ChunkedBenchmarkWindowMetadata,
+                coverageComplete,
+              }),
             )
           : outputQueryEvent;
         this.logger.log(`calculated result ${payload}`);

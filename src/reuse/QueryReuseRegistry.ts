@@ -29,6 +29,7 @@ export interface ActiveExecutionHandle {
   workerIds: string[];
   producerIds?: string[];
   producerTopics?: string[];
+  producerSnapshots?: import("../services/reuse/SubqueryProducerManager").SubqueryProducerRuntimeSnapshot[];
   state: ExecutionState;
   stop(): Promise<void>;
 }

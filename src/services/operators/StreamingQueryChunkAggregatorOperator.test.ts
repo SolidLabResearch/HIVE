@@ -1917,5 +1917,54 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
                 timeoutSpy.mockRestore();
             }
         });
+
+        test('completed reconstruction payload carries comparable top-level aggregates', () => {
+            (operator as any).windowRange = 180000;
+            (operator as any).windowSlide = 60000;
+            (operator as any).sessionId = 'chunked-session';
+            const payload = (operator as any).buildChunkedBenchmarkPayload({
+                aggregationFunction: 'AVG',
+                resultValue: 3.5,
+                windowNumber: 1,
+                comparableDiagnostics: {
+                    externalWindowNumber: 1,
+                    externalWindowStart: 1000,
+                    externalWindowEnd: 181000,
+                    internalChunkGroupIds: ['g1', 'g2', 'g3'],
+                    internalChunks: [],
+                    recomposedCount: 9,
+                    recomposedSum: 31.5,
+                    recomposedAvg: 3.5,
+                    resultValue: 3.5,
+                },
+                centeredWindowMetadata: {
+                    windowSemantics: 'trailing',
+                    logicalTriggerTime: 181000,
+                    windowStart: 1000,
+                    windowEnd: 181000,
+                    windowDataCloseTime: 181000,
+                    resultEmittedAt: 182000,
+                    latencyFromLogicalTriggerMs: null,
+                    latencyFromWindowCloseMs: null,
+                    metadataSource: 'reconstructed',
+                },
+                coverageComplete: true,
+            });
+
+            expect(payload.rangeMs).toBe(180000);
+            expect(payload.stepMs).toBe(60000);
+            expect(payload.eventCount).toBe(9);
+            expect(payload.sumValue).toBe(31.5);
+            expect(payload.avgValue).toBe(3.5);
+            expect(payload.count).toBe(9);
+            expect(payload.sum).toBe(31.5);
+            expect(payload.average).toBe(3.5);
+            expect(payload.comparableWindow).toBe(true);
+            expect(payload.isComparableWindow).toBe(true);
+            expect(payload.isPartialWindow).toBe(false);
+            expect(payload.coverageComplete).toBe(true);
+            expect(payload.windowStart).toBe(1000);
+            expect(payload.windowEnd).toBe(181000);
+        });
     });
 });

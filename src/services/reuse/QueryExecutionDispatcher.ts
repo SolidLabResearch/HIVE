@@ -22,6 +22,7 @@ import {
 } from "../../util/queryTargets";
 import {
   SubqueryProducerHandle,
+  SubqueryProducerRuntimeSnapshot,
   SubqueryProducerManager,
 } from "./SubqueryProducerManager";
 
@@ -180,6 +181,7 @@ export class QueryExecutionDispatcher {
   private readonly beeKeeper: BeeKeeper;
   private readonly listener: DispatchListener;
   private readonly producerManager: SubqueryProducerManager;
+  private readonly executionOwnerById = new Map<string, string>();
 
   constructor(
     beeKeeper = new BeeKeeper(),
@@ -193,7 +195,12 @@ export class QueryExecutionDispatcher {
       new SubqueryProducerManager(undefined, {
         onProducerFailed: (dependentExecutionIds, _producerId, reason) => {
           for (const dependentExecutionId of dependentExecutionIds) {
-            this.listener.onExecutionFailed?.(dependentExecutionId, reason);
+            const canonicalQueryId =
+              this.executionOwnerById.get(dependentExecutionId);
+            if (canonicalQueryId) {
+              this.executionOwnerById.delete(dependentExecutionId);
+              this.listener.onExecutionFailed?.(canonicalQueryId, reason);
+            }
           }
         },
       });
@@ -224,10 +231,14 @@ export class QueryExecutionDispatcher {
     }
 
     const runtimePlan = deriveSubqueryPlan(request.query);
-    if (request.approach === "approximation") {
+    if (
+      request.approach === "approximation" ||
+      request.approach === "chunked"
+    ) {
+      this.executionOwnerById.set(executionId, request.canonicalQueryId);
       const producers = await this.producerManager.ensureProducers(
         runtimePlan.subQueries,
-        request.canonicalQueryId,
+        executionId,
       );
       try {
         return this.createBeeExecution(
@@ -238,7 +249,8 @@ export class QueryExecutionDispatcher {
           producers,
         );
       } catch (error) {
-        await this.producerManager.releaseExecution(request.canonicalQueryId);
+        this.executionOwnerById.delete(executionId);
+        await this.producerManager.releaseExecution(executionId);
         throw error;
       }
     }
@@ -298,6 +310,7 @@ export class QueryExecutionDispatcher {
       request.approach === "approximation"
         ? "ApproximationApproachOperator"
         : "StreamingQueryChunkAggregatorOperator";
+    const usesSharedProducers = producerHandles.length > 0;
     let resolved = false;
     let handle!: MutableExecutionHandle;
     const readySignal =
@@ -343,10 +356,9 @@ export class QueryExecutionDispatcher {
                 `worker exited before activation code=${code} signal=${signal}`,
               ),
             );
-            if (request.approach === "approximation") {
-              void this.producerManager.releaseExecution(
-                request.canonicalQueryId,
-              );
+            if (usesSharedProducers) {
+              this.executionOwnerById.delete(executionId);
+              void this.producerManager.releaseExecution(executionId);
             }
             this.listener.onExecutionFailed?.(
               request.canonicalQueryId,
@@ -356,10 +368,9 @@ export class QueryExecutionDispatcher {
           }
           if (handle.state !== "stopping" && handle.state !== "stopped") {
             handle.state = "failed";
-            if (request.approach === "approximation") {
-              void this.producerManager.releaseExecution(
-                request.canonicalQueryId,
-              );
+            if (usesSharedProducers) {
+              this.executionOwnerById.delete(executionId);
+              void this.producerManager.releaseExecution(executionId);
             }
             this.listener.onExecutionFailed?.(
               request.canonicalQueryId,
@@ -370,10 +381,9 @@ export class QueryExecutionDispatcher {
         onError: (error) => {
           handle.state = "failed";
           readySignal?.reject(error);
-          if (request.approach === "approximation") {
-            void this.producerManager.releaseExecution(
-              request.canonicalQueryId,
-            );
+          if (usesSharedProducers) {
+            this.executionOwnerById.delete(executionId);
+            void this.producerManager.releaseExecution(executionId);
           }
           this.listener.onExecutionFailed?.(
             request.canonicalQueryId,
@@ -391,12 +401,14 @@ export class QueryExecutionDispatcher {
       workerIds: worker.getPid() ? [String(worker.getPid())] : [],
       producerIds: producerHandles.map((handle) => handle.producerId),
       producerTopics: producerHandles.map((handle) => handle.outputTopic),
+      producerSnapshots: this.buildProducerSnapshots(producerHandles),
       state: "starting",
       stop: async () => {
         handle.state = "stopping";
         worker.stop();
-        if (request.approach === "approximation") {
-          await this.producerManager.releaseExecution(request.canonicalQueryId);
+        if (usesSharedProducers) {
+          this.executionOwnerById.delete(executionId);
+          await this.producerManager.releaseExecution(executionId);
         }
         handle.state = "stopped";
       },
@@ -423,12 +435,27 @@ export class QueryExecutionDispatcher {
     } catch (error) {
       handle.state = "failed";
       worker.stop();
+      if (usesSharedProducers) {
+        this.executionOwnerById.delete(executionId);
+        await this.producerManager.releaseExecution(executionId);
+      }
       this.listener.onExecutionFailed?.(
         request.canonicalQueryId,
         error instanceof Error ? error.message : String(error),
       );
       throw error;
     }
+  }
+
+  private buildProducerSnapshots(
+    producerHandles: SubqueryProducerHandle[],
+  ): SubqueryProducerRuntimeSnapshot[] | undefined {
+    if (producerHandles.length === 0) {
+      return undefined;
+    }
+    return this.producerManager.getProducerSnapshots(
+      producerHandles.map((handle) => handle.producerId),
+    );
   }
 }
 

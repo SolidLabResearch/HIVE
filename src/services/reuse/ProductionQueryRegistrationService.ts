@@ -7,6 +7,7 @@ import {
   RegistrationApproach,
   deriveCanonicalQueryId,
 } from "./QueryExecutionDispatcher";
+import { SubqueryProducerRuntimeSnapshot } from "./SubqueryProducerManager";
 
 export type RuntimeRegistrationRequest = {
   approach: RegistrationApproach;
@@ -27,6 +28,7 @@ export type RuntimeRegistrationResponse = {
   executionState: string;
   containmentDecision: QueryReuseDecisionEvent;
   registrationTimestamp: number;
+  producerSnapshots?: SubqueryProducerRuntimeSnapshot[];
 };
 
 export class ProductionQueryRegistrationService {
@@ -85,6 +87,7 @@ export class ProductionQueryRegistrationService {
           timestamp: registrationTimestamp,
         },
         registrationTimestamp,
+        producerSnapshots: execution.producerSnapshots,
       };
     }
 
@@ -115,6 +118,7 @@ export class ProductionQueryRegistrationService {
       executionState: resolved.entry.state || "active",
       containmentDecision: resolved.decision,
       registrationTimestamp,
+      producerSnapshots: resolved.entry.runtimeHandle?.producerSnapshots,
     };
   }
 }

@@ -37,6 +37,19 @@ class FakeProducerManager {
       stop: async () => undefined,
     },
   ];
+  public snapshots = [
+    {
+      producerId: "producer-1",
+      canonicalSubqueryId: "producer-1",
+      canonicalQuery: "canonical-subquery-1",
+      query: "subquery-1",
+      outputTopic: "chunked/producer-1",
+      pid: 9001,
+      state: "ready" as const,
+      referenceCount: 1,
+      dependentExecutionIds: ["execution-1"],
+    },
+  ];
 
   async ensureProducers(
     queries: string[],
@@ -51,6 +64,10 @@ class FakeProducerManager {
 
   async releaseExecution(executionId: string): Promise<void> {
     this.releaseCalls.push(executionId);
+  }
+
+  getProducerSnapshots() {
+    return this.snapshots;
   }
 }
 
@@ -221,7 +238,7 @@ WHERE {
     worker.callbacks.onExit?.({ code: 1, signal: null });
 
     expect(handle.state).toBe("failed");
-    expect(producerManager.releaseCalls).toContain("canonical-query");
+    expect(producerManager.releaseCalls).toContain(handle.executionId);
     expect(onExecutionFailed).toHaveBeenCalledWith(
       "canonical-query",
       expect.stringContaining("worker exited code=1"),
@@ -260,6 +277,120 @@ WHERE {
     ).rejects.toThrow("producer startup failed");
 
     expect(beeKeeper.executeQuery).not.toHaveBeenCalled();
+  });
+
+  test("shares chunked producers across distinct final ranges and keeps final executions separate", async () => {
+    const worker = new FakeWorker();
+    const producerManager = new FakeProducerManager();
+    producerManager.handles = [
+      {
+        producerId: "producer-wearable",
+        canonicalSubqueryId: "producer-wearable",
+        query: "subquery-wearable",
+        outputTopic: "chunked/producer-wearable",
+        pid: 9001,
+        state: "ready" as const,
+        ready: Promise.resolve(),
+        stop: async () => undefined,
+      },
+      {
+        producerId: "producer-smartphone",
+        canonicalSubqueryId: "producer-smartphone",
+        query: "subquery-smartphone",
+        outputTopic: "chunked/producer-smartphone",
+        pid: 9002,
+        state: "ready" as const,
+        ready: Promise.resolve(),
+        stop: async () => undefined,
+      },
+    ];
+    (producerManager as any).getProducerSnapshots = jest.fn().mockReturnValue([
+      {
+        producerId: "producer-smartphone",
+        canonicalSubqueryId: "producer-smartphone",
+        canonicalQuery: "canonical-smartphone",
+        query: "subquery-smartphone",
+        outputTopic: "chunked/producer-smartphone",
+        pid: 9002,
+        state: "ready",
+        referenceCount: 3,
+        dependentExecutionIds: ["chunked-a", "chunked-b", "chunked-c"],
+      },
+      {
+        producerId: "producer-wearable",
+        canonicalSubqueryId: "producer-wearable",
+        canonicalQuery: "canonical-wearable",
+        query: "subquery-wearable",
+        outputTopic: "chunked/producer-wearable",
+        pid: 9001,
+        state: "ready",
+        referenceCount: 3,
+        dependentExecutionIds: ["chunked-a", "chunked-b", "chunked-c"],
+      },
+    ]);
+    const beeKeeper = {
+      executeQuery: jest.fn().mockImplementation(
+        (
+          _query: string,
+          _topic: string,
+          _operator: string,
+          _subQueries: string[],
+          _env: Record<string, string>,
+          callbacks: {
+            onMessage?: (message: unknown) => void;
+            onExit?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
+            onError?: (error: Error) => void;
+          },
+        ) => {
+          callbacks.onMessage?.({ type: "chunked_worker_ready", readyAt: Date.now() });
+          return worker;
+        },
+      ),
+    };
+    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any);
+
+    const q120 = `
+PREFIX mqtt_broker: <mqtt://localhost:1883/>
+PREFIX saref: <https://saref.etsi.org/core/>
+PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
+REGISTER RStream <output-120> AS
+SELECT (AVG(?value) AS ?avgValue)
+FROM NAMED WINDOW <mqtt://localhost:1883/wearableX> ON STREAM mqtt_broker:wearableX [RANGE 120000 STEP 60000]
+FROM NAMED WINDOW <mqtt://localhost:1883/smartphoneX> ON STREAM mqtt_broker:smartphoneX [RANGE 120000 STEP 60000]
+WHERE {
+  { WINDOW <mqtt://localhost:1883/wearableX> { ?s1 saref:hasValue ?value . ?s1 saref:hasTimestamp ?ts . ?s1 saref:relatesToProperty dahccsensors:wearableX . } }
+  UNION
+  { WINDOW <mqtt://localhost:1883/smartphoneX> { ?s2 saref:hasValue ?value . ?s2 saref:hasTimestamp ?ts . ?s2 saref:relatesToProperty dahccsensors:smartphoneX . } }
+}
+`;
+    const q180 = q120.replaceAll("120000", "180000").replace("output-120", "output-180");
+
+    const firstHandle = await dispatcher.createExecution({
+      approach: "chunked",
+      canonicalQueryId: "canonical-120",
+      query: q120,
+      requestedOutputTopic: "consumer-topic-120",
+    });
+    const secondHandle = await dispatcher.createExecution({
+      approach: "chunked",
+      canonicalQueryId: "canonical-180",
+      query: q180,
+      requestedOutputTopic: "consumer-topic-180",
+    });
+
+    expect(producerManager.ensureCalls).toHaveLength(2);
+    expect(firstHandle.executionId).not.toBe(secondHandle.executionId);
+    expect(firstHandle.sharedOutputTopic).not.toBe(secondHandle.sharedOutputTopic);
+    expect(firstHandle.producerIds).toEqual([
+      "producer-wearable",
+      "producer-smartphone",
+    ]);
+    expect(secondHandle.producerIds).toEqual([
+      "producer-wearable",
+      "producer-smartphone",
+    ]);
+    expect(firstHandle.producerSnapshots).toHaveLength(2);
+    expect(beeKeeper.executeQuery).toHaveBeenCalledTimes(2);
   });
 
   test("normalizes benchmark-prefixed stream topics before deriving reusable subqueries", async () => {

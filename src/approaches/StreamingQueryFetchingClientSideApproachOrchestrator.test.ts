@@ -64,11 +64,25 @@ jest.mock("rsp-js", () => {
       getStream: jest.fn().mockReturnValue({ add: jest.fn() }),
     })),
     RSPQLParser: jest.fn().mockImplementation(() => ({
-      parse: jest.fn().mockReturnValue({
-        s2r: [
-          { stream_name: "mqtt://localhost:1883/wearableX" },
-          { stream_name: "mqtt://localhost:1883/smartphoneX" },
-        ],
+      parse: jest.fn().mockImplementation((query: string) => {
+        const rangeMatch = query.match(/RANGE\s+(\d+)/i);
+        const stepMatch = query.match(/STEP\s+(\d+)/i);
+        const range = Number.parseInt(rangeMatch?.[1] || "120000", 10);
+        const step = Number.parseInt(stepMatch?.[1] || "60000", 10);
+        return {
+          s2r: [
+            {
+              stream_name: "mqtt://localhost:1883/wearableX",
+              width: range,
+              slide: step,
+            },
+            {
+              stream_name: "mqtt://localhost:1883/smartphoneX",
+              width: range,
+              slide: step,
+            },
+          ],
+        };
       }),
     })),
     RDFStream: jest.fn(),
@@ -95,6 +109,8 @@ SELECT (AVG(?v) AS ?avg)
 FROM NAMED WINDOW :wout ON STREAM :streamOut [RANGE 120000 STEP 60000]
 WHERE { WINDOW :wout { ?sensor :value ?v } }
 `;
+
+const QUERY_Q180 = QUERY.replace("RANGE 120000", "RANGE 180000");
 
 const WINDOW_START = 1756123145256;
 const WINDOW_END = 1756123265256;
@@ -317,6 +333,107 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     expect(mqttClients).toHaveLength(1);
     mqttClients[0].emit("connect");
     expect(mqttClients[0].publish).toHaveBeenCalledTimes(1);
+  });
+
+  test("derives final range and step from the registered query for longer windows", async () => {
+    configureEnv({
+      STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
+      OUTPUT_WINDOW_RANGE: "120000",
+      OUTPUT_WINDOW_STEP: "60000",
+    });
+    const operator = new FetchingAllDataClientSide(
+      QUERY_Q180,
+      "mqtt://localhost:1883/result",
+      "AVG",
+    );
+    createdOperators.push(operator);
+
+    expect((operator as any).windowRange).toBe(180000);
+    expect((operator as any).expectedWindowInterval).toBe(60000);
+    expect((operator as any).expectedEventCount).toBe(3600);
+  });
+
+  test("publishes query-specific top-level window metadata and aggregates for Q180", async () => {
+    configureEnv({
+      STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
+      OUTPUT_WINDOW_RANGE: "120000",
+      OUTPUT_WINDOW_STEP: "60000",
+      RESULT_TOPIC: "benchmark-payload-enabled",
+    });
+    const operator = new FetchingAllDataClientSide(
+      QUERY_Q180,
+      "mqtt://localhost:1883/result",
+      "AVG",
+    );
+    createdOperators.push(operator);
+    expect(lastRStreamEmitter).toBeTruthy();
+
+    const q180WindowStart = WINDOW_START;
+    const q180WindowEnd = WINDOW_START + 180000;
+    const q180LastEventIso = new Date(q180WindowEnd - 1000).toISOString();
+    const eventCount = 3600;
+    const avgValue = 2;
+    const sumValue = eventCount * avgValue;
+    const instance = operator as any;
+    instance.observationsByStream.set(
+      "mqtt://localhost:1883/wearableX",
+      Array.from({ length: 1800 }, (_value, index) => ({
+        timestamp: q180WindowStart + index * 100,
+        value: avgValue,
+      })),
+    );
+    instance.observationsByStream.set(
+      "mqtt://localhost:1883/smartphoneX",
+      Array.from({ length: 1800 }, (_value, index) => ({
+        timestamp: q180WindowStart + index * 100,
+        value: avgValue,
+      })),
+    );
+    instance.latestObservationTimestampByStream.set(
+      "mqtt://localhost:1883/wearableX",
+      q180WindowEnd + 1,
+    );
+    instance.latestObservationTimestampByStream.set(
+      "mqtt://localhost:1883/smartphoneX",
+      q180WindowEnd + 1,
+    );
+    instance.benchmarkReplayComplete = true;
+    instance.benchmarkFiniteReplayMode = true;
+
+    lastRStreamEmitter?.emit("RStream", {
+      window: {
+        open: q180WindowStart,
+        close: q180WindowEnd,
+      },
+      bindings: [
+        new Map([
+          ["?resultValue", { value: String(avgValue) }],
+          ["?eventCount", { value: String(eventCount) }],
+          ["?sumValue", { value: String(sumValue) }],
+          ["?avgValue", { value: String(avgValue) }],
+          ["?firstEventTimestamp", { value: new Date(q180WindowStart).toISOString() }],
+          ["?lastEventTimestamp", { value: q180LastEventIso }],
+        ]),
+      ],
+    });
+    await waitForAsyncProcessing(() => mqttClients.length === 1);
+
+    mqttClients[0].emit("connect");
+    const payloadText = mqttClients[0].publish.mock.calls[0][1];
+    const payload = JSON.parse(payloadText);
+    expect(payload.rangeMs).toBe(180000);
+    expect(payload.stepMs).toBe(60000);
+    expect(payload.windowStart).toBe(q180WindowStart);
+    expect(payload.windowEnd).toBe(q180WindowEnd);
+    expect(payload.eventCount).toBe(eventCount);
+    expect(payload.sumValue).toBe(sumValue);
+    expect(payload.avgValue).toBe(avgValue);
+    expect(payload.count).toBe(eventCount);
+    expect(payload.sum).toBe(sumValue);
+    expect(payload.average).toBe(avgValue);
+    expect(payload.comparableWindow).toBe(true);
+    expect(payload.isComparableWindow).toBe(true);
+    expect(payload.coverageComplete).toBe(true);
   });
 
   test("duplicate windows are still suppressed in deterministic mode", async () => {

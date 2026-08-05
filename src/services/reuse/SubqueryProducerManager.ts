@@ -19,6 +19,18 @@ export type SubqueryProducerHandle = {
   stop(): Promise<void>;
 };
 
+export type SubqueryProducerRuntimeSnapshot = {
+  producerId: string;
+  canonicalSubqueryId: string;
+  canonicalQuery: string;
+  query: string;
+  outputTopic: string;
+  pid?: number;
+  state: SubqueryProducerState;
+  referenceCount: number;
+  dependentExecutionIds: string[];
+};
+
 type RuntimeProducerHandle = {
   pid?: number;
   ready: Promise<void>;
@@ -235,6 +247,31 @@ export class SubqueryProducerManager {
 
   getActiveHandles(): SubqueryProducerHandle[] {
     return Array.from(this.entries.values()).map((entry) => entry.handle);
+  }
+
+  getProducerSnapshots(
+    producerIds?: string[],
+  ): SubqueryProducerRuntimeSnapshot[] {
+    const requestedIds = producerIds ? new Set(producerIds) : null;
+    return Array.from(this.entries.values())
+      .filter((entry) =>
+        requestedIds ? requestedIds.has(entry.handle.producerId) : true,
+      )
+      .map((entry) => {
+        const identity = buildSubqueryRuntimeIdentity(entry.handle.query);
+        return {
+          producerId: entry.handle.producerId,
+          canonicalSubqueryId: entry.handle.canonicalSubqueryId,
+          canonicalQuery: identity.canonicalQuery,
+          query: entry.handle.query,
+          outputTopic: entry.handle.outputTopic,
+          pid: entry.handle.pid,
+          state: entry.handle.state,
+          referenceCount: entry.dependentExecutionIds.size,
+          dependentExecutionIds: Array.from(entry.dependentExecutionIds).sort(),
+        };
+      })
+      .sort((left, right) => left.producerId.localeCompare(right.producerId));
   }
 
   private async handleProducerFailure(

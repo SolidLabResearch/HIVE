@@ -155,8 +155,8 @@ export function logLatency(args: {
   const emissionReason = args.proofEntry?.emissionReason ?? "unknown";
   const metadata = args.metadata ?? buildBenchmarkWindowMetadata({
     windowSemantics: process.env.RSP_WINDOW_SEMANTICS || "trailing",
-    logicalTriggerTime: args.expectedWindowClose - 60000,
-    windowStart: args.expectedWindowClose - 120000,
+    logicalTriggerTime: args.expectedWindowClose - args.windowSlide,
+    windowStart: args.expectedWindowClose - args.windowRange,
     windowEnd: args.expectedWindowClose,
     windowDataCloseTime: args.expectedWindowClose,
     resultEmittedAt: args.resultTime,

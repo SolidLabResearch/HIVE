@@ -25,6 +25,10 @@ WHERE {
 `;
 }
 
+function buildRangeVariantQuery(output: string, rangeMs: number): string {
+  return buildQuery(output).replace("[RANGE 120000 STEP 60000]", `[RANGE ${rangeMs} STEP 60000]`);
+}
+
 function buildVariantQuery(
   output: string,
   variant: "base" | "comment" | "aliases" | "alpha" = "base",
@@ -252,5 +256,38 @@ describe("ProductionQueryRegistrationService", () => {
     expect(second.executionId).not.toBe(first.executionId);
     expect(second.reuseHit).toBe(false);
     expect(containmentService.checkEquivalence).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps different final ranges in separate final executions with no final reuse hit", async () => {
+    const dispatcher = new FakeDispatcher();
+    const service = new ProductionQueryRegistrationService(
+      new QueryReuseRegistry(new RSPQLContainmentService()),
+      dispatcher as unknown as QueryExecutionDispatcher,
+    );
+
+    const q120 = await service.register({
+      approach: "chunked",
+      query: buildRangeVariantQuery("consumer-120-output", 120000),
+      requestedOutputTopic: "consumer-topic-120",
+      ownerQueryId: "query-120",
+      consumerId: "consumer-120",
+    });
+    const q180 = await service.register({
+      approach: "chunked",
+      query: buildRangeVariantQuery("consumer-180-output", 180000),
+      requestedOutputTopic: "consumer-topic-180",
+      ownerQueryId: "query-180",
+      consumerId: "consumer-180",
+    });
+
+    expect(dispatcher.calls).toHaveLength(2);
+    expect(q120.canonicalQueryId).not.toBe(q180.canonicalQueryId);
+    expect(q120.executionId).not.toBe(q180.executionId);
+    expect(q120.executionCreated).toBe(true);
+    expect(q180.executionCreated).toBe(true);
+    expect(q120.reuseHit).toBe(false);
+    expect(q180.reuseHit).toBe(false);
+    expect(q120.containmentDecision.mutuallyContained).toBe(false);
+    expect(q180.containmentDecision.mutuallyContained).toBe(false);
   });
 });

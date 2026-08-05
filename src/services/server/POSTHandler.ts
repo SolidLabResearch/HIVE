@@ -130,6 +130,7 @@ export class POSTHandler {
             executionState: registration.executionState,
             reuseDecision: registration.containmentDecision,
             registrationTimestamp: registration.registrationTimestamp,
+            producerSnapshots: registration.producerSnapshots,
         }));
         return;
     }

@@ -134,6 +134,36 @@ WHERE {
     expect(manager.getActiveHandles()).toHaveLength(0);
   });
 
+  test("reports dependent execution ids and reference count for shared producer", async () => {
+    const runtimeFactory = new FakeRuntimeFactory();
+    const manager = new SubqueryProducerManager(runtimeFactory as any);
+
+    const handle = await manager.ensureProducer(query, "execution-1");
+    await manager.ensureProducer(query, "execution-2");
+    await manager.ensureProducer(query, "execution-3");
+
+    const [snapshot] = manager.getProducerSnapshots([handle.producerId]);
+    expect(snapshot.producerId).toBe(handle.producerId);
+    expect(snapshot.referenceCount).toBe(3);
+    expect(snapshot.dependentExecutionIds).toEqual([
+      "execution-1",
+      "execution-2",
+      "execution-3",
+    ]);
+
+    await manager.releaseExecution("execution-2");
+    const [afterSingleRelease] = manager.getProducerSnapshots([handle.producerId]);
+    expect(afterSingleRelease.referenceCount).toBe(2);
+    expect(afterSingleRelease.dependentExecutionIds).toEqual([
+      "execution-1",
+      "execution-3",
+    ]);
+
+    await manager.releaseExecution("execution-1");
+    await manager.releaseExecution("execution-3");
+    expect(manager.getProducerSnapshots([handle.producerId])).toEqual([]);
+  });
+
   test("invalidates failed producer and notifies dependents", async () => {
     const runtimeFactory = new FakeRuntimeFactory();
     const onProducerFailed = jest.fn();
