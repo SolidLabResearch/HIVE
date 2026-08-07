@@ -16,6 +16,10 @@ export class POSTHandler {
         this.registrationService = service;
     }
 
+    public static async shutdownRegistrationService(): Promise<void> {
+        await this.registrationService.shutdown();
+    }
+
     /**
      *
      * @param request

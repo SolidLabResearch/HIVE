@@ -322,17 +322,43 @@ export function buildSubQuerySelectClause(
   const minAlias = `?min${topicSuffix}`;
   const maxAlias = `?max${topicSuffix}`;
 
-  if (aggregation === "COUNT") {
-    return `(COUNT(?value) AS ${aggAlias}) (COUNT(?value) AS ${countAlias}) (SUM(?value) AS ${sumAlias}) (AVG(?value) AS ${avgAlias}) (MIN(?value) AS ${minAlias}) (MAX(?value) AS ${maxAlias})`;
+  const projections: string[] = [];
+  projections.push(`(${aggregation}(?value) AS ${aggAlias})`);
+  if (aggregation !== "COUNT") {
+    projections.push(`(COUNT(?value) AS ${countAlias})`);
   }
-
-  return `(${aggregation}(?value) AS ${aggAlias}) (COUNT(?value) AS ${countAlias}) (SUM(?value) AS ${sumAlias}) (AVG(?value) AS ${avgAlias}) (MIN(?value) AS ${minAlias}) (MAX(?value) AS ${maxAlias})`;
+  if (aggregation !== "SUM") {
+    projections.push(`(SUM(?value) AS ${sumAlias})`);
+  }
+  if (aggregation !== "AVG") {
+    projections.push(`(AVG(?value) AS ${avgAlias})`);
+  }
+  if (aggregation !== "MIN") {
+    projections.push(`(MIN(?value) AS ${minAlias})`);
+  }
+  if (aggregation !== "MAX") {
+    projections.push(`(MAX(?value) AS ${maxAlias})`);
+  }
+  return projections.join(" ");
 }
 
 export function buildOutputSelectClause(
   aggregation: AggregationFunction,
 ): string {
-  return `(${aggregation}(?value) AS ?resultValue) (COUNT(?value) AS ?eventCount) (SUM(?value) AS ?sumValue) (AVG(?value) AS ?avgValue) (MIN(?ts) AS ?firstEventTimestamp) (MAX(?ts) AS ?lastEventTimestamp)`;
+  const projections: string[] = [];
+  projections.push(`(${aggregation}(?value) AS ?resultValue)`);
+  if (aggregation !== "COUNT") {
+    projections.push(`(COUNT(?value) AS ?eventCount)`);
+  }
+  if (aggregation !== "SUM") {
+    projections.push(`(SUM(?value) AS ?sumValue)`);
+  }
+  if (aggregation !== "AVG") {
+    projections.push(`(AVG(?value) AS ?avgValue)`);
+  }
+  projections.push(`(MIN(?ts) AS ?firstEventTimestamp)`);
+  projections.push(`(MAX(?ts) AS ?lastEventTimestamp)`);
+  return projections.join(" ");
 }
 
 export function buildBenchmarkResultPayload(

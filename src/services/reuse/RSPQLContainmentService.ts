@@ -125,6 +125,9 @@ function normalizeQueryForChecker(query: string): string {
 
 function inferFailureKind(error: unknown): ContainmentFailureReason {
   const message = error instanceof Error ? error.message : String(error);
+  if (/unsupported_query/i.test(message) || /fail-closed/i.test(message)) {
+    return "UNSUPPORTED_QUERY";
+  }
   if (/timeout/i.test(message)) {
     return "TIMEOUT";
   }
@@ -363,6 +366,10 @@ export class RSPQLContainmentService {
 
   private parseForChecker(query: string): ParsedCheckerQuery {
     const sanitizedQuery = normalizeQueryForChecker(query);
+    const unsupported = this.detectUnsupportedSyntax(sanitizedQuery);
+    if (unsupported) {
+      throw new Error(`UNSUPPORTED_QUERY: ${unsupported}`);
+    }
     const parsed = this.createParser().parse(sanitizedQuery);
     if (!parsed?.sparql) {
       throw new Error("Parsed queries do not contain valid SPARQL");
@@ -378,7 +385,7 @@ export class RSPQLContainmentService {
       windowSlides: Array.isArray(parsed.s2r)
         ? parsed.s2r.map((entry: { slide: number }) => Number(entry.slide))
         : [],
-      aggregationFunction: String(parsed.aggregation_function || "").toUpperCase(),
+      aggregationFunction: detectAggregationFromSelect(query),
       r2sOperator: String(parsed.r2s?.operator || ""),
     };
   }
@@ -409,14 +416,16 @@ export class RSPQLContainmentService {
   }
 
   private async runChecker(subQuery: string, superQuery: string): Promise<boolean> {
+    const deduppedSub = deduplicateSelectExpressions(subQuery);
+    const deduppedSuper = deduplicateSelectExpressions(superQuery);
     const checker = this.createChecker();
     const parser = this.createParser();
     const specsWrapper = this.createSPeCSWrapper();
     // The package-level checker is the public API. We still invoke the wrapper directly
     // to preserve timeout and ambiguous-result classification.
-    await checker.checkContainment(subQuery, superQuery);
-    const parsedSub = parser.parse(subQuery);
-    const parsedSuper = parser.parse(superQuery);
+    await checker.checkContainment(deduppedSub, deduppedSuper);
+    const parsedSub = parser.parse(deduppedSub);
+    const parsedSuper = parser.parse(deduppedSuper);
     const specsResult = await specsWrapper.runSPeCS({
       subquery: parsedSub.sparql,
       superquery: parsedSuper.sparql,
@@ -459,7 +468,7 @@ export class RSPQLContainmentService {
   }
 
   private createParser(): RSPQLParser {
-    return new RSPQLParser();
+    return new DeduplicatingRSPQLParser();
   }
 
   private createChecker(): ContainmentChecker {
@@ -471,4 +480,168 @@ export class RSPQLContainmentService {
   private createSPeCSWrapper(): SPeCSWrapper {
     return new SPeCSWrapper();
   }
+}
+
+class DeduplicatingRSPQLParser extends RSPQLParser {
+  parse(query: string) {
+    const deduppedQuery = deduplicateSelectExpressions(query);
+    return super.parse(deduppedQuery);
+  }
+}
+
+type ProjectionExpression = {
+  raw: string;
+  variable: string | null;
+  alias: string | null;
+  aggregation: string | null;
+};
+
+function parseSelectClause(selectClauseStr: string): ProjectionExpression[] {
+  const expressions: ProjectionExpression[] = [];
+  let remaining = selectClauseStr.trim();
+  while (remaining.length > 0) {
+    if (remaining.startsWith("(")) {
+      let depth = 0;
+      let endIdx = -1;
+      for (let i = 0; i < remaining.length; i++) {
+        if (remaining[i] === "(") depth++;
+        else if (remaining[i] === ")") {
+          depth--;
+          if (depth === 0) {
+            endIdx = i;
+            break;
+          }
+        }
+      }
+      if (endIdx === -1) {
+        throw new Error("Malformed SELECT clause: unbalanced parentheses");
+      }
+      const rawExpr = remaining.substring(0, endIdx + 1);
+      remaining = remaining.substring(endIdx + 1).trim();
+      
+      const aggMatch = rawExpr.match(/^\(\s*(AVG|COUNT|SUM|MIN|MAX)\s*\(\s*(\?[A-Za-z_][\w-]*)\s*\)\s+AS\s+(\?[A-Za-z_][\w-]*)\s*\)$/i);
+      if (aggMatch) {
+        expressions.push({
+          raw: rawExpr,
+          aggregation: aggMatch[1].toUpperCase(),
+          variable: aggMatch[2],
+          alias: aggMatch[3],
+        });
+        continue;
+      }
+      
+      const aliasMatch = rawExpr.match(/^\(\s*(\?[A-Za-z_][\w-]*)\s+AS\s+(\?[A-Za-z_][\w-]*)\s*\)$/i);
+      if (aliasMatch) {
+        expressions.push({
+          raw: rawExpr,
+          aggregation: null,
+          variable: aliasMatch[1],
+          alias: aliasMatch[2],
+        });
+        continue;
+      }
+      
+      throw new Error(`Unsupported SELECT projection expression syntax: ${rawExpr}`);
+    } else if (remaining.startsWith("?")) {
+      const varMatch = remaining.match(/^(\?[A-Za-z_][\w-]*)/);
+      if (!varMatch) {
+        throw new Error("Malformed variable in SELECT clause");
+      }
+      const rawVar = varMatch[1];
+      remaining = remaining.substring(rawVar.length).trim();
+      expressions.push({
+        raw: rawVar,
+        aggregation: null,
+        variable: rawVar,
+        alias: null,
+      });
+    } else {
+      throw new Error(`Unexpected token in SELECT clause: ${remaining}`);
+    }
+  }
+  return expressions;
+}
+
+function deduplicateSelectExpressions(query: string): string {
+  const selectMatch = query.match(/SELECT\s+([\s\S]+?)(?=\bFROM\b|\bWHERE\b)/i);
+  if (!selectMatch) {
+    return query;
+  }
+  const selectBody = selectMatch[1];
+  const expressions = parseSelectClause(selectBody);
+  
+  const seenBareVars = new Set<string>();
+  const seenAliases = new Map<string, string>(); // alias -> raw expression (normalized)
+  const uniqueExpressions: ProjectionExpression[] = [];
+  
+  for (const expr of expressions) {
+    if (expr.alias) {
+      const alias = expr.alias.toLowerCase();
+      const normExpr = expr.raw.replace(/\s+/g, "").toLowerCase();
+      if (seenAliases.has(alias)) {
+        const existing = seenAliases.get(alias)!;
+        if (existing !== normExpr) {
+          throw new Error(
+            `Fail-closed: Duplicate alias '${expr.alias}' used for different projection expressions: '${existing}' vs '${normExpr}'`
+          );
+        }
+        // Identical aliased expressions are safe to deduplicate.
+      } else {
+        seenAliases.set(alias, normExpr);
+        uniqueExpressions.push(expr);
+      }
+    } else if (expr.variable) {
+      // Bare variable
+      const variable = expr.variable.toLowerCase();
+      if (!seenBareVars.has(variable)) {
+        seenBareVars.add(variable);
+        uniqueExpressions.push(expr);
+      }
+    } else {
+      uniqueExpressions.push(expr);
+    }
+  }
+  
+  const newSelect = `SELECT ${uniqueExpressions.map((e) => e.raw).join(" ")}`;
+  return query.replace(/SELECT\s+[\s\S]+?(?=\bFROM\b|\bWHERE\b)/i, (matched) => {
+    const suffix = matched.match(/\s*$/)?.[0] ?? "";
+    return newSelect + suffix;
+  });
+}
+
+export const rspqlContainmentTestHooks = {
+  deduplicateSelectExpressions,
+};
+
+function detectAggregationFromSelect(query: string): string {
+  const selectMatch = query.match(/SELECT\s+([\s\S]+?)(?=\bFROM\b|\bWHERE\b)/i);
+  if (!selectMatch) {
+    return "AVG";
+  }
+  const selectBody = selectMatch[1];
+  const expressions = parseSelectClause(selectBody);
+  
+  const primaryExpr = expressions.find(
+    (e) =>
+      e.alias &&
+      (e.alias.toLowerCase().includes("result") ||
+        e.alias.toLowerCase().startsWith("?agg"))
+  );
+  if (primaryExpr && primaryExpr.aggregation) {
+    return primaryExpr.aggregation;
+  }
+  
+  const aggregates = expressions
+    .map((e) => e.aggregation)
+    .filter((agg): agg is string => agg !== null && agg !== "MIN" && agg !== "MAX");
+    
+  if (aggregates.length === 0) {
+    return "AVG";
+  }
+  
+  const uniqueMain = Array.from(new Set(aggregates));
+  if (uniqueMain.length > 1) {
+    throw new Error(`Ambiguous aggregation functions: multiple different aggregates found: ${uniqueMain.join(", ")}`);
+  }
+  return uniqueMain[0];
 }

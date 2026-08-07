@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import config from './config/httpServerConfig.json';
 
 import { program } from "commander";
+import { POSTHandler } from "./services/server/POSTHandler";
 
 /**
  * Fetch the current timestamp in the format YYYY-MM-DD-HH-mm-ss.
@@ -41,6 +42,15 @@ const logger = bunyan.createLogger({
 async function main() {
     new HTTPServer(config.port, logger)
 }
+
+async function shutdown(signal: string): Promise<void> {
+    console.log(`Received ${signal}; stopping manager-owned producer workers`);
+    await POSTHandler.shutdownRegistrationService();
+    process.exit(0);
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
 
 main().then(() => {
     console.log(`HTTP server has started`);

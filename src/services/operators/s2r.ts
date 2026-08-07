@@ -347,10 +347,10 @@ export class CSPARQLWindow {
             this.current_watermark = new_time;
             this.logger.info(`Watermark is increasing ${this.current_watermark} and time ${this.time}`, `CSPARQLWindow`);
         }
-        else {
+        else if (new_time < this.current_watermark) {
             this.watermarkStallWarningCount += 1;
             if (this.watermarkStallWarningCount === 1 || this.watermarkStallWarningCount % 500 === 0) {
-                console.warn(`Watermark is not increasing (count=${this.watermarkStallWarningCount}, current=${this.current_watermark}, candidate=${new_time})`);
+                console.warn(`Watermark is regression (count=${this.watermarkStallWarningCount}, current=${this.current_watermark}, candidate=${new_time})`);
             }
         }
     }

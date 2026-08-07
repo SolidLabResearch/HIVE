@@ -27,7 +27,10 @@ export interface ActiveExecutionHandle {
   canonicalQueryId: string;
   sharedOutputTopic: string;
   workerIds: string[];
+  /** Legacy producer IDs; currently canonical producer IDs. */
   producerIds?: string[];
+  canonicalProducerIds?: string[];
+  runtimeProducerIds?: string[];
   producerTopics?: string[];
   producerSnapshots?: import("../services/reuse/SubqueryProducerManager").SubqueryProducerRuntimeSnapshot[];
   state: ExecutionState;

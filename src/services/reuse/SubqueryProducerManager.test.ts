@@ -2,6 +2,7 @@ import {
   SubqueryProducerHandle,
   SubqueryProducerManager,
 } from "./SubqueryProducerManager";
+import { buildQueryTargetScalingSubQuery } from "../../util/queryTargets";
 
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -45,6 +46,8 @@ class FakeRuntimeFactory {
 }
 
 describe("SubqueryProducerManager", () => {
+  const originalAlignmentOrigin =
+    process.env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR;
   const query = `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
 PREFIX saref: <https://saref.etsi.org/core/>
@@ -61,6 +64,19 @@ WHERE {
 }
 `;
 
+  beforeEach(() => {
+    process.env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR = "1785924000000";
+  });
+
+  afterAll(() => {
+    if (originalAlignmentOrigin === undefined) {
+      delete process.env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR;
+    } else {
+      process.env.STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR =
+        originalAlignmentOrigin;
+    }
+  });
+
   test("creates one runtime producer and reuses it for repeated requests", async () => {
     const runtimeFactory = new FakeRuntimeFactory();
     const manager = new SubqueryProducerManager(runtimeFactory as any);
@@ -71,6 +87,8 @@ WHERE {
     expect(runtimeFactory.calls).toHaveLength(1);
     expect(first.producerId).toBe(second.producerId);
     expect(first.outputTopic).toBe(second.outputTopic);
+    expect(first.expectedInputStream).toBe("mqtt://localhost:1883/wearableX");
+    expect(first.alignmentOriginMs).toBe(1785924000000);
     expect(manager.getActiveHandles()).toHaveLength(1);
   });
 
@@ -183,5 +201,67 @@ WHERE {
       "producer crashed",
     );
     expect(manager.getActiveHandles()).toHaveLength(0);
+  });
+
+  test("shares thing1 across every nested query and leaves thing10 only on Q10", async () => {
+    const runtimeFactory = new FakeRuntimeFactory();
+    const manager = new SubqueryProducerManager(runtimeFactory as any);
+    const subqueriesByThing = Array.from({ length: 10 }, (_unused, index) =>
+      buildQueryTargetScalingSubQuery(
+        {
+          name: `thing${index + 1}`,
+          topicName: `thing${index + 1}`,
+          propertyName: "sharedNumericProperty",
+        },
+        "AVG",
+        60000,
+        30000,
+      ),
+    );
+
+    for (let queryIndex = 0; queryIndex < 10; queryIndex += 1) {
+      await manager.ensureProducers(
+        subqueriesByThing.slice(0, queryIndex + 1),
+        `execution-q${queryIndex + 1}`,
+      );
+    }
+
+    const snapshots = manager.getProducerSnapshots();
+    expect(snapshots).toHaveLength(10);
+
+    for (let index = 0; index < 10; index += 1) {
+      const topic = `chunked/${snapshots[index].producerId}`;
+      expect(topic).toBe(snapshots[index].outputTopic);
+    }
+
+    const snapshotByTopic = new Map(
+      snapshots.map((snapshot) => {
+        const topicNameMatch = snapshot.query.match(/ON STREAM mqtt_broker:([^\s\[]+)/i);
+        return [topicNameMatch?.[1], snapshot];
+      }),
+    );
+
+    const thing1 = snapshotByTopic.get("thing1");
+    const thing10 = snapshotByTopic.get("thing10");
+    expect(thing1?.referenceCount).toBe(10);
+    expect(thing1?.dependentExecutionIds).toEqual([
+      "execution-q1",
+      "execution-q10",
+      "execution-q2",
+      "execution-q3",
+      "execution-q4",
+      "execution-q5",
+      "execution-q6",
+      "execution-q7",
+      "execution-q8",
+      "execution-q9",
+    ]);
+    expect(thing10?.referenceCount).toBe(1);
+    expect(thing10?.dependentExecutionIds).toEqual(["execution-q10"]);
+
+    for (let index = 0; index < 10; index += 1) {
+      const snapshot = snapshotByTopic.get(`thing${index + 1}`);
+      expect(snapshot?.referenceCount).toBe(10 - index);
+    }
   });
 });

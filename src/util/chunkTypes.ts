@@ -18,6 +18,13 @@ export type WindowDescriptor = {
 export type PartialChunkResult = {
   queryId: string;
   subqueryId: string;
+  /** Legacy runtime message identity. */
+  producerId?: string;
+  canonicalProducerId?: string;
+  runtimeProducerId?: string;
+  chunkStart?: number;
+  chunkEnd?: number;
+  watermark?: number;
   window: WindowDescriptor;
   chunkId: string;
   reuseClassKey?: string;

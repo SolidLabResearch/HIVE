@@ -7,6 +7,17 @@ export type SubqueryIdentity = {
   topic: string;
 };
 
+export type ManagerOwnedProducerMapping = {
+  producerId: string;
+  canonicalProducerId: string;
+  runtimeProducerId: string;
+  topic: string;
+  canonicalProducerQuery: string;
+  runtimeProducerQuery: string;
+  alignmentOriginMs: number;
+  expectedInputStream: string;
+};
+
 export type ChunkWindowDiagnostics = {
   chunkGroupId: string;
   start: number;
@@ -18,6 +29,10 @@ export type ChunkWindowDiagnostics = {
   min: number | null;
   max: number | null;
   subqueries: string[];
+  producerIdentities: Array<{
+    canonicalProducerId: string;
+    runtimeProducerId: string;
+  }>;
   receivedChunkIdsBySubquery: Record<string, string[]>;
   duplicateChunksIgnoredBySubquery: Record<string, string[]>;
   missingSubqueryIds: string[];
@@ -133,6 +148,9 @@ export type DerivedOriginalOutputConsumer = {
 
 export type ChunkedDebugSummary = {
   chunkSizeMs: number;
+  managedProducerMode: boolean;
+  localProducerSpawnCount: number;
+  managerOwnedSubscriptionCount: number;
   comparableOutputCadenceOnly: boolean;
   useImmediateTrigger: boolean;
   expectedSubqueryCount: number;

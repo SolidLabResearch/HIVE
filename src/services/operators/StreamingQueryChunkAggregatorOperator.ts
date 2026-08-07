@@ -54,6 +54,7 @@ import type {
   DerivedOriginalChunkSummary,
   DerivedOriginalOutputConsumer,
   FinalWindowCoverageState,
+  ManagerOwnedProducerMapping,
   ParentPartialDiagnostics,
   SubqueryIdentity,
   WindowRecompositionSummary,
@@ -78,6 +79,47 @@ import {
   summarizeChunkGroup as summarizeChunkGroupPure,
   summarizeWindowRecomposition as summarizeWindowRecompositionPure,
 } from "./chunked/WindowRecomposer";
+
+export function parseManagerOwnedProducerMappings(raw: string | undefined): ManagerOwnedProducerMapping[] {
+  if (!raw || raw.trim() === "") {
+    return [];
+  }
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error("HIVE_PRODUCER_IDENTITY_MAPPINGS must be an array");
+  }
+  const mappings = parsed as ManagerOwnedProducerMapping[];
+  const canonicalIds = new Set<string>();
+  const runtimeIds = new Set<string>();
+  const topics = new Set<string>();
+  for (const mapping of mappings) {
+    if (
+      !mapping ||
+      typeof mapping.canonicalProducerId !== "string" ||
+      typeof mapping.runtimeProducerId !== "string" ||
+      typeof mapping.topic !== "string" ||
+      typeof mapping.canonicalProducerQuery !== "string" ||
+      typeof mapping.runtimeProducerQuery !== "string" ||
+      typeof mapping.expectedInputStream !== "string" ||
+      !Number.isFinite(mapping.alignmentOriginMs)
+    ) {
+      throw new Error("Invalid manager-owned producer mapping");
+    }
+    if (canonicalIds.has(mapping.canonicalProducerId)) {
+      throw new Error(`Duplicate canonical producer mapping: ${mapping.canonicalProducerId}`);
+    }
+    if (runtimeIds.has(mapping.runtimeProducerId)) {
+      throw new Error(`Two canonical producers claim runtime producer ${mapping.runtimeProducerId}`);
+    }
+    if (topics.has(mapping.topic)) {
+      throw new Error(`Duplicate manager-owned producer topic: ${mapping.topic}`);
+    }
+    canonicalIds.add(mapping.canonicalProducerId);
+    runtimeIds.add(mapping.runtimeProducerId);
+    topics.add(mapping.topic);
+  }
+  return mappings;
+}
 
 type ChunkedBenchmarkWindowMetadata = ReturnType<
   typeof buildBenchmarkWindowMetadata
@@ -147,6 +189,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   private chunkArrivalTimes: Map<string, number> = new Map();
   private chunkWindowMap: Map<string, { start: number; end: number }> = new Map();
   private parentPartialAvailabilityLogged: boolean = false;
+  private readonly latestWatermarkByProducer: Map<string, number> = new Map();
+  private readonly acceptedContributions: Set<string> = new Set();
+  private readonly managerOwnedProducerMappings: ManagerOwnedProducerMapping[];
   private cachedParsedQueries: Map<string, any> = new Map();
   private cachedOutputQuery: string = "";
   private cachedOutputQueryParsed: any = null;
@@ -176,6 +221,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   constructor() {
     this.subQueries = [];
     this.parser = new RSPQLParser();
+    this.managerOwnedProducerMappings = parseManagerOwnedProducerMappings(
+      process.env.HIVE_PRODUCER_IDENTITY_MAPPINGS,
+    );
     this.chunkGCD = 0;
     this.comparableOutputCadenceOnly = useChunkedComparableOutputCadence();
     this.useImmediateTrigger = getChunkedUseImmediateTrigger();
@@ -190,6 +238,9 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     this.chunkedEmissionProofPath = this.resolveLogFilePath(`chunked_emission_proof${consumerIdx}.json`);
     this.chunkedDebugSummary = {
       chunkSizeMs: 0,
+      managedProducerMode: this.managerOwnedProducerMappings.length > 0,
+      localProducerSpawnCount: 0,
+      managerOwnedSubscriptionCount: 0,
       comparableOutputCadenceOnly: this.comparableOutputCadenceOnly,
       useImmediateTrigger: this.useImmediateTrigger,
       expectedSubqueryCount: 0,
@@ -479,6 +530,15 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           Number.isFinite(parsed.window.start) &&
           Number.isFinite(parsed.window.end)
         ) {
+          if (
+            this.managerOwnedProducerMappings.length > 0 &&
+            (typeof parsed.runtimeProducerId !== "string" ||
+              typeof parsed.canonicalProducerId !== "string")
+          ) {
+            throw new Error(
+              "Managed chunk payload requires explicit canonicalProducerId and runtimeProducerId",
+            );
+          }
           const normalizedWindow = this.normalizeChunkWindowAlignment(
             parsed.window,
           );
@@ -490,6 +550,27 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
           return {
             queryId: parsed.queryId,
             subqueryId: parsed.subqueryId,
+            producerId:
+              this.managerOwnedProducerMappings.length > 0
+                ? parsed.canonicalProducerId
+                : typeof parsed.producerId === "string"
+                  ? parsed.producerId
+                  : parsed.subqueryId,
+            canonicalProducerId:
+              typeof parsed.canonicalProducerId === "string"
+                ? parsed.canonicalProducerId
+                : undefined,
+            runtimeProducerId:
+              typeof parsed.runtimeProducerId === "string"
+                ? parsed.runtimeProducerId
+                : this.managerOwnedProducerMappings.length > 0
+                  ? undefined
+                  : parsed.subqueryId,
+            chunkStart: normalizedWindow.start,
+            chunkEnd: normalizedWindow.end,
+            watermark: Number.isFinite(Number(parsed.watermark))
+              ? Number(parsed.watermark)
+              : normalizedWindow.logicalTriggerTime ?? normalizedWindow.end,
             window: normalizedWindow,
             chunkId: parsed.chunkId || `${chunkGroupId}:${parsed.subqueryId}`,
             reuseClassKey:
@@ -533,10 +614,71 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             rdfPayload: typeof parsed.rdfPayload === "string" ? parsed.rdfPayload : undefined,
           };
         }
+        if (
+          parsed?.message_format === "structured_reusable_result" &&
+          typeof parsed.source_query_id === "string" &&
+          typeof parsed.canonicalProducerId === "string" &&
+          typeof parsed.runtimeProducerId === "string" &&
+          Number.isFinite(Number(parsed.window_start ?? parsed.chunkStart)) &&
+          Number.isFinite(Number(parsed.window_end ?? parsed.chunkEnd))
+        ) {
+          const start = Number(parsed.window_start ?? parsed.chunkStart);
+          const end = Number(parsed.window_end ?? parsed.chunkEnd);
+          const window = this.normalizeChunkWindowAlignment({
+            start,
+            end,
+            range: Number(parsed.window?.range ?? end - start),
+            step: Number(parsed.window?.step ?? this.chunkGCD),
+            alignmentOriginMs: this.benchmarkEventTimeAnchor,
+            semantics: "[start,end)",
+            logicalTriggerTime: Number(parsed.logical_trigger_time ?? parsed.watermark),
+            windowDataCloseTime: Number(parsed.window_data_close_time ?? end),
+            resultEmittedAt: Number(parsed.result_emitted_at ?? Date.now()),
+            metadataSource: "reconstructed",
+          });
+          const runtimeProducerId = parsed.runtimeProducerId;
+          return {
+            queryId: parsed.source_query_id,
+            subqueryId: runtimeProducerId,
+            producerId:
+              this.managerOwnedProducerMappings.length > 0
+                ? parsed.canonicalProducerId
+                : typeof parsed.producerId === "string"
+                  ? parsed.producerId
+                  : parsed.source_query_id,
+            canonicalProducerId: parsed.canonicalProducerId,
+            runtimeProducerId,
+            chunkStart: window.start,
+            chunkEnd: window.end,
+            watermark: Number.isFinite(Number(parsed.watermark))
+              ? Number(parsed.watermark)
+              : window.logicalTriggerTime ?? window.end,
+            window,
+            chunkId: `${this.sessionId}:${window.start}:${window.end}:${runtimeProducerId}`,
+            sourceTopic:
+              typeof parsed.source_topic === "string" ? parsed.source_topic : undefined,
+            aggregateFunction: parsed.aggregationType,
+            value: Number.isFinite(Number(parsed.value)) ? Number(parsed.value) : undefined,
+            count: Number.isFinite(Number(parsed.count)) ? Number(parsed.count) : undefined,
+            sum: Number.isFinite(Number(parsed.sum)) ? Number(parsed.sum) : undefined,
+            avg: Number.isFinite(Number(parsed.avg)) ? Number(parsed.avg) : undefined,
+            min: Number.isFinite(Number(parsed.min)) ? Number(parsed.min) : undefined,
+            max: Number.isFinite(Number(parsed.max)) ? Number(parsed.max) : undefined,
+            state: {
+              count: Number.isFinite(Number(parsed.count)) ? Number(parsed.count) : undefined,
+              sum: Number.isFinite(Number(parsed.sum)) ? Number(parsed.sum) : undefined,
+              min: Number.isFinite(Number(parsed.min)) ? Number(parsed.min) : undefined,
+              max: Number.isFinite(Number(parsed.max)) ? Number(parsed.max) : undefined,
+            },
+          };
+        }
         return null;
       }));
-    } catch {
-      // legacy payload, keep null to skip structured aggregation
+    } catch (error) {
+      if (this.managerOwnedProducerMappings.length > 0) {
+        throw error;
+      }
+      // Unmanaged compatibility mode may ignore legacy payloads.
     }
     return null;
   }
@@ -1271,6 +1413,30 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
   }) {
     const comparableWindow =
       Boolean(args.comparableDiagnostics) && args.coverageComplete;
+    const requiredProducerIds = this.chunkedDebugSummary.expectedSubqueryIds;
+    const latestWatermarkByRequiredProducer = Object.fromEntries(
+      requiredProducerIds.map((producerId) => [
+        producerId,
+        this.latestWatermarkByProducer.get(producerId) ?? null,
+      ]),
+    );
+    const producerWatermarks = Object.values(latestWatermarkByRequiredProducer).filter(
+      (watermark): watermark is number => typeof watermark === "number",
+    );
+    const derivedReconstructionWatermark =
+      producerWatermarks.length === requiredProducerIds.length && producerWatermarks.length > 0
+        ? Math.min(...producerWatermarks)
+        : null;
+    const internalChunks = args.comparableDiagnostics?.internalChunks ?? [];
+    const requiredChunkContributions = internalChunks.length * requiredProducerIds.length;
+    const receivedChunkContributions = internalChunks.reduce(
+      (total, chunk) => total + (chunk.subqueries?.length ?? 0),
+      0,
+    );
+    const missingContributionCount = Math.max(
+      0,
+      requiredChunkContributions - receivedChunkContributions,
+    );
 
     return buildBenchmarkResultPayload(
       "chunked",
@@ -1301,7 +1467,12 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         stepMs: this.windowSlide,
         internalChunkIds:
           args.comparableDiagnostics?.internalChunkGroupIds ?? [],
-        internalChunks: args.comparableDiagnostics?.internalChunks ?? [],
+        internalChunks,
+        latestWatermarkByRequiredProducer,
+        derivedReconstructionWatermark,
+        requiredChunkContributions,
+        receivedChunkContributions,
+        missingContributionCount,
         coverageComplete: args.coverageComplete,
         comparableWindow,
         isPartialWindow: !comparableWindow,
@@ -1376,7 +1547,16 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
    */
   async handleAggregation(): Promise<void> {
     this.logger.log("Starting aggregation process for subqueries.");
-    await this.initializeSubQueryProcesses();
+    if (this.managerOwnedProducerMappings.length > 0) {
+      await this.initializeManagerOwnedProducerSubscriptions();
+    } else {
+      if (process.env.HIVE_SKIP_CHUNK_PRODUCER_SPAWNING === "true") {
+        throw new Error(
+          "Local producer spawning disabled but no manager-owned producer handles were supplied",
+        );
+      }
+      await this.initializeSubQueryProcesses();
+    }
     resourceTraceSnapshot(
       "after_subquery_processes_start",
       "chunked subquery processes initialized",
@@ -1485,6 +1665,15 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
       const expectedSubqueryIds = subqueryIdentities.map((entry) => entry.subqueryId);
       const topicToSubqueryId = new Map(
         subqueryIdentities.map((entry) => [entry.topic, entry.subqueryId]),
+      );
+      const managerMappingByRuntimeId = new Map(
+        this.managerOwnedProducerMappings.map((mapping) => [
+          mapping.runtimeProducerId,
+          mapping,
+        ]),
+      );
+      const managerMappingByTopic = new Map(
+        this.managerOwnedProducerMappings.map((mapping) => [mapping.topic, mapping]),
       );
       const sourceTopicToChunkTopic = new Map<string, string>();
       for (let index = 0; index < this.subQueries.length; index += 1) {
@@ -1699,7 +1888,129 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             }
           }
           const expectedSubqueryId = topicToSubqueryId.get(topic);
-          const effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
+          let effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
+          if (this.managerOwnedProducerMappings.length > 0) {
+            const runtimeProducerId = normalized.runtimeProducerId;
+            if (!runtimeProducerId) {
+              throw new Error(`Managed chunk on ${topic} omitted runtimeProducerId`);
+            }
+            const runtimeMapping = managerMappingByRuntimeId.get(runtimeProducerId);
+            if (!runtimeMapping) {
+              throw new Error(`Unknown runtimeProducerId ${runtimeProducerId} on ${topic}`);
+            }
+            const topicMapping = managerMappingByTopic.get(topic);
+            if (!topicMapping || topicMapping.runtimeProducerId !== runtimeProducerId) {
+              throw new Error(
+                `Runtime producer ${runtimeProducerId} published on unregistered topic ${topic}`,
+              );
+            }
+            if (normalized.canonicalProducerId !== runtimeMapping.canonicalProducerId) {
+              throw new Error(
+                `Payload canonicalProducerId ${normalized.canonicalProducerId ?? "missing"} conflicts with runtime mapping ${runtimeMapping.canonicalProducerId}`,
+              );
+            }
+            effectiveSubqueryId = runtimeProducerId;
+            normalized.subqueryId = runtimeProducerId;
+            normalized.runtimeProducerId = runtimeProducerId;
+            normalized.canonicalProducerId = runtimeMapping.canonicalProducerId;
+          }
+
+          const producerId = effectiveSubqueryId;
+          const prevWatermark = this.latestWatermarkByProducer.get(producerId);
+
+          let accepted = false;
+          let watermarkOutcome = "ignored";
+
+          if (prevWatermark === undefined) {
+            this.latestWatermarkByProducer.set(producerId, chunkTimestamp);
+            accepted = true;
+            watermarkOutcome = "accepted";
+          } else if (chunkTimestamp > prevWatermark) {
+            this.latestWatermarkByProducer.set(producerId, chunkTimestamp);
+            accepted = true;
+            watermarkOutcome = "accepted";
+          } else if (chunkTimestamp === prevWatermark) {
+            accepted = true; // Idempotent duplicate is accepted but does not advance the watermark
+            watermarkOutcome = "accepted";
+          } else {
+            accepted = false;
+            watermarkOutcome = "rejected";
+          }
+
+          const contributionKey = `${producerId}:${normalized.window.start}:${normalized.window.end}`;
+          const isDuplicateContribution = this.acceptedContributions.has(contributionKey);
+
+          if (accepted && !isDuplicateContribution) {
+            this.acceptedContributions.add(contributionKey);
+          }
+
+          let derivedReconstructionWatermark: number | null = null;
+          const allProducersHaveWatermark = expectedSubqueryIds.every((pid) =>
+            this.latestWatermarkByProducer.has(pid)
+          );
+          if (allProducersHaveWatermark) {
+            const watermarks = expectedSubqueryIds.map((pid) =>
+              this.latestWatermarkByProducer.get(pid)!
+            );
+            derivedReconstructionWatermark = Math.min(...watermarks);
+          }
+
+          const nextWindowStart = processingState.nextComparableWindowStartMs;
+          const missingContributionCount = nextWindowStart !== null
+            ? this.getMissingContributionCount(processingState, nextWindowStart)
+            : 0;
+
+          if (this.debugChunksEnabled || process.env.HIVE_WATERMARK_DEBUG === "true") {
+            const finalQueryLabelMatch = this.outputQuery.match(/REGISTER\s+\w+\s+<([^>]+)>/i);
+            const finalQueryLabel = finalQueryLabelMatch ? finalQueryLabelMatch[1] : "unknown-final-query";
+            const traceRecord = {
+              timestamp: Date.now(),
+              executionId: this.sessionId,
+              queryLabel: finalQueryLabel,
+              producerId,
+              chunkStart: normalized.window.start,
+              chunkEnd: normalized.window.end,
+              candidateWatermark: chunkTimestamp,
+              previousProducerWatermark: prevWatermark !== undefined ? prevWatermark : null,
+              watermarkOutcome,
+              duplicateContribution: isDuplicateContribution ? "true" : "false",
+              acceptedContribution: (accepted && !isDuplicateContribution) ? "true" : "false",
+              reconstructionWatermark: derivedReconstructionWatermark,
+              missingContributionCount,
+            };
+            this.logger.log(`WATERMARK_TRACE: ${JSON.stringify(traceRecord)}`);
+            console.log(`WATERMARK_TRACE: ${JSON.stringify(traceRecord)}`);
+          }
+
+          if (!accepted) {
+            this.logger.log(`Ignoring chunk ${normalized.chunkId} due to watermark regression for producer ${producerId}`);
+            endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
+            return;
+          }
+
+          if (isDuplicateContribution) {
+            this.duplicateChunkCount += 1;
+            this.chunkedDebugSummary.duplicateChunkCount = this.duplicateChunkCount;
+            profileCount("duplicateChunkCount");
+            const chunkGroupId = getLogicalChunkGroupId(normalized);
+            const coverageState =
+              processingState.chunkCoverageByWindow.get(chunkGroupId) ?? {
+                chunkGroupId,
+                expectedSubqueryIds: [...expectedSubqueryIds],
+                receivedChunkIdsBySubquery: Object.fromEntries(
+                  expectedSubqueryIds.map((subqueryId) => [subqueryId, [] as string[]]),
+                ),
+                duplicateChunksIgnoredBySubquery: Object.fromEntries(
+                  expectedSubqueryIds.map((subqueryId) => [subqueryId, [] as string[]]),
+                ),
+              };
+            processingState.chunkCoverageByWindow.set(chunkGroupId, coverageState);
+            coverageState.duplicateChunksIgnoredBySubquery[producerId].push(normalized.chunkId);
+            this.persistChunkedDebugSummary();
+            endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
+            return;
+          }
+
           const chunkGroupId = getLogicalChunkGroupId(normalized);
           const bySubquery =
             processingState.chunksByWindow.get(chunkGroupId) ??
@@ -2277,7 +2588,54 @@ For example, the allResults object might look like this:
   /**
    *
    */
-  async initializeSubQueryProcesses(): Promise<void> {
+  private async initializeManagerOwnedProducerSubscriptions(): Promise<void> {
+    if (process.env.HIVE_SKIP_CHUNK_PRODUCER_SPAWNING !== "true") {
+      throw new Error(
+        "Manager-owned producer handles and reconstruction-local producer spawning cannot both be active",
+      );
+    }
+    const chunkPlan = this.getOrBuildChunkPlan();
+    if (chunkPlan.chunkSize <= 0) {
+      throw new Error("Invalid chunk plan for manager-owned producers");
+    }
+    if (this.managerOwnedProducerMappings.length !== this.subQueries.length) {
+      throw new Error(
+        `Manager-owned producer mapping count ${this.managerOwnedProducerMappings.length} does not match subquery count ${this.subQueries.length}`,
+      );
+    }
+    this.chunkGCD = chunkPlan.chunkSize;
+    this.chunkedDebugSummary.chunkSizeMs = chunkPlan.chunkSize;
+    this.chunkedDebugSummary.managedProducerMode = true;
+    this.chunkedDebugSummary.managerOwnedSubscriptionCount =
+      this.managerOwnedProducerMappings.length;
+    this.chunkedDebugSummary.localProducerSpawnCount = 0;
+    for (const mapping of this.managerOwnedProducerMappings) {
+      this.subQueryMQTTTopicMap.set(mapping.runtimeProducerId, mapping.topic);
+      this.logger.log(
+        `MANAGER_OWNED_PRODUCER_SUBSCRIPTION canonicalProducerId=${mapping.canonicalProducerId} runtimeProducerId=${mapping.runtimeProducerId} topic=${mapping.topic}`,
+      );
+    }
+    this.persistChunkedDebugSummary();
+    resourceTraceSnapshot(
+      "manager_owned_producer_subscriptions_configured",
+      "reconstruction uses manager-owned producers; local RSPQueryProcess creation disabled",
+      {
+        managerOwnedProducerCount: this.managerOwnedProducerMappings.length,
+        localProducerProcessCount: 0,
+      },
+    );
+  }
+
+  private async initializeSubQueryProcesses(): Promise<void> {
+    if (
+      this.managerOwnedProducerMappings.length > 0 ||
+      process.env.HIVE_SKIP_CHUNK_PRODUCER_SPAWNING === "true"
+    ) {
+      throw new Error(
+        "Reconstruction-local RSPQueryProcess creation is forbidden when managed producers are configured or local spawning is disabled",
+      );
+    }
+    this.chunkedDebugSummary.managedProducerMode = false;
     this.logger.log(`Initializing subquery processes.`);
     this.logger.log(`DEBUG: subQueries length: ${this.subQueries.length}`);
     this.logger.log(`DEBUG: subQueries: ${JSON.stringify(this.subQueries)}`);
@@ -2302,6 +2660,7 @@ For example, the allResults object might look like this:
         this.logger.log(`Expected chunk topic: hash=${hash_subQuery} topic=${topicName} skipSpawning=${skipSpawning}`);
         
         if (!skipSpawning) {
+          this.chunkedDebugSummary.localProducerSpawnCount += 1;
           const rspQueryProcess = new RSPQueryProcess(
             rewrittenQuery,
             topicName,
@@ -2707,6 +3066,31 @@ For example, the allResults object might look like this:
       this.logger.log("Successfully published chunked results to chunked/output");
       profileCount("emitted_results");
     });
+  }
+
+  private getMissingContributionCount(
+    state: ChunkProcessingState,
+    finalWindowStart: number | null
+  ): number {
+    if (finalWindowStart === null) return 0;
+    const finalWindowEnd = finalWindowStart + this.windowRange;
+    const expectedChunkKeys = deriveExpectedChunkKeysForFinalWindow({
+      finalWindowStart,
+      finalWindowEnd,
+      chunkWindowWidthMs: state.chunkWindowWidthMs,
+      alignmentOriginMs: state.alignmentOriginMs,
+    });
+    
+    let missing = 0;
+    for (const chunkKey of expectedChunkKeys) {
+      const completed = state.completedChunkGroups.get(chunkKey);
+      if (!completed) {
+        const partialsMap = state.chunksByWindow.get(chunkKey);
+        const presentCount = partialsMap ? partialsMap.size : 0;
+        missing += (state.expectedSubqueryIds.length - presentCount);
+      }
+    }
+    return missing;
   }
 }
 

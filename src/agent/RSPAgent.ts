@@ -11,6 +11,7 @@ import {
     useCompactReusableResultPayload,
 } from "../util/runtimeConfig";
 import { recordPublishedMqttMessage } from "../util/mqttTraffic";
+import type { ProducerIdentity } from "../services/reuse/SubqueryRuntimeIdentity";
 import {
     endStageTimer,
     profileCount,
@@ -25,6 +26,13 @@ const mqtt = require('mqtt');
 type StructuredReusableResultPayload = {
     message_format: "structured_reusable_result";
     source_query_id: string;
+    /** Legacy field: raw runtime-query hash. */
+    producerId?: string;
+    canonicalProducerId: string;
+    runtimeProducerId: string;
+    chunkStart: number;
+    chunkEnd: number;
+    watermark: number;
     source_topic?: string | null;
     reusable_result_topic?: string;
     aggregationType: string | null;
@@ -81,6 +89,8 @@ export class RSPAgent {
     private readonly compactReusableResultPayload: boolean;
     private readonly registerQueryDefinitionOnInit: boolean;
     private readonly onRuntimeError?: (error: Error) => void;
+    private readonly producerIdentity: ProducerIdentity;
+    private readonly mqttClientId?: string;
 
     /**
      *
@@ -92,6 +102,8 @@ export class RSPAgent {
         r2s_topic: string,
         options: {
             registerQueryDefinition?: boolean;
+            producerIdentity?: ProducerIdentity;
+            mqttClientId?: string;
             onRuntimeError?: (error: Error) => void;
         } = {},
     ) {
@@ -109,6 +121,11 @@ export class RSPAgent {
         this.registerQueryDefinitionOnInit =
             options.registerQueryDefinition !== false;
         this.onRuntimeError = options.onRuntimeError;
+        this.producerIdentity = options.producerIdentity ?? {
+            canonicalProducerId: this.queryId,
+            runtimeProducerId: this.queryId,
+        };
+        this.mqttClientId = options.mqttClientId;
         this.rsp_engine = new RSPEngine(query);
         profileCount("rsp_engines_created");
         this.rstream_emitter = this.rsp_engine.register();
@@ -145,7 +162,9 @@ export class RSPAgent {
         await Promise.all(streams.map(async (stream) => {
             const stream_name = stream.stream_name;
             const mqtt_broker: string = this.returnMQTTBroker(stream_name);
-            const rsp_client = mqtt.connect(mqtt_broker);
+            const rsp_client = mqtt.connect(mqtt_broker, this.mqttClientId
+                ? { clientId: `${this.mqttClientId}-input` }
+                : undefined);
             this.mqttClients.push(rsp_client);
             profileCount("mqtt_clients_created");
             const rsp_stream_object = this.rsp_engine.getStream(stream_name);
@@ -257,7 +276,9 @@ export class RSPAgent {
      */
     public async subscribeRStream() {
         const mqtt_broker = "mqtt://localhost:1883";
-        const rstream_publisher = mqtt.connect(mqtt_broker);
+        const rstream_publisher = mqtt.connect(mqtt_broker, this.mqttClientId
+            ? { clientId: `${this.mqttClientId}-output` }
+            : undefined);
         this.mqttClients.push(rstream_publisher);
         profileCount("mqtt_clients_created");
 
@@ -454,6 +475,12 @@ export class RSPAgent {
         const basePayload: StructuredReusableResultPayload = {
             message_format: "structured_reusable_result",
             source_query_id: this.queryId,
+            producerId: this.queryId,
+            canonicalProducerId: this.producerIdentity.canonicalProducerId,
+            runtimeProducerId: this.producerIdentity.runtimeProducerId,
+            chunkStart: windowBounds.start,
+            chunkEnd: windowBounds.end,
+            watermark: logicalTriggerTime ?? windowBounds.end,
             aggregationType: this.aggregationType,
             value,
             count: this.extractNumericBinding(bindings, ["count"]),

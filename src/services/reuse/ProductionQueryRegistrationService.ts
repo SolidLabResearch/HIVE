@@ -49,6 +49,10 @@ export class ProductionQueryRegistrationService {
       });
   }
 
+  async shutdown(): Promise<void> {
+    await this.dispatcher.shutdown();
+  }
+
   async register(
     request: RuntimeRegistrationRequest,
   ): Promise<RuntimeRegistrationResponse> {

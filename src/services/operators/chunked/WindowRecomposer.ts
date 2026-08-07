@@ -139,6 +139,10 @@ export function summarizeChunkGroup(
     max: maxVal,
     value,
     subqueries: partials.map((partial) => partial.subqueryId),
+    producerIdentities: partials.map((partial) => ({
+      canonicalProducerId: partial.canonicalProducerId ?? partial.subqueryId,
+      runtimeProducerId: partial.runtimeProducerId ?? partial.subqueryId,
+    })),
     receivedChunkIdsBySubquery,
     duplicateChunksIgnoredBySubquery,
     missingSubqueryIds,

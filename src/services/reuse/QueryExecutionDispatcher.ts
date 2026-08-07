@@ -324,6 +324,22 @@ export class QueryExecutionDispatcher {
         RESULT_TOPIC: sharedOutputTopic,
         BENCHMARK_APPROACH: request.approach,
         EXECUTION_ID: executionId,
+        HIVE_SKIP_CHUNK_PRODUCER_SPAWNING:
+          request.approach === "chunked" && usesSharedProducers ? "true" : "false",
+        HIVE_PRODUCER_IDENTITY_MAPPINGS: usesSharedProducers
+          ? JSON.stringify(
+              producerHandles.map((producer) => ({
+                producerId: producer.producerId,
+                canonicalProducerId: producer.canonicalProducerId,
+                runtimeProducerId: producer.runtimeProducerId,
+                topic: producer.producerTopic,
+                canonicalProducerQuery: producer.canonicalProducerQuery,
+                runtimeProducerQuery: producer.runtimeProducerQuery,
+                expectedInputStream: producer.expectedInputStream,
+                alignmentOriginMs: producer.alignmentOriginMs,
+              })),
+            )
+          : "[]",
       },
       {
         onMessage: (message) => {
@@ -401,6 +417,8 @@ export class QueryExecutionDispatcher {
       sharedOutputTopic,
       workerIds: worker.getPid() ? [String(worker.getPid())] : [],
       producerIds: producerHandles.map((handle) => handle.producerId),
+      canonicalProducerIds: producerHandles.map((handle) => handle.canonicalProducerId),
+      runtimeProducerIds: producerHandles.map((handle) => handle.runtimeProducerId),
       producerTopics: producerHandles.map((handle) => handle.outputTopic),
       producerSnapshots: this.buildProducerSnapshots(producerHandles),
       state: "starting",
@@ -446,6 +464,10 @@ export class QueryExecutionDispatcher {
       );
       throw error;
     }
+  }
+
+  async shutdown(): Promise<void> {
+    await this.producerManager.stopAll();
   }
 
   private buildProducerSnapshots(

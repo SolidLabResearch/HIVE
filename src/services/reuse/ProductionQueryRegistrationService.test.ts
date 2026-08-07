@@ -29,6 +29,38 @@ function buildRangeVariantQuery(output: string, rangeMs: number): string {
   return buildQuery(output).replace("[RANGE 120000 STEP 60000]", `[RANGE ${rangeMs} STEP 60000]`);
 }
 
+function buildNestedThingQuery(output: string, thingCount: number): string {
+  const thingNames = Array.from({ length: thingCount }, (_unused, index) => `thing${index + 1}`);
+  const fromClauses = thingNames
+    .map(
+      (thingName) =>
+        `FROM NAMED WINDOW <mqtt://localhost:1883/${thingName}> ON STREAM mqtt_broker:${thingName} [RANGE 120000 STEP 60000]`,
+    )
+    .join("\n");
+  const unionClauses = thingNames
+    .map(
+      (thingName) => `{
+    WINDOW <mqtt://localhost:1883/${thingName}> {
+      ?obs_${thingName} saref:hasValue ?value .
+      ?obs_${thingName} saref:hasTimestamp ?ts .
+      ?obs_${thingName} saref:relatesToProperty <https://example.org/property/sharedNumericProperty> .
+    }
+  }`,
+    )
+    .join(" UNION ");
+  return `
+PREFIX mqtt_broker: <mqtt://localhost:1883/>
+PREFIX saref: <https://saref.etsi.org/core/>
+
+REGISTER RStream <${output}> AS
+SELECT (AVG(?value) AS ?resultValue)
+${fromClauses}
+WHERE {
+  ${unionClauses}
+}
+`;
+}
+
 function buildVariantQuery(
   output: string,
   variant: "base" | "comment" | "aliases" | "alpha" = "base",
@@ -256,6 +288,62 @@ describe("ProductionQueryRegistrationService", () => {
     expect(second.executionId).not.toBe(first.executionId);
     expect(second.reuseHit).toBe(false);
     expect(containmentService.checkEquivalence).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps ten nested final queries as separate executions with no final-result reuse", async () => {
+    const dispatcher = new FakeDispatcher();
+    const containmentService = {
+      getNormalizedInputHash: (query: string) => query.replace(/\s+/g, " ").trim(),
+      checkEquivalence: jest.fn().mockResolvedValue({
+        equivalent: false,
+        supported: true,
+        durationMs: 1,
+        forward: {
+          contained: false,
+          supported: true,
+          durationMs: 1,
+          cacheHit: false,
+          direction: "subquery_in_superquery" as const,
+          checkerVersion: "fake",
+        },
+        reverse: {
+          contained: false,
+          supported: true,
+          durationMs: 1,
+          cacheHit: false,
+          direction: "subquery_in_superquery" as const,
+          checkerVersion: "fake",
+        },
+      }),
+    };
+    const service = new ProductionQueryRegistrationService(
+      new QueryReuseRegistry(containmentService as any),
+      dispatcher as unknown as QueryExecutionDispatcher,
+    );
+
+    const registrations = [];
+    for (let thingCount = 1; thingCount <= 10; thingCount += 1) {
+      registrations.push(
+        await service.register({
+          approach: "chunked",
+          query: buildNestedThingQuery(`consumer-${thingCount}-output`, thingCount),
+          requestedOutputTopic: `consumer-topic-${thingCount}`,
+          ownerQueryId: `query-${thingCount}`,
+          consumerId: `consumer-${thingCount}`,
+        }),
+      );
+    }
+
+    expect(dispatcher.calls).toHaveLength(10);
+    expect(new Set(registrations.map((entry) => entry.canonicalQueryId)).size).toBe(10);
+    expect(new Set(registrations.map((entry) => entry.executionId)).size).toBe(10);
+    expect(new Set(registrations.map((entry) => entry.sharedOutputTopic)).size).toBe(10);
+    for (const registration of registrations) {
+      expect(registration.executionCreated).toBe(true);
+      expect(registration.reuseHit).toBe(false);
+      expect(registration.containmentDecision.reuseHit).toBe(false);
+    }
+    expect(containmentService.checkEquivalence).toHaveBeenCalledTimes(45);
   });
 
   test("keeps different final ranges in separate final executions with no final reuse hit", async () => {

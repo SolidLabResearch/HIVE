@@ -438,7 +438,21 @@ async function postRegistration(port, requestBody) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
   });
-  const payload = await response.json();
+  const responseText = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(responseText);
+  } catch {
+    payload = responseText;
+  }
+  const outputTopic = payload && typeof payload === "object"
+    ? payload.outputTopic
+    : undefined;
+  if (!response.ok || typeof outputTopic !== "string" || outputTopic.trim() === "") {
+    throw new Error(
+      `Registration failed for ${requestBody.consumer_id}: status=${response.status} payload=${JSON.stringify(payload)}`,
+    );
+  }
   return {
     consumerId: requestBody.consumer_id,
     requestStartedAt,
@@ -447,7 +461,7 @@ async function postRegistration(port, requestBody) {
     requestBody,
     responseBody: payload,
     executionId: payload.executionId,
-    outputTopic: payload.outputTopic,
+    outputTopic,
     reuseHit: payload.reuseHit,
     executionCreated: payload.executionCreated,
     reuseDecision: payload.reuseDecision,
@@ -616,57 +630,94 @@ function enrichFetchingDeliveries(runRoot, firstDeliveries, allDeliveries) {
 }
 
 async function subscribeConsumers({ registrations, expectedCount, deliveryPath }) {
-  const clients = [];
+  const clientRecords = [];
   const firstDeliveryByConsumer = new Map();
   const allDeliveries = [];
-  await Promise.all(
-    registrations.map(({ consumerId, executionId, outputTopic }) => new Promise((resolve, reject) => {
-      const client = mqtt.connect("mqtt://localhost:1883", {
-        clean: true,
-        clientId: `${consumerId}-${Math.random().toString(16).slice(2, 10)}`,
-      });
-      clients.push(client);
-      const timeout = setTimeout(() => {
-        reject(new Error(`Timed out subscribing ${consumerId}`));
-      }, 15_000);
-      client.on("connect", () => {
-        client.subscribe(outputTopic, { qos: 1 }, (error) => {
-          clearTimeout(timeout);
-          if (error) {
-            reject(error);
-          } else {
-            resolve();
+
+  const closeClients = async () => {
+    await Promise.all(clientRecords.map(async ({ client, timeout }) => {
+      clearTimeout(timeout);
+      client.removeAllListeners();
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) {
+            return;
           }
-        });
+          settled = true;
+          resolve();
+        };
+        const closeTimeout = setTimeout(finish, 1_000);
+        try {
+          client.end(true, {}, () => {
+            clearTimeout(closeTimeout);
+            finish();
+          });
+        } catch {
+          clearTimeout(closeTimeout);
+          finish();
+        }
       });
-      client.on("message", (topic, payloadBuffer) => {
-        if (topic !== outputTopic) {
+    }));
+  };
+
+  try {
+    await Promise.all(
+      registrations.map(({ consumerId, executionId, outputTopic }) => new Promise((resolve, reject) => {
+        if (typeof outputTopic !== "string" || outputTopic.trim() === "") {
+          reject(new Error(`Invalid output topic for ${consumerId}: ${String(outputTopic)}`));
           return;
         }
-        const parsed = parseResultPayload(payloadBuffer.toString("utf8"));
-        const event = {
-          consumerId,
-          executionId,
-          sharedOutputTopic: outputTopic,
-          windowStart: parsed.windowStart,
-          windowEnd: parsed.windowEnd,
-          resultValue: parsed.value,
-          sourcePublicationTimestamp: parsed.publicationTimestamp,
-          consumerReceptionTimestamp: Date.now(),
-          payload: parsed.raw,
-        };
-        allDeliveries.push(event);
-        appendNdjson(deliveryPath, event);
-        if (!firstDeliveryByConsumer.has(consumerId)) {
-          firstDeliveryByConsumer.set(consumerId, event);
-        }
-      });
-      client.on("error", reject);
-    })),
-  );
+        const client = mqtt.connect("mqtt://localhost:1883", {
+          clean: true,
+          clientId: `${consumerId}-${Math.random().toString(16).slice(2, 10)}`,
+        });
+        const timeout = setTimeout(() => {
+          reject(new Error(`Timed out subscribing ${consumerId}`));
+        }, 15_000);
+        clientRecords.push({ client, timeout });
+        client.on("connect", () => {
+          client.subscribe(outputTopic, { qos: 1 }, (error) => {
+            clearTimeout(timeout);
+            if (error) {
+              reject(error);
+            } else {
+              resolve();
+            }
+          });
+        });
+        client.on("message", (topic, payloadBuffer) => {
+          if (topic !== outputTopic) {
+            return;
+          }
+          const parsed = parseResultPayload(payloadBuffer.toString("utf8"));
+          const event = {
+            consumerId,
+            executionId,
+            sharedOutputTopic: outputTopic,
+            windowStart: parsed.windowStart,
+            windowEnd: parsed.windowEnd,
+            resultValue: parsed.value,
+            sourcePublicationTimestamp: parsed.publicationTimestamp,
+            consumerReceptionTimestamp: Date.now(),
+            payload: parsed.raw,
+          };
+          allDeliveries.push(event);
+          appendNdjson(deliveryPath, event);
+          if (!firstDeliveryByConsumer.has(consumerId)) {
+            firstDeliveryByConsumer.set(consumerId, event);
+          }
+        });
+        client.on("error", reject);
+      })),
+    );
+  } catch (error) {
+    await closeClients();
+    throw error;
+  }
 
   return {
-    clients,
+    clients: clientRecords.map(({ client }) => client),
     waitForAll: async (timeoutMs) => {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
@@ -682,15 +733,7 @@ async function subscribeConsumers({ registrations, expectedCount, deliveryPath }
         `Timed out waiting for ${expectedCount} consumer deliveries; got ${firstDeliveryByConsumer.size}`,
       );
     },
-    close: async () => {
-      for (const client of clients) {
-        try {
-          client.end(true);
-        } catch {
-          // ignore
-        }
-      }
-    },
+    close: closeClients,
   };
 }
 
