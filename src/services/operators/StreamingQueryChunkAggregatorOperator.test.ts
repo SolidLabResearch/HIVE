@@ -1667,6 +1667,137 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
     });
 
     describe('structured chunk normalization and timestamp filtering', () => {
+        function configureManagedProducer(origin: number) {
+            (operator as any).benchmarkEventTimeAnchor = origin;
+            (operator as any).managerOwnedProducerMappings = [{
+                producerId: 'legacy-runtime',
+                canonicalProducerId: 'canonical-producer',
+                runtimeProducerId: 'runtime-producer',
+                topic: 'managed/chunks',
+                canonicalProducerQuery: 'canonical query',
+                runtimeProducerQuery: 'runtime query',
+                expectedInputStream: 'wearable/temperature',
+                alignmentOriginMs: origin,
+            }];
+        }
+
+        function managedPayload(args: {
+            rawWindowStart: number;
+            rawWindowEnd: number;
+            inputWatermark: number;
+            temporallyComplete: boolean;
+            count: number;
+            sum: number;
+            alignmentCandidateStart?: number;
+        }) {
+            const alignmentCandidateStart =
+                args.alignmentCandidateStart ?? args.rawWindowStart;
+            const alignmentCandidateEnd =
+                alignmentCandidateStart + (args.rawWindowEnd - args.rawWindowStart);
+            return JSON.stringify({
+                message_format: 'structured_reusable_result',
+                source_query_id: 'runtime-query',
+                canonicalProducerId: 'canonical-producer',
+                runtimeProducerId: 'runtime-producer',
+                window_start: alignmentCandidateStart,
+                window_end: alignmentCandidateEnd,
+                chunkStart: alignmentCandidateStart,
+                chunkEnd: alignmentCandidateEnd,
+                rawWindowStart: args.rawWindowStart,
+                rawWindowEnd: args.rawWindowEnd,
+                inputWatermark: args.inputWatermark,
+                producerCoverageOrigin: 1_000_000,
+                temporallyComplete: args.temporallyComplete,
+                watermark: args.rawWindowEnd - 30_000,
+                aggregationType: 'AVG',
+                value: args.sum / args.count,
+                avg: args.sum / args.count,
+                count: args.count,
+                sum: args.sum,
+                window: { range: 60_000, step: 30_000 },
+            });
+        }
+
+        test('Case B rejects startup partial before it can reserve the target identity', () => {
+            const origin = 1_000_000;
+            configureManagedProducer(origin);
+            const startupPartial = (operator as any).normalizeChunkPayload(managedPayload({
+                rawWindowStart: origin - 1,
+                rawWindowEnd: origin + 59_999,
+                inputWatermark: origin + 59_999,
+                temporallyComplete: false,
+                count: 720,
+                sum: -16_546.38866,
+                alignmentCandidateStart: origin + 1,
+            }));
+            expect(startupPartial).toBeNull();
+
+            const complete = (operator as any).normalizeChunkPayload(managedPayload({
+                rawWindowStart: origin,
+                rawWindowEnd: origin + 60_000,
+                inputWatermark: origin + 60_000,
+                temporallyComplete: true,
+                count: 962,
+                sum: -22_120.722912,
+            }));
+            expect(complete).not.toBeNull();
+            expect(complete.window.start).toBe(origin);
+            expect(complete.window.end).toBe(origin + 60_000);
+            expect(complete.count).toBe(962);
+            expect(complete.sum / complete.count).toBeCloseTo(-22.99451446153846, 12);
+            expect((operator as any).acceptedContributions.size).toBe(0);
+        });
+
+        test('Case A ignores a pre-origin startup chunk and recomposes later complete chunks exactly', () => {
+            const origin = 1_000_000;
+            configureManagedProducer(origin);
+            expect((operator as any).normalizeChunkPayload(managedPayload({
+                rawWindowStart: origin - 60_000,
+                rawWindowEnd: origin,
+                inputWatermark: origin,
+                temporallyComplete: false,
+                count: 240,
+                sum: -5_518.038106,
+            }))).toBeNull();
+
+            const first = (operator as any).normalizeChunkPayload(managedPayload({
+                rawWindowStart: origin,
+                rawWindowEnd: origin + 60_000,
+                inputWatermark: origin + 60_000,
+                temporallyComplete: true,
+                count: 480,
+                sum: -11_034.7204,
+            }));
+            const second = (operator as any).normalizeChunkPayload(managedPayload({
+                rawWindowStart: origin + 60_000,
+                rawWindowEnd: origin + 120_000,
+                inputWatermark: origin + 120_000,
+                temporallyComplete: true,
+                count: 482,
+                sum: -11_086.002512,
+            }));
+            const coverage = {
+                expectedSubqueryIds: ['runtime-producer'],
+                receivedChunkIdsBySubquery: { 'runtime-producer': [] },
+                duplicateChunksIgnoredBySubquery: { 'runtime-producer': [] },
+            };
+            const groups = [first, second].map((partial) => ({
+                chunkGroupId: `${partial.window.start}:${partial.window.end}`,
+                start: partial.window.start,
+                end: partial.window.end,
+                summary: (operator as any).summarizeChunkGroup(
+                    `${partial.window.start}:${partial.window.end}`,
+                    new Map([['runtime-producer', partial]]),
+                    'AVG',
+                    coverage,
+                ),
+            }));
+            const result = (operator as any).summarizeWindowRecomposition(groups, 'AVG');
+            expect(result.recomposedCount).toBe(962);
+            expect(result.recomposedSum).toBeCloseTo(-22_120.722912, 9);
+            expect(result.resultValue).toBeCloseTo(-22.99451446153846, 12);
+        });
+
         test('legacy or unstructured payload is ignored', () => {
             expect((operator as any).normalizeChunkPayload('not-json')).toBeNull();
             expect((operator as any).normalizeChunkPayload(JSON.stringify({ foo: 'bar' }))).toBeNull();
@@ -1699,6 +1830,12 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
             expect((operator as any).normalizeChunkPayload(payload)).toEqual({
                 queryId: 'q1',
                 subqueryId: 'subA',
+                producerId: 'subA',
+                canonicalProducerId: undefined,
+                runtimeProducerId: 'subA',
+                chunkStart: 1000,
+                chunkEnd: 2000,
+                watermark: 2000,
                 window: {
                     windowName: 'https://rsp.js/w1',
                     start: 1000,

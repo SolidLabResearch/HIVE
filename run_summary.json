@@ -1,14 +1,14 @@
 {
   "publisherExitReason": "finite_replay_duration_reached",
-  "completionStatus": "completed",
-  "publishedObservations": 161,
+  "completionStatus": "incomplete",
+  "publishedObservations": 33,
   "totalSourceObservations": 61,
-  "publishAttempts": 161,
+  "publishAttempts": 33,
   "failedPublishes": 0,
   "finiteReplayMode": true,
-  "finiteReplayDurationSeconds": 40,
-  "replayLoopCount": 2,
-  "topic": "real-data-replay-check-2/wearableX",
-  "firstPublishedTimestamp": "2026-06-24T17:41:44.833Z",
-  "lastPublishedTimestamp": "2026-06-24T17:42:24.836Z"
+  "finiteReplayDurationSeconds": 8,
+  "replayLoopCount": 0,
+  "topic": "wearableX",
+  "firstPublishedTimestamp": "2026-08-05T08:59:24.331Z",
+  "lastPublishedTimestamp": "2026-08-05T08:59:32.332Z"
 }

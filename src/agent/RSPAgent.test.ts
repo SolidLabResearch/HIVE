@@ -264,4 +264,65 @@ describe("RSPAgent", () => {
 
     expect(global.fetch).not.toHaveBeenCalled();
   });
+
+  test("Case D managed producer requires an authoritative coverage origin", () => {
+    const query = `
+      PREFIX mqtt_broker: <mqtt://localhost:1883/>
+      PREFIX : <https://rsp.js/>
+      REGISTER RStream <output> AS
+      SELECT (AVG(?v) AS ?avgTemp)
+      FROM NAMED WINDOW :w1 ON STREAM mqtt_broker:wearable/temperature [RANGE 60000 STEP 30000]
+      WHERE { WINDOW :w1 { ?sensor :value ?v } }
+    `;
+
+    expect(() => new RSPAgent(query, "chunked/test-hash", {
+      registerQueryDefinition: false,
+      managedProducer: true,
+      producerIdentity: {
+        canonicalProducerId: "canonical",
+        runtimeProducerId: "runtime",
+      },
+    } as any)).toThrow("coverage origin must be finite");
+  });
+
+  test("Case C marks sparse managed windows complete from raw bounds and the input watermark", () => {
+    const origin = 1_000_000;
+    const query = `
+      PREFIX mqtt_broker: <mqtt://localhost:1883/>
+      PREFIX : <https://rsp.js/>
+      REGISTER RStream <output> AS
+      SELECT (AVG(?v) AS ?avgTemp)
+      FROM NAMED WINDOW :w1 ON STREAM mqtt_broker:wearable/temperature [RANGE 60000 STEP 30000]
+      WHERE { WINDOW :w1 { ?sensor :value ?v } }
+    `;
+    const agent = new RSPAgent(query, "chunked/test-hash", {
+      registerQueryDefinition: false,
+      managedProducer: true,
+      producerCoverageOrigin: origin,
+      producerIdentity: {
+        canonicalProducerId: "canonical",
+        runtimeProducerId: "runtime",
+      },
+    } as any);
+    const publisher = mqttClients[0];
+    publisher.emit("connect");
+
+    agent.rstream_emitter.emit("RStream", {
+      timestamp_from: origin,
+      timestamp_to: origin + 60_000,
+      result_emitted_at: origin + 60_000,
+      bindings: new Map([
+        [{ value: "?avgTemp" }, { value: "12.5" }],
+      ]),
+    });
+
+    const payload = JSON.parse(publisher.publish.mock.calls[0][1]);
+    expect(payload).toMatchObject({
+      rawWindowStart: origin,
+      rawWindowEnd: origin + 60_000,
+      inputWatermark: origin + 60_000,
+      producerCoverageOrigin: origin,
+      temporallyComplete: true,
+    });
+  });
 });

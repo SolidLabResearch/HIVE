@@ -4,9 +4,15 @@ const query = process.env.PRODUCER_QUERY;
 const topic = process.env.PRODUCER_TOPIC;
 const canonicalProducerId = process.env.CANONICAL_PRODUCER_ID;
 const runtimeProducerId = process.env.RUNTIME_PRODUCER_ID;
+const producerCoverageOrigin = Number(process.env.PRODUCER_ALIGNMENT_ORIGIN);
 
 if (!query || !topic || !canonicalProducerId || !runtimeProducerId) {
   throw new Error("Missing manager-owned producer runtime configuration");
+}
+if (!Number.isFinite(producerCoverageOrigin)) {
+  throw new Error(
+    `Managed producer coverage origin must be finite; received ${String(process.env.PRODUCER_ALIGNMENT_ORIGIN)}`,
+  );
 }
 
 process.send?.({
@@ -20,6 +26,8 @@ process.send?.({
 
 const agent = new RSPAgent(query, topic, {
   registerQueryDefinition: false,
+  managedProducer: true,
+  producerCoverageOrigin,
   mqttClientId: process.env.PRODUCER_MQTT_CLIENT_ID,
   producerIdentity: {
     canonicalProducerId,

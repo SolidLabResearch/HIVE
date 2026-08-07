@@ -624,6 +624,47 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         ) {
           const start = Number(parsed.window_start ?? parsed.chunkStart);
           const end = Number(parsed.window_end ?? parsed.chunkEnd);
+          const runtimeProducerId = parsed.runtimeProducerId;
+          const managedMapping = this.managerOwnedProducerMappings.length > 0
+            ? this.managerOwnedProducerMappings.find(
+                (mapping) => mapping.runtimeProducerId === runtimeProducerId,
+              )
+            : undefined;
+          if (this.managerOwnedProducerMappings.length > 0) {
+            if (!managedMapping) {
+              throw new Error(`Unknown runtimeProducerId ${runtimeProducerId} in managed chunk`);
+            }
+            const rawWindowStart = Number(parsed.rawWindowStart);
+            const rawWindowEnd = Number(parsed.rawWindowEnd);
+            const inputWatermark = Number(parsed.inputWatermark);
+            const producerCoverageOrigin = Number(parsed.producerCoverageOrigin);
+            if (
+              !Number.isFinite(rawWindowStart) ||
+              !Number.isFinite(rawWindowEnd) ||
+              !Number.isFinite(inputWatermark) ||
+              !Number.isFinite(producerCoverageOrigin)
+            ) {
+              throw new Error(
+                `Managed chunk from ${runtimeProducerId} omitted finite temporal completeness metadata`,
+              );
+            }
+            if (producerCoverageOrigin !== managedMapping.alignmentOriginMs) {
+              throw new Error(
+                `Managed chunk coverage origin ${producerCoverageOrigin} conflicts with runtime mapping ${managedMapping.alignmentOriginMs}`,
+              );
+            }
+            const temporallyComplete =
+              rawWindowStart >= producerCoverageOrigin &&
+              inputWatermark >= rawWindowEnd;
+            if (parsed.temporallyComplete === true && !temporallyComplete) {
+              throw new Error(
+                `Managed chunk from ${runtimeProducerId} falsely claimed temporal completeness`,
+              );
+            }
+            if (parsed.temporallyComplete !== true) {
+              return null;
+            }
+          }
           const window = this.normalizeChunkWindowAlignment({
             start,
             end,
@@ -636,7 +677,6 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             resultEmittedAt: Number(parsed.result_emitted_at ?? Date.now()),
             metadataSource: "reconstructed",
           });
-          const runtimeProducerId = parsed.runtimeProducerId;
           return {
             queryId: parsed.source_query_id,
             subqueryId: runtimeProducerId,
@@ -653,6 +693,22 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
             watermark: Number.isFinite(Number(parsed.watermark))
               ? Number(parsed.watermark)
               : window.logicalTriggerTime ?? window.end,
+            rawWindowStart: Number.isFinite(Number(parsed.rawWindowStart))
+              ? Number(parsed.rawWindowStart)
+              : undefined,
+            rawWindowEnd: Number.isFinite(Number(parsed.rawWindowEnd))
+              ? Number(parsed.rawWindowEnd)
+              : undefined,
+            inputWatermark: Number.isFinite(Number(parsed.inputWatermark))
+              ? Number(parsed.inputWatermark)
+              : undefined,
+            producerCoverageOrigin: Number.isFinite(Number(parsed.producerCoverageOrigin))
+              ? Number(parsed.producerCoverageOrigin)
+              : undefined,
+            temporallyComplete:
+              typeof parsed.temporallyComplete === "boolean"
+                ? parsed.temporallyComplete
+                : undefined,
             window,
             chunkId: `${this.sessionId}:${window.start}:${window.end}:${runtimeProducerId}`,
             sourceTopic:

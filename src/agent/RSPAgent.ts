@@ -33,6 +33,11 @@ type StructuredReusableResultPayload = {
     chunkStart: number;
     chunkEnd: number;
     watermark: number;
+    rawWindowStart: number;
+    rawWindowEnd: number;
+    inputWatermark: number | null;
+    producerCoverageOrigin: number | null;
+    temporallyComplete: boolean | null;
     source_topic?: string | null;
     reusable_result_topic?: string;
     aggregationType: string | null;
@@ -91,6 +96,8 @@ export class RSPAgent {
     private readonly onRuntimeError?: (error: Error) => void;
     private readonly producerIdentity: ProducerIdentity;
     private readonly mqttClientId?: string;
+    private readonly managedProducer: boolean;
+    private readonly producerCoverageOrigin: number | null;
 
     /**
      *
@@ -104,6 +111,8 @@ export class RSPAgent {
             registerQueryDefinition?: boolean;
             producerIdentity?: ProducerIdentity;
             mqttClientId?: string;
+            managedProducer?: boolean;
+            producerCoverageOrigin?: number;
             onRuntimeError?: (error: Error) => void;
         } = {},
     ) {
@@ -126,6 +135,16 @@ export class RSPAgent {
             runtimeProducerId: this.queryId,
         };
         this.mqttClientId = options.mqttClientId;
+        this.managedProducer = options.managedProducer === true;
+        const configuredCoverageOrigin = Number(options.producerCoverageOrigin);
+        if (this.managedProducer && !Number.isFinite(configuredCoverageOrigin)) {
+            throw new Error(
+                `Managed producer coverage origin must be finite; received ${String(options.producerCoverageOrigin)}`,
+            );
+        }
+        this.producerCoverageOrigin = Number.isFinite(configuredCoverageOrigin)
+            ? configuredCoverageOrigin
+            : null;
         this.rsp_engine = new RSPEngine(query);
         profileCount("rsp_engines_created");
         this.rstream_emitter = this.rsp_engine.register();
@@ -471,6 +490,17 @@ export class RSPAgent {
 
         const logicalTriggerTime =
             Number.isFinite(this.range) ? windowBounds.end - (this.range as number) / 2 : null;
+        const rawInputWatermark = Number(rstreamObject?.result_emitted_at);
+        if (this.managedProducer && !Number.isFinite(rawInputWatermark)) {
+            throw new Error("Managed reusable result omitted the rsp-js input watermark");
+        }
+        const inputWatermark = Number.isFinite(rawInputWatermark)
+            ? rawInputWatermark
+            : null;
+        const temporallyComplete = this.managedProducer
+            ? windowBounds.start >= (this.producerCoverageOrigin as number) &&
+              (inputWatermark as number) >= windowBounds.end
+            : null;
 
         const basePayload: StructuredReusableResultPayload = {
             message_format: "structured_reusable_result",
@@ -481,6 +511,11 @@ export class RSPAgent {
             chunkStart: windowBounds.start,
             chunkEnd: windowBounds.end,
             watermark: logicalTriggerTime ?? windowBounds.end,
+            rawWindowStart: windowBounds.start,
+            rawWindowEnd: windowBounds.end,
+            inputWatermark,
+            producerCoverageOrigin: this.producerCoverageOrigin,
+            temporallyComplete,
             aggregationType: this.aggregationType,
             value,
             count: this.extractNumericBinding(bindings, ["count"]),

@@ -25,6 +25,11 @@ export type PartialChunkResult = {
   chunkStart?: number;
   chunkEnd?: number;
   watermark?: number;
+  rawWindowStart?: number;
+  rawWindowEnd?: number;
+  inputWatermark?: number;
+  producerCoverageOrigin?: number;
+  temporallyComplete?: boolean;
   window: WindowDescriptor;
   chunkId: string;
   reuseClassKey?: string;
