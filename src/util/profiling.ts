@@ -107,6 +107,7 @@ let exitHookRegistered = false;
 let flushed = false;
 let signalHooksRegistered = false;
 let stageFlushed = false;
+let artifactWriteSequence = 0;
 
 function sanitize(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]+/g, "_");
@@ -245,14 +246,13 @@ function flushProfileSummary() {
   const summary = buildSummary(counters, timingsMs, artifactPath, finishedAt);
 
   if (artifactPath) {
-    fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
-    fs.writeFileSync(artifactPath, `${JSON.stringify(summary, null, 2)}\n`);
+    writeJsonArtifactAtomically(artifactPath, summary);
   }
 
   console.error(`HIVE_PROFILE ${JSON.stringify(summary)}`);
 }
 
-function resolveStageArtifactPath(): string | null {
+export function resolveStageArtifactPath(processId = process.pid): string | null {
   const explicitFile = (process.env.HIVE_STAGE_PROFILE_OUTPUT_FILE || "").trim();
   if (explicitFile) {
     return path.resolve(explicitFile);
@@ -270,7 +270,10 @@ function resolveStageArtifactPath(): string | null {
       return path.resolve(outputDir, "approximation_root_cpu_attribution_summary.json");
     }
     if (processRole.includes("approximation_bee_worker")) {
-      return path.resolve(outputDir, "approximation_cpu_attribution_summary.json");
+      return path.resolve(
+        outputDir,
+        `approximation_cpu_attribution_summary.${processId}.json`,
+      );
     }
     return path.resolve(
       outputDir,
@@ -282,7 +285,10 @@ function resolveStageArtifactPath(): string | null {
       return path.resolve(outputDir, "chunked_root_cpu_attribution_summary.json");
     }
     if (processRole.includes("chunked_bee_worker")) {
-      return path.resolve(outputDir, "chunked_cpu_attribution_summary.json");
+      return path.resolve(
+        outputDir,
+        `chunked_cpu_attribution_summary.${processId}.json`,
+      );
     }
     return path.resolve(
       outputDir,
@@ -348,12 +354,11 @@ function flushStageProfileSummary() {
   const summary = buildStageSummary(artifactPath, finishedAt);
 
   if (artifactPath) {
-    fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
-    fs.writeFileSync(artifactPath, `${JSON.stringify(summary, null, 2)}\n`);
+    writeJsonArtifactAtomically(artifactPath, summary);
   }
 }
 
-function resolveArtifactPath(): string | null {
+export function resolveArtifactPath(processId = process.pid): string | null {
   const explicitFile = (process.env.HIVE_PROFILE_OUTPUT_FILE || "").trim();
   if (explicitFile) {
     return path.resolve(explicitFile);
@@ -367,8 +372,25 @@ function resolveArtifactPath(): string | null {
   const consumerIdx = process.env.K_SCALING_CONSUMER_INDEX ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}` : "";
   return path.resolve(
     outputDir,
-    `hive_profile_summary.${sanitize(processRoleGroup)}${consumerIdx}.json`,
+    `hive_profile_summary.${sanitize(processRoleGroup)}${consumerIdx}.${processId}.json`,
   );
+}
+
+function writeJsonArtifactAtomically(artifactPath: string, summary: unknown): void {
+  const directory = path.dirname(artifactPath);
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(artifactPath)}.${process.pid}.${artifactWriteSequence++}.tmp`,
+  );
+  fs.mkdirSync(directory, { recursive: true });
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(summary, null, 2)}\n`);
+    fs.renameSync(temporaryPath, artifactPath);
+  } finally {
+    if (fs.existsSync(temporaryPath)) {
+      fs.unlinkSync(temporaryPath);
+    }
+  }
 }
 
 function registerExitHook() {
@@ -466,8 +488,7 @@ export function writeProfileArtifact(): void {
     new Date().toISOString(),
   );
 
-  fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
-  fs.writeFileSync(artifactPath, `${JSON.stringify(summary, null, 2)}\n`);
+  writeJsonArtifactAtomically(artifactPath, summary);
 }
 
 export function isStageProfileEnabled(): boolean {

@@ -741,7 +741,15 @@ function collectProfileSummaries(runRoot) {
   return fs
     .readdirSync(runRoot, { withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.startsWith("hive_profile_summary."))
-    .map((entry) => JSON.parse(fs.readFileSync(path.join(runRoot, entry.name), "utf8")));
+    .map((entry) => {
+      const profilePath = path.join(runRoot, entry.name);
+      try {
+        return JSON.parse(fs.readFileSync(profilePath, "utf8"));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to parse profile summary ${profilePath}: ${detail}`);
+      }
+    });
 }
 
 function summarizeProfiles(profiles, approach) {
