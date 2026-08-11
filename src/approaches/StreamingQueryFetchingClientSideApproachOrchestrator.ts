@@ -187,6 +187,10 @@ export class FetchingAllDataClientSide {
   private rejectCompletion!: (error: Error) => void;
   private completionSettled = false;
   private replayDrainStarted = false;
+  /** Final result MQTT publishes must settle before finite replay completion. */
+  private pendingFinalPublications = 0;
+  /** Async RStream callbacks may still be processing after MQTT replay completion. */
+  private pendingRStreamHandlers = 0;
   private readonly lifecycleHooks: FetchingLifecycleHooks;
 
   private deriveQueryWindowConfiguration(): QueryWindowConfiguration {
@@ -1062,11 +1066,17 @@ export class FetchingAllDataClientSide {
 
     const flushStartedAt = Date.now();
     while ((Date.now() - flushStartedAt) < BENCHMARK_REPLAY_SETTLE_TIMEOUT_MS) {
-      if (this.countPendingLogicalWindows() === 0) {
+      if (this.countPendingLogicalWindows() === 0 && this.pendingFinalPublications === 0 && this.pendingRStreamHandlers === 0) {
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, BENCHMARK_REPLAY_POLL_INTERVAL_MS));
       this.flushPendingFinalizedWindows();
+    }
+
+    if (this.pendingFinalPublications > 0 || this.pendingRStreamHandlers > 0) {
+      throw new Error(
+        `Fetching consumer ${this.consumerIndex ?? "standalone"} final RStream processing/publication did not settle before replay completion`,
+      );
     }
 
     await new Promise((resolve) => setTimeout(resolve, BENCHMARK_REPLAY_POLL_INTERVAL_MS));
@@ -1358,7 +1368,12 @@ export class FetchingAllDataClientSide {
       summaryPath: this.consumerSummaryPath,
       latencyPath: this.latencyLogPath,
     });
-    this.settleCompletion();
+    // In finite replay, completion is settled by the final publication
+    // callback.  The durable local summary alone is not sufficient because
+    // the runner's result subscriber still depends on that publication.
+    if (!this.benchmarkFiniteReplayMode) {
+      this.settleCompletion();
+    }
   }
 
   /**
@@ -1373,7 +1388,9 @@ export class FetchingAllDataClientSide {
     this.rstream_emitter.on("error", (err: any) => {
       console.error("Error in RStream emitter:", err);
     });
-    this.rstream_emitter.on("RStream", async (object: any) => {
+    this.rstream_emitter.on("RStream", (object: any) => {
+      this.pendingRStreamHandlers += 1;
+      void (async () => {
       console.log("DEBUG: RStream event received:", JSON.stringify(object));
       this.tracePipelineEvent("rstream_result_received", {
         payloadSummary: {
@@ -1827,6 +1844,7 @@ export class FetchingAllDataClientSide {
           });
           this.mqttClients.push(pubClient);
           profileCount("mqtt_clients_created");
+          this.pendingFinalPublications += 1;
           pubClient.on("connect", () => {
             const publishStartTime = Date.now();
             pubClient.publish(
@@ -1861,6 +1879,10 @@ export class FetchingAllDataClientSide {
                   });
                 }
                 pubClient.end();
+                this.pendingFinalPublications = Math.max(0, this.pendingFinalPublications - 1);
+                if (this.benchmarkFiniteReplayMode && this.pendingFinalPublications === 0) {
+                  this.settleCompletion(err ? new Error(String(err)) : undefined);
+                }
               },
             );
           });
@@ -2183,6 +2205,7 @@ export class FetchingAllDataClientSide {
         });
         this.mqttClients.push(pubClient);
         profileCount("mqtt_clients_created");
+        this.pendingFinalPublications += 1;
         pubClient.on("connect", () => {
           const publishStartTime = Date.now();
           pubClient.publish(
@@ -2218,10 +2241,17 @@ export class FetchingAllDataClientSide {
                 });
               }
               pubClient.end();
+              this.pendingFinalPublications = Math.max(0, this.pendingFinalPublications - 1);
+              if (this.benchmarkFiniteReplayMode && this.pendingFinalPublications === 0) {
+                this.settleCompletion(err ? new Error(String(err)) : undefined);
+              }
             },
           );
         });
       }
+      })().finally(() => {
+        this.pendingRStreamHandlers = Math.max(0, this.pendingRStreamHandlers - 1);
+      });
     });
   }
 

@@ -13,6 +13,10 @@ const {
   buildScenarioOracle,
   buildScenarioQueryDefinitions,
 } = require("./different-things-scaling-common");
+const {
+  buildExistingPrimitiveRegistrationBodies,
+  parseArgs,
+} = require("./run-production-different-things-scaling");
 
 describe("different-things-scaling common helpers", () => {
   test("builds ten nested queries with the fixed final window", () => {
@@ -153,6 +157,23 @@ describe("different-things-scaling common helpers", () => {
       expect(producerExpectations.every((entry) => entry.expectedReferenceCount > 0)).toBe(true);
     }
   });
+
+  test("builds the separate existing-reuse-density Phase-1 workload from exactly seven primitives", () => {
+    const primitives = buildExistingPrimitiveRegistrationBodies({
+      approach: "chunked",
+      topicPrefix: "experiment2/existing-reuse-density-m2",
+    });
+    expect(primitives).toHaveLength(7);
+    expect(primitives.map((entry) => entry.query_label)).toEqual(["P1", "P2", "P3", "P4", "P5", "P6", "P7"]);
+    expect(primitives.map((entry) => entry.included_things)).toEqual([
+      ["thing1"], ["thing2"], ["thing3"], ["thing4"], ["thing5"], ["thing6"], ["thing7"],
+    ]);
+    expect(parseArgs(["--mode", "existing-reuse-density", "--approaches", "fetching,chunked"])).toMatchObject({
+      mode: "existing-reuse-density",
+      things: [2, 4, 8, 16],
+      approaches: ["fetching", "chunked"],
+    });
+  });
 });
 
 
@@ -161,7 +182,10 @@ const { StreamingQueryChunkAggregatorOperator } = require("../../dist/services/o
 const {
   buildApproachScenarioMetrics,
   buildNestedDependencyTopology,
+  buildRspEngineEvidence,
   classifyProcessTopology,
+  compareTopologyPhases,
+  subtractNumericRecords,
   validateDeliveryProducerIdentities,
   validateProducerIdentityMappings,
 } = require("./run-production-different-things-scaling");
@@ -180,6 +204,43 @@ describe("approach-specific scaling metrics", () => {
       totalProducerDependencies: 15,
       reusedProducerAcquisitions: 10,
     });
+  });
+});
+
+describe("existing-reuse-density phase evidence helpers", () => {
+  test("persists comparable topology identities and phase additions", () => {
+    const phase1 = { processes: [
+      { pid: 1, alive: true, classification: "server" },
+      { pid: 2, alive: true, classification: "managed_producer" },
+    ] };
+    const post = { processes: [
+      ...phase1.processes,
+      { pid: 3, alive: true, classification: "reconstruction_worker" },
+    ] };
+    expect(compareTopologyPhases(phase1, post)).toMatchObject({
+      processCountDelta: 1,
+      addedProcesses: [expect.objectContaining({ pid: 3, classification: "reconstruction_worker" })],
+      phase1RoleCounts: { server: 1, managed_producer: 1 },
+      postAdditionRoleCounts: { server: 1, managed_producer: 1, reconstruction_worker: 1 },
+    });
+  });
+
+  test("calculates profile/MQTT counter deltas without CPU-percent arithmetic", () => {
+    expect(subtractNumericRecords(
+      { rsp_engines_created: 7, mqtt_messages_published: 11 },
+      { rsp_engines_created: 7, mqtt_messages_published: 4 },
+    )).toEqual({ mqtt_messages_published: 7, rsp_engines_created: 0 });
+  });
+
+  test("proves Chunked primitive engine identity is fixed across phase boundaries", () => {
+    const phase1 = buildRspEngineEvidence({ approach: "chunked", registrations: [], producerMappings: [
+      { runtimeProducerId: "p1" }, { runtimeProducerId: "p2" },
+    ] });
+    const post = buildRspEngineEvidence({ approach: "chunked", registrations: [], producerMappings: [
+      { runtimeProducerId: "p1" }, { runtimeProducerId: "p2" }, { runtimeProducerId: "p1" },
+    ] });
+    expect(phase1.primitiveRspEngineCount).toBe(2);
+    expect(post.primitiveRspEngineCount - phase1.primitiveRspEngineCount).toBe(0);
   });
 });
 

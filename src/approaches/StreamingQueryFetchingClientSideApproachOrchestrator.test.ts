@@ -16,6 +16,8 @@ const mqttClients: MockMqttClient[] = [];
 let lastRStreamEmitter: EventEmitter | null = null;
 let logRoot: string;
 const createdOperators: FetchingAllDataClientSide[] = [];
+let deferPublishes = false;
+let deferredPublishCallback: (() => void) | null = null;
 
 function createMockMqttClient(): MockMqttClient {
   const handlers: Record<string, Function> = {};
@@ -30,11 +32,15 @@ function createMockMqttClient(): MockMqttClient {
       return client;
     }),
     subscribe: jest.fn(),
-    publish: jest.fn((_topic, _payload, _optionsOrCb, maybeCb) => {
-      const callback =
-        typeof _optionsOrCb === "function" ? _optionsOrCb : maybeCb;
-      if (callback) {
-        callback();
+      publish: jest.fn((_topic, _payload, _optionsOrCb, maybeCb) => {
+        const callback =
+          typeof _optionsOrCb === "function" ? _optionsOrCb : maybeCb;
+        if (deferPublishes) {
+          deferredPublishCallback = callback;
+          return;
+        }
+        if (callback) {
+          callback();
       }
     }),
     end: jest.fn(),
@@ -184,6 +190,8 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     await Promise.all(createdOperators.map((operator) => operator.cleanup()));
     process.env = originalEnv;
     Date.now = originalNow;
+    deferredPublishCallback = null;
+    deferPublishes = false;
   });
 
   function createOperator(envOverrides: Record<string, string>) {
@@ -256,6 +264,29 @@ describe("StreamingQueryFetchingClientSideApproachOrchestrator timing filter", (
     expect(mqttClients).toHaveLength(1);
     mqttClients[0].emit("connect");
     expect(mqttClients[0].publish).toHaveBeenCalledTimes(1);
+  });
+
+  test("finite replay waits for an in-flight final publication before completing", async () => {
+    const operator = createOperator({
+      STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: "1",
+      RESULT_TOPIC: "benchmark-payload-enabled",
+    });
+    primeCompleteWindow(operator);
+    deferPublishes = true;
+    const completion = (operator as any).awaitCompletion();
+    lastRStreamEmitter?.emit("RStream", buildCompleteRStreamObject());
+    await waitForAsyncProcessing(() => (operator as any).pendingFinalPublications === 1);
+    mqttClients.at(-1)?.emit("connect");
+    await waitForAsyncProcessing();
+    let settled = false;
+    completion.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    const releasePublication = deferredPublishCallback!;
+    releasePublication();
+    await waitForAsyncProcessing();
+    expect((operator as any).pendingFinalPublications).toBe(0);
   });
 
   test("legacy mode still applies cadence filtering", async () => {

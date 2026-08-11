@@ -25,6 +25,7 @@ const {
   REUSE_DENSITY_MANIFEST,
   REUSE_DENSITY_PRODUCER_COUNT,
   REUSE_DENSITY_TARGET_COUNTS,
+  buildFinalQuery,
   buildFixture,
   buildProducerExpectations,
   buildReuseDensityMetrics,
@@ -259,12 +260,12 @@ function parseArgs(argv) {
   if (args.approaches.length === 0) {
     throw new Error("At least one approach must be selected");
   }
-  assert(["nested", "reuse-density"].includes(args.mode), `Unsupported mode: ${args.mode}`);
-  if (args.mode === "reuse-density" && !countExplicitlySet) {
+  assert(["nested", "reuse-density", "existing-reuse-density"].includes(args.mode), `Unsupported mode: ${args.mode}`);
+  if (["reuse-density", "existing-reuse-density"].includes(args.mode) && !countExplicitlySet) {
     args.things = [...REUSE_DENSITY_TARGET_COUNTS];
   }
-  if (args.mode === "reuse-density" && args.approaches.includes("approximation")) {
-    throw new Error("reuse-density mode supports only fetching,chunked");
+  if (["reuse-density", "existing-reuse-density"].includes(args.mode) && args.approaches.includes("approximation")) {
+    throw new Error(`${args.mode} mode supports only fetching,chunked`);
   }
   for (const approach of args.approaches) {
     if (!ALL_APPROACHES.includes(approach)) {
@@ -274,7 +275,7 @@ function parseArgs(argv) {
   if (args.things.length === 0) {
     throw new Error("At least one thing count must be selected");
   }
-  const allowedCounts = args.mode === "reuse-density"
+  const allowedCounts = ["reuse-density", "existing-reuse-density"].includes(args.mode)
     ? REUSE_DENSITY_TARGET_COUNTS
     : null;
   for (const thingCount of args.things) {
@@ -284,7 +285,7 @@ function parseArgs(argv) {
       (args.mode === "nested" && thingCount > 10) ||
       (allowedCounts && !allowedCounts.includes(thingCount))
     ) {
-      throw new Error(`Unsupported ${args.mode === "reuse-density" ? "target" : "thing"} count: ${thingCount}`);
+      throw new Error(`Unsupported ${["reuse-density", "existing-reuse-density"].includes(args.mode) ? "target" : "thing"} count: ${thingCount}`);
     }
   }
   return args;
@@ -686,13 +687,13 @@ function buildApproachEnv({
 }
 
 function buildQueryDefinitions(mode, targetCount, options) {
-  return mode === "reuse-density"
+  return ["reuse-density", "existing-reuse-density"].includes(mode)
     ? buildReuseDensityQueryDefinitions(targetCount, options)
     : buildScenarioQueryDefinitions(targetCount, options);
 }
 
 function buildScenarioOracleForMode(mode, targetCount, fixture) {
-  return mode === "reuse-density"
+  return ["reuse-density", "existing-reuse-density"].includes(mode)
     ? buildReuseDensityOracle(targetCount, fixture)
     : buildScenarioOracle(targetCount, fixture);
 }
@@ -722,6 +723,117 @@ function buildRegistrationBodies({ approach, thingCount, topicPrefix, mode = "ne
     expectedWindowStart: queryDefinition.expectedWindowStart,
     expectedWindowEnd: queryDefinition.expectedWindowEnd,
   }));
+}
+
+// This intentionally uses the same query builder and production /register body as
+// the target workload.  The only distinction is time: these seven registrations
+// form the pre-existing workload before a composite is allowed to arrive.
+function buildExistingPrimitiveRegistrationBodies({ approach, topicPrefix }) {
+  return Array.from({ length: REUSE_DENSITY_PRODUCER_COUNT }, (_unused, index) => {
+    const thingName = `thing${index + 1}`;
+    const queryLabel = `P${index + 1}`;
+    const query = buildScenarioQueryDefinitions(1, {
+      topicPrefix,
+      outputIriBuilder: () => `mqtt://localhost:1883/${topicPrefix}/results/${approach}/${queryLabel.toLowerCase()}`,
+    })[0];
+    // buildScenarioQueryDefinitions always starts at thing1, so use the shared
+    // final-query constructor indirectly through the fixed manifest definition.
+    const definition = index === 0 ? query : {
+      ...query,
+      includedThings: [thingName],
+      query: buildFinalQuery({
+        includedThings: [thingName],
+        topicPrefix,
+        outputIri: `mqtt://localhost:1883/${topicPrefix}/results/${approach}/${queryLabel.toLowerCase()}`,
+        rangeMs: OUTPUT_RANGE_MS,
+        stepMs: OUTPUT_STEP_MS,
+      }),
+    };
+    return {
+      id: `${approach}-existing-reuse-density-primitive-${queryLabel.toLowerCase()}`,
+      consumer_id: `${approach}-existing-reuse-density-primitive-${queryLabel.toLowerCase()}-consumer`,
+      query_label: queryLabel,
+      included_things: definition.includedThings,
+      approach,
+      rspql_query: definition.query,
+      r2s_topic: `mqtt://localhost:1883/${topicPrefix}/results/${approach}/${queryLabel.toLowerCase()}`,
+      data_topic: `mqtt://localhost:1883/${topicPrefix}/results/${approach}/${queryLabel.toLowerCase()}`,
+      expectedWindowStart: ALIGNMENT_ORIGIN_MS,
+      expectedWindowEnd: ALIGNMENT_ORIGIN_MS + OUTPUT_RANGE_MS,
+    };
+  });
+}
+
+function latestResourceSnapshot(csvPath) {
+  const metrics = parseResourceMetrics(csvPath);
+  if (!fs.existsSync(csvPath)) return metrics;
+  const lines = fs.readFileSync(csvPath, "utf8").trim().split(/\r?\n/).slice(1);
+  const last = lines.at(-1)?.split(",") || [];
+  return {
+    ...metrics,
+    timestamp: Number(last[0]) || null,
+    processCount: Number(last[2]) || null,
+    rssMb: Number(last[3]) / (1024 * 1024) || null,
+    cumulativeProcessTreeCpuSeconds: Number(last[4]) || null,
+  };
+}
+
+function sumRoleCounts(processes = []) {
+  return processes.reduce((counts, process) => {
+    const role = process.classification || "unknown";
+    counts[role] = (counts[role] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function subtractNumericRecords(after = {}, before = {}) {
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  return Object.fromEntries([...keys].sort().map((key) => [
+    key,
+    (Number(after[key]) || 0) - (Number(before[key]) || 0),
+  ]));
+}
+
+function buildPhaseProfileSnapshot(runRoot) {
+  const summary = collectProfileSummaries(runRoot);
+  return {
+    capturedAt: Date.now(),
+    scope: "finalized per-process profile artifacts currently present in this run directory",
+    liveCounterAvailability: summary.artifactCount > 0
+      ? "partial-finalized-artifacts-only"
+      : "unavailable-until-worker-shutdown",
+    ...summary,
+  };
+}
+
+function buildRspEngineEvidence({ approach, registrations, producerMappings }) {
+  if (approach === "chunked") {
+    const runtimeProducerIds = [...new Set(producerMappings.map((mapping) => mapping.runtimeProducerId))].sort();
+    return {
+      scope: "manager-owned primitive producer runtimes reported by production /register",
+      primitiveRspEngineCount: runtimeProducerIds.length,
+      primitiveRuntimeProducerIds: runtimeProducerIds,
+      reconstructionExecutionIds: registrations.map((registration) => registration.executionId),
+    };
+  }
+  return {
+    scope: "production /register execution records; Fetching is in-process and does not expose per-engine worker IDs",
+    primitiveRspEngineCount: null,
+    executionCount: registrations.length,
+    executionIds: registrations.map((registration) => registration.executionId),
+  };
+}
+
+function compareTopologyPhases(before, after) {
+  const beforePids = new Set(before.processes.filter((process) => process.alive).map((process) => process.pid));
+  const afterPids = new Set(after.processes.filter((process) => process.alive).map((process) => process.pid));
+  return {
+    processCountDelta: afterPids.size - beforePids.size,
+    addedProcesses: after.processes.filter((process) => process.alive && !beforePids.has(process.pid)),
+    removedProcesses: before.processes.filter((process) => process.alive && !afterPids.has(process.pid)),
+    phase1RoleCounts: sumRoleCounts(before.processes.filter((process) => process.alive)),
+    postAdditionRoleCounts: sumRoleCounts(after.processes.filter((process) => process.alive)),
+  };
 }
 
 function validateRegistrationSet(approach, registrations) {
@@ -1464,6 +1576,142 @@ function validateChunkedWatermarkAndCoverage(deliveries, registrations) {
   });
 }
 
+async function runExistingReuseDensityApproach({ approach, thingCount, fixture, scenarioRoot, deliveryTimeoutMs, expectedBuildManifest }) {
+  const runRoot = path.join(scenarioRoot, approach);
+  ensureDir(runRoot);
+  const topicPrefix = `experiment2/${path.basename(scenarioRoot)}/existing-reuse-density/m${thingCount}`;
+  const registrationPath = path.join(runRoot, "registration_events.ndjson");
+  const deliveryPath = path.join(runRoot, "consumer_delivery_events.ndjson");
+  const publishEventsPath = path.join(runRoot, "published_fixture_events.ndjson");
+  const resourcePath = path.join(runRoot, "process_tree_resource_usage.csv");
+  const serverOutPath = path.join(runRoot, "server.stdout.log");
+  const serverErrPath = path.join(runRoot, "server.stderr.log");
+  assertControlPortIsFree(CONTROL_PORT);
+  verifyBuildManifestOrThrow(expectedBuildManifest);
+  const server = spawn("node", [SERVER_EXECUTABLE_PATH], { cwd: REPO_ROOT, env: buildApproachEnv({ approach, runRoot, replayAnchor: fixture.anchorMs, topicPrefix }), detached: true, stdio: ["ignore", fs.openSync(serverOutPath, "a"), fs.openSync(serverErrPath, "a")] });
+  let sampler = null;
+  let subscribers = null;
+  const baselineRegistrations = [];
+  const compositeRegistrations = [];
+  try {
+    await waitForServerLog(serverOutPath);
+    await waitForRegisterReady(CONTROL_PORT);
+    sampler = startProcessTreeResourceLogging(resourcePath, server.pid, 200);
+    for (const body of buildExistingPrimitiveRegistrationBodies({ approach, topicPrefix })) {
+      const registration = await postRegistration(CONTROL_PORT, body);
+      registration.expectedWindowStart = body.expectedWindowStart;
+      registration.expectedWindowEnd = body.expectedWindowEnd;
+      appendNdjson(registrationPath, { phase: "baseline", ...registration });
+      baselineRegistrations.push(registration);
+    }
+    validateRegistrationSet(approach, baselineRegistrations);
+    assert(baselineRegistrations.length === REUSE_DENSITY_PRODUCER_COUNT, "existing-reuse-density requires exactly seven Phase-1 primitives");
+    await delay(300);
+    const baselineSnapshots = latestResourceSnapshot(resourcePath);
+    const baselineProducerMappings = baselineRegistrations.flatMap((entry) => entry.producerIdentityMappings || []);
+    if (approach === "chunked") {
+      assert(baselineProducerMappings.length === REUSE_DENSITY_PRODUCER_COUNT, "Chunked Phase 1 must expose exactly seven primitive runtimes");
+      assert(new Set(baselineProducerMappings.map((entry) => entry.runtimeProducerId)).size === REUSE_DENSITY_PRODUCER_COUNT, "Chunked Phase 1 primitive runtime IDs must be distinct");
+    }
+    const phase1BaselineTopology = captureProcessTopology({
+      serverPid: server.pid,
+      producerSnapshots: baselineRegistrations.flatMap((entry) => entry.producerSnapshots || []),
+      reconstructionWorkerIds: baselineRegistrations.flatMap((entry) => entry.workerIds || []),
+    });
+    const phase1ProfileSnapshot = buildPhaseProfileSnapshot(runRoot);
+    const phase1RspEngineEvidence = buildRspEngineEvidence({
+      approach,
+      registrations: baselineRegistrations,
+      producerMappings: baselineProducerMappings,
+    });
+    writeJson(path.join(runRoot, "phase1_baseline_evidence.json"), {
+      timestamp: Date.now(), resourceSnapshot: baselineSnapshots, processTopology: phase1BaselineTopology,
+      profileSnapshot: phase1ProfileSnapshot, rspEngineEvidence: phase1RspEngineEvidence,
+    });
+
+    const cpuIntervalStartedAt = Date.now();
+    const compositeStartSnapshot = latestResourceSnapshot(resourcePath);
+    for (const body of buildRegistrationBodies({ approach, thingCount, topicPrefix, mode: "existing-reuse-density" })) {
+      const registration = await postRegistration(CONTROL_PORT, body);
+      registration.expectedWindowStart = body.expectedWindowStart;
+      registration.expectedWindowEnd = body.expectedWindowEnd;
+      appendNdjson(registrationPath, { phase: "post_addition", ...registration });
+      compositeRegistrations.push(registration);
+    }
+    validateRegistrationSet(approach, compositeRegistrations);
+    if (approach === "chunked") {
+      const baselineRuntimeIds = new Set(baselineProducerMappings.map((entry) => entry.runtimeProducerId));
+      const compositeMappings = compositeRegistrations.flatMap((entry) => entry.producerIdentityMappings);
+      assert(compositeMappings.length === thingCount * 4, "Chunked composite dependency count mismatch");
+      assert(compositeMappings.every((entry) => baselineRuntimeIds.has(entry.runtimeProducerId)), "Chunked created a primitive runtime after composite registration");
+      assert(new Set(compositeMappings.map((entry) => entry.runtimeProducerId)).size === REUSE_DENSITY_PRODUCER_COUNT, "Chunked composite dependencies do not resolve to the seven Phase-1 runtimes");
+      assert(compositeRegistrations.every((entry) => entry.localProducerSpawnCount === 0), "Chunked local producer spawning must remain zero");
+    }
+    await delay(300);
+    const postAdditionSnapshot = latestResourceSnapshot(resourcePath);
+    const postAdditionTopology = captureProcessTopology({
+      serverPid: server.pid,
+      producerSnapshots: [...baselineRegistrations, ...compositeRegistrations].flatMap((entry) => entry.producerSnapshots || []),
+      reconstructionWorkerIds: [...baselineRegistrations, ...compositeRegistrations].flatMap((entry) => entry.workerIds || []),
+    });
+    const postAdditionProfileSnapshot = buildPhaseProfileSnapshot(runRoot);
+    const postAdditionRspEngineEvidence = buildRspEngineEvidence({
+      approach,
+      registrations: [...baselineRegistrations, ...compositeRegistrations],
+      producerMappings: [...baselineProducerMappings, ...compositeRegistrations.flatMap((entry) => entry.producerIdentityMappings)],
+    });
+    const topologyDelta = compareTopologyPhases(phase1BaselineTopology, postAdditionTopology);
+    const profileCounterDelta = subtractNumericRecords(postAdditionProfileSnapshot.counters, phase1ProfileSnapshot.counters);
+    const profileTimingDeltaMs = subtractNumericRecords(postAdditionProfileSnapshot.timingsMs, phase1ProfileSnapshot.timingsMs);
+    const phaseEvidenceDelta = {
+      processTopology: topologyDelta,
+      profileCounters: profileCounterDelta,
+      profileTimingsMs: profileTimingDeltaMs,
+      rspPrimitiveEngineDelta: approach === "chunked"
+        ? postAdditionRspEngineEvidence.primitiveRspEngineCount - phase1RspEngineEvidence.primitiveRspEngineCount
+        : null,
+    };
+    writeJson(path.join(runRoot, "post_addition_evidence.json"), {
+      timestamp: Date.now(), resourceSnapshot: postAdditionSnapshot, processTopology: postAdditionTopology,
+      profileSnapshot: postAdditionProfileSnapshot, rspEngineEvidence: postAdditionRspEngineEvidence,
+      phase1ToPostAdditionDelta: phaseEvidenceDelta,
+    });
+    subscribers = await subscribeConsumers({ registrations: [...baselineRegistrations, ...compositeRegistrations], deliveryPath });
+    await publishFixture({ fixture, thingCount: REUSE_DENSITY_PRODUCER_COUNT, topicPrefix, publishEventsPath });
+    const allDeliveries = await subscribers.waitForComparableDeliveries(deliveryTimeoutMs, approach);
+    const deliveries = allDeliveries.filter((entry) => /^Q\d+$/.test(entry.queryLabel));
+    const baselineDeliveries = allDeliveries.filter((entry) => /^P\d+$/.test(entry.queryLabel));
+    const checks = compareToOracle(approach, deliveries, buildReuseDensityOracle(thingCount, fixture));
+    validateExactApproach(approach, checks);
+    assert(baselineDeliveries.length === REUSE_DENSITY_PRODUCER_COUNT, "all Phase-1 primitives must deliver before completion");
+    await delay(ARTIFACT_SETTLE_MS);
+    const completionSnapshot = latestResourceSnapshot(resourcePath);
+    const incremental = {
+      cpuIntervalStartedAt,
+      cpuIntervalEndedAt: Date.now(),
+      cpuSeconds: completionSnapshot.cumulativeProcessTreeCpuSeconds - compositeStartSnapshot.cumulativeProcessTreeCpuSeconds,
+      rssMb: postAdditionSnapshot.rssMb - baselineSnapshots.rssMb,
+      processCount: postAdditionSnapshot.processCount - baselineSnapshots.processCount,
+    };
+    assert(Number.isFinite(incremental.cpuSeconds) && incremental.cpuSeconds >= 0, "invalid incremental CPU-seconds accounting");
+    assert(Number.isFinite(incremental.rssMb), "invalid incremental RSS accounting");
+    const provenance = compositeRegistrations.flatMap((composite) => composite.producerIdentityMappings.map((mapping) => {
+      const primitive = baselineRegistrations.find((entry) => entry.producerIdentityMappings.some((candidate) => candidate.runtimeProducerId === mapping.runtimeProducerId));
+      return { compositeQueryLabel: composite.queryLabel, compositeRegisteredAt: composite.requestStartedAt, primitiveQueryLabel: primitive?.queryLabel, primitiveExecutionId: primitive?.executionId, primitiveRegisteredAt: primitive?.responseReceivedAt, runtimeProducerId: mapping.runtimeProducerId, topic: mapping.topic };
+    }));
+    assert(provenance.every((entry) => entry.primitiveRegisteredAt < entry.compositeRegisteredAt), "a composite dependency does not predate composite registration");
+    const summary = { approach, mode: "existing-reuse-density", thingCount, runRoot, topicPrefix, baseline: { registrations: baselineRegistrations, deliveries: baselineDeliveries, resourceSnapshot: baselineSnapshots, producerMappings: baselineProducerMappings, processTopology: phase1BaselineTopology, profileSnapshot: phase1ProfileSnapshot, rspEngineEvidence: phase1RspEngineEvidence }, postAddition: { registrations: compositeRegistrations, resourceSnapshot: postAdditionSnapshot, processTopology: postAdditionTopology, profileSnapshot: postAdditionProfileSnapshot, rspEngineEvidence: postAdditionRspEngineEvidence }, phase2EvidenceDelta: phaseEvidenceDelta, completion: { resourceSnapshot: completionSnapshot }, incremental: { ...incremental, rssMeasurementScope: "instantaneous summed RSS of the authoritative server process tree at each boundary; run-wide peak is retained separately" }, deliveries, checks, workloadManifest: REUSE_DENSITY_MANIFEST.slice(0, thingCount).map((dependencies, index) => ({ queryLabel: `Q${index + 1}`, dependencies: [...dependencies] })), provenance, topology: { existingPrimitiveExecutions: REUSE_DENSITY_PRODUCER_COUNT, dependencyReferences: thingCount * 4, reusedDependencyReferences: thingCount * 4 - REUSE_DENSITY_PRODUCER_COUNT, additionalPrimitiveExecutions: approach === "chunked" ? 0 : null, additionalIndependentExecutions: approach === "fetching" ? thingCount : null, compositeReconstructionPaths: approach === "chunked" ? thingCount : 0 }, resourceMetrics: parseResourceMetrics(resourcePath), profileSummary: collectProfileSummaries(runRoot), deliveryDecisions: subscribers.getDeliveryDecisions() };
+    writeJson(path.join(runRoot, "approach_summary.json"), summary);
+    return summary;
+  } finally {
+    await subscribers?.close?.().catch?.(() => undefined);
+    sampler?.stop();
+    await terminateChildProcessTree(server, { logger: () => undefined, termWaitMs: 2000, killWaitMs: 2000 });
+    await delay(500);
+    assertControlPortIsFree(CONTROL_PORT);
+  }
+}
+
 async function runApproach({
   approach,
   thingCount,
@@ -1473,6 +1721,9 @@ async function runApproach({
   deliveryTimeoutMs,
   expectedBuildManifest,
 }) {
+  if (mode === "existing-reuse-density") {
+    return runExistingReuseDensityApproach({ approach, thingCount, fixture, scenarioRoot, deliveryTimeoutMs, expectedBuildManifest });
+  }
   const runRoot = path.join(scenarioRoot, approach);
   ensureDir(runRoot);
   const topicPrefix = mode === "reuse-density"
@@ -1777,12 +2028,12 @@ async function main() {
   const resultRoot = buildResultRoot();
   ensureDir(resultRoot);
   const fixture = buildFixture(
-    args.mode === "reuse-density" ? REUSE_DENSITY_PRODUCER_COUNT : 10,
+    ["reuse-density", "existing-reuse-density"].includes(args.mode) ? REUSE_DENSITY_PRODUCER_COUNT : 10,
     args.baseAnchorMs,
   );
   writeJson(path.join(resultRoot, "fixture_oracle.json"), {
     mode: args.mode,
-    workloadManifest: args.mode === "reuse-density"
+    workloadManifest: ["reuse-density", "existing-reuse-density"].includes(args.mode)
       ? REUSE_DENSITY_MANIFEST.map((dependencies, index) => ({
           queryLabel: `Q${index + 1}`,
           dependencies: [...dependencies],
@@ -1809,7 +2060,7 @@ async function main() {
   for (const { thingCount, approach, mode } of executionOrder) {
     const scenarioRoot = path.join(
       resultRoot,
-      mode === "reuse-density" ? `reuse-density-m${thingCount}` : `n${thingCount}`,
+      mode === "reuse-density" ? `reuse-density-m${thingCount}` : mode === "existing-reuse-density" ? `existing-reuse-density-m${thingCount}` : `n${thingCount}`,
     );
     ensureDir(scenarioRoot);
     const summary = await runApproach({
@@ -1834,7 +2085,10 @@ async function main() {
     thingCount,
     approach,
     deliveries: summary.deliveries.length,
-    registrations: summary.registrations.length,
+    registrations:
+      summary.registrations?.length ??
+      ((summary.baseline?.registrations?.length ?? 0) +
+        (summary.postAddition?.registrations?.length ?? 0)),
     exactOrComparable:
       approach === "approximation"
         ? summary.checks.every((entry) => Number.isFinite(entry.absoluteError))
@@ -1877,6 +2131,10 @@ module.exports = {
   buildOrderedPublishEvents,
   buildProducerReferenceRows,
   buildRegistrationBodies,
+  buildExistingPrimitiveRegistrationBodies,
+  buildPhaseProfileSnapshot,
+  buildRspEngineEvidence,
+  compareTopologyPhases,
   buildScenarioOrder,
   assertControlPortIsFree,
   classifyProcessTopology,
@@ -1886,6 +2144,8 @@ module.exports = {
   parseArgs,
   parseProcessRows,
   parseResourceMetrics,
+  subtractNumericRecords,
+  latestResourceSnapshot,
   parseResultPayload,
   validateChunkedContributionEvidence,
   validateChunkedWatermarkAndCoverage,
