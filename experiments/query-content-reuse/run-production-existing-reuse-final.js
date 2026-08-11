@@ -11,6 +11,7 @@ const RUNNER = path.join(__dirname, "run-production-different-things-scaling.js"
 const EXPECTED_RSPJS_SHA = "0039e59fcad7a7b6472f7bbd6b0b915c39e335f5";
 const DEFAULT_TARGETS = [2, 4, 8, 16];
 const DEFAULT_APPROACHES = ["fetching", "chunked"];
+const RSP_JS_PATH = process.env.RSP_JS_PATH || "/Users/kushbisen/Code/RSP-JS";
 
 function command(command) { return execSync(command, { cwd: ROOT, encoding: "utf8" }).trim(); }
 function sha(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
@@ -35,7 +36,7 @@ function parse(argv) {
   return args;
 }
 function assertPreflight() {
-  const rsp = command("git -C /Users/kushbisen/Code/RSP-JS rev-parse HEAD");
+  const rsp = command(`git -C ${JSON.stringify(RSP_JS_PATH)} rev-parse HEAD`);
   if (rsp !== EXPECTED_RSPJS_SHA) throw new Error(`RSP-JS SHA mismatch: ${rsp}`);
   const port = command("lsof -nP -iTCP:8080 -sTCP:LISTEN -t || true");
   if (port) throw new Error(`Port 8080 is occupied by ${port}`);
@@ -54,7 +55,7 @@ function main() {
   mkdir(resultRoot);
   const manifestSource = fs.readFileSync(path.join(__dirname, "different-things-scaling-common.js"), "utf8");
   write(path.join(resultRoot, "campaign_metadata.json"), {
-    experiment: "experiment2-existing-reuse-final", branch: command("git branch --show-current"), hiveSha: command("git rev-parse HEAD"), rspJsSha: command("git -C /Users/kushbisen/Code/RSP-JS rev-parse HEAD"), node: process.version, platform: `${process.platform}/${process.arch}`, cpu: os.cpus()[0]?.model || null, targets: args.targets, approaches: args.approaches, iterations: args.iterations, discardPolicy: args.iterations === 35 ? { warmup: [1, 2, 3], tail: [34, 35], analyzed: [4, 33] } : { warmup: [], tail: [], analyzed: [1, args.iterations] }, timeoutMs: args.timeoutMs, measurementScope: "full authoritative server process tree", samplingInterval: "canonical runner process-tree sampler", workloadManifestSha256: sha(manifestSource), startedAt: new Date().toISOString(), smoke: args.smoke,
+    experiment: "experiment2-existing-reuse-final", branch: command("git branch --show-current"), hiveSha: command("git rev-parse HEAD"), rspJsPath: RSP_JS_PATH, rspJsSha: command(`git -C ${JSON.stringify(RSP_JS_PATH)} rev-parse HEAD`), node: process.version, platform: `${process.platform}/${process.arch}`, cpu: os.cpus()[0]?.model || null, targets: args.targets, approaches: args.approaches, iterations: args.iterations, discardPolicy: args.iterations === 35 ? { warmup: [1, 2, 3], tail: [34, 35], analyzed: [4, 33] } : { warmup: [], tail: [], analyzed: [1, args.iterations] }, timeoutMs: args.timeoutMs, measurementScope: "full authoritative server process tree", samplingInterval: "canonical runner process-tree sampler", workloadManifestSha256: sha(manifestSource), startedAt: new Date().toISOString(), smoke: args.smoke,
   });
   const parent = path.join(ROOT, "results", "query-content-reuse");
   for (const target of args.targets) for (const approach of args.approaches) for (let iteration = 1; iteration <= args.iterations; iteration += 1) {
