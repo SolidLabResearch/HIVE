@@ -71,13 +71,22 @@ class FakeProducerManager {
   }
 }
 
+class FakeSharedChunkedRuntime {
+  public registrations: any[] = [];
+  public releases: string[] = [];
+  getPid(): number { return 8765; }
+  async registerPlan(registration: any): Promise<void> { this.registrations.push(registration); }
+  async releasePlan(planId: string): Promise<void> { this.releases.push(planId); }
+  shutdown(): void { return; }
+}
+
 describe("QueryExecutionDispatcher", () => {
   afterEach(() => {
     jest.restoreAllMocks();
     jest.clearAllMocks();
   });
 
-  test("creates fetching execution without synthetic shared consumer index", async () => {
+  test("creates fetching execution with an isolated diagnostic consumer index", async () => {
     const cleanup = jest.fn().mockResolvedValue(undefined);
     const process_streams = jest.fn().mockResolvedValue(undefined);
     (FetchingAllDataClientSide as unknown as jest.Mock).mockImplementation(() => ({
@@ -98,7 +107,10 @@ describe("QueryExecutionDispatcher", () => {
     expect(fetchingCall[0]).toBe("SELECT (AVG(?value) AS ?avgValue) WHERE { ?s ?p ?value }");
     expect(fetchingCall[1]).toMatch(/^shared\/fetching_[0-9a-f]{16}\/consumer-topic$/);
     expect(fetchingCall[2]).toBe("AVG");
-    expect(fetchingCall).toHaveLength(3);
+    // Fetching stays in the server process; the fourth argument only separates
+    // diagnostic artifacts for concurrently registered final executions.
+    expect(fetchingCall).toHaveLength(4);
+    expect(fetchingCall[3]).toBe(1);
     expect(handle.state).toBe("active");
   });
 
@@ -251,7 +263,10 @@ WHERE {
     };
     const producerManager = new FakeProducerManager();
     producerManager.shouldFail = true;
-    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any);
+    const sharedRuntime = new FakeSharedChunkedRuntime();
+    const dispatcher = new QueryExecutionDispatcher(
+      beeKeeper as any, {}, producerManager as any, () => sharedRuntime as any,
+    );
 
     await expect(
       dispatcher.createExecution({
@@ -347,7 +362,10 @@ WHERE {
         },
       ),
     };
-    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any);
+    const sharedRuntime = new FakeSharedChunkedRuntime();
+    const dispatcher = new QueryExecutionDispatcher(
+      beeKeeper as any, {}, producerManager as any, () => sharedRuntime as any,
+    );
 
     const q120 = `
 PREFIX mqtt_broker: <mqtt://localhost:1883/>
@@ -364,6 +382,7 @@ WHERE {
 }
 `;
     const q180 = q120.replaceAll("120000", "180000").replace("output-120", "output-180");
+    const q300 = q120.replaceAll("120000", "300000").replace("output-120", "output-300");
 
     const firstHandle = await dispatcher.createExecution({
       approach: "chunked",
@@ -377,8 +396,14 @@ WHERE {
       query: q180,
       requestedOutputTopic: "consumer-topic-180",
     });
+    const thirdHandle = await dispatcher.createExecution({
+      approach: "chunked",
+      canonicalQueryId: "canonical-300",
+      query: q300,
+      requestedOutputTopic: "consumer-topic-300",
+    });
 
-    expect(producerManager.ensureCalls).toHaveLength(2);
+    expect(producerManager.ensureCalls).toHaveLength(3);
     expect(firstHandle.executionId).not.toBe(secondHandle.executionId);
     expect(firstHandle.sharedOutputTopic).not.toBe(secondHandle.sharedOutputTopic);
     expect(firstHandle.producerIds).toEqual([
@@ -390,7 +415,16 @@ WHERE {
       "producer-smartphone",
     ]);
     expect(firstHandle.producerSnapshots).toHaveLength(2);
-    expect(beeKeeper.executeQuery).toHaveBeenCalledTimes(2);
+    expect(beeKeeper.executeQuery).not.toHaveBeenCalled();
+    expect(sharedRuntime.registrations).toHaveLength(3);
+    expect(sharedRuntime.registrations.map((entry) => entry.planId)).toEqual([
+      firstHandle.executionId,
+      secondHandle.executionId,
+      thirdHandle.executionId,
+    ]);
+    expect(firstHandle.workerIds).toEqual(["8765"]);
+    expect(secondHandle.workerIds).toEqual(["8765"]);
+    expect(thirdHandle.workerIds).toEqual(["8765"]);
   });
 
   test("normalizes benchmark-prefixed stream topics before deriving reusable subqueries", async () => {

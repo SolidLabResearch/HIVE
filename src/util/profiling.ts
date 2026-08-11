@@ -431,6 +431,12 @@ export function profileCount(name: string, delta = 1): void {
   add(bucket.counters, name, delta);
 }
 
+/** Records a counter high-water mark instead of accumulating samples. */
+export function profileMax(name: string, value: number): void {
+  if (!enabled) return;
+  bucket.counters.set(name, Math.max(bucket.counters.get(name) ?? 0, value));
+}
+
 export function profileTime(name: string, durationMs: number): void {
   if (!enabled) {
     return;

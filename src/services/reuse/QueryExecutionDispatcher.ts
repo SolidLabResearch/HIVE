@@ -25,6 +25,12 @@ import {
   SubqueryProducerRuntimeSnapshot,
   SubqueryProducerManager,
 } from "./SubqueryProducerManager";
+import {
+  createChunkedPlanConfigFromEnvironment,
+  type ChunkedReconstructionPlanConfig,
+} from "../operators/chunked/ChunkedReconstructionPlan";
+import { SharedChunkedReconstructionRuntime } from "./SharedChunkedReconstructionRuntime";
+import { profileCount } from "../../util/profiling";
 
 export type RegistrationApproach = "fetching" | "approximation" | "chunked";
 
@@ -39,6 +45,10 @@ export type ExecutionCreationRequest = {
 type DispatchListener = {
   onExecutionFailed?: (canonicalQueryId: string, reason: string) => void;
 };
+
+type SharedChunkedRuntimeFactory = (
+  onRuntimeFailed: (reason: string, executionIds: string[]) => void,
+) => SharedChunkedReconstructionRuntime;
 
 type DerivedSubqueryPlan = {
   aggregation: AggregationFunction;
@@ -182,6 +192,7 @@ export class QueryExecutionDispatcher {
   private readonly listener: DispatchListener;
   private readonly producerManager: SubqueryProducerManager;
   private readonly executionOwnerById = new Map<string, string>();
+  private sharedChunkedRuntime: SharedChunkedReconstructionRuntime | null = null;
   // Multiple independently registered Fetching targets live in one server
   // process. Give their diagnostic artifacts distinct consumer slots; this is
   // observability only and does not alter query execution or result topics.
@@ -191,6 +202,8 @@ export class QueryExecutionDispatcher {
     beeKeeper = new BeeKeeper(),
     listener: DispatchListener = {},
     producerManager?: SubqueryProducerManager,
+    private readonly sharedChunkedRuntimeFactory: SharedChunkedRuntimeFactory =
+      (onRuntimeFailed) => new SharedChunkedReconstructionRuntime(onRuntimeFailed),
   ) {
     this.beeKeeper = beeKeeper;
     this.listener = listener;
@@ -245,7 +258,11 @@ export class QueryExecutionDispatcher {
         executionId,
       );
       try {
-        return this.createBeeExecution(
+        return request.approach === "chunked"
+          ? this.createSharedChunkedExecution(
+              request, executionId, sharedOutputTopic, runtimePlan.subQueries, producers,
+            )
+          : this.createBeeExecution(
           request,
           executionId,
           sharedOutputTopic,
@@ -264,6 +281,93 @@ export class QueryExecutionDispatcher {
       sharedOutputTopic,
       runtimePlan.subQueries,
     );
+  }
+
+  private buildChunkedPlanConfig(
+    executionId: string,
+    sharedOutputTopic: string,
+    producerHandles: SubqueryProducerHandle[],
+  ): ChunkedReconstructionPlanConfig {
+    return createChunkedPlanConfigFromEnvironment({
+      planId: executionId,
+      executionId,
+      outputTopic: sharedOutputTopic,
+      managerOwnedProducerMappings: producerHandles.map((producer) => ({
+        producerId: producer.producerId,
+        canonicalProducerId: producer.canonicalProducerId,
+        runtimeProducerId: producer.runtimeProducerId,
+        topic: producer.producerTopic,
+        canonicalProducerQuery: producer.canonicalProducerQuery,
+        runtimeProducerQuery: producer.runtimeProducerQuery,
+        expectedInputStream: producer.expectedInputStream,
+        alignmentOriginMs: producer.alignmentOriginMs,
+      })),
+      skipLocalProducerSpawning: true,
+    });
+  }
+
+  private ensureSharedChunkedRuntime(): SharedChunkedReconstructionRuntime {
+    if (this.sharedChunkedRuntime) {
+      profileCount("chunked_reconstruction_runtime_reuse_hits");
+      return this.sharedChunkedRuntime;
+    }
+    profileCount("chunked_reconstruction_runtime_processes_created");
+    this.sharedChunkedRuntime = this.sharedChunkedRuntimeFactory((reason, executionIds) => {
+      for (const executionId of executionIds) {
+        const canonicalQueryId = this.executionOwnerById.get(executionId);
+        if (!canonicalQueryId) continue;
+        this.executionOwnerById.delete(executionId);
+        void this.producerManager.releaseExecution(executionId);
+        this.listener.onExecutionFailed?.(canonicalQueryId, reason);
+      }
+      this.sharedChunkedRuntime = null;
+    });
+    return this.sharedChunkedRuntime;
+  }
+
+  private async createSharedChunkedExecution(
+    request: ExecutionCreationRequest,
+    executionId: string,
+    sharedOutputTopic: string,
+    subQueries: string[],
+    producerHandles: SubqueryProducerHandle[],
+  ): Promise<ActiveExecutionHandle> {
+    const runtime = this.ensureSharedChunkedRuntime();
+    let handle!: MutableExecutionHandle;
+    try {
+      await runtime.registerPlan({
+        planId: executionId,
+        query: request.query,
+        subQueries,
+        config: this.buildChunkedPlanConfig(executionId, sharedOutputTopic, producerHandles),
+      });
+      handle = {
+        executionId,
+        approach: "chunked",
+        canonicalQueryId: request.canonicalQueryId,
+        sharedOutputTopic,
+        workerIds: runtime.getPid() ? [String(runtime.getPid())] : [],
+        producerIds: producerHandles.map((producer) => producer.producerId),
+        canonicalProducerIds: producerHandles.map((producer) => producer.canonicalProducerId),
+        runtimeProducerIds: producerHandles.map((producer) => producer.runtimeProducerId),
+        producerTopics: producerHandles.map((producer) => producer.outputTopic),
+        producerSnapshots: this.buildProducerSnapshots(producerHandles),
+        state: "active",
+        stop: async () => {
+          handle.state = "stopping";
+          await runtime.releasePlan(executionId);
+          this.executionOwnerById.delete(executionId);
+          await this.producerManager.releaseExecution(executionId);
+          handle.state = "stopped";
+        },
+      };
+      return handle;
+    } catch (error) {
+      this.executionOwnerById.delete(executionId);
+      await this.producerManager.releaseExecution(executionId);
+      this.listener.onExecutionFailed?.(request.canonicalQueryId, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 
   private async createFetchingExecution(
@@ -472,6 +576,8 @@ export class QueryExecutionDispatcher {
   }
 
   async shutdown(): Promise<void> {
+    this.sharedChunkedRuntime?.shutdown();
+    this.sharedChunkedRuntime = null;
     await this.producerManager.stopAll();
   }
 
