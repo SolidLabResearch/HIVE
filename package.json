@@ -40,6 +40,7 @@
         "eyereasoner": "^18.18.0",
         "hive-scout-bee": "^1.2.1",
         "hive-thought-rewriter": "^1.5.1",
+        "ldfetch": "^1.2.9",
         "mqtt": "^5.12.0",
         "n3": "^1.24.2",
         "rsp-js": "file:../RSP-JS",

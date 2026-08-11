@@ -7,7 +7,6 @@ const path = require("path");
 const mqtt = require("mqtt");
 const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 const {
-  cleanupStaleBenchmarkProcesses,
   delay,
   terminateChildProcessTree,
 } = require("../utils/processCleanup");
@@ -36,11 +35,16 @@ const CHUNK_RANGE_MS = 60_000;
 const CHUNK_STEP_MS = 30_000;
 const FINAL_STEP_MS = 60_000;
 const FLOAT_TOLERANCE = 1e-9;
+const REPLAY_ANCHOR_MS = 1_785_924_000_000;
 const DATA_PATH = "custom_patterns/low_variability";
 const FINAL_QUERIES = [
   { label: "Q120", rangeMs: 120_000 },
   { label: "Q180", rangeMs: 180_000 },
 ];
+const EXPECTED_FETCHING_ORACLE = {
+  Q120: { count: 962, sum: -22120.722912, avg: -22.99451446153846 },
+  Q180: { count: 1442, sum: -33155.43247399998, avg: -22.992671618585284 },
+};
 const ALL_APPROACHES = ["fetching", "approximation", "chunked"];
 
 function sha256(value) {
@@ -73,12 +77,12 @@ function runCommand(command, cwd = REPO_ROOT) {
   }).trim();
 }
 
-function buildResultRoot() {
+function buildResultRoot(experimentName = "production-different-windows-preliminary") {
   return path.join(
     REPO_ROOT,
     "results",
     "window-reuse",
-    `production-different-windows-preliminary-${sanitizeTimestamp(new Date())}`,
+    `${experimentName}-${sanitizeTimestamp(new Date())}`,
   );
 }
 
@@ -231,6 +235,10 @@ function parseArgs(argv) {
     baseAnchorMs: null,
     approaches: [...ALL_APPROACHES],
     oracleRoot: null,
+    rangesSeconds: FINAL_QUERIES.map((entry) => entry.rangeMs / 1000),
+    replayDurationSeconds: REPLAY_DURATION_SECONDS,
+    chunkStepSeconds: CHUNK_STEP_MS / 1000,
+    experimentName: "production-different-windows-preliminary",
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -256,6 +264,25 @@ function parseArgs(argv) {
         args.oracleRoot = next ? path.resolve(next) : null;
         index += 1;
         break;
+      case "--ranges":
+        args.rangesSeconds = String(next || "")
+          .split(",")
+          .map((entry) => Number.parseInt(entry.trim(), 10))
+          .filter((entry) => Number.isFinite(entry) && entry > 0);
+        index += 1;
+        break;
+      case "--replay-duration-seconds":
+        args.replayDurationSeconds = Number.parseInt(next || "", 10);
+        index += 1;
+        break;
+      case "--chunk-step-seconds":
+        args.chunkStepSeconds = Number.parseInt(next || "", 10);
+        index += 1;
+        break;
+      case "--experiment-name":
+        args.experimentName = String(next || "").trim();
+        index += 1;
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }
@@ -268,7 +295,29 @@ function parseArgs(argv) {
       throw new Error(`Unsupported approach: ${approach}`);
     }
   }
+  if (args.baseAnchorMs !== null && args.baseAnchorMs !== REPLAY_ANCHOR_MS) {
+    throw new Error(
+      `Experiment 1 requires replay anchor ${REPLAY_ANCHOR_MS}; received ${args.baseAnchorMs}`,
+    );
+  }
+  assert(args.rangesSeconds.length > 0, "At least one positive target range is required");
+  assert(new Set(args.rangesSeconds).size === args.rangesSeconds.length, "Target ranges must be unique");
+  assert(Number.isFinite(args.replayDurationSeconds), "--replay-duration-seconds must be a positive integer");
+  assert(Number.isFinite(args.chunkStepSeconds), "--chunk-step-seconds must be a positive integer");
+  assert(/^[a-z0-9-]+$/.test(args.experimentName), "--experiment-name must contain only lowercase letters, digits, and hyphens");
   return args;
+}
+
+function buildQueriesForRanges(rangesSeconds) {
+  return rangesSeconds.map((rangeSeconds) => ({
+    label: `Q${rangeSeconds}`,
+    rangeMs: rangeSeconds * 1000,
+  }));
+}
+
+function calculateRequiredReplayDurationSeconds(queries, finalStepMs = FINAL_STEP_MS) {
+  const longestRangeMs = Math.max(...queries.map((entry) => entry.rangeMs));
+  return (longestRangeMs / 1000) + (finalStepMs / 1000);
 }
 
 function buildWindowPlan(anchorMs, queries) {
@@ -327,7 +376,7 @@ function loadJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
-function loadFetchingOracleSummary({ oracleRoot, excludeRoot } = {}) {
+function loadFetchingOracleSummary({ oracleRoot, excludeRoot, queries = FINAL_QUERIES } = {}) {
   const candidateRoots = [];
   if (oracleRoot) {
     candidateRoots.push(oracleRoot);
@@ -345,7 +394,7 @@ function loadFetchingOracleSummary({ oracleRoot, excludeRoot } = {}) {
       continue;
     }
     const summary = loadJson(summaryPath);
-    if (Array.isArray(summary?.deliveries) && summary.deliveries.length === FINAL_QUERIES.length) {
+    if (Array.isArray(summary?.deliveries) && summary.deliveries.length === queries.length) {
       return {
         oracleRoot: root,
         summary,
@@ -567,21 +616,11 @@ async function subscribeConsumers({ registrations, deliveryPath }) {
             }
             return {
               ...delivery,
-              ...normalizeDelivery(approach, registration, {
-                ...delivery.payload,
-                value: delivery.value,
-                windowStart: delivery.windowStart,
-                windowEnd: delivery.windowEnd,
-                publicationTimestamp: delivery.publicationTimestamp,
-                eventCount: delivery.count,
-                sumValue: delivery.sum,
-                avgValue: delivery.avg,
-                recomposedCount: delivery.count,
-                recomposedSum: delivery.sum,
-                recomposedAvg: delivery.avg,
-                isComparableWindow: true,
-                coverageComplete: delivery.coverageComplete,
-              }),
+              ...normalizeDelivery(
+                approach,
+                registration,
+                parseResultPayload(JSON.stringify(delivery.payload)),
+              ),
             };
           });
         }
@@ -666,21 +705,24 @@ function buildApproachEnv({
   runRoot,
   replayAnchor,
   topicPrefix,
+  replayDurationSeconds,
+  chunkStepMs,
+  experimentName,
 }) {
   const replayEnv = createBenchmarkReplayRunEnv(process.env);
-  const benchmarkMaxTimestamp = replayAnchor + (REPLAY_DURATION_SECONDS * 1000);
+  const benchmarkMaxTimestamp = replayAnchor + (replayDurationSeconds * 1000);
   return replayEnv.withBenchmarkReplayEnv({
     ...process.env,
     LOG_PATH: runRoot,
     DATA_PATH,
-    SESSION_ID: `experiment1_${approach}_${path.basename(runRoot)}`,
-    BENCHMARK_SCENARIO: "experiment1-production-different-windows-preliminary",
+    SESSION_ID: `${experimentName}_${approach}_${path.basename(runRoot)}`,
+    BENCHMARK_SCENARIO: experimentName,
     BENCHMARK_APPROACH: approach,
     STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX: topicPrefix,
     STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: "1",
     STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: "1",
     STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: String(
-      REPLAY_DURATION_SECONDS,
+      replayDurationSeconds,
     ),
     STREAMING_QUERY_HIVE_BENCHMARK_START_TIME: String(replayAnchor),
     STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: String(replayAnchor),
@@ -689,7 +731,7 @@ function buildApproachEnv({
     RESULT_TOPIC: "benchmark-payload-enabled",
     OUTPUT_WINDOW_STEP: String(FINAL_STEP_MS),
     SUB_WINDOW_RANGE: String(CHUNK_RANGE_MS),
-    SUB_WINDOW_STEP: String(CHUNK_STEP_MS),
+    SUB_WINDOW_STEP: String(chunkStepMs),
     STREAMING_QUERY_HIVE_DETERMINISTIC_EVENT_TIME: "1",
     STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY: "1",
     STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY: "0",
@@ -766,6 +808,9 @@ async function runApproach({
   resultRoot,
   deliveryTimeoutMs,
   expectedBuildManifest,
+  replayDurationSeconds,
+  chunkStepMs,
+  experimentName,
 }) {
   const runRoot = path.join(resultRoot, approach);
   ensureDir(runRoot);
@@ -776,15 +821,22 @@ async function runApproach({
   const publisherOutPath = path.join(runRoot, "publisher.stdout.log");
   const publisherErrPath = path.join(runRoot, "publisher.stderr.log");
   const resourcePath = path.join(runRoot, "process_tree_resource_usage.csv");
-  const sharedTopicPrefix = `experiment1/${path.basename(resultRoot)}`;
+  const sharedTopicPrefix = `${experimentName}/${path.basename(resultRoot)}`;
   const env = buildApproachEnv({
     approach,
     runRoot,
     replayAnchor,
     topicPrefix: sharedTopicPrefix,
+    replayDurationSeconds,
+    chunkStepMs,
+    experimentName,
   });
 
-  await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  const controlPortBeforeRun = checkPortStatus(CONTROL_PORT);
+  assert(
+    controlPortBeforeRun.activePids.length === 0,
+    `Experiment 1 will not kill an existing server on port ${CONTROL_PORT}: ${controlPortBeforeRun.activePids.join(", ")}`,
+  );
   verifyBuildManifestOrThrow(expectedBuildManifest);
 
   const server = spawn("node", [SERVER_EXECUTABLE_PATH], {
@@ -874,6 +926,9 @@ async function runApproach({
       approach,
       runRoot,
       replayAnchor,
+      replayDurationSeconds,
+      chunkRangeMs: CHUNK_RANGE_MS,
+      chunkStepMs,
       sharedTopicPrefix,
       registrations,
       deliveries,
@@ -914,6 +969,54 @@ function indexByLabel(entries) {
   return new Map(entries.map((entry) => [entry.queryLabel, entry]));
 }
 
+function buildMetricComparison(expected, actual, exactRequired) {
+  const fields = ["count", "sum", "avg"];
+  const absoluteErrors = Object.fromEntries(
+    fields.map((field) => [
+      field,
+      Number.isFinite(actual[field]) && Number.isFinite(expected[field])
+        ? Math.abs(actual[field] - expected[field])
+        : null,
+    ]),
+  );
+  const values = Object.values(absoluteErrors).filter(Number.isFinite);
+  const relativeErrors = fields
+    .filter((field) => Number.isFinite(absoluteErrors[field]) && Math.abs(expected[field]) > 1e-12)
+    .map((field) => absoluteErrors[field] / Math.abs(expected[field]));
+  const exact =
+    actual.count === expected.count &&
+    absoluteErrors.sum <= FLOAT_TOLERANCE &&
+    absoluteErrors.avg <= FLOAT_TOLERANCE;
+  return {
+    expected,
+    actual,
+    expectedOutputCount: 1,
+    comparableOutputCount: 1,
+    exactOutputCount: exact ? 1 : 0,
+    absoluteErrors,
+    mae: values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null,
+    maxAbsoluteError: values.length > 0 ? Math.max(...values) : null,
+    mape: relativeErrors.length > 0
+      ? relativeErrors.reduce((sum, value) => sum + value, 0) / relativeErrors.length
+      : null,
+    exact: exactRequired ? exact : undefined,
+  };
+}
+
+function validateExpectedFetchingOracle(fetchingSummary) {
+  for (const delivery of fetchingSummary.deliveries) {
+    const expected = EXPECTED_FETCHING_ORACLE[delivery.queryLabel];
+    if (!expected) {
+      continue;
+    }
+    const comparison = buildMetricComparison(expected, delivery, true);
+    assert(
+      comparison.exact === true,
+      `fetching/${delivery.queryLabel}: dataset oracle mismatch ${JSON.stringify(comparison.absoluteErrors)}`,
+    );
+  }
+}
+
 function compareAgainstFetching(fetchingSummary, otherSummary, approach) {
   const fetchingByLabel = indexByLabel(fetchingSummary.deliveries);
   return otherSummary.deliveries.map((delivery) => {
@@ -921,25 +1024,96 @@ function compareAgainstFetching(fetchingSummary, otherSummary, approach) {
     if (!oracle) {
       throw new Error(`${approach}/${delivery.queryLabel}: missing fetching oracle`);
     }
-    const avgError = Math.abs((delivery.avg ?? 0) - (oracle.avg ?? 0));
-    const percentError =
-      Math.abs(oracle.avg ?? 0) > 1e-12 ? avgError / Math.abs(oracle.avg) : 0;
+    const metrics = buildMetricComparison(oracle, delivery, approach === "chunked");
     return {
       queryLabel: delivery.queryLabel,
       windowStartMatch: delivery.windowStart === oracle.windowStart,
       windowEndMatch: delivery.windowEnd === oracle.windowEnd,
-      countMatch:
-        approach === "chunked" ? delivery.count === oracle.count : undefined,
-      sumError:
-        approach === "chunked" && delivery.sum !== null && oracle.sum !== null
-          ? Math.abs(delivery.sum - oracle.sum)
-          : null,
-      avgError,
-      percentError,
+      countMatch: delivery.count === oracle.count,
+      sumError: metrics.absoluteErrors.sum,
+      avgError: metrics.absoluteErrors.avg,
+      percentError: metrics.mape,
+      metrics,
       oracle,
       delivery,
     };
   });
+}
+
+function readJsonIfPresent(filePath) {
+  return fs.existsSync(filePath) ? loadJson(filePath) : null;
+}
+
+function collectProfileArtifacts(runRoot) {
+  return fs.readdirSync(runRoot)
+    .filter((name) => /^hive_profile_summary\.[^.]+\.\d+\.json$/.test(name))
+    .sort()
+    .map((name) => ({ fileName: name, ...loadJson(path.join(runRoot, name)) }));
+}
+
+function validateReconstructionChunks(delivery) {
+  const internalChunks = delivery.payload?.internalChunks;
+  const expectedChunkCount = delivery.rangeMs / CHUNK_RANGE_MS;
+  assert(Array.isArray(internalChunks), `chunked/${delivery.queryLabel}: missing internal chunk evidence`);
+  assert(internalChunks.length === expectedChunkCount, `chunked/${delivery.queryLabel}: expected ${expectedChunkCount} chunks, got ${internalChunks.length}`);
+  assert(delivery.payload?.metadataSource === "reconstructed", `chunked/${delivery.queryLabel}: payload was not reconstructed`);
+  for (let index = 0; index < internalChunks.length; index += 1) {
+    const chunk = internalChunks[index];
+    assert(chunk.coverageComplete === true, `chunked/${delivery.queryLabel}: incomplete internal chunk`);
+    assert(chunk.start === delivery.windowStart + (index * CHUNK_RANGE_MS), `chunked/${delivery.queryLabel}: non-contiguous chunk start`);
+    assert(chunk.end === chunk.start + CHUNK_RANGE_MS, `chunked/${delivery.queryLabel}: incorrect chunk width`);
+  }
+  return internalChunks;
+}
+
+function buildChunkedTopology(chunkedSummary, queries) {
+  const registrations = chunkedSummary.registrations;
+  const executionIds = registrations.map((entry) => entry.executionId);
+  const finalSnapshot = registrations.at(-1)?.producerSnapshots || [];
+  assert(finalSnapshot.length === 2, `chunked: expected two shared producers, got ${finalSnapshot.length}`);
+  for (const producer of finalSnapshot) {
+    assert(producer.referenceCount === queries.length, `chunked/${producer.producerId}: referenceCount=${producer.referenceCount}`);
+    assert(
+      JSON.stringify([...producer.dependentExecutionIds].sort()) === JSON.stringify([...executionIds].sort()),
+      `chunked/${producer.producerId}: dependent execution IDs do not cover Q120 and Q180`,
+    );
+    assert(
+      String(producer.processCommandLine || "").includes("SubqueryProducerWorker"),
+      `chunked/${producer.producerId}: producer is not manager-owned`,
+    );
+  }
+
+  const reconstructionResults = chunkedSummary.deliveries.map((delivery) => {
+    const internalChunks = validateReconstructionChunks(delivery);
+    return {
+      queryLabel: delivery.queryLabel,
+      reconstructed: true,
+      internalChunkCount: internalChunks.length,
+      allInternalChunksCoverageComplete: true,
+      recomposedCount: delivery.count,
+      recomposedSum: delivery.sum,
+      recomposedAvg: delivery.avg,
+    };
+  });
+
+  const debugSummary = readJsonIfPresent(path.join(chunkedSummary.runRoot, "chunked_debug_summary.json"));
+  assert(debugSummary, "chunked: missing operator debug counters");
+  assert(debugSummary.managedProducerMode === true, "chunked: manager-owned producer mode was not active");
+  assert(debugSummary.localProducerSpawnCount === 0, "chunked: reconstruction-local producer spawning occurred");
+  assert(debugSummary.managerOwnedSubscriptionCount === 2, "chunked: unexpected manager-owned subscription count");
+
+  return {
+    executionCount: executionIds.length,
+    finalReuseHits: registrations.filter((entry) => entry.reuseHit === true).length,
+    sharedProducerCount: finalSnapshot.length,
+    producerReferenceCounts: finalSnapshot.map((entry) => entry.referenceCount),
+    producerDependentExecutionIds: finalSnapshot.map((entry) => entry.dependentExecutionIds),
+    reconstructionPathCount: reconstructionResults.length,
+    reconstructionResults,
+    consumerDeliveryCount: chunkedSummary.deliveries.length,
+    operatorCounters: debugSummary,
+    profileArtifacts: collectProfileArtifacts(chunkedSummary.runRoot),
+  };
 }
 
 function validateChunkedChecks(chunkedChecks) {
@@ -968,11 +1142,22 @@ function validateChunkedChecks(chunkedChecks) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const queries = FINAL_QUERIES;
-  const resultRoot = buildResultRoot();
+  const queries = buildQueriesForRanges(args.rangesSeconds);
+  for (const query of queries) {
+    assert(
+      query.rangeMs % CHUNK_RANGE_MS === 0,
+      `${query.label}: target range must be an integer number of ${CHUNK_RANGE_MS / 1000}s chunks`,
+    );
+  }
+  const requiredReplayDurationSeconds = calculateRequiredReplayDurationSeconds(queries);
+  assert(
+    args.replayDurationSeconds >= requiredReplayDurationSeconds,
+    `Replay duration ${args.replayDurationSeconds}s is too short; ${requiredReplayDurationSeconds}s is required for the first complete target window plus one ${FINAL_STEP_MS / 1000}s step`,
+  );
+  const resultRoot = buildResultRoot(args.experimentName);
   ensureDir(resultRoot);
 
-  const replayAnchor = args.baseAnchorMs || Date.UTC(2026, 7, 5, 10, 0, 0, 0);
+  const replayAnchor = REPLAY_ANCHOR_MS;
   const windowPlan = buildWindowPlan(replayAnchor, queries);
   writeJson(path.join(resultRoot, "window_plan.json"), windowPlan);
 
@@ -986,6 +1171,9 @@ async function main() {
       resultRoot,
       deliveryTimeoutMs: args.timeoutMs,
       expectedBuildManifest: buildInfo.buildManifest,
+      replayDurationSeconds: args.replayDurationSeconds,
+      chunkStepMs: args.chunkStepSeconds * 1000,
+      experimentName: args.experimentName,
     });
   }
 
@@ -995,6 +1183,7 @@ async function main() {
     const oracle = loadFetchingOracleSummary({
       oracleRoot: args.oracleRoot,
       excludeRoot: resultRoot,
+      queries,
     });
     fetchingSummary = oracle.summary;
     oracleSourceRoot = oracle.oracleRoot;
@@ -1018,11 +1207,22 @@ async function main() {
   if (chunkedChecks.length > 0) {
     validateChunkedChecks(chunkedChecks);
   }
+  if (fetchingSummary) {
+    validateExpectedFetchingOracle(fetchingSummary);
+  }
+  const chunkedTopology = chunkedSummary
+    ? buildChunkedTopology(chunkedSummary, queries)
+    : null;
 
   const portStatus = checkPortStatus(CONTROL_PORT);
   const summary = {
     resultRoot,
-    fallbackMode: "two-window",
+    experimentName: args.experimentName,
+    fallbackMode: "production-window-range-scaling",
+    replayDurationSeconds: args.replayDurationSeconds,
+    requiredReplayDurationSeconds,
+    chunkRangeMs: CHUNK_RANGE_MS,
+    chunkStepMs: args.chunkStepSeconds * 1000,
     selectedApproaches: args.approaches,
     oracleSourceRoot,
     buildInfo,
@@ -1032,6 +1232,7 @@ async function main() {
     chunkedSummary,
     approximationChecks,
     chunkedChecks,
+    chunkedTopology,
     controlPortStatus: portStatus,
     orphanProcessStatus: {
       controlPortFree: portStatus.activePids.length === 0,
@@ -1062,7 +1263,14 @@ module.exports = {
   ALL_APPROACHES,
   FINAL_QUERIES,
   FINAL_STEP_MS,
+  REPLAY_ANCHOR_MS,
+  EXPECTED_FETCHING_ORACLE,
+  buildQueriesForRanges,
+  calculateRequiredReplayDurationSeconds,
+  buildMetricComparison,
+  buildChunkedTopology,
   buildWindowPlan,
+  validateReconstructionChunks,
   evaluateComparableDelivery,
   normalizeDelivery,
   parseArgs,
