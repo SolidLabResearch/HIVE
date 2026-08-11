@@ -29,6 +29,11 @@ const {
   sanitizeTimestamp,
 } = require("../k-scaling/local-k-scaling-smoke-common");
 const { buildOutputSelectClause } = require("../../dist/util/runtimeConfig");
+const {
+  discoverFetchingOracle,
+  summarizePhysicalFinalComputations,
+  compareAgainstFetchingOracle,
+} = require("./experiment3-runtime-evidence");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const CONTROL_PORT = 8080;
@@ -599,21 +604,14 @@ function parseResultPayload(payloadText) {
 }
 
 function readFetchingComparableSummary(runRoot) {
-  const summaryPath = path.join(
-    runRoot,
-    "benchmark_window_cap_summary_consumer_0.json",
-  );
-  if (!fs.existsSync(summaryPath)) {
-    return null;
-  }
-  return JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+  return discoverFetchingOracle(runRoot, {
+    expectedAggregation: "AVG",
+    targetWindowCount: TARGET_WINDOWS,
+  });
 }
 
 function enrichFetchingDeliveries(runRoot, firstDeliveries, allDeliveries) {
   const summary = readFetchingComparableSummary(runRoot);
-  if (!summary || !Number.isFinite(summary.resultValue)) {
-    return { firstDeliveries, allDeliveries };
-  }
   const enrich = (entry) => ({
     ...entry,
     windowStart: summary.windowStart,
@@ -753,22 +751,7 @@ function collectProfileSummaries(runRoot) {
 }
 
 function summarizeProfiles(profiles, approach) {
-  const beeProfiles = profiles.filter((entry) =>
-    approach === "approximation"
-      ? entry.processRole === "approximation_bee_worker"
-      : approach === "chunked"
-      ? entry.processRole === "chunked_bee_worker"
-      : entry.processRoleGroup === "orchestrator",
-  );
-  const total = (field) =>
-    beeProfiles.reduce((sum, profile) => sum + Number(profile[field] || 0), 0);
-  return {
-    mqttMessagesReceived: total("mqtt_messages_received"),
-    emittedResults: total("emitted_results"),
-    reconstructedSuperqueryResults: total("reconstructed_superquery_results"),
-    comparableWindowsEmitted: total("comparable_windows_emitted"),
-    chunkGroupsCompleted: total("chunk_groups_completed"),
-  };
+  return summarizePhysicalFinalComputations(profiles, approach);
 }
 
 function readMqttTraffic(runRoot) {
@@ -862,14 +845,13 @@ function computeCorrectness({
     .map((entry) => entry.resultValue)
     .filter(Number.isFinite);
   const comparableCount = resultValues.length;
-  const errors = Number.isFinite(referenceValue)
-    ? resultValues.map((value) => Math.abs(value - referenceValue))
-    : [];
+  const comparison = Number.isFinite(referenceValue)
+    ? compareAgainstFetchingOracle(resultValues, referenceValue)
+    : { errors: [], mae: null, maxAbsoluteError: null, exactCount: 0 };
+  const { errors } = comparison;
   const mae =
-    errors.length > 0
-      ? errors.reduce((sum, value) => sum + value, 0) / errors.length
-      : null;
-  const maxAbsoluteError = errors.length > 0 ? Math.max(...errors) : null;
+    comparison.mae;
+  const maxAbsoluteError = comparison.maxAbsoluteError;
   const mape =
     errors.length > 0 && Math.abs(referenceValue) > 1e-12
       ? errors.reduce((sum, value) => sum + (value / Math.abs(referenceValue)), 0) /
@@ -881,7 +863,7 @@ function computeCorrectness({
     expectedCount: firstDeliveries.length,
     exactCount:
       approach === "chunked"
-        ? errors.filter((value) => value <= 1e-9).length
+        ? comparison.exactCount
         : null,
     mae,
     medianAbsoluteError: errors.length > 0 ? median(errors) : null,
@@ -984,6 +966,7 @@ async function runMainCell({
   let resourceSampler = null;
   let publisher = null;
   let subscribers = null;
+  let serverFinalized = false;
   try {
     const runtimeBuild = verifyBuildManifestOrThrow();
     await waitForServerLog(serverOutPath);
@@ -1045,10 +1028,21 @@ async function runMainCell({
       killWaitMs: 3_000,
     });
     publisher = null;
-    await delay(ARTIFACT_SETTLE_TIMEOUT_MS);
-
+    // The performance interval ends with the first-result evidence.  Shutdown
+    // and profile serialization must not affect the sampled CPU/RSS metric.
     const processMetrics = readProcessTreeMetrics(runRoot);
+    resourceSampler?.stop();
+    resourceSampler = null;
     const mqttTraffic = readMqttTraffic(runRoot);
+    // SIGTERM is the established graceful server contract: its shutdown hook
+    // releases the dispatcher, shared runtime, and managed producers.  Awaiting
+    // the process tree gives their exit hooks a deterministic profile flush.
+    await terminateChildProcessTree(server, {
+      logger: () => undefined,
+      termWaitMs: 3_000,
+      killWaitMs: 3_000,
+    });
+    serverFinalized = true;
     const profiles = collectProfileSummaries(runRoot);
     const mqttSummary = summarizeMqttTraffic(mqttTraffic, registrations);
     const runtimeSummary = buildRuntimeSummary({
@@ -1088,11 +1082,13 @@ async function runMainCell({
     if (resourceSampler) {
       resourceSampler.stop();
     }
-    await terminateChildProcessTree(server, {
-      logger: () => undefined,
-      termWaitMs: 1_000,
-      killWaitMs: 1_000,
-    });
+    if (!serverFinalized) {
+      await terminateChildProcessTree(server, {
+        logger: () => undefined,
+        termWaitMs: 1_000,
+        killWaitMs: 1_000,
+      });
+    }
     await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
   }
 }
