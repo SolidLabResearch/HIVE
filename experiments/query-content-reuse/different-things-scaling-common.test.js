@@ -3,6 +3,12 @@ const {
   OUTPUT_RANGE_MS,
   buildFixture,
   buildProducerExpectations,
+  buildReuseDensityMetrics,
+  buildReuseDensityProducerExpectations,
+  buildReuseDensityQueryDefinitions,
+  REUSE_DENSITY_MANIFEST,
+  REUSE_DENSITY_PRODUCER_COUNT,
+  REUSE_DENSITY_TARGET_COUNTS,
   buildScenarioMetrics,
   buildScenarioOracle,
   buildScenarioQueryDefinitions,
@@ -104,6 +110,48 @@ describe("different-things-scaling common helpers", () => {
     expect(metrics.totalProducerDependencies).toBe(55);
     expect(metrics.reusedProducerAcquisitions).toBe(45);
     expect(metrics.producerReusePercentage).toBeCloseTo(81.8181818, 6);
+  });
+
+  test("defines a fixed, cumulative, balanced reuse-density manifest", () => {
+    expect(REUSE_DENSITY_MANIFEST).toHaveLength(16);
+    expect(REUSE_DENSITY_TARGET_COUNTS).toEqual([2, 4, 8, 16]);
+    expect(REUSE_DENSITY_PRODUCER_COUNT).toBe(7);
+
+    const queries = buildReuseDensityQueryDefinitions(16);
+    expect(new Set(queries.map((query) => query.includedThings.join("|"))).size).toBe(16);
+    expect(queries.every((query) => query.includedThings.length === 4)).toBe(true);
+    expect(
+      new Set(queries.flatMap((query) => query.includedThings)),
+    ).toEqual(new Set(["thing1", "thing2", "thing3", "thing4", "thing5", "thing6", "thing7"]));
+    expect(new Set(queries.slice(0, 2).flatMap((query) => query.includedThings))).toEqual(
+      new Set(["thing1", "thing2", "thing3", "thing4", "thing5", "thing6", "thing7"]),
+    );
+    expect(queries[0].includedThings).toEqual(["thing1", "thing2", "thing3", "thing4"]);
+    expect(queries[1].includedThings).toEqual(["thing1", "thing5", "thing6", "thing7"]);
+
+    for (const targetCount of REUSE_DENSITY_TARGET_COUNTS) {
+      expect(buildReuseDensityQueryDefinitions(targetCount)).toEqual(queries.slice(0, targetCount));
+    }
+  });
+
+  test("keeps the producer pool fixed while reuse density rises", () => {
+    const expected = new Map([
+      [2, { dependencies: 8, reused: 1, reusePct: 12.5 }],
+      [4, { dependencies: 16, reused: 9, reusePct: 56.25 }],
+      [8, { dependencies: 32, reused: 25, reusePct: 78.125 }],
+      [16, { dependencies: 64, reused: 57, reusePct: 89.0625 }],
+    ]);
+    for (const [targetCount, expectation] of expected) {
+      const metrics = buildReuseDensityMetrics(targetCount);
+      const producerExpectations = buildReuseDensityProducerExpectations(targetCount);
+      expect(metrics.uniqueProducers).toBe(7);
+      expect(metrics.totalProducerDependencies).toBe(expectation.dependencies);
+      expect(metrics.reusedProducerAcquisitions).toBe(expectation.reused);
+      expect(metrics.producerReusePercentage).toBe(expectation.reusePct);
+      expect(producerExpectations).toHaveLength(7);
+      expect(producerExpectations.reduce((sum, entry) => sum + entry.expectedReferenceCount, 0)).toBe(expectation.dependencies);
+      expect(producerExpectations.every((entry) => entry.expectedReferenceCount > 0)).toBe(true);
+    }
   });
 });
 

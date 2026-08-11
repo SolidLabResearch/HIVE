@@ -182,6 +182,10 @@ export class QueryExecutionDispatcher {
   private readonly listener: DispatchListener;
   private readonly producerManager: SubqueryProducerManager;
   private readonly executionOwnerById = new Map<string, string>();
+  // Multiple independently registered Fetching targets live in one server
+  // process. Give their diagnostic artifacts distinct consumer slots; this is
+  // observability only and does not alter query execution or result topics.
+  private nextFetchingArtifactConsumerIndex = 1;
 
   constructor(
     beeKeeper = new BeeKeeper(),
@@ -271,6 +275,7 @@ export class QueryExecutionDispatcher {
       request.query,
       sharedOutputTopic,
       detectAggregation(request.query),
+      this.nextFetchingArtifactConsumerIndex++,
     );
     const handle: MutableExecutionHandle = {
       executionId,

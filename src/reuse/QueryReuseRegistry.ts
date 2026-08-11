@@ -244,6 +244,51 @@ export function buildCanonicalQueryId(query: string): string {
   return buildQueryId(query);
 }
 
+function expandPrefixedTerm(term: string, prefixes: Map<string, string>): string {
+  const trimmed = term.trim();
+  if (trimmed.startsWith("<") && trimmed.endsWith(">")) {
+    return trimmed.slice(1, -1);
+  }
+  const match = trimmed.match(/^([A-Za-z][A-Za-z0-9_-]*):(.+)$/);
+  if (!match) {
+    return trimmed;
+  }
+  return `${prefixes.get(match[1]) ?? `${match[1]}:`}${match[2]}`;
+}
+
+/**
+ * Exact final-result reuse cannot cross distinct source declarations. This
+ * precondition is deliberately independent of the semantic checker: it makes
+ * a checker false-positive fail closed before it can attach a consumer to the
+ * wrong final execution.
+ */
+export function hasEquivalentInputWindowDeclarations(
+  queryA: string,
+  queryB: string,
+): boolean {
+  const declarationsFor = (query: string): string[] => {
+    const prefixes = new Map<string, string>();
+    for (const match of query.matchAll(/PREFIX\s+([A-Za-z][A-Za-z0-9_-]*):\s*<([^>]+)>/gi)) {
+      prefixes.set(match[1], match[2]);
+    }
+    const declarations: string[] = [];
+    for (const match of query.matchAll(
+      /FROM\s+NAMED\s+WINDOW\s+(<[^>]+>|[^\s]+)\s+ON\s+STREAM\s+([^\s\[]+)\s*\[\s*RANGE\s+(\d+)\s+STEP\s+(\d+)\s*\]/gi,
+    )) {
+      declarations.push([
+        expandPrefixedTerm(match[1], prefixes),
+        expandPrefixedTerm(match[2], prefixes),
+        match[3],
+        match[4],
+      ].join("|"));
+    }
+    return declarations.sort();
+  };
+  const left = declarationsFor(queryA);
+  const right = declarationsFor(queryB);
+  return left.length > 0 && JSON.stringify(left) === JSON.stringify(right);
+}
+
 function cacheHitFromEquivalence(equivalence: EquivalenceResult): boolean {
   return equivalence.forward.cacheHit && equivalence.reverse.cacheHit;
 }
@@ -547,7 +592,10 @@ export class QueryReuseRegistry {
         candidate.originalQuery,
       );
       bestObserved = choosePreferredEquivalence(bestObserved, equivalence);
-      if (equivalence.equivalent) {
+      if (
+        equivalence.equivalent &&
+        hasEquivalentInputWindowDeclarations(query, candidate.originalQuery)
+      ) {
         matchedEntry = candidate;
         bestObserved = equivalence;
         break;

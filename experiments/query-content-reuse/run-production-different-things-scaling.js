@@ -7,7 +7,6 @@ const path = require("path");
 const mqtt = require("mqtt");
 const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
 const {
-  cleanupStaleBenchmarkProcesses,
   delay,
   terminateChildProcessTree,
 } = require("../utils/processCleanup");
@@ -23,8 +22,15 @@ const {
   OUTPUT_RANGE_MS,
   OUTPUT_STEP_MS,
   PRELIMINARY_THING_COUNTS,
+  REUSE_DENSITY_MANIFEST,
+  REUSE_DENSITY_PRODUCER_COUNT,
+  REUSE_DENSITY_TARGET_COUNTS,
   buildFixture,
   buildProducerExpectations,
+  buildReuseDensityMetrics,
+  buildReuseDensityOracle,
+  buildReuseDensityProducerExpectations,
+  buildReuseDensityQueryDefinitions,
   buildScenarioMetrics,
   buildScenarioOracle,
   buildScenarioQueryDefinitions,
@@ -203,7 +209,9 @@ function parseArgs(argv) {
     things: [...PRELIMINARY_THING_COUNTS],
     timeoutMs: DELIVERY_TIMEOUT_MS,
     baseAnchorMs: ALIGNMENT_ORIGIN_MS,
+    mode: "nested",
   };
+  let countExplicitlySet = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     const next = argv[index + 1];
@@ -222,6 +230,7 @@ function parseArgs(argv) {
           .map((entry) => Number.parseInt(entry.trim(), 10))
           .filter((value) => Number.isFinite(value));
         index += 1;
+        countExplicitlySet = true;
         break;
       case "--timeout-ms":
         args.timeoutMs = Number.parseInt(next || "", 10);
@@ -231,12 +240,31 @@ function parseArgs(argv) {
         args.baseAnchorMs = Number.parseInt(next || "", 10);
         index += 1;
         break;
+      case "--mode":
+        args.mode = String(next || "").trim().toLowerCase();
+        index += 1;
+        break;
+      case "--targets":
+        args.things = String(next || "")
+          .split(",")
+          .map((entry) => Number.parseInt(entry.trim(), 10))
+          .filter((value) => Number.isFinite(value));
+        index += 1;
+        countExplicitlySet = true;
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }
   }
   if (args.approaches.length === 0) {
     throw new Error("At least one approach must be selected");
+  }
+  assert(["nested", "reuse-density"].includes(args.mode), `Unsupported mode: ${args.mode}`);
+  if (args.mode === "reuse-density" && !countExplicitlySet) {
+    args.things = [...REUSE_DENSITY_TARGET_COUNTS];
+  }
+  if (args.mode === "reuse-density" && args.approaches.includes("approximation")) {
+    throw new Error("reuse-density mode supports only fetching,chunked");
   }
   for (const approach of args.approaches) {
     if (!ALL_APPROACHES.includes(approach)) {
@@ -246,9 +274,17 @@ function parseArgs(argv) {
   if (args.things.length === 0) {
     throw new Error("At least one thing count must be selected");
   }
+  const allowedCounts = args.mode === "reuse-density"
+    ? REUSE_DENSITY_TARGET_COUNTS
+    : null;
   for (const thingCount of args.things) {
-    if (!Number.isInteger(thingCount) || thingCount <= 0 || thingCount > 10) {
-      throw new Error(`Unsupported thing count: ${thingCount}`);
+    if (
+      !Number.isInteger(thingCount) ||
+      thingCount <= 0 ||
+      (args.mode === "nested" && thingCount > 10) ||
+      (allowedCounts && !allowedCounts.includes(thingCount))
+    ) {
+      throw new Error(`Unsupported ${args.mode === "reuse-density" ? "target" : "thing"} count: ${thingCount}`);
     }
   }
   return args;
@@ -539,6 +575,8 @@ function parseResourceMetrics(csvPath) {
       peakRssMb: null,
       peakProcessCount: null,
       sampleCount: 0,
+      totalProcessTreeCpuSeconds: null,
+      activeCpuSeconds: null,
     };
   }
   const lines = fs.readFileSync(csvPath, "utf8").trim().split(/\r?\n/).slice(1);
@@ -549,13 +587,18 @@ function parseResourceMetrics(csvPath) {
       peakRssMb: null,
       peakProcessCount: null,
       sampleCount: 0,
+      totalProcessTreeCpuSeconds: null,
+      activeCpuSeconds: null,
     };
   }
   const samples = lines
     .map((line) => line.split(","))
     .map((parts) => ({
+      timestamp: Number(parts[0]),
       processCount: Number(parts[2]),
       rssMb: Number(parts[3]) / (1024 * 1024),
+      treeCpuSeconds: Number(parts[4]),
+      treeCpuSecondsDelta: Number(parts[5]),
       cpuPct: Number(parts[7]),
     }))
     .filter((entry) => Number.isFinite(entry.processCount));
@@ -569,6 +612,39 @@ function parseResourceMetrics(csvPath) {
     peakRssMb: samples.reduce((peak, entry) => Math.max(peak, entry.rssMb || 0), 0),
     peakProcessCount: samples.reduce((peak, entry) => Math.max(peak, entry.processCount || 0), 0),
     sampleCount: samples.length,
+    totalProcessTreeCpuSeconds: samples.at(-1)?.treeCpuSeconds ?? null,
+    activeCpuSeconds: samples.reduce(
+      (sum, entry) => sum + (Number.isFinite(entry.treeCpuSecondsDelta) ? entry.treeCpuSecondsDelta : 0),
+      0,
+    ),
+  };
+}
+
+function collectProfileSummaries(runRoot) {
+  if (!fs.existsSync(runRoot)) {
+    return { artifactCount: 0, counters: {}, timingsMs: {} };
+  }
+  const summaries = fs.readdirSync(runRoot, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /^hive_profile_summary\..+\.json$/.test(entry.name))
+    .map((entry) => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(runRoot, entry.name), "utf8"));
+      } catch (error) {
+        throw new Error(`Invalid profile artifact ${entry.name}: ${error.message}`);
+      }
+    });
+  const aggregate = (field) => summaries.reduce((result, summary) => {
+    for (const [key, value] of Object.entries(summary[field] || {})) {
+      if (Number.isFinite(value)) {
+        result[key] = (result[key] || 0) + value;
+      }
+    }
+    return result;
+  }, {});
+  return {
+    artifactCount: summaries.length,
+    counters: aggregate("counters"),
+    timingsMs: aggregate("timingsMs"),
   };
 }
 
@@ -609,14 +685,26 @@ function buildApproachEnv({
   });
 }
 
-function buildRegistrationBodies({ approach, thingCount, topicPrefix }) {
-  return buildScenarioQueryDefinitions(thingCount, {
+function buildQueryDefinitions(mode, targetCount, options) {
+  return mode === "reuse-density"
+    ? buildReuseDensityQueryDefinitions(targetCount, options)
+    : buildScenarioQueryDefinitions(targetCount, options);
+}
+
+function buildScenarioOracleForMode(mode, targetCount, fixture) {
+  return mode === "reuse-density"
+    ? buildReuseDensityOracle(targetCount, fixture)
+    : buildScenarioOracle(targetCount, fixture);
+}
+
+function buildRegistrationBodies({ approach, thingCount, topicPrefix, mode = "nested" }) {
+  return buildQueryDefinitions(mode, thingCount, {
     topicPrefix,
     outputIriBuilder: (label) =>
       `mqtt://localhost:1883/${topicPrefix}/results/${approach}/${label.toLowerCase()}`,
   }).map((queryDefinition) => ({
-    id: `${approach}-${thingCount}-${queryDefinition.queryLabel.toLowerCase()}`,
-    consumer_id: `${approach}-${thingCount}-${queryDefinition.queryLabel.toLowerCase()}-consumer`,
+    id: `${approach}-${mode}-${thingCount}-${queryDefinition.queryLabel.toLowerCase()}`,
+    consumer_id: `${approach}-${mode}-${thingCount}-${queryDefinition.queryLabel.toLowerCase()}-consumer`,
     query_label: queryDefinition.queryLabel,
     included_things: queryDefinition.includedThings,
     approach,
@@ -932,7 +1020,87 @@ function buildProducerReferenceRows({ producerSnapshots, registrations, dependen
   });
 }
 
-function validateProducerTopology({ thingCount, registrations, latestProducerSnapshots }) {
+function validateReuseDensityProducerTopology({ targetCount, registrations, latestProducerSnapshots }) {
+  assert(registrations.length === targetCount, `expected ${targetCount} registrations, got ${registrations.length}`);
+  assert(
+    latestProducerSnapshots.length === REUSE_DENSITY_PRODUCER_COUNT,
+    `expected ${REUSE_DENSITY_PRODUCER_COUNT} unique producers, got ${latestProducerSnapshots.length}`,
+  );
+  const snapshotByCanonical = new Map();
+  for (const snapshot of latestProducerSnapshots) {
+    const thingName = String(snapshot.expectedInputStream || "").split("/").at(-1);
+    assert(/^thing[1-7]$/.test(thingName), `invalid fixed-pool producer stream ${snapshot.expectedInputStream}`);
+    assert(!snapshotByCanonical.has(snapshot.canonicalProducerId), `duplicate producer ${snapshot.canonicalProducerId}`);
+    snapshotByCanonical.set(snapshot.canonicalProducerId, { ...snapshot, thingName });
+  }
+  assertSameStringSet(
+    [...snapshotByCanonical.values()].map((snapshot) => snapshot.thingName),
+    Array.from({ length: REUSE_DENSITY_PRODUCER_COUNT }, (_unused, index) => `thing${index + 1}`),
+    "reuse-density fixed producer pool",
+  );
+
+  const identityByCanonical = new Map();
+  for (const registration of registrations) {
+    const mappings = validateProducerIdentityMappings(
+      registration.producerIdentityMappings,
+      `${registration.queryLabel}: producerIdentityMappings`,
+    );
+    assert(mappings.length === 4, `${registration.queryLabel}: expected four producer mappings`);
+    const mappedThings = mappings.map((mapping) => {
+      const snapshot = snapshotByCanonical.get(mapping.canonicalProducerId);
+      assert(snapshot, `${registration.queryLabel}: unknown canonical producer ${mapping.canonicalProducerId}`);
+      assert(
+        snapshot.runtimeProducerId === mapping.runtimeProducerId &&
+          (snapshot.topic || snapshot.producerTopic || snapshot.outputTopic) === mapping.topic,
+        `${registration.queryLabel}: producer identity mismatch for ${mapping.canonicalProducerId}`,
+      );
+      const prior = identityByCanonical.get(mapping.canonicalProducerId);
+      if (prior) {
+        assert(
+          prior.runtimeProducerId === mapping.runtimeProducerId && prior.topic === mapping.topic,
+          `${registration.queryLabel}: canonical producer ${mapping.canonicalProducerId} changed identity`,
+        );
+      } else {
+        identityByCanonical.set(mapping.canonicalProducerId, mapping);
+      }
+      return snapshot.thingName;
+    });
+    assertSameStringSet(mappedThings, registration.includedThings, `${registration.queryLabel}: fixed-pool dependencies`);
+    registration.producerIdentityMappings = mappings;
+  }
+
+  const dependencyTopology = {
+    nodes: [...snapshotByCanonical.values()].map((snapshot) => ({
+      thingName: snapshot.thingName,
+      canonicalProducerId: snapshot.canonicalProducerId,
+      runtimeProducerId: snapshot.runtimeProducerId,
+      topic: snapshot.topic || snapshot.producerTopic || snapshot.outputTopic,
+    })),
+    finalProducerIdentityMappings: [...identityByCanonical.values()],
+  };
+  const rows = buildProducerReferenceRows({
+    producerSnapshots: latestProducerSnapshots,
+    registrations,
+    dependencyTopology,
+  });
+  const expectations = buildReuseDensityProducerExpectations(targetCount);
+  for (const expectation of expectations) {
+    const row = rows.find((entry) => entry.thingName === expectation.thingName);
+    assert(row, `missing producer topology node for ${expectation.thingName}`);
+    assert(row.referenceCount === expectation.expectedReferenceCount, `${expectation.thingName}: referenceCount=${row.referenceCount} expected=${expectation.expectedReferenceCount}`);
+    assertSameStringSet(row.dependentQueryLabels, expectation.dependentQueryLabels, `${expectation.thingName}: dependent queries`);
+  }
+  return { dependencyTopology, producerReferenceRows: rows };
+}
+
+function validateProducerTopology({ thingCount, registrations, latestProducerSnapshots, mode = "nested" }) {
+  if (mode === "reuse-density") {
+    return validateReuseDensityProducerTopology({
+      targetCount: thingCount,
+      registrations,
+      latestProducerSnapshots,
+    });
+  }
   const dependencyTopology = buildNestedDependencyTopology({ registrations, thingCount });
   assert(latestProducerSnapshots.length === thingCount, `expected ${thingCount} unique producers, got ${latestProducerSnapshots.length}`);
   const rows = buildProducerReferenceRows({
@@ -950,8 +1118,10 @@ function validateProducerTopology({ thingCount, registrations, latestProducerSna
   return { dependencyTopology, producerReferenceRows: rows };
 }
 
-function buildApproachScenarioMetrics(approach, thingCount) {
-  const metrics = buildScenarioMetrics(thingCount);
+function buildApproachScenarioMetrics(approach, thingCount, mode = "nested") {
+  const metrics = mode === "reuse-density"
+    ? buildReuseDensityMetrics(thingCount)
+    : buildScenarioMetrics(thingCount);
   if (approach === "fetching") {
     return {
       ...metrics,
@@ -1297,6 +1467,7 @@ function validateChunkedWatermarkAndCoverage(deliveries, registrations) {
 async function runApproach({
   approach,
   thingCount,
+  mode = "nested",
   fixture,
   scenarioRoot,
   deliveryTimeoutMs,
@@ -1304,7 +1475,9 @@ async function runApproach({
 }) {
   const runRoot = path.join(scenarioRoot, approach);
   ensureDir(runRoot);
-  const topicPrefix = `experiment2/${path.basename(scenarioRoot)}/n${thingCount}`;
+  const topicPrefix = mode === "reuse-density"
+    ? `experiment2/${path.basename(scenarioRoot)}/reuse-density/m${thingCount}`
+    : `experiment2/${path.basename(scenarioRoot)}/n${thingCount}`;
   const registrationPath = path.join(runRoot, "registration_events.ndjson");
   const deliveryPath = path.join(runRoot, "consumer_delivery_events.ndjson");
   const publishEventsPath = path.join(runRoot, "published_fixture_events.ndjson");
@@ -1313,7 +1486,8 @@ async function runApproach({
   const resourcePath = path.join(runRoot, "process_tree_resource_usage.csv");
   const processTopologyPath = path.join(runRoot, "process_topology.json");
   const processLifecyclePath = path.join(runRoot, "process_lifecycle_evidence.json");
-  const sentinelVerification = validateWatermarkSentinels(fixture, thingCount);
+  const producerCount = mode === "reuse-density" ? REUSE_DENSITY_PRODUCER_COUNT : thingCount;
+  const sentinelVerification = validateWatermarkSentinels(fixture, producerCount);
   const env = buildApproachEnv({
     approach,
     runRoot,
@@ -1321,7 +1495,9 @@ async function runApproach({
     topicPrefix,
   });
 
-  await cleanupStaleBenchmarkProcesses({ logger: () => undefined });
+  // Experiments 1 and 3 may be active independently. A busy port is an
+  // ownership conflict, not permission to terminate an unrelated process.
+  assertControlPortIsFree(CONTROL_PORT);
   verifyBuildManifestOrThrow(expectedBuildManifest);
 
   const server = spawn("node", [SERVER_EXECUTABLE_PATH], {
@@ -1347,7 +1523,7 @@ async function runApproach({
     await waitForRegisterReady(CONTROL_PORT);
     resourceSampler = startProcessTreeResourceLogging(resourcePath, server.pid, 200);
 
-    for (const requestBody of buildRegistrationBodies({ approach, thingCount, topicPrefix })) {
+    for (const requestBody of buildRegistrationBodies({ approach, thingCount, topicPrefix, mode })) {
       const registration = await postRegistration(CONTROL_PORT, requestBody);
       registration.expectedWindowStart = requestBody.expectedWindowStart;
       registration.expectedWindowEnd = requestBody.expectedWindowEnd;
@@ -1355,7 +1531,11 @@ async function runApproach({
       registrations.push(registration);
     }
     validateRegistrationSet(approach, registrations);
-    latestProducerSnapshots = registrations.at(-1)?.producerSnapshots || [];
+    latestProducerSnapshots = [...new Map(
+      registrations
+        .flatMap((registration) => registration.producerSnapshots || [])
+        .map((snapshot) => [snapshot.canonicalProducerId, snapshot]),
+    ).values()];
     reconstructionWorkerIds = [...new Set(registrations.flatMap((registration) => registration.workerIds || []))];
     const registrationProcessTopology = captureProcessTopology({
       serverPid: server.pid,
@@ -1405,7 +1585,7 @@ async function runApproach({
 
     await publishFixture({
       fixture,
-      thingCount,
+      thingCount: producerCount,
       topicPrefix,
       publishEventsPath,
     });
@@ -1417,6 +1597,7 @@ async function runApproach({
 
     await delay(ARTIFACT_SETTLE_MS);
     const resourceMetrics = parseResourceMetrics(resourcePath);
+    const profileSummary = collectProfileSummaries(runRoot);
     let dependencyTopology = {
       nodes: [],
       finalProducerIdentityMappings: [],
@@ -1427,11 +1608,12 @@ async function runApproach({
         thingCount,
         registrations,
         latestProducerSnapshots,
+        mode,
       });
       dependencyTopology = validatedTopology.dependencyTopology;
       producerReferenceRows = validatedTopology.producerReferenceRows;
     }
-    const oracleRows = buildScenarioOracle(thingCount, fixture);
+    const oracleRows = buildScenarioOracleForMode(mode, thingCount, fixture);
     const checks = compareToOracle(approach, deliveries, oracleRows);
     if (approach === "fetching" || approach === "chunked") {
       validateExactApproach(approach, checks);
@@ -1465,6 +1647,7 @@ async function runApproach({
 
     const summary = {
       approach,
+      mode,
       thingCount,
       runRoot,
       topicPrefix,
@@ -1501,7 +1684,14 @@ async function runApproach({
         sentinelExcludedFromTargetResult: true,
       })),
       resourceMetrics,
-      scenarioMetrics: buildApproachScenarioMetrics(approach, thingCount),
+      profileSummary,
+      scenarioMetrics: buildApproachScenarioMetrics(approach, thingCount, mode),
+      workloadManifest: mode === "reuse-density"
+        ? REUSE_DENSITY_MANIFEST.slice(0, thingCount).map((dependencies, index) => ({
+            queryLabel: `Q${index + 1}`,
+            dependencies: [...dependencies],
+          }))
+        : null,
       deliveryDecisions: subscribers.getDeliveryDecisions(),
     };
     writeJson(path.join(runRoot, "approach_summary.json"), summary);
@@ -1549,6 +1739,7 @@ async function runApproach({
       afterTermination.processes.every((process) => !process.alive),
       `managed process lifecycle incomplete; still alive: ${afterTermination.processes.filter((process) => process.alive).map((process) => process.pid).join(",")}`,
     );
+    assertControlPortIsFree(CONTROL_PORT);
   }
 }
 
@@ -1563,12 +1754,21 @@ function checkPortStatus(port) {
   };
 }
 
+function assertControlPortIsFree(port) {
+  const status = checkPortStatus(port);
+  assert(
+    status.activePids.length === 0,
+    `Refusing to start Experiment 2: control port ${port} is owned by existing PID(s) ${status.activePids.join(",")}. ` +
+      "The runner never kills pre-existing processes; stop only the known owner and retry.",
+  );
+}
+
 function buildScenarioOrder(args) {
   const selectedApproaches = args.approaches.slice();
   return args.things.flatMap((thingCount) =>
     ["fetching", "chunked", "approximation"]
       .filter((approach) => selectedApproaches.includes(approach))
-      .map((approach) => ({ thingCount, approach })),
+      .map((approach) => ({ thingCount, approach, mode: args.mode })),
   );
 }
 
@@ -1576,8 +1776,18 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const resultRoot = buildResultRoot();
   ensureDir(resultRoot);
-  const fixture = buildFixture(10, args.baseAnchorMs);
+  const fixture = buildFixture(
+    args.mode === "reuse-density" ? REUSE_DENSITY_PRODUCER_COUNT : 10,
+    args.baseAnchorMs,
+  );
   writeJson(path.join(resultRoot, "fixture_oracle.json"), {
+    mode: args.mode,
+    workloadManifest: args.mode === "reuse-density"
+      ? REUSE_DENSITY_MANIFEST.map((dependencies, index) => ({
+          queryLabel: `Q${index + 1}`,
+          dependencies: [...dependencies],
+        }))
+      : null,
     fixture: {
       anchorMs: fixture.anchorMs,
       windowStart: fixture.windowStart,
@@ -1596,25 +1806,31 @@ async function main() {
   const buildInfo = ensureFreshProductionBuild(resultRoot);
   const executionOrder = buildScenarioOrder(args);
   const scenarioSummaries = [];
-  for (const { thingCount, approach } of executionOrder) {
-    const scenarioRoot = path.join(resultRoot, `n${thingCount}`);
+  for (const { thingCount, approach, mode } of executionOrder) {
+    const scenarioRoot = path.join(
+      resultRoot,
+      mode === "reuse-density" ? `reuse-density-m${thingCount}` : `n${thingCount}`,
+    );
     ensureDir(scenarioRoot);
     const summary = await runApproach({
       approach,
       thingCount,
+      mode,
       fixture,
       scenarioRoot,
       deliveryTimeoutMs: args.timeoutMs,
       expectedBuildManifest: buildInfo.buildManifest,
     });
     scenarioSummaries.push({
+      mode,
       thingCount,
       approach,
       summary,
     });
   }
 
-  const completeness = scenarioSummaries.map(({ thingCount, approach, summary }) => ({
+  const completeness = scenarioSummaries.map(({ mode, thingCount, approach, summary }) => ({
+    mode,
     thingCount,
     approach,
     deliveries: summary.deliveries.length,
@@ -1656,22 +1872,26 @@ if (require.main === module) {
 
 module.exports = {
   buildApproachScenarioMetrics,
+  buildQueryDefinitions,
   buildNestedDependencyTopology,
   buildOrderedPublishEvents,
   buildProducerReferenceRows,
   buildRegistrationBodies,
   buildScenarioOrder,
+  assertControlPortIsFree,
   classifyProcessTopology,
   compareToOracle,
   evaluateComparableDelivery,
   normalizeDelivery,
   parseArgs,
   parseProcessRows,
+  parseResourceMetrics,
   parseResultPayload,
   validateChunkedContributionEvidence,
   validateChunkedWatermarkAndCoverage,
   validateDeliveryProducerIdentities,
   validateProducerIdentityMappings,
   validateProducerTopology,
+  validateReuseDensityProducerTopology,
   validateWatermarkSentinels,
 };

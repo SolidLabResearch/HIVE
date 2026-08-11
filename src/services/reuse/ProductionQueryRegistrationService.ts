@@ -8,6 +8,7 @@ import {
   deriveCanonicalQueryId,
 } from "./QueryExecutionDispatcher";
 import { SubqueryProducerRuntimeSnapshot } from "./SubqueryProducerManager";
+import { ActiveExecutionHandle } from "../../reuse/QueryReuseRegistry";
 
 export type RuntimeRegistrationRequest = {
   approach: RegistrationApproach;
@@ -29,7 +30,35 @@ export type RuntimeRegistrationResponse = {
   containmentDecision: QueryReuseDecisionEvent;
   registrationTimestamp: number;
   producerSnapshots?: SubqueryProducerRuntimeSnapshot[];
+  workerIds: string[];
+  producerIdentityMappings: Array<{
+    canonicalProducerId: string;
+    runtimeProducerId: string;
+    topic: string;
+  }>;
+  localProducerSpawnCount?: number;
+  managedProducerMode?: boolean;
 };
+
+/** Runtime facts from the actual registered execution, never benchmark counters. */
+function buildRuntimeTopologyEvidence(handle?: ActiveExecutionHandle) {
+  const producerSnapshots = handle?.producerSnapshots ?? [];
+  const producerIdentityMappings = producerSnapshots.map((snapshot) => ({
+    canonicalProducerId: snapshot.canonicalProducerId,
+    runtimeProducerId: snapshot.runtimeProducerId,
+    topic: snapshot.topic || snapshot.producerTopic || snapshot.outputTopic,
+  }));
+  const managedProducerMode =
+    handle?.approach === "chunked" && producerIdentityMappings.length > 0;
+
+  return {
+    workerIds: handle?.workerIds ?? [],
+    producerSnapshots: handle?.producerSnapshots,
+    producerIdentityMappings,
+    localProducerSpawnCount: managedProducerMode ? 0 : undefined,
+    managedProducerMode: managedProducerMode || undefined,
+  };
+}
 
 export class ProductionQueryRegistrationService {
   private readonly registry: QueryReuseRegistry;
@@ -91,7 +120,7 @@ export class ProductionQueryRegistrationService {
           timestamp: registrationTimestamp,
         },
         registrationTimestamp,
-        producerSnapshots: execution.producerSnapshots,
+        ...buildRuntimeTopologyEvidence(execution),
       };
     }
 
@@ -122,7 +151,7 @@ export class ProductionQueryRegistrationService {
       executionState: resolved.entry.state || "active",
       containmentDecision: resolved.decision,
       registrationTimestamp,
-      producerSnapshots: resolved.entry.runtimeHandle?.producerSnapshots,
+      ...buildRuntimeTopologyEvidence(resolved.entry.runtimeHandle),
     };
   }
 }

@@ -135,6 +135,10 @@ export class POSTHandler {
             reuseDecision: registration.containmentDecision,
             registrationTimestamp: registration.registrationTimestamp,
             producerSnapshots: registration.producerSnapshots,
+            workerIds: registration.workerIds,
+            producerIdentityMappings: registration.producerIdentityMappings,
+            localProducerSpawnCount: registration.localProducerSpawnCount,
+            managedProducerMode: registration.managedProducerMode,
         }));
         return;
     }

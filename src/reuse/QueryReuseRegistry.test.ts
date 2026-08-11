@@ -1,4 +1,7 @@
-import { QueryReuseRegistry } from "./QueryReuseRegistry";
+import {
+  hasEquivalentInputWindowDeclarations,
+  QueryReuseRegistry,
+} from "./QueryReuseRegistry";
 import { RSPQLContainmentService } from "../services/reuse/RSPQLContainmentService";
 
 function buildQuery(options?: {
@@ -286,6 +289,42 @@ describe("QueryReuseRegistry", () => {
     expect(secondDecision.decision.reuseHit).toBe(true);
     expect(secondDecision.entry.executionId).toBe("execution-1");
     expect(secondDecision.decision.mutuallyContained).toBe(true);
+  });
+
+  test("fails closed when a checker claims equivalent final queries use different streams", async () => {
+    const containmentService = {
+      getNormalizedInputHash: (query: string) => query.replace(/\s+/g, " ").trim(),
+      checkEquivalence: jest.fn().mockResolvedValue({
+        equivalent: true,
+        supported: true,
+        durationMs: 1,
+        forward: { contained: true, supported: true, durationMs: 1, cacheHit: false, direction: "subquery_in_superquery", checkerVersion: "fake" },
+        reverse: { contained: true, supported: true, durationMs: 1, cacheHit: false, direction: "subquery_in_superquery", checkerVersion: "fake" },
+      }),
+    };
+    const first = buildQuery({ output: "consumer-1-output", stream: "mqtt_broker:thing1" });
+    const second = buildQuery({ output: "consumer-2-output", stream: "mqtt_broker:thing2" });
+    expect(hasEquivalentInputWindowDeclarations(first, second)).toBe(false);
+    const registry = new QueryReuseRegistry(containmentService as any);
+    await registry.resolveReusableRuntimeRegistration({
+      approach: "chunked",
+      query: first,
+      resultTopic: "results/1",
+      ownerQueryId: "owner-1",
+      consumerId: "consumer-1",
+      createExecution: async () => ({ executionId: "execution-1", approach: "chunked", canonicalQueryId: "query-1", sharedOutputTopic: "shared/1", workerIds: [], state: "active", stop: async () => undefined }),
+    });
+    const secondDecision = await registry.resolveReusableRuntimeRegistration({
+      approach: "chunked",
+      query: second,
+      resultTopic: "results/2",
+      ownerQueryId: "owner-2",
+      consumerId: "consumer-2",
+      createExecution: async () => ({ executionId: "execution-2", approach: "chunked", canonicalQueryId: "query-2", sharedOutputTopic: "shared/2", workerIds: [], state: "active", stop: async () => undefined }),
+    });
+    expect(secondDecision.executionCreated).toBe(true);
+    expect(secondDecision.decision.reuseHit).toBe(false);
+    expect(containmentService.checkEquivalence).toHaveBeenCalledTimes(1);
   });
 
   test("reuses equivalent queries across prefix alias renaming in stage-1 candidate lookup", async () => {

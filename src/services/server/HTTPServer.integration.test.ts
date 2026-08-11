@@ -112,6 +112,9 @@ describe("HTTPServer production registration integration", () => {
     expect(secondPayload.reuseHit).toBe(true);
     expect(secondPayload.executionId).toBe(firstPayload.executionId);
     expect(secondPayload.outputTopic).toBe(firstPayload.outputTopic);
+    expect(firstPayload.workerIds).toEqual(["worker-1"]);
+    expect(firstPayload.producerIdentityMappings).toEqual([]);
+    expect(firstPayload.producerSnapshots).toBeUndefined();
   });
 
   test("returns 400 for missing approach", async () => {

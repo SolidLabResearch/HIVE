@@ -31,6 +31,7 @@ jest.mock('fs', () => ({
 
 import { StreamingQueryChunkAggregatorOperator } from './StreamingQueryChunkAggregatorOperator';
 import fs from 'fs';
+import { EventEmitter } from 'events';
 
 const CHUNKED_LATENCY_HEADERS = [
     'window_number',
@@ -1099,6 +1100,59 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
             expect(publisherClient.publish).toHaveBeenCalled();
         });
 
+        test('waits for a final R2R publish when the binding stream ends first', async () => {
+            const mqtt = require('mqtt');
+            let publishCallback: (() => void) | undefined;
+            const publisherClient = {
+                connected: true,
+                publish: jest.fn((topic, payload, options, callback) => {
+                    publishCallback = callback;
+                }),
+                once: jest.fn(),
+                end: jest.fn(),
+            };
+            mqtt.connect.mockReturnValueOnce(publisherClient);
+            const bindingStream = new EventEmitter();
+            executeR2RMock.mockResolvedValue(bindingStream);
+            operator.setOutputQuery(QUERY_SINGLE_WINDOW);
+
+            let resolved = false;
+            const completion = operator.executeR2ROperator([
+                {
+                    queryId: 'q1',
+                    subqueryId: 'p1',
+                    window: {
+                        windowName: 'w1',
+                        start: 0,
+                        end: 10,
+                        range: 10,
+                        step: 2,
+                        semantics: '[start,end)' as const,
+                    },
+                    chunkId: 'c1',
+                    value: 10,
+                    count: 1,
+                    sum: 10,
+                    rdfPayload: '<s> <p> "10" .',
+                },
+            ]).then(() => {
+                resolved = true;
+            });
+
+            await Promise.resolve();
+            bindingStream.emit('data', new Map([['result', { value: '10' }]]));
+            bindingStream.emit('end');
+            await Promise.resolve();
+
+            expect(publisherClient.publish).toHaveBeenCalledTimes(1);
+            expect(resolved).toBe(false);
+            expect(publishCallback).toBeDefined();
+
+            publishCallback?.();
+            await completion;
+            expect(resolved).toBe(true);
+        });
+
         test('reuses a single MQTT publisher client across emissions', async () => {
             const mqtt = require('mqtt');
             const publisherClient = {
@@ -2059,6 +2113,31 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
             (operator as any).windowRange = 180000;
             (operator as any).windowSlide = 60000;
             (operator as any).sessionId = 'chunked-session';
+            (operator as any).chunkedDebugSummary.expectedSubqueryIds = ['runtime-p1', 'runtime-p2'];
+            (operator as any).chunkedDebugSummary.managedProducerMode = true;
+            (operator as any).chunkedDebugSummary.localProducerSpawnCount = 0;
+            (operator as any).latestWatermarkByProducer.set('runtime-p1', 181000);
+            (operator as any).latestWatermarkByProducer.set('runtime-p2', 181500);
+            (operator as any).managerOwnedProducerMappings = [
+                {
+                    canonicalProducerId: 'canonical-p1',
+                    runtimeProducerId: 'runtime-p1',
+                    topic: 'chunked/canonical-p1',
+                    canonicalProducerQuery: 'query-p1',
+                    runtimeProducerQuery: 'query-p1',
+                    expectedInputStream: 'stream-p1',
+                    alignmentOriginMs: 1000,
+                },
+                {
+                    canonicalProducerId: 'canonical-p2',
+                    runtimeProducerId: 'runtime-p2',
+                    topic: 'chunked/canonical-p2',
+                    canonicalProducerQuery: 'query-p2',
+                    runtimeProducerQuery: 'query-p2',
+                    expectedInputStream: 'stream-p2',
+                    alignmentOriginMs: 1000,
+                },
+            ];
             const payload = (operator as any).buildChunkedBenchmarkPayload({
                 aggregationFunction: 'AVG',
                 resultValue: 3.5,
@@ -2068,7 +2147,24 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
                     externalWindowStart: 1000,
                     externalWindowEnd: 181000,
                     internalChunkGroupIds: ['g1', 'g2', 'g3'],
-                    internalChunks: [],
+                    internalChunks: [
+                        {
+                            chunkGroupId: 'g1',
+                            start: 1000,
+                            end: 61000,
+                            count: 4,
+                            sum: 14,
+                            avg: 3.5,
+                            value: 3.5,
+                            min: 1,
+                            max: 6,
+                            subqueries: ['runtime-p1', 'runtime-p2'],
+                            receivedChunkIdsBySubquery: {},
+                            duplicateChunksIgnoredBySubquery: {},
+                            missingSubqueryIds: [],
+                            coverageComplete: true,
+                        },
+                    ],
                     recomposedCount: 9,
                     recomposedSum: 31.5,
                     recomposedAvg: 3.5,
@@ -2102,6 +2198,22 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
             expect(payload.coverageComplete).toBe(true);
             expect(payload.windowStart).toBe(1000);
             expect(payload.windowEnd).toBe(181000);
+            // The runner rejects a numerically correct result unless this
+            // production payload proves its manager-owned provenance.
+            expect(payload.producerIdentityMappings).toEqual([
+                { canonicalProducerId: 'canonical-p1', runtimeProducerId: 'runtime-p1', topic: 'chunked/canonical-p1' },
+                { canonicalProducerId: 'canonical-p2', runtimeProducerId: 'runtime-p2', topic: 'chunked/canonical-p2' },
+            ]);
+            expect(payload.requiredRuntimeProducerIds).toEqual(['runtime-p1', 'runtime-p2']);
+            expect(payload.receivedRuntimeProducerIds).toEqual(['runtime-p1', 'runtime-p2']);
+            expect(payload.missingRuntimeProducerIds).toEqual([]);
+            expect(payload.latestWatermarkByRequiredRuntimeProducer).toEqual({
+                'runtime-p1': 181000,
+                'runtime-p2': 181500,
+            });
+            expect(payload.derivedReconstructionWatermark).toBe(181000);
+            expect(payload.localProducerSpawnCount).toBe(0);
+            expect(payload.managedProducerMode).toBe(true);
         });
     });
 });

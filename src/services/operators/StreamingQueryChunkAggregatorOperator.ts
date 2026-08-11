@@ -1470,6 +1470,30 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
     const comparableWindow =
       Boolean(args.comparableDiagnostics) && args.coverageComplete;
     const requiredProducerIds = this.chunkedDebugSummary.expectedSubqueryIds;
+    // Carry the manager-owned identity mapping through to the final comparable
+    // result.  The reconstruction has already validated these runtime IDs; the
+    // payload makes that provenance auditable by production consumers without
+    // inferring it from a benchmark-side registration record.
+    const managerMappingByRuntimeProducerId = new Map(
+      this.managerOwnedProducerMappings.map((mapping) => [
+        mapping.runtimeProducerId,
+        mapping,
+      ]),
+    );
+    const producerIdentityMappings = requiredProducerIds
+      .map((runtimeProducerId) => managerMappingByRuntimeProducerId.get(runtimeProducerId))
+      .filter((mapping): mapping is ManagerOwnedProducerMapping => mapping !== undefined)
+      .map((mapping) => ({
+        canonicalProducerId: mapping.canonicalProducerId,
+        runtimeProducerId: mapping.runtimeProducerId,
+        topic: mapping.topic,
+      }));
+    const requiredRuntimeProducerIds = [...requiredProducerIds];
+    const requiredCanonicalProducerIds = requiredRuntimeProducerIds
+      .map((runtimeProducerId) =>
+        managerMappingByRuntimeProducerId.get(runtimeProducerId)?.canonicalProducerId,
+      )
+      .filter((producerId): producerId is string => producerId !== undefined);
     const latestWatermarkByRequiredProducer = Object.fromEntries(
       requiredProducerIds.map((producerId) => [
         producerId,
@@ -1484,6 +1508,20 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         ? Math.min(...producerWatermarks)
         : null;
     const internalChunks = args.comparableDiagnostics?.internalChunks ?? [];
+    const receivedRuntimeProducerIds = [...new Set(
+      internalChunks.flatMap((chunk) => chunk.subqueries ?? []),
+    )];
+    const receivedCanonicalProducerIds = receivedRuntimeProducerIds
+      .map((runtimeProducerId) =>
+        managerMappingByRuntimeProducerId.get(runtimeProducerId)?.canonicalProducerId,
+      )
+      .filter((producerId): producerId is string => producerId !== undefined);
+    const missingRuntimeProducerIds = requiredRuntimeProducerIds.filter(
+      (runtimeProducerId) => !receivedRuntimeProducerIds.includes(runtimeProducerId),
+    );
+    const missingCanonicalProducerIds = requiredCanonicalProducerIds.filter(
+      (canonicalProducerId) => !receivedCanonicalProducerIds.includes(canonicalProducerId),
+    );
     const requiredChunkContributions = internalChunks.length * requiredProducerIds.length;
     const receivedChunkContributions = internalChunks.reduce(
       (total, chunk) => total + (chunk.subqueries?.length ?? 0),
@@ -1524,7 +1562,16 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         internalChunkIds:
           args.comparableDiagnostics?.internalChunkGroupIds ?? [],
         internalChunks,
+        producerIdentityMappings,
+        requiredCanonicalProducerIds,
+        receivedCanonicalProducerIds,
+        missingCanonicalProducerIds,
+        requiredRuntimeProducerIds,
+        receivedRuntimeProducerIds,
+        missingRuntimeProducerIds,
         latestWatermarkByRequiredProducer,
+        latestWatermarkByRequiredRuntimeProducer:
+          latestWatermarkByRequiredProducer,
         derivedReconstructionWatermark,
         requiredChunkContributions,
         receivedChunkContributions,
@@ -1533,6 +1580,8 @@ export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperat
         comparableWindow,
         isPartialWindow: !comparableWindow,
         isComparableWindow: comparableWindow,
+        localProducerSpawnCount: this.chunkedDebugSummary.localProducerSpawnCount,
+        managedProducerMode: this.chunkedDebugSummary.managedProducerMode,
       },
       {
         windowSemantics: args.centeredWindowMetadata.windowSemantics,
@@ -2488,10 +2537,17 @@ For example, the allResults object might look like this:
     }
     await new Promise<void>((resolve) => {
       let completed = false;
+      let bindingStreamEnded = false;
+      let pendingPublishes = 0;
       const finalize = () => {
         if (completed) return;
         completed = true;
         resolve();
+      };
+      const finalizeWhenPublished = () => {
+        if (bindingStreamEnded && pendingPublishes === 0) {
+          finalize();
+        }
       };
 
       bindingStream.on("data", (data: any) => {
@@ -2508,6 +2564,7 @@ For example, the allResults object might look like this:
         }
 
         // Calculate and log latency with multiple metrics
+        pendingPublishes += 1;
         const resultEmittedAt = Date.now();
         const proofEntry = this.buildChunkEmissionProofEntry(
           partials,
@@ -2603,8 +2660,8 @@ For example, the allResults object might look like this:
             )
           : outputQueryEvent;
         this.logger.log(`calculated result ${payload}`);
-        void this.publishWithSharedClient(resultTopic, payload, { qos: 1 }).then(
-          () => {
+        void this.publishWithSharedClient(resultTopic, payload, { qos: 1 })
+          .then(() => {
                         this.logger.log(
               `Output query event published to topic ${resultTopic}`,
             );
@@ -2613,21 +2670,25 @@ For example, the allResults object might look like this:
             this.persistChunkedDebugSummary();
             profileCount("emitted_results");
             this.recordFinalizedWindow(this.windowCount);
-            finalize();
-          },
-        );
+          })
+          .finally(() => {
+            pendingPublishes -= 1;
+            finalizeWhenPublished();
+          });
       });
 
       bindingStream.on("end", () => {
         this.logger.log(
           "R2R Operator binding stream ended without additional results.",
         );
-        finalize();
+        bindingStreamEnded = true;
+        finalizeWhenPublished();
       });
 
       bindingStream.on("error", (err: any) => {
         console.error("R2R Operator binding stream error:", err);
-        finalize();
+        bindingStreamEnded = true;
+        finalizeWhenPublished();
       });
     });
   }
