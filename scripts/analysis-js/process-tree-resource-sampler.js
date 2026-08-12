@@ -7,6 +7,7 @@ const {
 } = require('../../experiments/utils/processTreeMetrics');
 
 function startProcessTreeResourceLogging(filePath, rootPid, intervalMs = 100) {
+  const rootPids = Array.isArray(rootPid) ? rootPid : [rootPid];
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const writeHeader = !fs.existsSync(filePath);
   const logStream = fs.createWriteStream(filePath, { flags: 'a' });
@@ -25,14 +26,14 @@ function startProcessTreeResourceLogging(filePath, rootPid, intervalMs = 100) {
 
     try {
       const timestamp = Date.now();
-      const sample = collectTreeMetrics([rootPid], tracker, timestamp, timestamp - startedAt);
+      const sample = collectTreeMetrics(rootPids, tracker, timestamp, timestamp - startedAt);
       if (!sample) {
         return;
       }
       logStream.write(
         [
           timestamp,
-          rootPid,
+          rootPids.join(";"),
           sample.processCount,
           (sample.totalRssMb * 1024 * 1024).toFixed(0),
           sample.treeCpuSeconds.toFixed(3),
@@ -45,7 +46,7 @@ function startProcessTreeResourceLogging(filePath, rootPid, intervalMs = 100) {
       logStream.write(
         [
           Date.now(),
-          rootPid,
+          rootPids.join(";"),
           0,
           0,
           0,
@@ -70,7 +71,7 @@ function startProcessTreeResourceLogging(filePath, rootPid, intervalMs = 100) {
       clearInterval(timer);
       logStream.end();
       const summary = {
-        rootPid,
+        rootPids,
         logPath: filePath,
         trackerNegativeDeltaCount: tracker.negativeDeltaEvents.length,
         trackerResetLikeDeltaCount: tracker.resetLikeDeltaCount,
