@@ -44,7 +44,7 @@
         "mqtt": "^5.12.0",
         "n3": "^1.24.2",
         "rsp-js": "file:../RSP-JS",
-        "rspql-containment-checker": "^2.7.0",
+        "rspql-containment-checker": "github:SolidLabResearch/rspql-containment-checker#bf18a1cf912b9ccdc9e5818bf812811c24e2f028",
         "rspql-query-isomorphism": "^2.0.0",
         "sparqljs": "^3.7.3",
         "streamify-string": "^1.0.1"
