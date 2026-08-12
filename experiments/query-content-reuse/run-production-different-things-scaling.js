@@ -264,9 +264,6 @@ function parseArgs(argv) {
   if (["reuse-density", "existing-reuse-density"].includes(args.mode) && !countExplicitlySet) {
     args.things = [...REUSE_DENSITY_TARGET_COUNTS];
   }
-  if (["reuse-density", "existing-reuse-density"].includes(args.mode) && args.approaches.includes("approximation")) {
-    throw new Error(`${args.mode} mode supports only fetching,chunked`);
-  }
   for (const approach of args.approaches) {
     if (!ALL_APPROACHES.includes(approach)) {
       throw new Error(`Unsupported approach: ${approach}`);
@@ -758,6 +755,14 @@ function buildExistingPrimitiveRegistrationBodies({ approach, topicPrefix }) {
       rspql_query: definition.query,
       r2s_topic: `mqtt://localhost:1883/${topicPrefix}/results/${approach}/${queryLabel.toLowerCase()}`,
       data_topic: `mqtt://localhost:1883/${topicPrefix}/results/${approach}/${queryLabel.toLowerCase()}`,
+      approximation_config:
+        approach === "approximation"
+          ? {
+              policy: "rate-based-completed-window",
+              completedWindowMode: true,
+              earlyTriggerMode: false,
+            }
+          : undefined,
       expectedWindowStart: ALIGNMENT_ORIGIN_MS,
       expectedWindowEnd: ALIGNMENT_ORIGIN_MS + OUTPUT_RANGE_MS,
     };
@@ -836,15 +841,17 @@ function compareTopologyPhases(before, after) {
   };
 }
 
-function validateRegistrationSet(approach, registrations) {
+function validateRegistrationSet(approach, registrations, { allowFinalReuse = false } = {}) {
   assert(registrations.length > 0, `${approach}: missing registrations`);
   const executionIds = new Set(registrations.map((entry) => entry.executionId));
   const canonicalQueryIds = new Set(registrations.map((entry) => entry.canonicalQueryId));
   const outputTopics = new Set(registrations.map((entry) => entry.outputTopic));
-  assert(
-    executionIds.size === registrations.length,
-    `${approach}: final queries shared one execution`,
-  );
+  if (!allowFinalReuse) {
+    assert(
+      executionIds.size === registrations.length,
+      `${approach}: final queries shared one execution`,
+    );
+  }
   assert(
     canonicalQueryIds.size === registrations.length,
     `${approach}: final queries shared one canonical final-query ID`,
@@ -855,12 +862,14 @@ function validateRegistrationSet(approach, registrations) {
   );
   for (const registration of registrations) {
     assert(registration.status === 200, `${approach}/${registration.queryLabel}: register failed`);
-    assert(registration.executionCreated === true, `${approach}/${registration.queryLabel}: executionCreated=false`);
-    assert(registration.reuseHit === false, `${approach}/${registration.queryLabel}: reuseHit=true`);
-    assert(
-      registration.reuseDecision?.reuseHit === false,
-      `${approach}/${registration.queryLabel}: reuseDecision.reuseHit=true`,
-    );
+    if (!allowFinalReuse) {
+      assert(registration.executionCreated === true, `${approach}/${registration.queryLabel}: executionCreated=false`);
+      assert(registration.reuseHit === false, `${approach}/${registration.queryLabel}: reuseHit=true`);
+      assert(
+        registration.reuseDecision?.reuseHit === false,
+        `${approach}/${registration.queryLabel}: reuseDecision.reuseHit=true`,
+      );
+    }
     if (approach !== "fetching") {
       validateProducerIdentityMappings(
         registration.producerIdentityMappings,
@@ -1303,6 +1312,31 @@ function validateExactApproach(approach, checks) {
   }
 }
 
+function summarizeCorrectness(checks) {
+  const finite = (field) => checks.map((check) => check[field]).filter(Number.isFinite);
+  const mean = (values) => values.length > 0
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null;
+  const max = (values) => values.length > 0 ? Math.max(...values) : null;
+  return {
+    checkCount: checks.length,
+    countErrors: finite("countError"),
+    sumErrors: finite("sumError"),
+    averageErrors: finite("absoluteError"),
+    mae: mean(finite("absoluteError")),
+    mape: mean(finite("percentageError")),
+    maxAbsoluteError: max(finite("absoluteError")),
+  };
+}
+
+function summarizeRegistrations(registrations) {
+  return {
+    registrationCount: registrations.length,
+    executionCount: new Set(registrations.map((entry) => entry.executionId).filter(Boolean)).size,
+    reuseHits: registrations.filter((entry) => entry.reuseHit === true || entry.reuseDecision?.reuseHit === true).length,
+  };
+}
+
 function validateDeliveryProducerIdentities(delivery, registration) {
   const mappings = validateProducerIdentityMappings(
     delivery.producerIdentityMappings,
@@ -1604,7 +1638,7 @@ async function runExistingReuseDensityApproach({ approach, thingCount, fixture, 
       appendNdjson(registrationPath, { phase: "baseline", ...registration });
       baselineRegistrations.push(registration);
     }
-    validateRegistrationSet(approach, baselineRegistrations);
+    validateRegistrationSet(approach, baselineRegistrations, { allowFinalReuse: approach === "approximation" });
     assert(baselineRegistrations.length === REUSE_DENSITY_PRODUCER_COUNT, "existing-reuse-density requires exactly seven Phase-1 primitives");
     await delay(300);
     const baselineSnapshots = latestResourceSnapshot(resourcePath);
@@ -1638,7 +1672,7 @@ async function runExistingReuseDensityApproach({ approach, thingCount, fixture, 
       appendNdjson(registrationPath, { phase: "post_addition", ...registration });
       compositeRegistrations.push(registration);
     }
-    validateRegistrationSet(approach, compositeRegistrations);
+    validateRegistrationSet(approach, compositeRegistrations, { allowFinalReuse: approach === "approximation" });
     if (approach === "chunked") {
       const baselineRuntimeIds = new Set(baselineProducerMappings.map((entry) => entry.runtimeProducerId));
       const compositeMappings = compositeRegistrations.flatMap((entry) => entry.producerIdentityMappings);
@@ -1682,7 +1716,9 @@ async function runExistingReuseDensityApproach({ approach, thingCount, fixture, 
     const deliveries = allDeliveries.filter((entry) => /^Q\d+$/.test(entry.queryLabel));
     const baselineDeliveries = allDeliveries.filter((entry) => /^P\d+$/.test(entry.queryLabel));
     const checks = compareToOracle(approach, deliveries, buildReuseDensityOracle(thingCount, fixture));
-    validateExactApproach(approach, checks);
+    if (approach !== "approximation") {
+      validateExactApproach(approach, checks);
+    }
     assert(baselineDeliveries.length === REUSE_DENSITY_PRODUCER_COUNT, "all Phase-1 primitives must deliver before completion");
     await delay(ARTIFACT_SETTLE_MS);
     const completionSnapshot = latestResourceSnapshot(resourcePath);
@@ -1700,7 +1736,8 @@ async function runExistingReuseDensityApproach({ approach, thingCount, fixture, 
       return { compositeQueryLabel: composite.queryLabel, compositeRegisteredAt: composite.requestStartedAt, primitiveQueryLabel: primitive?.queryLabel, primitiveExecutionId: primitive?.executionId, primitiveRegisteredAt: primitive?.responseReceivedAt, runtimeProducerId: mapping.runtimeProducerId, topic: mapping.topic };
     }));
     assert(provenance.every((entry) => entry.primitiveRegisteredAt < entry.compositeRegisteredAt), "a composite dependency does not predate composite registration");
-    const summary = { approach, mode: "existing-reuse-density", thingCount, runRoot, topicPrefix, baseline: { registrations: baselineRegistrations, deliveries: baselineDeliveries, resourceSnapshot: baselineSnapshots, producerMappings: baselineProducerMappings, processTopology: phase1BaselineTopology, profileSnapshot: phase1ProfileSnapshot, rspEngineEvidence: phase1RspEngineEvidence }, postAddition: { registrations: compositeRegistrations, resourceSnapshot: postAdditionSnapshot, processTopology: postAdditionTopology, profileSnapshot: postAdditionProfileSnapshot, rspEngineEvidence: postAdditionRspEngineEvidence }, phase2EvidenceDelta: phaseEvidenceDelta, completion: { resourceSnapshot: completionSnapshot }, incremental: { ...incremental, rssMeasurementScope: "instantaneous summed RSS of the authoritative server process tree at each boundary; run-wide peak is retained separately" }, deliveries, checks, workloadManifest: REUSE_DENSITY_MANIFEST.slice(0, thingCount).map((dependencies, index) => ({ queryLabel: `Q${index + 1}`, dependencies: [...dependencies] })), provenance, topology: { existingPrimitiveExecutions: REUSE_DENSITY_PRODUCER_COUNT, dependencyReferences: thingCount * 4, reusedDependencyReferences: thingCount * 4 - REUSE_DENSITY_PRODUCER_COUNT, additionalPrimitiveExecutions: approach === "chunked" ? 0 : null, additionalIndependentExecutions: approach === "fetching" ? thingCount : null, compositeReconstructionPaths: approach === "chunked" ? thingCount : 0 }, resourceMetrics: parseResourceMetrics(resourcePath), profileSummary: collectProfileSummaries(runRoot), deliveryDecisions: subscribers.getDeliveryDecisions() };
+    const registrations = [...baselineRegistrations, ...compositeRegistrations];
+    const summary = { approach, mode: "existing-reuse-density", thingCount, runRoot, topicPrefix, baseline: { registrations: baselineRegistrations, registrationMetrics: summarizeRegistrations(baselineRegistrations), deliveries: baselineDeliveries, resourceSnapshot: baselineSnapshots, producerMappings: baselineProducerMappings, processTopology: phase1BaselineTopology, profileSnapshot: phase1ProfileSnapshot, rspEngineEvidence: phase1RspEngineEvidence }, postAddition: { registrations: compositeRegistrations, registrationMetrics: summarizeRegistrations(compositeRegistrations), resourceSnapshot: postAdditionSnapshot, processTopology: postAdditionTopology, profileSnapshot: postAdditionProfileSnapshot, rspEngineEvidence: postAdditionRspEngineEvidence }, registrationMetrics: summarizeRegistrations(registrations), phase2EvidenceDelta: phaseEvidenceDelta, completion: { resourceSnapshot: completionSnapshot }, incremental: { ...incremental, rssMeasurementScope: "instantaneous summed RSS of the authoritative server process tree at each boundary; run-wide peak is retained separately" }, deliveries, checks, correctness: summarizeCorrectness(checks), workloadManifest: REUSE_DENSITY_MANIFEST.slice(0, thingCount).map((dependencies, index) => ({ queryLabel: `Q${index + 1}`, dependencies: [...dependencies] })), provenance, topology: { existingPrimitiveExecutions: REUSE_DENSITY_PRODUCER_COUNT, dependencyReferences: thingCount * 4, reusedDependencyReferences: thingCount * 4 - REUSE_DENSITY_PRODUCER_COUNT, additionalPrimitiveExecutions: approach === "chunked" ? 0 : null, additionalIndependentExecutions: approach === "fetching" ? thingCount : null, compositeReconstructionPaths: approach === "chunked" ? thingCount : 0 }, resourceMetrics: parseResourceMetrics(resourcePath), profileSummary: collectProfileSummaries(runRoot), deliveryDecisions: subscribers.getDeliveryDecisions() };
     writeJson(path.join(runRoot, "approach_summary.json"), summary);
     return summary;
   } finally {
@@ -2139,6 +2176,8 @@ module.exports = {
   assertControlPortIsFree,
   classifyProcessTopology,
   compareToOracle,
+  summarizeCorrectness,
+  summarizeRegistrations,
   evaluateComparableDelivery,
   normalizeDelivery,
   parseArgs,

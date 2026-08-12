@@ -168,11 +168,15 @@ describe("different-things-scaling common helpers", () => {
     expect(primitives.map((entry) => entry.included_things)).toEqual([
       ["thing1"], ["thing2"], ["thing3"], ["thing4"], ["thing5"], ["thing6"], ["thing7"],
     ]);
-    expect(parseArgs(["--mode", "existing-reuse-density", "--approaches", "fetching,chunked"])).toMatchObject({
+    expect(parseArgs(["--mode", "existing-reuse-density", "--approaches", "fetching,approximation,chunked"])).toMatchObject({
       mode: "existing-reuse-density",
       things: [2, 4, 8, 16],
-      approaches: ["fetching", "chunked"],
+      approaches: ["fetching", "approximation", "chunked"],
     });
+    expect(buildExistingPrimitiveRegistrationBodies({
+      approach: "approximation",
+      topicPrefix: "experiment2/existing-reuse-density-m2",
+    }).every((entry) => entry.approximation_config?.policy === "rate-based-completed-window")).toBe(true);
   });
 });
 

@@ -10,7 +10,7 @@ const ROOT = path.resolve(__dirname, "..", "..");
 const RUNNER = path.join(__dirname, "run-production-different-things-scaling.js");
 const EXPECTED_RSPJS_SHA = "0039e59fcad7a7b6472f7bbd6b0b915c39e335f5";
 const DEFAULT_TARGETS = [2, 4, 8, 16];
-const DEFAULT_APPROACHES = ["fetching", "chunked"];
+const DEFAULT_APPROACHES = ["fetching", "approximation", "chunked"];
 const RSP_JS_PATH = process.env.RSP_JS_PATH || "/Users/kushbisen/Code/RSP-JS";
 
 function command(command) { return execSync(command, { cwd: ROOT, encoding: "utf8" }).trim(); }
@@ -23,7 +23,7 @@ function parse(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const value = argv[i + 1];
     if (argv[i] === "--targets") { args.targets = value.split(",").map(Number); i += 1; }
-    else if (argv[i] === "--approaches") { args.approaches = value.split(","); i += 1; }
+    else if (argv[i] === "--approaches") { args.approaches = value.split(",").map((entry) => entry.trim().toLowerCase()).filter(Boolean); i += 1; }
     else if (argv[i] === "--iterations") { args.iterations = Number(value); i += 1; }
     else if (argv[i] === "--timeout-ms") { args.timeoutMs = Number(value); i += 1; }
     else if (argv[i] === "--result-root") { args.resultRoot = path.resolve(value); i += 1; }
@@ -31,7 +31,7 @@ function parse(argv) {
     else throw new Error(`Unknown argument: ${argv[i]}`);
   }
   if (!args.targets.every((value) => DEFAULT_TARGETS.includes(value))) throw new Error("Targets must be a subset of 2,4,8,16");
-  if (!args.approaches.every((value) => DEFAULT_APPROACHES.includes(value))) throw new Error("Approaches must be fetching,chunked");
+  if (!args.approaches.every((value) => DEFAULT_APPROACHES.includes(value))) throw new Error("Approaches must be fetching,approximation,chunked");
   if (!Number.isInteger(args.iterations) || args.iterations < 1) throw new Error("--iterations must be a positive integer");
   return args;
 }
@@ -74,4 +74,6 @@ function main() {
   metadata.finishedAt = new Date().toISOString(); write(path.join(resultRoot, "campaign_metadata.json"), metadata);
   console.log(resultRoot);
 }
-main();
+if (require.main === module) main();
+
+module.exports = { DEFAULT_APPROACHES, DEFAULT_TARGETS, parse };
