@@ -114,6 +114,25 @@ describe("RSPQLContainmentService", () => {
     expect(result.reverse.contained).toBe(true);
   });
 
+  test("records bounded directional checker diagnostics without changing containment", async () => {
+    const query = buildQuery({ output: "consumer-1-output" });
+
+    const result = await service.checkContainment(query, query);
+
+    expect(result).toMatchObject({ contained: true, supported: true });
+    expect(result.diagnostic).toMatchObject({
+      checkerInvocationMode: "package-checker-plus-direct-specs",
+      checkerVersion: "rspql-containment-checker@2.7.0",
+      timeout: false,
+      subprocessExitCode: 0,
+    });
+    expect(result.diagnostic?.containedQueryInputHash).toBe(
+      result.diagnostic?.containingQueryInputHash,
+    );
+    expect(result.diagnostic?.stdoutBytes).toBeGreaterThanOrEqual(0);
+    expect(result.diagnostic?.stderrBytes).toBeGreaterThanOrEqual(0);
+  });
+
   test("accepts prefix alias renaming and variable alpha-renaming", async () => {
     const first = buildQuery();
     const second = buildQuery({
@@ -180,8 +199,8 @@ WHERE {
 `;
     const spy = jest
       .spyOn(service as any, "runChecker")
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(false);
+      .mockResolvedValueOnce({ contained: true, diagnostic: {} })
+      .mockResolvedValueOnce({ contained: false, diagnostic: {} });
 
     const forward = await service.checkContainment(first, second);
     const reverse = await service.checkContainment(second, first);
@@ -240,6 +259,12 @@ WHERE {
 
     expect(first.supported).toBe(false);
     expect(first.failureKind).toBe("TIMEOUT");
+    expect(first.diagnostic).toMatchObject({
+      timeout: true,
+      errorType: "Error",
+      errorMessage: "Process timeout after 30 seconds",
+      executablePath: expect.stringContaining("rspql-containment-checker/specs/src/specs"),
+    });
     expect(second.cacheHit).toBe(true);
     expect(spy).toHaveBeenCalledTimes(1);
   });
@@ -289,6 +314,12 @@ describe("QueryReuseRegistry", () => {
     expect(secondDecision.decision.reuseHit).toBe(true);
     expect(secondDecision.entry.executionId).toBe("execution-1");
     expect(secondDecision.decision.mutuallyContained).toBe(true);
+    expect(secondDecision.decision.directionalContainment).toMatchObject({
+      incomingCanonicalQueryId: secondDecision.decision.incomingQueryId,
+      candidateCanonicalQueryId: firstDecision.decision.incomingQueryId,
+      forward: { contained: true, supported: true },
+      reverse: { contained: true, supported: true },
+    });
   });
 
   test("fails closed when a checker claims equivalent final queries use different streams", async () => {

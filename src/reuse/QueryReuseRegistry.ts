@@ -52,6 +52,14 @@ export type QueryReuseDecisionEvent = {
   cacheHit: boolean;
   lookupDurationMs: number;
   containmentDurationMs: number;
+  /** Preserves both checker directions without affecting the reuse decision. */
+  directionalContainment?: {
+    forward: ContainmentResult;
+    reverse: ContainmentResult;
+    equivalenceDurationMs: number;
+    incomingCanonicalQueryId: string;
+    candidateCanonicalQueryId: string;
+  };
   timestamp: number;
 };
 
@@ -212,6 +220,7 @@ function buildCandidateSignature(
 type CandidateEvaluation = {
   candidateQueryIdsInspected: string[];
   bestObserved?: EquivalenceResult;
+  bestObservedCandidate?: FinalResultEntry;
   matchedEntry?: FinalResultEntry;
 };
 
@@ -306,6 +315,23 @@ function buildMissDecisionEvidence(equivalence?: EquivalenceResult) {
   };
 }
 
+function buildDirectionalContainmentEvidence(
+  incomingQuery: string,
+  candidateQuery: string,
+  equivalence?: EquivalenceResult,
+): QueryReuseDecisionEvent["directionalContainment"] {
+  if (!equivalence) {
+    return undefined;
+  }
+  return {
+    forward: equivalence.forward,
+    reverse: equivalence.reverse,
+    equivalenceDurationMs: equivalence.durationMs,
+    incomingCanonicalQueryId: buildQueryId(incomingQuery),
+    candidateCanonicalQueryId: buildQueryId(candidateQuery),
+  };
+}
+
 export class QueryReuseRegistry {
   private readonly finalResults = new Map<string, FinalResultEntry[]>();
   private readonly lock = new KeyedLock();
@@ -386,6 +412,11 @@ export class QueryReuseRegistry {
             containmentDurationMs:
               evaluation.bestObserved.forward.durationMs +
               evaluation.bestObserved.reverse.durationMs,
+            directionalContainment: buildDirectionalContainmentEvidence(
+              params.query,
+              evaluation.matchedEntry.originalQuery,
+              evaluation.bestObserved,
+            ),
             timestamp: Date.now(),
           },
         };
@@ -416,6 +447,11 @@ export class QueryReuseRegistry {
           incomingQueryId: entry.queryId,
           candidateQueryIdsInspected: evaluation.candidateQueryIdsInspected,
           ...buildMissDecisionEvidence(evaluation.bestObserved),
+          directionalContainment: buildDirectionalContainmentEvidence(
+            params.query,
+            evaluation.bestObservedCandidate?.originalQuery ?? params.query,
+            evaluation.bestObserved,
+          ),
           reuseHit: false,
           executionId: entry.executionId,
           resultTopic: entry.resultTopic,
@@ -467,6 +503,11 @@ export class QueryReuseRegistry {
             containmentDurationMs:
               evaluation.bestObserved.forward.durationMs +
               evaluation.bestObserved.reverse.durationMs,
+            directionalContainment: buildDirectionalContainmentEvidence(
+              params.query,
+              evaluation.matchedEntry.originalQuery,
+              evaluation.bestObserved,
+            ),
             timestamp: Date.now(),
           },
         };
@@ -502,6 +543,11 @@ export class QueryReuseRegistry {
           incomingQueryId: entry.queryId,
           candidateQueryIdsInspected: evaluation.candidateQueryIdsInspected,
           ...buildMissDecisionEvidence(evaluation.bestObserved),
+          directionalContainment: buildDirectionalContainmentEvidence(
+            params.query,
+            evaluation.bestObservedCandidate?.originalQuery ?? params.query,
+            evaluation.bestObserved,
+          ),
           reuseHit: false,
           executionId: entry.executionId,
           resultTopic: entry.resultTopic,
@@ -580,6 +626,7 @@ export class QueryReuseRegistry {
   ): Promise<CandidateEvaluation> {
     const candidateQueryIdsInspected: string[] = [];
     let bestObserved: EquivalenceResult | undefined;
+    let bestObservedCandidate: FinalResultEntry | undefined;
     let matchedEntry: FinalResultEntry | undefined;
 
     for (const candidate of candidates) {
@@ -591,7 +638,11 @@ export class QueryReuseRegistry {
         query,
         candidate.originalQuery,
       );
-      bestObserved = choosePreferredEquivalence(bestObserved, equivalence);
+      const preferred = choosePreferredEquivalence(bestObserved, equivalence);
+      if (preferred === equivalence) {
+        bestObservedCandidate = candidate;
+      }
+      bestObserved = preferred;
       if (
         equivalence.equivalent &&
         hasEquivalentInputWindowDeclarations(query, candidate.originalQuery)
@@ -605,6 +656,7 @@ export class QueryReuseRegistry {
     return {
       candidateQueryIdsInspected,
       bestObserved,
+      bestObservedCandidate,
       matchedEntry,
     };
   }

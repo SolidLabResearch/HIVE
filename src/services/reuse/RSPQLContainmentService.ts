@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import path from "path";
+import { spawn } from "child_process";
 import {
   ContainmentChecker,
   RSPQLParser,
@@ -41,7 +43,32 @@ export interface ContainmentResult {
   direction: "subquery_in_superquery";
   failureKind?: ContainmentFailureReason;
   checkerVersion: string;
+  /** Observational metadata; never read by containment or reuse decisions. */
+  diagnostic?: ContainmentDiagnostic;
 }
+
+export type ContainmentDiagnostic = {
+  containedQueryInputHash: string;
+  containingQueryInputHash: string;
+  checkerInvocationMode: "package-checker-plus-direct-specs" | "not-invoked";
+  checkerVersion: string;
+  executablePath?: string;
+  workingDirectory?: string;
+  timeoutMs?: number;
+  timeout: boolean;
+  diagnosticReplayTimeout?: boolean;
+  subprocessExitCode?: number | null;
+  subprocessSignal?: NodeJS.Signals | null;
+  checkerResult?: boolean;
+  stdoutExcerpt?: string;
+  stdoutBytes?: number;
+  stderrExcerpt?: string;
+  stderrBytes?: number;
+  errorType?: string;
+  errorMessage?: string;
+  errorCode?: string | number;
+  diagnosticError?: string;
+};
 
 export interface EquivalenceResult {
   equivalent: boolean;
@@ -64,12 +91,39 @@ type ParsedCheckerQuery = {
   r2sOperator: string;
 };
 
+type CheckerRunResult = {
+  contained: boolean;
+  diagnostic: Omit<ContainmentDiagnostic, "containedQueryInputHash" | "containingQueryInputHash">;
+};
+
+const SPECS_TIMEOUT_MS = 30_000;
+const DIAGNOSTIC_EXCERPT_MAX_BYTES = 4_096;
+
 function nowMs(): number {
   return Date.now();
 }
 
 function hashValue(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function excerpt(value: string): string {
+  return Buffer.from(value).subarray(0, DIAGNOSTIC_EXCERPT_MAX_BYTES).toString();
+}
+
+function errorDiagnostic(error: unknown): Pick<
+  ContainmentDiagnostic,
+  "errorType" | "errorMessage" | "errorCode"
+> {
+  if (error instanceof Error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return {
+      errorType: error.name,
+      errorMessage: error.message,
+      ...(typeof code === "string" || typeof code === "number" ? { errorCode: code } : {}),
+    };
+  }
+  return { errorType: typeof error, errorMessage: String(error) };
 }
 
 function stripLineComments(query: string): string {
@@ -171,6 +225,7 @@ export class RSPQLContainmentService {
     containingQuery: string,
   ): Promise<ContainmentResult> {
     const startedAt = nowMs();
+    const diagnosticBase = this.buildDiagnosticBase(containedQuery, containingQuery);
     profileCount("semantic_containment_checks");
     const cacheKey = this.buildCacheKey(containedQuery, containingQuery);
     const cached = this.readCache(cacheKey);
@@ -178,6 +233,9 @@ export class RSPQLContainmentService {
       profileCount("semantic_containment_cache_hits");
       return {
         ...cached,
+        diagnostic: cached.diagnostic
+          ? { ...cached.diagnostic, ...diagnosticBase }
+          : diagnosticBase,
         durationMs: 0,
         cacheHit: true,
       };
@@ -200,6 +258,7 @@ export class RSPQLContainmentService {
             direction: "subquery_in_superquery",
             failureKind: "UNSUPPORTED_QUERY",
             checkerVersion: CHECKER_VERSION,
+            diagnostic: { ...diagnosticBase, checkerInvocationMode: "not-invoked" },
           },
           startedAt,
           DEFAULT_UNSUPPORTED_TTL_MS,
@@ -220,6 +279,7 @@ export class RSPQLContainmentService {
             direction: "subquery_in_superquery",
             failureKind: "WINDOW_SEMANTICS_UNSUPPORTED",
             checkerVersion: CHECKER_VERSION,
+            diagnostic: { ...diagnosticBase, checkerInvocationMode: "not-invoked" },
           },
           startedAt,
           DEFAULT_UNSUPPORTED_TTL_MS,
@@ -233,10 +293,11 @@ export class RSPQLContainmentService {
       return this.finishAndCache(
         cacheKey,
         {
-          contained: result,
+          contained: result.contained,
           supported: true,
           direction: "subquery_in_superquery",
           checkerVersion: CHECKER_VERSION,
+          diagnostic: { ...diagnosticBase, ...result.diagnostic },
         },
         startedAt,
         DEFAULT_SUCCESS_TTL_MS,
@@ -245,6 +306,11 @@ export class RSPQLContainmentService {
       const failureKind = inferFailureKind(error);
       const ttlMs =
         failureKind === "TIMEOUT" ? DEFAULT_TIMEOUT_TTL_MS : DEFAULT_UNSUPPORTED_TTL_MS;
+      const diagnostic = await this.captureFailureDiagnostic(
+        containedQuery,
+        containingQuery,
+        error,
+      );
       return this.finishAndCache(
         cacheKey,
         {
@@ -254,6 +320,7 @@ export class RSPQLContainmentService {
           direction: "subquery_in_superquery",
           failureKind,
           checkerVersion: CHECKER_VERSION,
+          diagnostic: { ...diagnosticBase, ...diagnostic },
         },
         startedAt,
         ttlMs,
@@ -415,7 +482,7 @@ export class RSPQLContainmentService {
     return null;
   }
 
-  private async runChecker(subQuery: string, superQuery: string): Promise<boolean> {
+  private async runChecker(subQuery: string, superQuery: string): Promise<CheckerRunResult> {
     const deduppedSub = deduplicateSelectExpressions(subQuery);
     const deduppedSuper = deduplicateSelectExpressions(superQuery);
     const checker = this.createChecker();
@@ -423,7 +490,7 @@ export class RSPQLContainmentService {
     const specsWrapper = this.createSPeCSWrapper();
     // The package-level checker is the public API. We still invoke the wrapper directly
     // to preserve timeout and ambiguous-result classification.
-    await checker.checkContainment(deduppedSub, deduppedSuper);
+    const checkerResult = await checker.checkContainment(deduppedSub, deduppedSuper);
     const parsedSub = parser.parse(deduppedSub);
     const parsedSuper = parser.parse(deduppedSuper);
     const specsResult = await specsWrapper.runSPeCS({
@@ -435,7 +502,124 @@ export class RSPQLContainmentService {
     if (specsResult.containment === null) {
       throw new Error("SPeCS returned an ambiguous containment result");
     }
-    return specsResult.containment;
+    return {
+      contained: specsResult.containment,
+      diagnostic: {
+        checkerInvocationMode: "package-checker-plus-direct-specs",
+        checkerVersion: CHECKER_VERSION,
+        executablePath: this.getSPeCSExecutablePath(),
+        workingDirectory: process.cwd(),
+        timeoutMs: SPECS_TIMEOUT_MS,
+        timeout: false,
+        checkerResult,
+        subprocessExitCode: specsResult.exitCode,
+        subprocessSignal: null,
+        stdoutBytes: Buffer.byteLength(specsResult.stdout),
+        stdoutExcerpt: excerpt(specsResult.stdout),
+        stderrBytes: Buffer.byteLength(specsResult.stderr),
+        stderrExcerpt: excerpt(specsResult.stderr),
+      },
+    };
+  }
+
+  private buildDiagnosticBase(
+    containedQuery: string,
+    containingQuery: string,
+  ): Pick<ContainmentDiagnostic, "containedQueryInputHash" | "containingQueryInputHash" | "checkerVersion" | "checkerInvocationMode" | "timeout"> {
+    return {
+      containedQueryInputHash: this.getNormalizedInputHash(containedQuery),
+      containingQueryInputHash: this.getNormalizedInputHash(containingQuery),
+      checkerVersion: CHECKER_VERSION,
+      checkerInvocationMode: "not-invoked",
+      timeout: false,
+    };
+  }
+
+  private getSPeCSExecutablePath(): string {
+    return path.resolve(
+      path.dirname(require.resolve("rspql-containment-checker")),
+      "../specs/src/specs",
+    );
+  }
+
+  /**
+   * The package wrapper discards process metadata on rejection. A failed
+   * directional check therefore gets one diagnostic-only replay with the
+   * wrapper's same executable, arguments, cwd, and timeout. Its result is
+   * never used by containment or reuse.
+   */
+  private async captureFailureDiagnostic(
+    containedQuery: string,
+    containingQuery: string,
+    originalError: unknown,
+  ): Promise<Omit<ContainmentDiagnostic, "containedQueryInputHash" | "containingQueryInputHash">> {
+    const base = {
+      checkerInvocationMode: "package-checker-plus-direct-specs" as const,
+      checkerVersion: CHECKER_VERSION,
+      executablePath: this.getSPeCSExecutablePath(),
+      workingDirectory: process.cwd(),
+      timeoutMs: SPECS_TIMEOUT_MS,
+      timeout: false,
+      ...errorDiagnostic(originalError),
+    };
+    try {
+      const subQuery = this.parseForChecker(containedQuery).sanitizedQuery;
+      const superQuery = this.parseForChecker(containingQuery).sanitizedQuery;
+      const parser = this.createParser();
+      const result = await this.runSPeCSDiagnostic(
+        parser.parse(deduplicateSelectExpressions(subQuery)).sparql,
+        parser.parse(deduplicateSelectExpressions(superQuery)).sparql,
+      );
+      return {
+        ...base,
+        ...result,
+        timeout: /timeout/i.test(base.errorMessage ?? "") || result.timeout,
+        diagnosticReplayTimeout: result.timeout,
+      };
+    } catch (diagnosticError) {
+      return {
+        ...base,
+        diagnosticError: errorDiagnostic(diagnosticError).errorMessage,
+      };
+    }
+  }
+
+  private async runSPeCSDiagnostic(
+    subquery: string,
+    superquery: string,
+  ): Promise<Pick<ContainmentDiagnostic, "timeout" | "subprocessExitCode" | "subprocessSignal" | "stdoutBytes" | "stdoutExcerpt" | "stderrBytes" | "stderrExcerpt" | "errorType" | "errorMessage" | "errorCode">> {
+    return new Promise((resolve) => {
+      const child = spawn(this.getSPeCSExecutablePath(), [
+        "-superquery", superquery,
+        "-subquery", subquery,
+        "-rename",
+        "-qc",
+      ], { stdio: ["pipe", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let spawnError: unknown;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, SPECS_TIMEOUT_MS);
+      child.stdout?.on("data", (data: Buffer) => { stdout += data.toString(); });
+      child.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
+      child.on("error", (error) => { spawnError = error; });
+      child.on("close", (code, signal) => {
+        clearTimeout(timer);
+        resolve({
+          timeout: timedOut,
+          subprocessExitCode: code,
+          subprocessSignal: signal,
+          stdoutBytes: Buffer.byteLength(stdout),
+          stdoutExcerpt: excerpt(stdout),
+          stderrBytes: Buffer.byteLength(stderr),
+          stderrExcerpt: excerpt(stderr),
+          ...(spawnError ? errorDiagnostic(spawnError) : {}),
+        });
+      });
+    });
   }
 
   private haveSameFinalSemantics(
