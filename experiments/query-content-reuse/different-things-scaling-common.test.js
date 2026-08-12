@@ -1,6 +1,10 @@
 const {
   ALIGNMENT_ORIGIN_MS,
   OUTPUT_RANGE_MS,
+  EXISTING_COMPUTATION_TARGET_COUNTS,
+  buildExistingComputationCompositeQueryDefinition,
+  buildExistingComputationOracle,
+  buildExistingComputationPrimitiveQueryDefinitions,
   buildFixture,
   buildProducerExpectations,
   buildReuseDensityMetrics,
@@ -15,6 +19,7 @@ const {
 } = require("./different-things-scaling-common");
 const {
   buildExistingPrimitiveRegistrationBodies,
+  buildExistingComputationPrimitiveRegistrationBodies,
   parseArgs,
 } = require("./run-production-different-things-scaling");
 
@@ -177,6 +182,33 @@ describe("different-things-scaling common helpers", () => {
       approach: "approximation",
       topicPrefix: "experiment2/existing-reuse-density-m2",
     }).every((entry) => entry.approximation_config?.policy === "rate-based-completed-window")).toBe(true);
+  });
+
+  test.each([2, 4, 8, 16])("existing-computation scaling registers exactly P1..P%s and Q%s uses every stream", (target) => {
+    const primitives = buildExistingComputationPrimitiveQueryDefinitions(target);
+    const composite = buildExistingComputationCompositeQueryDefinition(target);
+    expect(EXISTING_COMPUTATION_TARGET_COUNTS).toEqual([2, 4, 8, 16]);
+    expect(primitives.map((entry) => entry.queryLabel)).toEqual(Array.from({ length: target }, (_unused, index) => `P${index + 1}`));
+    expect(primitives.flatMap((entry) => entry.includedThings)).toEqual(Array.from({ length: target }, (_unused, index) => `thing${index + 1}`));
+    expect(composite.queryLabel).toBe(`Q${target}`);
+    expect(composite.includedThings).toEqual(Array.from({ length: target }, (_unused, index) => `thing${index + 1}`));
+    expect(composite.query).toContain("(AVG(?value) AS ?resultValue)");
+    expect(composite.query.match(/FROM NAMED WINDOW/g)).toHaveLength(target);
+    expect(buildExistingComputationPrimitiveRegistrationBodies({ approach: "approximation", thingCount: target, topicPrefix: "test" }).every((entry) => entry.approximation_config?.policy === "rate-based-completed-window")).toBe(true);
+    expect(buildExistingComputationPrimitiveRegistrationBodies({ approach: "chunked", thingCount: target, topicPrefix: "test" }).every((entry) => entry.approach === "chunked" && entry.approximation_config === undefined)).toBe(true);
+  });
+
+  test("existing-computation oracle is deterministic and weighted across all dependencies", () => {
+    const fixture = buildFixture(16);
+    expect(buildExistingComputationOracle(16, fixture)).toEqual(buildExistingComputationOracle(16, fixture));
+    const row = buildExistingComputationOracle(4, fixture)[0];
+    expect(row.count).toBe(fixture.things.slice(0, 4).reduce((total, thing) => total + thing.oracle.count, 0));
+    expect(row.sum).toBe(fixture.things.slice(0, 4).reduce((total, thing) => total + thing.oracle.sum, 0));
+  });
+
+  test("existing-computation scaling CLI accepts only the paper targets", () => {
+    expect(parseArgs(["--mode", "existing-computation-scaling", "--targets", "2,4,8,16", "--approaches", "fetching,approximation,chunked"])).toMatchObject({ mode: "existing-computation-scaling", things: [2, 4, 8, 16] });
+    expect(() => parseArgs(["--mode", "existing-computation-scaling", "--targets", "3"])).toThrow("Unsupported target count");
   });
 });
 

@@ -8,6 +8,10 @@ const WATERMARK_SENTINEL_OFFSET_MS = 130000;
 const PRELIMINARY_THING_COUNTS = [2, 5, 10];
 const REUSE_DENSITY_PRODUCER_COUNT = 7;
 const REUSE_DENSITY_TARGET_COUNTS = [2, 4, 8, 16];
+// Experiment 2's paper workload: M pre-existing single-stream computations,
+// followed by one M-stream composite.  This is intentionally separate from the
+// historical fixed-pool reuse-density workload above.
+const EXISTING_COMPUTATION_TARGET_COUNTS = [2, 4, 8, 16];
 const ALL_APPROACHES = ["fetching", "chunked", "approximation"];
 const FLOAT_TOLERANCE = 1e-9;
 
@@ -44,6 +48,7 @@ const THING_EVENT_OFFSETS_MS = {
   thing9: [5000, 22000, 35000, 48000, 65000, 95000],
   thing10: [5000, 35000, 65000, 88000, 95000],
 };
+const DEFAULT_THING_EVENT_OFFSETS_MS = [5000, 20000, 35000, 50000, 65000, 80000, 95000];
 
 function assert(condition, message) {
   if (!condition) {
@@ -96,7 +101,9 @@ function buildObservationPayload({ thing, observationId, timestampMs, value }) {
 
 function buildFixture(maxThings = 10, anchorMs = ALIGNMENT_ORIGIN_MS) {
   const things = buildThingDefinitions(maxThings).map((thing) => {
-    const offsets = THING_EVENT_OFFSETS_MS[thing.thingName];
+    // Streams beyond the original exploratory ten use the same deterministic
+    // template; later streams are not given special distributions or values.
+    const offsets = THING_EVENT_OFFSETS_MS[thing.thingName] || DEFAULT_THING_EVENT_OFFSETS_MS;
     assert(
       Array.isArray(offsets) && offsets.length > 0,
       `Missing offsets for ${thing.thingName}`,
@@ -366,11 +373,60 @@ function buildReuseDensityMetrics(targetCount) {
   };
 }
 
+function buildExistingComputationPrimitiveQueryDefinitions(targetCount, options = {}) {
+  assert(
+    EXISTING_COMPUTATION_TARGET_COUNTS.includes(targetCount),
+    `existing-computation target must be one of ${EXISTING_COMPUTATION_TARGET_COUNTS.join(",")}`,
+  );
+  return buildThingDefinitions(targetCount).map((thing, index) => ({
+    queryLabel: `P${index + 1}`,
+    queryIndex: index + 1,
+    includedThings: [thing.thingName],
+    expectedWindowStart: ALIGNMENT_ORIGIN_MS,
+    expectedWindowEnd: ALIGNMENT_ORIGIN_MS + OUTPUT_RANGE_MS,
+    rangeMs: OUTPUT_RANGE_MS,
+    stepMs: OUTPUT_STEP_MS,
+    query: buildFinalQuery({
+      includedThings: [thing.thingName],
+      topicPrefix: options.topicPrefix,
+      outputIri: options.outputIriBuilder?.(`P${index + 1}`, index + 1) ?? `mqtt://localhost:1883/results/p${index + 1}`,
+    }),
+  }));
+}
+
+function buildExistingComputationCompositeQueryDefinition(targetCount, options = {}) {
+  assert(EXISTING_COMPUTATION_TARGET_COUNTS.includes(targetCount), `unsupported existing-computation target ${targetCount}`);
+  const includedThings = buildThingDefinitions(targetCount).map((thing) => thing.thingName);
+  return {
+    queryLabel: `Q${targetCount}`,
+    queryIndex: targetCount,
+    includedThings,
+    expectedWindowStart: ALIGNMENT_ORIGIN_MS,
+    expectedWindowEnd: ALIGNMENT_ORIGIN_MS + OUTPUT_RANGE_MS,
+    rangeMs: OUTPUT_RANGE_MS,
+    stepMs: OUTPUT_STEP_MS,
+    query: buildFinalQuery({
+      includedThings,
+      topicPrefix: options.topicPrefix,
+      outputIri: options.outputIriBuilder?.(`Q${targetCount}`, targetCount) ?? `mqtt://localhost:1883/results/q${targetCount}`,
+    }),
+  };
+}
+
+function buildExistingComputationOracle(targetCount, fixture = buildFixture(targetCount)) {
+  const includedThings = fixture.things.slice(0, targetCount).map((thing) => thing.thingName);
+  const contributions = fixture.things.slice(0, targetCount).map((thing) => thing.oracle);
+  const count = contributions.reduce((total, entry) => total + entry.count, 0);
+  const sum = contributions.reduce((total, entry) => total + entry.sum, 0);
+  return [{ queryLabel: `Q${targetCount}`, includedThings, windowStart: fixture.windowStart, windowEnd: fixture.windowEnd, count, sum, average: sum / count }];
+}
+
 module.exports = {
   ALIGNMENT_ORIGIN_MS,
   ALL_APPROACHES,
   CHUNK_RANGE_MS,
   CHUNK_STEP_MS,
+  EXISTING_COMPUTATION_TARGET_COUNTS,
   FLOAT_TOLERANCE,
   OUTPUT_RANGE_MS,
   OUTPUT_STEP_MS,
@@ -381,6 +437,9 @@ module.exports = {
   PROPERTY_NAME,
   WATERMARK_SENTINEL_OFFSET_MS,
   buildFixture,
+  buildExistingComputationCompositeQueryDefinition,
+  buildExistingComputationOracle,
+  buildExistingComputationPrimitiveQueryDefinitions,
   buildFinalQuery,
   buildObservationPayload,
   buildProducerExpectations,
