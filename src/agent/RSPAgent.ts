@@ -98,6 +98,7 @@ export class RSPAgent {
     private readonly mqttClientId?: string;
     private readonly managedProducer: boolean;
     private readonly producerCoverageOrigin: number | null;
+    private readonly inputMessageProcessingChains = new Map<string, Promise<void>>();
 
     /**
      *
@@ -239,19 +240,21 @@ export class RSPAgent {
                     });
                 });
 
-                rsp_client.on("message", async (topic: any, message: any) => {
-                    try {
-                        const message_string = message.toString();
-                        profileCount("mqtt_messages_received");
-                        const latest_event_store = await turtleStringToStore(message_string);
-                        const timestamp = latest_event_store.getQuads(null, DataFactory.namedNode("https://saref.etsi.org/core/hasTimestamp"), null, null)[0].object.value;
-                        const timestamp_epoch = Date.parse(timestamp);
-                        if (rsp_stream_object) {
-                            await this.add_event_store_to_rsp_engine(latest_event_store, [rsp_stream_object], timestamp_epoch);
+                rsp_client.on("message", (topic: any, message: any) => {
+                    void this.enqueueInputMessage(stream_name, async () => {
+                        try {
+                            const message_string = message.toString();
+                            profileCount("mqtt_messages_received");
+                            const latest_event_store = await turtleStringToStore(message_string);
+                            const timestamp = latest_event_store.getQuads(null, DataFactory.namedNode("https://saref.etsi.org/core/hasTimestamp"), null, null)[0].object.value;
+                            const timestamp_epoch = Date.parse(timestamp);
+                            if (rsp_stream_object) {
+                                await this.add_event_store_to_rsp_engine(latest_event_store, [rsp_stream_object], timestamp_epoch);
+                            }
+                        } catch (error) {
+                            console.error(`Error processing message from stream ${stream_name}:`, error);
                         }
-                    } catch (error) {
-                        console.error(`Error processing message from stream ${stream_name}:`, error);
-                    }
+                    });
                 });
 
                 rsp_client.on("error", (error: any) => {
@@ -270,6 +273,23 @@ export class RSPAgent {
                 });
             });
         }));
+    }
+
+    /**
+     * MQTT.js invokes listeners in arrival order but does not await async
+     * listeners.  Keep parsing and RSP-JS insertion ordered per input stream
+     * so a later watermark cannot overtake an earlier observation.
+     */
+    private enqueueInputMessage(streamName: string, work: () => Promise<void>): Promise<void> {
+        const previous = this.inputMessageProcessingChains.get(streamName) ?? Promise.resolve();
+        const current = previous.catch(() => undefined).then(work);
+        this.inputMessageProcessingChains.set(streamName, current);
+        void current.finally(() => {
+            if (this.inputMessageProcessingChains.get(streamName) === current) {
+                this.inputMessageProcessingChains.delete(streamName);
+            }
+        });
+        return current;
     }
 
     /**

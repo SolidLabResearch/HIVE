@@ -96,9 +96,22 @@ type WindowParameters = {
 };
 
 /**
+ * Optional process-local wiring used by the production shared approximation
+ * runtime.  Leaving this undefined preserves the legacy BeeWorker behaviour.
+ */
+export type ApproximationOperatorRuntimeOverrides = Readonly<{
+  mqttClient?: any;
+  resultTopic?: string;
+  executionId?: string;
+  processLifecycle?: "dedicated" | "shared";
+  onPlanComplete?: () => void | Promise<void>;
+}>;
+
+/**
  *
  */
 export class ApproximationApproachOperator implements IStreamQueryOperator {
+  private readonly runtimeOverrides: ApproximationOperatorRuntimeOverrides;
   private readonly consumerIdx: string =
     process.env.K_SCALING_CONSUMER_INDEX
       ? `_consumer_${process.env.K_SCALING_CONSUMER_INDEX}`
@@ -163,14 +176,18 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   private cleanupPromise: Promise<void> | null = null;
   private finalizePromise: Promise<void> | null = null;
   private completionNotified: boolean = false;
-  private readonly executionId: string | null =
-    (process.env.EXECUTION_ID || "").trim() || null;
+  private readonly executionId: string | null;
 
   /**
    * The constructor class with optional inactivity configuration.
    * @param inactivityConfig Optional configuration for data inactivity detection
    */
-  constructor(inactivityConfig?: InactivityConfig) {
+  constructor(
+    inactivityConfig?: InactivityConfig,
+    runtimeOverrides: ApproximationOperatorRuntimeOverrides = {},
+  ) {
+    this.runtimeOverrides = runtimeOverrides;
+    this.executionId = runtimeOverrides.executionId ?? ((process.env.EXECUTION_ID || "").trim() || null);
     // Set default configuration with optional overrides
     this.inactivityConfig = {
       minSamplesForInterval: 3, // Reduced from 10 - need faster detection
@@ -321,6 +338,10 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       const summaryPath = await this.writeConsumerSummary();
       await this.notifyCompletion(summaryPath, latencyPath);
       await this.cleanup();
+      if (this.runtimeOverrides.processLifecycle === "shared") {
+        await this.runtimeOverrides.onPlanComplete?.();
+        return;
+      }
       this.requestProcessExit(0);
     })().catch(async (error) => {
       process.send?.({
@@ -649,7 +670,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     }
     const outputQueryWidth = outputWindowParameters.width;
     const outputQuerySlide = outputWindowParameters.slide;
-    const resultTopic = getResultTopic("approximation/output");
+    const resultTopic = this.runtimeOverrides.resultTopic ?? getResultTopic("approximation/output");
     this.windowRange = outputQueryWidth;
     this.windowSlide = outputQuerySlide;
     this.diagnosticsWriter.updateWindowConfig(
@@ -698,7 +719,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
     }
 
     // Create MQTT client for communication with the broker with different MQTT client IDs.
-    const rsp_client = mqtt.connect(CONFIG.mqttBroker, {
+    const rsp_client = this.runtimeOverrides.mqttClient ?? mqtt.connect(CONFIG.mqttBroker, {
       clientId:
         "approximation-operator-" + Math.random().toString(16).substr(2, 8),
       clean: true,
@@ -706,7 +727,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
       reconnectPeriod: 1000,
     });
     this.activeMqttClients.push(rsp_client);
-    profileCount("mqtt_clients_created");
+    if (!this.runtimeOverrides.mqttClient) profileCount("mqtt_clients_created");
 
     rsp_client.on("error", (error: any) => {
       console.error("MQTT Client Error:", error);
@@ -1013,7 +1034,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
               resultTopic,
               publishedPayload,
               { qos: 1 },
-              (error) => {
+              (error: Error | undefined) => {
                 endStageTimer(
                   "approximation.final_mqtt_publish_total_ms",
                   publishStartedAt,
@@ -1067,7 +1088,11 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
         this.lastDataReceivedTime = nowForLatency;
 
         try {
-          const data = message.toString();
+          // SharedApproximationProducerSubscriptionRegistry passes an already
+          // decoded immutable object.  Legacy BeeWorkers still pass Buffer.
+          const data = typeof message === "object" && !Buffer.isBuffer(message)
+            ? message
+            : message.toString();
           profileCount("mqtt_messages_received");
           const structuredWindowMessage = this.parseApproximationWindowMessage(
             data,
@@ -1112,7 +1137,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
             this.messageCounters.legacy_messages_seen += 1;
             this.messageCounters.suppressed_missing_window_metadata += 1;
             this.logger.log(
-              `Approximation branch decision: topic=${topic} branch=suppressed_missing_window_metadata payload=${data}`,
+            `Approximation branch decision: topic=${topic} branch=suppressed_missing_window_metadata payload=${typeof data === "string" ? data : JSON.stringify(data)}`,
             );
             endStageTimer(
               "approximation.mqtt_message_callback_total_ms",
@@ -1123,14 +1148,14 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
 
           // Parse the RDF triple to extract the numeric value
           // Look for patterns like: hasValue> "number"^^<type>
-          const valueMatch = data.match(VALUE_EXTRACT_REGEX);
+          const valueMatch = typeof data === "string" ? data.match(VALUE_EXTRACT_REGEX) : null;
           let value: number;
 
           if (valueMatch && valueMatch[1]) {
             value = parseFloat(valueMatch[1]);
           } else {
             // Fallback: try to parse as direct number
-            value = parseFloat(data);
+            value = parseFloat(String(data));
           }
 
           if (isNaN(value)) {
@@ -1572,7 +1597,7 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
                   resultTopic,
                   publishedPayload,
                   { qos: 1 },
-                  (error) => {
+                  (error: Error | undefined) => {
                     if (error) {
                       console.error(
                         "Failed to publish aggregated results:",
@@ -1628,16 +1653,18 @@ export class ApproximationApproachOperator implements IStreamQueryOperator {
   }
 
   private parseApproximationWindowMessage(
-    rawData: string,
+    rawData: unknown,
     topic: string,
     fallbackAggregationType: AggregationFunction,
   ): ApproximationWindowMessage | null {
     let parsed: any;
     try {
-      parsed = profileStageSync(
-        "approximation.structured_json_parse_ms",
-        () => JSON.parse(rawData),
-      );
+      parsed = typeof rawData === "object" && rawData !== null
+        ? rawData
+        : profileStageSync(
+            "approximation.structured_json_parse_ms",
+            () => JSON.parse(String(rawData)),
+          );
     } catch {
       return null;
     }

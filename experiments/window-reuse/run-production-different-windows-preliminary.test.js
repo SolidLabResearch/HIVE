@@ -3,14 +3,89 @@ const {
   buildMetricComparison,
   buildQueriesForRanges,
   calculateRequiredReplayDurationSeconds,
+  collectChunkedDebugSummaries,
   evaluateComparableDelivery,
   normalizeDelivery,
   parseArgs,
   parseResultPayload,
   validateReconstructionChunks,
 } = require("./run-production-different-windows-preliminary");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+function writeDebugSummary(runRoot, id, rangeMs, overrides = {}) {
+  fs.writeFileSync(path.join(runRoot, `chunked_debug_summary_chunked_${id}.json`), JSON.stringify({
+    lastComparableWindowStart: REPLAY_ANCHOR_MS,
+    lastComparableWindowEnd: REPLAY_ANCHOR_MS + rangeMs,
+    managedProducerMode: true,
+    localProducerSpawnCount: 0,
+    managerOwnedSubscriptionCount: 2,
+    reconstructedSuperqueryResultCount: 1,
+    coverageCompleteEmissionCount: 1,
+    emittedIncompleteWindowCount: 0,
+    ...overrides,
+  }));
+}
 
 describe("run-production-different-windows-preliminary", () => {
+  let debugRunRoot;
+
+  beforeEach(() => {
+    debugRunRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hive-chunked-debug-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(debugRunRoot, { recursive: true, force: true });
+  });
+
+  test("collects valid per-plan Chunked debug summaries by configured query range", () => {
+    writeDebugSummary(debugRunRoot, "q180", 180000);
+    writeDebugSummary(debugRunRoot, "q120", 120000);
+
+    expect(collectChunkedDebugSummaries(debugRunRoot, buildQueriesForRanges([120, 180]))).toEqual({
+      Q120: expect.objectContaining({ fileName: "chunked_debug_summary_chunked_q120.json", rangeMs: 120000 }),
+      Q180: expect.objectContaining({ fileName: "chunked_debug_summary_chunked_q180.json", rangeMs: 180000 }),
+    });
+  });
+
+  test("rejects a missing per-plan Chunked debug summary", () => {
+    writeDebugSummary(debugRunRoot, "q120", 120000);
+
+    expect(() => collectChunkedDebugSummaries(debugRunRoot, buildQueriesForRanges([120, 180])))
+      .toThrow("expected 2 operator debug summaries, got 1");
+  });
+
+  test("rejects duplicate comparable window ranges", () => {
+    writeDebugSummary(debugRunRoot, "q120a", 120000);
+    writeDebugSummary(debugRunRoot, "q120b", 120000);
+
+    expect(() => collectChunkedDebugSummaries(debugRunRoot, buildQueriesForRanges([120, 180])))
+      .toThrow("duplicate operator debug summary range 120000");
+  });
+
+  test("rejects an unexpected comparable window range", () => {
+    writeDebugSummary(debugRunRoot, "q120", 120000);
+    writeDebugSummary(debugRunRoot, "q300", 300000);
+
+    expect(() => collectChunkedDebugSummaries(debugRunRoot, buildQueriesForRanges([120, 180])))
+      .toThrow("unexpected comparable window range 300000");
+  });
+
+  test("rejects reconstruction-local producer spawning", () => {
+    writeDebugSummary(debugRunRoot, "q120", 120000, { localProducerSpawnCount: 1 });
+
+    expect(() => collectChunkedDebugSummaries(debugRunRoot, buildQueriesForRanges([120])))
+      .toThrow("reconstruction-local producer spawning occurred");
+  });
+
+  test("rejects incomplete window emissions", () => {
+    writeDebugSummary(debugRunRoot, "q120", 120000, { emittedIncompleteWindowCount: 1 });
+
+    expect(() => collectChunkedDebugSummaries(debugRunRoot, buildQueriesForRanges([120])))
+      .toThrow("incomplete window emission occurred");
+  });
+
   test("parses a single selected approach", () => {
     const args = parseArgs(["--approach", "approximation"]);
 

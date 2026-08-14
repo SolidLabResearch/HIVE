@@ -80,6 +80,15 @@ class FakeSharedChunkedRuntime {
   shutdown(): void { return; }
 }
 
+class FakeSharedApproximationRuntime {
+  public registrations: any[] = [];
+  public releases: string[] = [];
+  getPid(): number { return 9876; }
+  async registerPlan(registration: any): Promise<void> { this.registrations.push(registration); }
+  async releasePlan(planId: string): Promise<void> { this.releases.push(planId); }
+  shutdown(): void { return; }
+}
+
 describe("QueryExecutionDispatcher", () => {
   afterEach(() => {
     jest.restoreAllMocks();
@@ -167,7 +176,8 @@ describe("QueryExecutionDispatcher", () => {
         },
       ),
     };
-    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any);
+    const sharedApproximationRuntime = new FakeSharedApproximationRuntime();
+    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any, undefined, () => sharedApproximationRuntime as any);
     const request = {
       approach: "approximation" as const,
       canonicalQueryId: "canonical-query",
@@ -196,7 +206,7 @@ WHERE {
     expect(firstHandle.sharedOutputTopic).not.toBe(secondHandle.sharedOutputTopic);
   });
 
-  test("marks runtime handle failed and notifies listener when active worker exits", async () => {
+  test("routes an approximation execution to the shared runtime instead of BeeWorker", async () => {
     const worker = new FakeWorker();
     const producerManager = new FakeProducerManager();
     const beeKeeper = {
@@ -218,9 +228,10 @@ WHERE {
       ),
     };
     const onExecutionFailed = jest.fn();
+    const sharedApproximationRuntime = new FakeSharedApproximationRuntime();
     const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {
       onExecutionFailed,
-    }, producerManager as any);
+    }, producerManager as any, undefined, () => sharedApproximationRuntime as any);
 
     const handle = await dispatcher.createExecution({
       approach: "approximation",
@@ -247,14 +258,15 @@ WHERE {
     expect(handle.producerIds).toEqual(["producer-1"]);
     expect(handle.producerTopics).toEqual(["chunked/producer-1"]);
 
-    worker.callbacks.onExit?.({ code: 1, signal: null });
-
-    expect(handle.state).toBe("failed");
+    expect(beeKeeper.executeQuery).not.toHaveBeenCalled();
+    expect(sharedApproximationRuntime.registrations).toEqual([
+      expect.objectContaining({ planId: handle.executionId, outputTopic: handle.sharedOutputTopic }),
+    ]);
+    expect(handle.workerIds).toEqual(["9876"]);
+    await handle.stop();
+    expect(sharedApproximationRuntime.releases).toEqual([handle.executionId]);
     expect(producerManager.releaseCalls).toContain(handle.executionId);
-    expect(onExecutionFailed).toHaveBeenCalledWith(
-      "canonical-query",
-      expect.stringContaining("worker exited code=1"),
-    );
+    expect(onExecutionFailed).not.toHaveBeenCalled();
   });
 
   test("does not start approximation worker when producer startup fails", async () => {
@@ -449,7 +461,8 @@ WHERE {
         },
       ),
     };
-    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any);
+    const sharedApproximationRuntime = new FakeSharedApproximationRuntime();
+    const dispatcher = new QueryExecutionDispatcher(beeKeeper as any, {}, producerManager as any, undefined, () => sharedApproximationRuntime as any);
 
     await dispatcher.createExecution({
       approach: "approximation",

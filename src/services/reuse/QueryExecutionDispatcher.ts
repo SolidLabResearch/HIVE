@@ -30,6 +30,7 @@ import {
   type ChunkedReconstructionPlanConfig,
 } from "../operators/chunked/ChunkedReconstructionPlan";
 import { SharedChunkedReconstructionRuntime } from "./SharedChunkedReconstructionRuntime";
+import { SharedApproximationRuntime } from "./SharedApproximationRuntime";
 import { profileCount } from "../../util/profiling";
 
 export type RegistrationApproach = "fetching" | "approximation" | "chunked";
@@ -49,6 +50,10 @@ type DispatchListener = {
 type SharedChunkedRuntimeFactory = (
   onRuntimeFailed: (reason: string, executionIds: string[]) => void,
 ) => SharedChunkedReconstructionRuntime;
+
+type SharedApproximationRuntimeFactory = (
+  onRuntimeFailed: (reason: string, executionIds: string[]) => void,
+) => SharedApproximationRuntime;
 
 type DerivedSubqueryPlan = {
   aggregation: AggregationFunction;
@@ -193,6 +198,7 @@ export class QueryExecutionDispatcher {
   private readonly producerManager: SubqueryProducerManager;
   private readonly executionOwnerById = new Map<string, string>();
   private sharedChunkedRuntime: SharedChunkedReconstructionRuntime | null = null;
+  private sharedApproximationRuntime: SharedApproximationRuntime | null = null;
   // Multiple independently registered Fetching targets live in one server
   // process. Give their diagnostic artifacts distinct consumer slots; this is
   // observability only and does not alter query execution or result topics.
@@ -204,6 +210,8 @@ export class QueryExecutionDispatcher {
     producerManager?: SubqueryProducerManager,
     private readonly sharedChunkedRuntimeFactory: SharedChunkedRuntimeFactory =
       (onRuntimeFailed) => new SharedChunkedReconstructionRuntime(onRuntimeFailed),
+    private readonly sharedApproximationRuntimeFactory: SharedApproximationRuntimeFactory =
+      (onRuntimeFailed) => new SharedApproximationRuntime(onRuntimeFailed),
   ) {
     this.beeKeeper = beeKeeper;
     this.listener = listener;
@@ -262,13 +270,9 @@ export class QueryExecutionDispatcher {
           ? this.createSharedChunkedExecution(
               request, executionId, sharedOutputTopic, runtimePlan.subQueries, producers,
             )
-          : this.createBeeExecution(
-          request,
-          executionId,
-          sharedOutputTopic,
-          runtimePlan.subQueries,
-          producers,
-        );
+          : this.createSharedApproximationExecution(
+              request, executionId, sharedOutputTopic, runtimePlan.subQueries, producers,
+            );
       } catch (error) {
         this.executionOwnerById.delete(executionId);
         await this.producerManager.releaseExecution(executionId);
@@ -344,6 +348,71 @@ export class QueryExecutionDispatcher {
       handle = {
         executionId,
         approach: "chunked",
+        canonicalQueryId: request.canonicalQueryId,
+        sharedOutputTopic,
+        workerIds: runtime.getPid() ? [String(runtime.getPid())] : [],
+        producerIds: producerHandles.map((producer) => producer.producerId),
+        canonicalProducerIds: producerHandles.map((producer) => producer.canonicalProducerId),
+        runtimeProducerIds: producerHandles.map((producer) => producer.runtimeProducerId),
+        producerTopics: producerHandles.map((producer) => producer.outputTopic),
+        producerSnapshots: this.buildProducerSnapshots(producerHandles),
+        state: "active",
+        stop: async () => {
+          handle.state = "stopping";
+          await runtime.releasePlan(executionId);
+          this.executionOwnerById.delete(executionId);
+          await this.producerManager.releaseExecution(executionId);
+          handle.state = "stopped";
+        },
+      };
+      return handle;
+    } catch (error) {
+      this.executionOwnerById.delete(executionId);
+      await this.producerManager.releaseExecution(executionId);
+      this.listener.onExecutionFailed?.(request.canonicalQueryId, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  private ensureSharedApproximationRuntime(): SharedApproximationRuntime {
+    if (this.sharedApproximationRuntime) {
+      profileCount("approximation_reconstruction_runtime_reuse_hits");
+      return this.sharedApproximationRuntime;
+    }
+    profileCount("approximation_reconstruction_runtime_processes_created");
+    this.sharedApproximationRuntime = this.sharedApproximationRuntimeFactory((reason, executionIds) => {
+      for (const executionId of executionIds) {
+        const canonicalQueryId = this.executionOwnerById.get(executionId);
+        if (!canonicalQueryId) continue;
+        this.executionOwnerById.delete(executionId);
+        void this.producerManager.releaseExecution(executionId);
+        this.listener.onExecutionFailed?.(canonicalQueryId, reason);
+      }
+      this.sharedApproximationRuntime = null;
+    });
+    return this.sharedApproximationRuntime;
+  }
+
+  private async createSharedApproximationExecution(
+    request: ExecutionCreationRequest,
+    executionId: string,
+    sharedOutputTopic: string,
+    subQueries: string[],
+    producerHandles: SubqueryProducerHandle[],
+  ): Promise<ActiveExecutionHandle> {
+    const runtime = this.ensureSharedApproximationRuntime();
+    let handle!: MutableExecutionHandle;
+    try {
+      await runtime.registerPlan({
+        planId: executionId,
+        query: request.query,
+        subQueries,
+        outputTopic: sharedOutputTopic,
+        executionId,
+      });
+      handle = {
+        executionId,
+        approach: "approximation",
         canonicalQueryId: request.canonicalQueryId,
         sharedOutputTopic,
         workerIds: runtime.getPid() ? [String(runtime.getPid())] : [],
@@ -578,6 +647,8 @@ export class QueryExecutionDispatcher {
   async shutdown(): Promise<void> {
     this.sharedChunkedRuntime?.shutdown();
     this.sharedChunkedRuntime = null;
+    this.sharedApproximationRuntime?.shutdown();
+    this.sharedApproximationRuntime = null;
     await this.producerManager.stopAll();
   }
 

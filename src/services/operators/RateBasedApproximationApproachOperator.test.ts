@@ -281,6 +281,26 @@ WHERE { WINDOW :w2 { ?sensor :value ?v } }
     });
   });
 
+  test('accepts a shared-runtime decoded payload without changing structured-window semantics', () => {
+    const operator = new ApproximationApproachOperator();
+    const payload = Object.freeze({
+      message_format: 'structured_reusable_result',
+      source_topic: 'wearable/temperature',
+      aggregationType: 'AVG',
+      value: 12.434782608695652,
+      window_start: 0,
+      window_end: 120000,
+    });
+    expect((operator as any).parseApproximationWindowMessage(payload, 'chunked/a', 'AVG')).toEqual({
+      kind: 'structured',
+      windowStart: 0,
+      windowEnd: 120000,
+      value: 12.434782608695652,
+      aggregationType: 'AVG',
+      sourceTopic: 'wearable/temperature',
+    });
+  });
+
   test('completed-window mode emits correctly from compact structured reusable_result payloads', async () => {
     const { client } = await startOperator();
 

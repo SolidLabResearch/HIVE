@@ -8,6 +8,7 @@ type MockMqttClient = {
 };
 
 const mqttClients: MockMqttClient[] = [];
+const turtleStringToStoreMock = jest.fn();
 
 function createMockMqttClient(): MockMqttClient {
   const handlers: Record<string, Function> = {};
@@ -31,12 +32,21 @@ function createMockMqttClient(): MockMqttClient {
   return client;
 }
 
+function timestampStore(timestamp: string): { getQuads: jest.Mock } {
+  return { getQuads: jest.fn().mockReturnValue([{ object: { value: timestamp } }]) };
+}
+
 jest.mock("mqtt", () => ({
   connect: jest.fn().mockImplementation(() => {
     const client = createMockMqttClient();
     mqttClients.push(client);
     return client;
   }),
+}));
+
+jest.mock("../util/Util", () => ({
+  ...jest.requireActual("../util/Util"),
+  turtleStringToStore: (...args: unknown[]) => turtleStringToStoreMock(...args),
 }));
 
 global.fetch = jest.fn().mockResolvedValue({
@@ -147,6 +157,45 @@ describe("RSPAgent", () => {
     const rstream_topic = "rstream_topic";
     const agent = new RSPAgent(query, rstream_topic);
     expect(agent.returnMQTTBroker("mqtt://localhost:1883/topic/random/sensor/room/temperature")).toBe("mqtt://localhost:1883/");
+  });
+
+  test("inserts ordered MQTT messages into RSP-JS even when an earlier parse is slower", async () => {
+    const query = `
+      PREFIX mqtt_broker: <mqtt://localhost:1883/>
+      PREFIX : <https://rsp.js/>
+      REGISTER RStream <output> AS
+      SELECT *
+      FROM NAMED WINDOW :w ON STREAM mqtt_broker:ordered/input [RANGE 60000 STEP 60000]
+      WHERE { WINDOW :w { ?s ?p ?o } }
+    `;
+    let releaseFirst: (() => void) | undefined;
+    const firstParsed = new Promise<any>((resolve) => { releaseFirst = () => resolve(timestampStore("2026-01-01T00:00:05.000Z")); });
+    turtleStringToStoreMock.mockImplementation((payload: string) =>
+      payload === "first" ? firstParsed : Promise.resolve(timestampStore("2026-01-01T00:02:05.001Z")),
+    );
+    const agent = new RSPAgent(query, "chunked/ordered-test");
+    const inserted: number[] = [];
+    jest.spyOn(agent, "add_event_store_to_rsp_engine").mockImplementation(async (_store, _streams, timestamp) => {
+      inserted.push(timestamp);
+    });
+    const started = agent.process_streams();
+    const inputClient = mqttClients[1];
+    inputClient.subscribe.mockImplementation((_topic: string, callback: (error?: Error) => void) => callback());
+    inputClient.emit("connect");
+    await started;
+
+    inputClient.emit("message", "ordered/input", Buffer.from("first"));
+    inputClient.emit("message", "ordered/input", Buffer.from("sentinel"));
+    await Promise.resolve();
+    expect(inserted).toEqual([]);
+    releaseFirst?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(inserted).toEqual([
+      Date.parse("2026-01-01T00:00:05.000Z"),
+      Date.parse("2026-01-01T00:02:05.001Z"),
+    ]);
   });
 
   test("publishes structured reusable_result payloads with reconstructed window metadata", () => {

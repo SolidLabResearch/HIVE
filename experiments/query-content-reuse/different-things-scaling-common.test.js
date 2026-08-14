@@ -65,11 +65,16 @@ describe("different-things-scaling common helpers", () => {
     for (const thing of fixture.things) {
       expect(thing.watermarkSentinel).toMatchObject({
         isWatermarkSentinel: true,
-        sentinelTimestamp: ALIGNMENT_ORIGIN_MS + 130000,
         sentinelStream: thing.thingName,
         sentinelExcludedFromOracle: true,
         value: 0,
       });
+      expect(thing.watermarkSentinel.offsetMs).toBe(
+        thing.events[0].offsetMs + OUTPUT_RANGE_MS + 1,
+      );
+      expect(thing.watermarkSentinel.sentinelTimestamp).toBe(
+        thing.events[0].timestampMs + OUTPUT_RANGE_MS + 1,
+      );
       expect(thing.watermarkSentinel.sentinelTimestamp).toBeGreaterThanOrEqual(fixture.windowEnd);
       expect(thing.events).not.toContainEqual(
         expect.objectContaining({ isWatermarkSentinel: true }),

@@ -1040,15 +1040,51 @@ function compareAgainstFetching(fetchingSummary, otherSummary, approach) {
   });
 }
 
-function readJsonIfPresent(filePath) {
-  return fs.existsSync(filePath) ? loadJson(filePath) : null;
-}
-
 function collectProfileArtifacts(runRoot) {
   return fs.readdirSync(runRoot)
     .filter((name) => /^hive_profile_summary\.[^.]+\.\d+\.json$/.test(name))
     .sort()
     .map((name) => ({ fileName: name, ...loadJson(path.join(runRoot, name)) }));
+}
+
+function collectChunkedDebugSummaries(runRoot, queries) {
+  const perPlanFileNames = fs.readdirSync(runRoot)
+    .filter((name) => /^chunked_debug_summary_.+\.json$/.test(name))
+    .sort();
+  const legacyFileName = "chunked_debug_summary.json";
+  const legacyFilePath = path.join(runRoot, legacyFileName);
+
+  // A legacy summary has no per-plan identity, so it is only unambiguous for a
+  // single reconstruction query. Per-plan artifacts are authoritative whenever
+  // they are present.
+  const fileNames = perPlanFileNames.length > 0
+    ? perPlanFileNames
+    : (queries.length === 1 && fs.existsSync(legacyFilePath) ? [legacyFileName] : []);
+  assert(
+    fileNames.length === queries.length,
+    `chunked: expected ${queries.length} operator debug summaries, got ${fileNames.length}`,
+  );
+
+  const queryByRangeMs = new Map(queries.map((query) => [query.rangeMs, query]));
+  const summariesByQuery = {};
+  for (const fileName of fileNames) {
+    const counters = loadJson(path.join(runRoot, fileName));
+    const rangeMs = counters.lastComparableWindowEnd - counters.lastComparableWindowStart;
+    const query = queryByRangeMs.get(rangeMs);
+    assert(query, `chunked/${fileName}: unexpected comparable window range ${rangeMs}`);
+    assert(!summariesByQuery[query.label], `chunked/${query.label}: duplicate operator debug summary range ${rangeMs}`);
+    assert(counters.managedProducerMode === true, `chunked/${query.label}: manager-owned producer mode was not active`);
+    assert(counters.localProducerSpawnCount === 0, `chunked/${query.label}: reconstruction-local producer spawning occurred`);
+    assert(counters.managerOwnedSubscriptionCount === 2, `chunked/${query.label}: unexpected manager-owned subscription count`);
+    assert(counters.reconstructedSuperqueryResultCount >= 1, `chunked/${query.label}: no reconstructed superquery result`);
+    assert(counters.coverageCompleteEmissionCount >= 1, `chunked/${query.label}: no coverage-complete emission`);
+    assert(counters.emittedIncompleteWindowCount === 0, `chunked/${query.label}: incomplete window emission occurred`);
+    summariesByQuery[query.label] = { fileName, rangeMs, counters };
+  }
+  for (const query of queries) {
+    assert(summariesByQuery[query.label], `chunked/${query.label}: missing operator debug summary`);
+  }
+  return summariesByQuery;
 }
 
 function validateReconstructionChunks(delivery) {
@@ -1096,11 +1132,7 @@ function buildChunkedTopology(chunkedSummary, queries) {
     };
   });
 
-  const debugSummary = readJsonIfPresent(path.join(chunkedSummary.runRoot, "chunked_debug_summary.json"));
-  assert(debugSummary, "chunked: missing operator debug counters");
-  assert(debugSummary.managedProducerMode === true, "chunked: manager-owned producer mode was not active");
-  assert(debugSummary.localProducerSpawnCount === 0, "chunked: reconstruction-local producer spawning occurred");
-  assert(debugSummary.managerOwnedSubscriptionCount === 2, "chunked: unexpected manager-owned subscription count");
+  const operatorCountersByQuery = collectChunkedDebugSummaries(chunkedSummary.runRoot, queries);
 
   return {
     executionCount: executionIds.length,
@@ -1111,7 +1143,7 @@ function buildChunkedTopology(chunkedSummary, queries) {
     reconstructionPathCount: reconstructionResults.length,
     reconstructionResults,
     consumerDeliveryCount: chunkedSummary.deliveries.length,
-    operatorCounters: debugSummary,
+    operatorCountersByQuery,
     profileArtifacts: collectProfileArtifacts(chunkedSummary.runRoot),
   };
 }
@@ -1270,6 +1302,7 @@ module.exports = {
   buildMetricComparison,
   buildChunkedTopology,
   buildWindowPlan,
+  collectChunkedDebugSummaries,
   validateReconstructionChunks,
   evaluateComparableDelivery,
   normalizeDelivery,

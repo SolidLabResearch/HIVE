@@ -4,7 +4,6 @@ const OUTPUT_STEP_MS = 60000;
 const CHUNK_RANGE_MS = 60000;
 const CHUNK_STEP_MS = 60000;
 const ALIGNMENT_ORIGIN_MS = 1785924000000;
-const WATERMARK_SENTINEL_OFFSET_MS = 130000;
 const PRELIMINARY_THING_COUNTS = [2, 5, 10];
 const REUSE_DENSITY_PRODUCER_COUNT = 7;
 const REUSE_DENSITY_TARGET_COUNTS = [2, 4, 8, 16];
@@ -128,7 +127,10 @@ function buildFixture(maxThings = 10, anchorMs = ALIGNMENT_ORIGIN_MS) {
     });
     const count = events.length;
     const sum = events.reduce((total, event) => total + event.value, 0);
-    const sentinelTimestamp = anchorMs + WATERMARK_SENTINEL_OFFSET_MS;
+    const firstEventTimestampMs = events[0].timestampMs;
+    const requiredProducerCoverageEnd = firstEventTimestampMs + OUTPUT_RANGE_MS;
+    const sentinelTimestamp = requiredProducerCoverageEnd + 1;
+    const sentinelOffsetMs = sentinelTimestamp - anchorMs;
     const sentinelObservationId = `${thing.thingName}-watermark-sentinel`;
     const watermarkSentinel = {
       isWatermarkSentinel: true,
@@ -136,7 +138,7 @@ function buildFixture(maxThings = 10, anchorMs = ALIGNMENT_ORIGIN_MS) {
       sentinelStream: thing.thingName,
       sentinelExcludedFromOracle: true,
       observationId: sentinelObservationId,
-      offsetMs: WATERMARK_SENTINEL_OFFSET_MS,
+      offsetMs: sentinelOffsetMs,
       timestampMs: sentinelTimestamp,
       timestamp: formatTimestamp(sentinelTimestamp),
       value: 0,
@@ -435,7 +437,6 @@ module.exports = {
   REUSE_DENSITY_PRODUCER_COUNT,
   REUSE_DENSITY_TARGET_COUNTS,
   PROPERTY_NAME,
-  WATERMARK_SENTINEL_OFFSET_MS,
   buildFixture,
   buildExistingComputationCompositeQueryDefinition,
   buildExistingComputationOracle,
