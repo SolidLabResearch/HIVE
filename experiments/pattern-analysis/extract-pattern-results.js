@@ -620,6 +620,59 @@ class PatternResultExtractor {
   }
 
   extractResults() {
+    // The reusable approaches execute through production HIVE's /register
+    // path.  Their authoritative comparable delivery is preserved verbatim by
+    // the pattern-local runtime helper, rather than being reconstructed from
+    // legacy orchestrator CSV logs.
+    const productionSummaryPath = path.join(
+      this.logDir,
+      "production_delivery_summary.json",
+    );
+    if (
+      ["approximation", "chunked"].includes(this.approach) &&
+      fs.existsSync(productionSummaryPath)
+    ) {
+      const summary = JSON.parse(fs.readFileSync(productionSummaryPath, "utf8"));
+      const delivery = summary?.delivery;
+      if (
+        delivery?.accepted !== true ||
+        delivery?.isComparableWindow !== true ||
+        delivery?.coverageComplete !== true ||
+        !Number.isFinite(delivery?.value) ||
+        !Number.isFinite(delivery?.windowStart) ||
+        !Number.isFinite(delivery?.windowEnd)
+      ) {
+        throw new Error(
+          "Production delivery summary is not a complete comparable result",
+        );
+      }
+      const queryRegisteredTime = Number.isFinite(summary?.registration?.requestedAt)
+        ? summary.registration.requestedAt
+        : null;
+      const timestamp = Number.isFinite(delivery?.timestamp)
+        ? delivery.timestamp
+        : delivery.receivedAt;
+      return {
+        results: [{
+          timestamp,
+          resultValue: delivery.value,
+          windowNumber: 1,
+          windowStart: delivery.windowStart,
+          windowEnd: delivery.windowEnd,
+        }],
+        queryRegisteredTime,
+        firstResultTime: timestamp,
+        latencySummary: this.approach === "chunked" ? {
+          queryRegisteredTime,
+          firstInternalChunkAvailableTime: null,
+          parentPartialAvailableTime: null,
+          firstFinalizedComparableAvailableTime: timestamp,
+          firstFinalizedComparablePublishedTime: timestamp,
+          finalizedPublicationDelayMs: 0,
+          steadyStateOutputIntervalMs: null,
+        } : null,
+      };
+    }
     const fetchingFinalizedFile = this.approach === "fetching" && this.diagnosticsFile
       && fs.existsSync(this.diagnosticsFile)
       ? this.diagnosticsFile

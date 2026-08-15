@@ -680,9 +680,11 @@ class CustomPatternComparisonRunner {
     const scripts = {
       fetching:
         "dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js",
-      approximation:
-        "dist/approaches/StreamingQueryApproximationApproachOrchestrator.js",
-      chunked: "dist/approaches/StreamingQueryChunkedApproachOrchestrator.js",
+      // Reusable approaches must go through production /register so HIVE owns
+      // the final shared producer/reconstruction topology.  The legacy
+      // orchestrators remain intentionally unused here.
+      approximation: "experiments/pattern-analysis/run-production-pattern-runtime.js",
+      chunked: "experiments/pattern-analysis/run-production-pattern-runtime.js",
       naive_distributed: "dist/approaches/StreamingQueryNaiveDistributedApproachOrchestrator.js",
     };
     return scripts[approach];
@@ -936,7 +938,10 @@ class CustomPatternComparisonRunner {
       STREAMING_QUERY_HIVE_TIMESTAMP_DOMAIN_MAX: String(timestampDomainMax),
       STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: targetWindowsStr,
       STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD:
-        process.env.STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD || "1",
+        // The shared production reconstruction runtime requires the structured
+        // reusable-result contract; compact legacy payloads are intentionally
+        // not enabled for this benchmark.
+        process.env.STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD || "0",
       STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE:
         process.env.STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE || "1",
       STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE:
@@ -1071,7 +1076,11 @@ class CustomPatternComparisonRunner {
         attemptId,
         command: `node ${this.getApproachScript(approach)}`,
       });
-      approachProc = spawn("node", [this.getApproachScript(approach)], {
+      const approachArgs = [this.getApproachScript(approach)];
+      if (["approximation", "chunked"].includes(approach)) {
+        approachArgs.push(approach);
+      }
+      approachProc = spawn("node", approachArgs, {
         env: {
           ...env,
           HIVE_PROCESS_ROLE: `${approach}_orchestrator`,
