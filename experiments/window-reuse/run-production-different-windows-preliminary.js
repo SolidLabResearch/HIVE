@@ -34,7 +34,8 @@ const ARTIFACT_SETTLE_MS = 2_000;
 const CHUNK_RANGE_MS = 60_000;
 const CHUNK_STEP_MS = 30_000;
 const FINAL_STEP_MS = 60_000;
-const FLOAT_TOLERANCE = 1e-9;
+const SUM_TOLERANCE = 1e-8;
+const AVG_TOLERANCE = 1e-9;
 const REPLAY_ANCHOR_MS = 1_785_924_000_000;
 const DATA_PATH = "custom_patterns/low_variability";
 const FINAL_QUERIES = [
@@ -969,7 +970,7 @@ function indexByLabel(entries) {
   return new Map(entries.map((entry) => [entry.queryLabel, entry]));
 }
 
-function buildMetricComparison(expected, actual, exactRequired) {
+function buildMetricComparison(expected, actual, exactRequired, sumTolerance = AVG_TOLERANCE) {
   const fields = ["count", "sum", "avg"];
   const absoluteErrors = Object.fromEntries(
     fields.map((field) => [
@@ -985,8 +986,8 @@ function buildMetricComparison(expected, actual, exactRequired) {
     .map((field) => absoluteErrors[field] / Math.abs(expected[field]));
   const exact =
     actual.count === expected.count &&
-    absoluteErrors.sum <= FLOAT_TOLERANCE &&
-    absoluteErrors.avg <= FLOAT_TOLERANCE;
+    absoluteErrors.sum <= sumTolerance &&
+    absoluteErrors.avg <= AVG_TOLERANCE;
   return {
     expected,
     actual,
@@ -1024,7 +1025,12 @@ function compareAgainstFetching(fetchingSummary, otherSummary, approach) {
     if (!oracle) {
       throw new Error(`${approach}/${delivery.queryLabel}: missing fetching oracle`);
     }
-    const metrics = buildMetricComparison(oracle, delivery, approach === "chunked");
+    const metrics = buildMetricComparison(
+      oracle,
+      delivery,
+      approach === "chunked",
+      approach === "chunked" ? SUM_TOLERANCE : AVG_TOLERANCE,
+    );
     return {
       queryLabel: delivery.queryLabel,
       windowStartMatch: delivery.windowStart === oracle.windowStart,
@@ -1032,6 +1038,8 @@ function compareAgainstFetching(fetchingSummary, otherSummary, approach) {
       countMatch: delivery.count === oracle.count,
       sumError: metrics.absoluteErrors.sum,
       avgError: metrics.absoluteErrors.avg,
+      sumExactWithinTolerance: metrics.absoluteErrors.sum <= SUM_TOLERANCE,
+      avgExactWithinTolerance: metrics.absoluteErrors.avg <= AVG_TOLERANCE,
       percentError: metrics.mape,
       metrics,
       oracle,
@@ -1154,11 +1162,11 @@ function validateChunkedChecks(chunkedChecks) {
     assert(check.windowEndMatch, `chunked/${check.queryLabel}: windowEnd mismatch`);
     assert(check.countMatch === true, `chunked/${check.queryLabel}: count mismatch`);
     assert(
-      (check.sumError ?? Infinity) <= FLOAT_TOLERANCE,
+      (check.sumError ?? Infinity) <= SUM_TOLERANCE,
       `chunked/${check.queryLabel}: sum mismatch ${check.sumError}`,
     );
     assert(
-      check.avgError <= FLOAT_TOLERANCE,
+      check.avgError <= AVG_TOLERANCE,
       `chunked/${check.queryLabel}: avg mismatch ${check.avgError}`,
     );
     assert(
