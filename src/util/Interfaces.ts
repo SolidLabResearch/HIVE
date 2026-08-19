@@ -4,4 +4,5 @@ export interface IStreamQueryOperator {
     getSubQueries(): string[];
     init(): Promise<void>;
     handleAggregation(): Promise<void>;
+    cleanup?(): void | Promise<void>;
 }

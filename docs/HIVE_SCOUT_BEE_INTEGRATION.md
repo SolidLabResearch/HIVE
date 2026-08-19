@@ -133,9 +133,9 @@ const orchestrator = new IntelligentOrchestrator(
 3. **Deep Insights**: Detailed stream analysis and reasoning
 4. **Adaptive**: Continuously learns from stream patterns
 5. **Real-time**: Low-latency decision making
-6. ** Backward Compatible**: Works with existing code
+6. **🛡️ Backward Compatible**: Works with existing code
 
-##  File Locations
+## 📁 File Locations
 
 - **Core Implementation**: `src/services/HiveScoutBee.ts`
 - **Enhanced Orchestrator**: `src/orchestrator/IntelligentOrchestrator.ts`

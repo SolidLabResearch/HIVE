@@ -42,10 +42,9 @@ export class HiveScoutBeeWrapper {
             },
             {
                 name: 'fetching-client-side',
-                description: 'Optimal for high-variance, complex streams',
+                description: 'Optimal for high-variance streams (volatile or unpredictable)',
                 minThresholds: {
-                    variance: 50,
-                    entropy: 3.0
+                    variance: 50
                 },
                 priority: 2
             },

@@ -1,12 +1,23 @@
 import { createServer, Server, ServerResponse, IncomingMessage } from "http";
 import { GETHandler } from "./GETHandler";
 import { POSTHandler } from "./POSTHandler";
+import { QueryReuseDecisionEvent } from "../../reuse/QueryReuseRegistry";
 
 export type RSPAgentQuery = {
     id: string,
     rspql_query: string,
     r2s_topic: string,
-    data_topic: string
+    data_topic: string,
+    chunk_state_primary_reuse?: boolean,
+    compatibility_kind?: string,
+    reuse_class_key?: string,
+    source_topic?: string,
+    source_stream_id?: string,
+    original_window_range?: number,
+    original_window_step?: number,
+    reuse_decision?: QueryReuseDecisionEvent,
+    execution_id?: string,
+    shared_result_topic?: string,
 }
 
 export const RSPAgentQueryRecord: Record<string, RSPAgentQuery> = {};
@@ -76,5 +87,10 @@ export class HTTPServer {
                 response.end();
             }
         }
+    }
+
+    public close(): void {
+        this.http_server.close();
+        this.logger.info("HTTP Server stopped");
     }
 }

@@ -14,7 +14,7 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
     function verb(n) { return function (v) { return step([n, v]); }; }
     function step(op) {
         if (f) throw new TypeError("Generator is already executing.");
-        while (g && (g = 0, op[0] && (_ = 0)), _) try {
+        while (_) try {
             if (f = 1, y && (t = op[0] & 2 ? y["return"] : op[0] ? y["throw"] || ((t = y["return"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;
             if (y = 0, t) op = [op[0] & 2, t.value];
             switch (op[0]) {
@@ -36,7 +36,7 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
     }
 };
 exports.__esModule = true;
-exports.hash_string_md5 = exports.stringToStore = exports.storeToString = exports.turtleStringToStore = exports.lcm = void 0;
+exports.generateQuery = exports.hash_string_md5 = exports.stringToStore = exports.storeToString = exports.turtleStringToStore = exports.lcm = void 0;
 var n3_1 = require("n3");
 var crypto_1 = require("crypto");
 var rdfParser = require("rdf-parse")["default"];
@@ -119,61 +119,36 @@ function hash_string_md5(input_string) {
     return hash.digest('hex');
 }
 exports.hash_string_md5 = hash_string_md5;
-// /**
-//  *
-//  * @param order
-//  */
-// export function generateQuery(order: Axis[] = ['z', 'y', 'x']) {
-//     const windowMappings: Record<Axis, {
-//         window: string;
-//         stream: string;
-//         variable: string;
-//         property: string;
-//         subject: string;
-//     }> = {
-//         x: {
-//             window: ':w1',
-//             stream: 'mqtt_broker:accX',
-//             variable: '?o',
-//             property: 'dahccsensors:x',
-//             subject: '?s'
-//         },
-//         y: {
-//             window: ':w2',
-//             stream: 'mqtt_broker:accY',
-//             variable: '?o2',
-//             property: 'dahccsensors:y',
-//             subject: '?s2'
-//         },
-//         z: {
-//             window: ':w3',
-//             stream: 'mqtt_broker:accZ',
-//             variable: '?o3',
-//             property: 'dahccsensors:z',
-//             subject: '?s3'
-//         }
-//     };
-//     const windowClauses = order.map(axis => {
-//         const { window, variable, property, subject } = windowMappings[axis];
-//         return `
-//     { WINDOW ${window} {
-//         ${subject} saref:hasValue ${variable} .
-//         ${subject} saref:relatesToProperty ${property} .
-//     }}`;
-//     }).join(' UNION');
-//     const query = `
-// PREFIX mqtt_broker: <mqtt://localhost:1883/>
-// PREFIX saref: <https://saref.etsi.org/core/>
-// PREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>
-// PREFIX : <https://rsp.js> 
-// REGISTER RStream <output> AS
-// SELECT ?o ?o2 ?o3
-// FROM NAMED WINDOW :w1 ON STREAM mqtt_broker:accX [RANGE 120000 STEP 30000]
-// FROM NAMED WINDOW :w2 ON STREAM mqtt_broker:accY [RANGE 120000 STEP 30000]
-// FROM NAMED WINDOW :w3 ON STREAM mqtt_broker:accZ [RANGE 120000 STEP 30000]
-// WHERE {
-//     ${windowClauses}
-// }
-// `;
-//     return query;
-// }
+function generateQuery(order) {
+    if (order === void 0) { order = ['z', 'y', 'x']; }
+    var windowMappings = {
+        x: {
+            window: ':w1',
+            stream: 'mqtt_broker:accX',
+            variable: '?o',
+            property: 'dahccsensors:x',
+            subject: '?s'
+        },
+        y: {
+            window: ':w2',
+            stream: 'mqtt_broker:accY',
+            variable: '?o2',
+            property: 'dahccsensors:y',
+            subject: '?s2'
+        },
+        z: {
+            window: ':w3',
+            stream: 'mqtt_broker:accZ',
+            variable: '?o3',
+            property: 'dahccsensors:z',
+            subject: '?s3'
+        }
+    };
+    var windowClauses = order.map(function (axis) {
+        var _a = windowMappings[axis], window = _a.window, variable = _a.variable, property = _a.property, subject = _a.subject;
+        return "\n    { WINDOW ".concat(window, " {\n        ").concat(subject, " saref:hasValue ").concat(variable, " .\n        ").concat(subject, " saref:relatesToProperty ").concat(property, " .\n    }}");
+    }).join(' UNION');
+    var query = "\nPREFIX mqtt_broker: <mqtt://localhost:1883/>\nPREFIX saref: <https://saref.etsi.org/core/>\nPREFIX dahccsensors: <https://dahcc.idlab.ugent.be/Homelab/SensorsAndActuators/>\nPREFIX : <https://rsp.js> \n\nREGISTER RStream <output> AS\nSELECT ?o ?o2 ?o3\nFROM NAMED WINDOW :w1 ON STREAM mqtt_broker:accX [RANGE 120000 STEP 30000]\nFROM NAMED WINDOW :w2 ON STREAM mqtt_broker:accY [RANGE 120000 STEP 30000]\nFROM NAMED WINDOW :w3 ON STREAM mqtt_broker:accZ [RANGE 120000 STEP 30000]\nWHERE {\n    ".concat(windowClauses, "\n}\n");
+    return query;
+}
+exports.generateQuery = generateQuery;

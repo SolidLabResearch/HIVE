@@ -1,0 +1,944 @@
+#!/usr/bin/env node
+
+const fs = require("fs");
+const path = require("path");
+const {
+  calculateRegistrationAnchoredLatencies,
+  compareResults,
+  compareAggregateResultEquivalence,
+  REGISTRATION_ANCHORED_LATENCY_SOURCE,
+} = require("../../analysis/accuracy/accuracy-comparison-custom-patterns.js");
+
+const DEFAULT_PATTERNS = [
+  "low_variability",
+  "step_pattern",
+  "spike_pattern",
+  "low_freq_oscillation",
+  "high_freq_oscillation",
+  "spike_boundary_short",
+  "spike_boundary_medium",
+  "spike_asymmetric_long",
+  "late_burst",
+  "multiple_bursts",
+  "step_misaligned_45",
+  "step_misaligned_75",
+  "linear_ramp",
+  "asymmetric_activity",
+];
+const DEFAULT_APPROACHES = ["fetching", "approximation", "chunked"];
+
+const FILES = {
+  fetching: {
+    results: "fetching_results.csv",
+    latency: "fetching_latency_log.csv",
+    diagnostics: "fetching_window_diagnostics.csv",
+  },
+  approximation: {
+    results: "approximation_results.csv",
+    latency: "approximation_latency_log.csv",
+    diagnostics: null,
+  },
+  chunked: {
+    results: "chunked_results.csv",
+    latency: "chunked_latency_log.csv",
+    diagnostics: "chunked_window_diagnostics.csv",
+  },
+};
+
+const EXECUTION_SUMMARY_FILE = "custom_pattern_comparison_summary.json";
+
+function parseArgs(argv) {
+  const args = {
+    inputRoot: path.resolve(process.cwd(), "logs/custom-pattern-comparison"),
+    outputDir: null,
+    patterns: [...DEFAULT_PATTERNS],
+    approaches: [...DEFAULT_APPROACHES],
+    iterations: [1],
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = argv[index + 1];
+
+    switch (arg) {
+      case "--input-root":
+        args.inputRoot = resolvePath(requireValue("--input-root", next));
+        index += 1;
+        break;
+      case "--output-dir":
+        args.outputDir = resolvePath(requireValue("--output-dir", next));
+        index += 1;
+        break;
+      case "--patterns":
+        args.patterns = parseCsvList(requireValue("--patterns", next));
+        index += 1;
+        break;
+      case "--approaches":
+        args.approaches = parseCsvList(requireValue("--approaches", next));
+        index += 1;
+        break;
+      case "--iterations":
+        args.iterations = parseCsvList(requireValue("--iterations", next))
+          .map((value) => Number.parseInt(value, 10))
+          .filter((value) => Number.isFinite(value) && value > 0);
+        index += 1;
+        break;
+      case "--help":
+      case "-h":
+        printHelp();
+        process.exit(0);
+        break;
+      default:
+        throw new Error(`Unknown argument: ${arg}`);
+    }
+  }
+
+  if (!args.outputDir) {
+    args.outputDir = path.join(args.inputRoot, "analysis", "first-window-smoke");
+  }
+
+  return args;
+}
+
+function printHelp() {
+  console.log(`Usage: node scripts/benchmark/validate-custom-pattern-first-window-smoke.js [options]
+
+Options:
+  --input-root <path>   Benchmark result root (default: logs/custom-pattern-comparison)
+  --output-dir <path>   Output directory for summary artifacts
+  --patterns <list>     Comma-separated pattern list
+  --approaches <list>   Comma-separated approach list
+  --iterations <list>   Comma-separated iteration list (default: 1)
+  --help                Show this help
+`);
+}
+
+function requireValue(flag, value) {
+  if (!value) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
+}
+
+function resolvePath(inputPath) {
+  return path.isAbsolute(inputPath)
+    ? inputPath
+    : path.resolve(process.cwd(), inputPath);
+}
+
+function parseCsvList(value) {
+  return value.split(",").map((entry) => entry.trim()).filter(Boolean);
+}
+
+function sortNumeric(values) {
+  return [...values].sort((left, right) => left - right);
+}
+
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function exists(filePath) {
+  try {
+    return fs.existsSync(filePath);
+  } catch {
+    return false;
+  }
+}
+
+function readJson(filePath) {
+  if (!exists(filePath)) {
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function parseCsv(content) {
+  const lines = content.trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) {
+    return [];
+  }
+  const headers = parseCsvLine(lines[0]);
+  return lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    return Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ""]));
+  });
+}
+
+function parseCsvLine(line) {
+  const values = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "\"") {
+      if (inQuotes && line[index + 1] === "\"") {
+        current += "\"";
+        index += 1;
+        continue;
+      }
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  values.push(current);
+  return values;
+}
+
+function readCsvRows(filePath) {
+  if (!exists(filePath)) {
+    return [];
+  }
+  return parseCsv(fs.readFileSync(filePath, "utf8"));
+}
+
+function parseNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isPresent(value) {
+  return value !== null && value !== undefined && value !== "";
+}
+
+function readRawNumericField(row, fieldName) {
+  if (!row || !Object.prototype.hasOwnProperty.call(row, fieldName)) {
+    return { present: false, value: null, rawValue: undefined };
+  }
+  const rawValue = row[fieldName];
+  return {
+    present: isPresent(rawValue),
+    value: parseNumber(rawValue),
+    rawValue,
+  };
+}
+
+function collectLatencyValidationFailures(latencyRow, outputWindowRangeMs, outputWindowStepMs) {
+  const failures = [];
+  const queryRegisteredAtField = readRawNumericField(latencyRow, "query_registered_at");
+  const resultEmittedAtField = readRawNumericField(latencyRow, "result_emitted_at");
+  const windowNumberField = readRawNumericField(latencyRow, "window_number");
+
+  if (!queryRegisteredAtField.present) {
+    failures.push("missing query registration timestamp");
+  } else if (!Number.isFinite(queryRegisteredAtField.value)) {
+    failures.push("non-numerical query registration timestamp");
+  }
+
+  if (!resultEmittedAtField.present) {
+    failures.push("missing result-emission timestamp");
+  } else if (!Number.isFinite(resultEmittedAtField.value)) {
+    failures.push("non-numerical result-emission timestamp");
+  }
+
+  if (!windowNumberField.present) {
+    failures.push("invalid window number");
+  } else if (!Number.isFinite(windowNumberField.value) || !Number.isInteger(windowNumberField.value) || windowNumberField.value < 1) {
+    failures.push("invalid window number");
+  }
+
+  if (!Number.isFinite(outputWindowRangeMs) || outputWindowRangeMs <= 0) {
+    failures.push("missing or invalid range");
+  }
+  if (!Number.isFinite(outputWindowStepMs) || outputWindowStepMs <= 0) {
+    failures.push("missing or invalid step");
+  }
+
+  return failures;
+}
+
+function validateLatencyConsistency(row, fieldName, expectedValue, failures, label) {
+  const field = readRawNumericField(row, fieldName);
+  if (!field.present) {
+    return;
+  }
+  if (!Number.isFinite(field.value)) {
+    failures.push(`non-numerical ${label}`);
+    return;
+  }
+  if (Math.abs(field.value - expectedValue) > 1) {
+    failures.push(`${label} mismatch greater than 1 ms`);
+  }
+}
+
+function findConfiguredTimeoutMs(executionSummary, approach, pattern, iteration) {
+  const results = Array.isArray(executionSummary?.results) ? executionSummary.results : [];
+  const match = results.find((result) =>
+    result?.approach === approach
+      && result?.pattern === pattern
+      && Number(result?.iteration) === iteration,
+  );
+  return parseNumber(match?.configuredTimeoutMs);
+}
+
+function resolveIterationDir(inputRoot, approach, pattern, iteration) {
+  const baseDir = path.join(inputRoot, approach, pattern, `iteration${iteration}`);
+  if (!exists(baseDir)) {
+    return null;
+  }
+
+  if (exists(path.join(baseDir, "resource_summary.json"))) {
+    return baseDir;
+  }
+
+  const attempts = fs.readdirSync(baseDir)
+    .filter((entry) => /^attempt\d+$/.test(entry))
+    .map((entry) => path.join(baseDir, entry))
+    .filter((entry) => exists(path.join(entry, "resource_summary.json")))
+    .sort();
+
+  return attempts[attempts.length - 1] || baseDir;
+}
+
+function readFirstRawInputPublishTime(runDir) {
+  const ndjsonPath = path.join(runDir, "mqtt_traffic.ndjson");
+  if (!exists(ndjsonPath)) {
+    return null;
+  }
+
+  const lines = fs.readFileSync(ndjsonPath, "utf8").trim().split(/\r?\n/).filter(Boolean);
+  for (const line of lines) {
+    try {
+      const record = JSON.parse(line);
+      if (record.messageType === "raw_input_stream" && Number.isFinite(Number(record.timestamp))) {
+        return Number(record.timestamp);
+      }
+    } catch {
+    }
+  }
+
+  return null;
+}
+
+function readChunkCoverage(runDir, windowNumber) {
+  const diagnosticsPath = path.join(runDir, FILES.chunked.diagnostics);
+  const rows = readCsvRows(diagnosticsPath);
+  const row = rows.find((entry) => Number.parseInt(entry.external_window_number, 10) === windowNumber);
+  if (!row) {
+    return { complete: false, chunkCount: 0 };
+  }
+
+  try {
+    const chunks = JSON.parse(row.internal_chunks_json || "[]");
+    const complete = chunks.length > 0 && chunks.every((chunk) => chunk.coverageComplete === true);
+    return {
+      complete,
+      chunkCount: chunks.length,
+    };
+  } catch {
+    return { complete: false, chunkCount: 0 };
+  }
+}
+
+function readFetchingCompleteness(runDir, windowNumber) {
+  const diagnosticsPath = path.join(runDir, FILES.fetching.diagnostics);
+  const rows = readCsvRows(diagnosticsPath);
+  const row = rows.find((entry) => Number.parseInt(entry.window_number, 10) === windowNumber);
+  if (!row) {
+    return { complete: false, isPartialWindow: true, reason: "missing_fetching_window_diagnostics" };
+  }
+
+  const complete = row.completeness_status === "complete"
+    && row.accepted_or_suppressed === "accepted";
+
+  return {
+    complete,
+    isPartialWindow: !complete,
+    reason: row.reason || null,
+  };
+}
+
+function readApproximationCompleteness(runDir, windowNumber) {
+  const latencyPath = path.join(runDir, FILES.approximation.latency);
+  const rows = readCsvRows(latencyPath);
+  const row = rows.find((entry) => Number.parseInt(entry.window_number, 10) === windowNumber);
+  if (!row) {
+    return { complete: false, isPartialWindow: true, reason: "missing_approximation_latency_row" };
+  }
+
+  const complete = row.approximation_status === "completed_window_approximation";
+  return {
+    complete,
+    isPartialWindow: !complete,
+    reason: row.approximation_status || null,
+  };
+}
+
+function readApproachRow(runDir, approach, options = {}) {
+  const resultsRows = readCsvRows(path.join(runDir, FILES[approach].results));
+  const latencyRows = readCsvRows(path.join(runDir, FILES[approach].latency));
+  const resourceSummary = readJson(path.join(runDir, "resource_summary.json")) || {};
+  const capSummary = readJson(path.join(runDir, "benchmark_window_cap_summary.json"));
+  const attemptMetadata = readJson(path.join(runDir, "attempt_metadata.json")) || {};
+  const resultRow = resultsRows[0] || null;
+  const windowNumber = Number.parseInt(resultRow?.window_number || latencyRows[0]?.window_number || "", 10);
+  const latencyRow = latencyRows.find((row) => Number.parseInt(row.window_number, 10) === windowNumber) || latencyRows[0] || null;
+  const outputWindowRange = parseNumber(attemptMetadata.output_window_range);
+  const outputWindowStep = parseNumber(attemptMetadata.output_window_step);
+  const configuredTimeoutMs =
+    parseNumber(attemptMetadata.configuredTimeoutMs)
+    ?? findConfiguredTimeoutMs(
+      options.executionSummary,
+      options.approach ?? approach,
+      options.pattern,
+      options.iteration,
+    );
+  const validationFailures = collectLatencyValidationFailures(latencyRow, outputWindowRange, outputWindowStep);
+  const queryRegisteredAt = parseNumber(latencyRow?.query_registered_at);
+  const resultEmittedAt = parseNumber(latencyRow?.result_emitted_at);
+  const normalizedWindowNumber = Number.isFinite(windowNumber) ? windowNumber : parseNumber(latencyRow?.window_number);
+
+  let latencyMetrics = null;
+  if (
+    validationFailures.length === 0 &&
+    Number.isFinite(queryRegisteredAt) &&
+    Number.isFinite(resultEmittedAt) &&
+    Number.isFinite(normalizedWindowNumber) &&
+    Number.isFinite(outputWindowRange) &&
+    Number.isFinite(outputWindowStep)
+  ) {
+    latencyMetrics = calculateRegistrationAnchoredLatencies({
+      queryRegisteredAt,
+      resultEmittedAt,
+      windowNumber: normalizedWindowNumber,
+      outputWindowRangeMs: outputWindowRange,
+      outputWindowStepMs: outputWindowStep,
+    });
+
+    if (!Number.isFinite(latencyMetrics.queryToFirstResultMs) || Number.isNaN(latencyMetrics.queryToFirstResultMs)) {
+      validationFailures.push("NaN or infinite value");
+    }
+    if (!Number.isFinite(latencyMetrics.postWindowCloseLatencyMs) || Number.isNaN(latencyMetrics.postWindowCloseLatencyMs)) {
+      validationFailures.push("NaN or infinite value");
+    }
+    if (resultEmittedAt < queryRegisteredAt) {
+      validationFailures.push("result emitted before query registration");
+    }
+    if (latencyMetrics.queryToFirstResultMs < 0) {
+      validationFailures.push("negative query-to-first-result latency");
+    }
+    if (latencyMetrics.postWindowCloseLatencyMs < 0) {
+      validationFailures.push("negative post-window-close latency");
+    }
+
+    validateLatencyConsistency(
+      latencyRow,
+      "elapsed_since_registration_ms",
+      latencyMetrics.queryToFirstResultMs,
+      validationFailures,
+      "elapsed_since_registration_ms",
+    );
+    validateLatencyConsistency(
+      latencyRow,
+      "delay_past_expected_close_ms",
+      latencyMetrics.postWindowCloseLatencyMs,
+      validationFailures,
+      "delay_past_expected_close_ms",
+    );
+    if (approach === "fetching") {
+      validateLatencyConsistency(
+        latencyRow,
+        "latency_from_window_close_ms",
+        latencyMetrics.postWindowCloseLatencyMs,
+        validationFailures,
+        "latency_from_window_close_ms",
+      );
+    }
+  }
+
+  const dataAlignedWindowCloseAt = parseNumber(latencyRow?.window_data_close_time);
+  const dataAlignedWindowCloseLatencyMs =
+    Number.isFinite(dataAlignedWindowCloseAt) && Number.isFinite(resultEmittedAt)
+      ? resultEmittedAt - dataAlignedWindowCloseAt
+      : null;
+
+  let completeness;
+  if (approach === "fetching") {
+    completeness = readFetchingCompleteness(runDir, windowNumber);
+  } else if (approach === "approximation") {
+    completeness = readApproximationCompleteness(runDir, windowNumber);
+  } else {
+    const coverage = readChunkCoverage(runDir, windowNumber);
+    completeness = {
+      complete: coverage.complete,
+      isPartialWindow: !coverage.complete,
+      reason: coverage.complete ? null : "chunk_coverage_incomplete",
+      chunkCount: coverage.chunkCount,
+    };
+  }
+
+  return {
+    runDir,
+    resultRow,
+    latencyRow,
+    resourceSummary,
+    capSummary,
+    attemptMetadata,
+    configuredTimeoutMs,
+    latencyValidationFailures: validationFailures,
+    windowNumber: Number.isFinite(windowNumber) ? windowNumber : null,
+    windowStart: parseNumber(resultRow?.window_start) ?? parseNumber(latencyRow?.window_start),
+    windowEnd: parseNumber(resultRow?.window_end) ?? parseNumber(latencyRow?.window_end),
+    resultValue: parseNumber(resultRow?.result_value),
+    resultEmittedAt,
+    queryRegisteredAt,
+    outputWindowRangeMs: outputWindowRange,
+    outputWindowStepMs: outputWindowStep,
+    registrationAnchoredWindowCloseAt: latencyMetrics?.registrationAnchoredWindowCloseAt ?? null,
+    queryToFirstResultMs: latencyMetrics?.queryToFirstResultMs ?? null,
+    postWindowCloseLatencyMs: latencyMetrics?.postWindowCloseLatencyMs ?? null,
+    latencyMetricSource: latencyMetrics?.latencyMetricSource ?? null,
+    dataAlignedWindowCloseLatencyMs,
+    completeWindow:
+      capSummary?.stoppedAfterTargetWindows === true
+      && Number(capSummary?.emittedFinalWindowCount) >= 1
+      && completeness.complete === true,
+    completeness,
+    averageCpuPct: parseNumber(resourceSummary.meanCpuPct),
+    peakRssMb: parseNumber(resourceSummary.peakRssMb),
+  };
+}
+
+function validatePattern(inputRoot, pattern, iteration, approaches) {
+  const perApproach = {};
+  const warnings = [];
+  const failures = [];
+  const executionSummary = readJson(path.join(inputRoot, EXECUTION_SUMMARY_FILE));
+
+  for (const approach of approaches) {
+    const runDir = resolveIterationDir(inputRoot, approach, pattern, iteration);
+    if (!runDir) {
+      failures.push(`${approach}: missing iteration directory`);
+      continue;
+    }
+    perApproach[approach] = readApproachRow(runDir, approach, {
+      approach,
+      pattern,
+      iteration,
+      executionSummary,
+    });
+  }
+
+  const fetching = perApproach.fetching;
+  const approximation = perApproach.approximation;
+  const chunked = perApproach.chunked;
+
+  const sharedWindowNumber = fetching?.windowNumber;
+  const sharedWindowStart = fetching?.windowStart;
+  const sharedWindowEnd = fetching?.windowEnd;
+
+  for (const approach of approaches) {
+    const row = perApproach[approach];
+    if (!row) {
+      continue;
+    }
+
+    if (!row.completeWindow) {
+      failures.push(`${approach}: first result is not confirmed complete and comparable`);
+    }
+    if (row.completeness?.isPartialWindow) {
+      failures.push(`${approach}: partial window evidence present`);
+    }
+    if (!Number.isFinite(row.resultValue)) {
+      failures.push(`${approach}: missing result value`);
+    }
+    if (!Number.isFinite(row.averageCpuPct)) {
+      failures.push(`${approach}: average CPU missing`);
+    }
+    if (!Number.isFinite(row.peakRssMb)) {
+      failures.push(`${approach}: peak RSS missing`);
+    }
+    for (const validationFailure of row.latencyValidationFailures || []) {
+      failures.push(`${approach}: ${validationFailure}`);
+    }
+    if (!Number.isFinite(row.queryToFirstResultMs)) {
+      failures.push(`${approach}: query-to-first-result latency missing or invalid`);
+    }
+    if (!Number.isFinite(row.postWindowCloseLatencyMs)) {
+      failures.push(`${approach}: post-window-close latency missing or invalid`);
+    } else if (!Number.isFinite(row.configuredTimeoutMs)) {
+      failures.push(`${approach}: configured pattern timeout missing`);
+    } else if (row.postWindowCloseLatencyMs > row.configuredTimeoutMs) {
+      failures.push(
+        `${approach}: post-window-close latency exceeds configured timeout (${row.postWindowCloseLatencyMs} > ${row.configuredTimeoutMs})`,
+      );
+    }
+    if (row.latencyMetricSource !== REGISTRATION_ANCHORED_LATENCY_SOURCE) {
+      failures.push(`${approach}: latency metric source missing`);
+    }
+    if (row.capSummary?.emittedFinalWindowCount !== 1) {
+      warnings.push(`${approach}: emittedFinalWindowCount=${row.capSummary?.emittedFinalWindowCount ?? "missing"}`);
+    }
+  }
+
+  if (
+    Number.isFinite(sharedWindowNumber) &&
+    (approximation?.windowNumber !== sharedWindowNumber || chunked?.windowNumber !== sharedWindowNumber)
+  ) {
+    failures.push("window_number mismatch across approaches");
+  }
+  if (
+    Number.isFinite(sharedWindowStart) &&
+    Number.isFinite(sharedWindowEnd) &&
+    (
+      approximation?.windowStart !== sharedWindowStart ||
+      approximation?.windowEnd !== sharedWindowEnd ||
+      chunked?.windowStart !== sharedWindowStart ||
+      chunked?.windowEnd !== sharedWindowEnd
+    )
+  ) {
+    failures.push("window bounds mismatch across approaches");
+  }
+
+  let approximationAccuracy = null;
+  let chunkedAccuracy = null;
+
+  if (fetching && approximation) {
+    approximationAccuracy = compareResults(
+      [{
+        windowNumber: fetching.windowNumber,
+        windowStart: fetching.windowStart,
+        windowEnd: fetching.windowEnd,
+        resultValue: fetching.resultValue,
+      }],
+      [{
+        windowNumber: approximation.windowNumber,
+        windowStart: approximation.windowStart,
+        windowEnd: approximation.windowEnd,
+        resultValue: approximation.resultValue,
+      }],
+      { trimWindowStart: 1, trimWindowEnd: 1 },
+    );
+  }
+
+  if (fetching && chunked) {
+    chunkedAccuracy = compareResults(
+      [{
+        windowNumber: fetching.windowNumber,
+        windowStart: fetching.windowStart,
+        windowEnd: fetching.windowEnd,
+        resultValue: fetching.resultValue,
+      }],
+      [{
+        windowNumber: chunked.windowNumber,
+        windowStart: chunked.windowStart,
+        windowEnd: chunked.windowEnd,
+        resultValue: chunked.resultValue,
+      }],
+      { trimWindowStart: 1, trimWindowEnd: 1 },
+    );
+  }
+
+  if (fetching) {
+    const fetchingComparison = compareAggregateResultEquivalence(fetching.resultValue, fetching.resultValue);
+    perApproach.fetching.referenceResult = fetchingComparison.referenceResult;
+    perApproach.fetching.producedResult = fetchingComparison.producedResult;
+    perApproach.fetching.rawAbsoluteError = fetchingComparison.rawAbsoluteError;
+    perApproach.fetching.absoluteError = fetchingComparison.rawAbsoluteError;
+    perApproach.fetching.mae = fetchingComparison.rawAbsoluteError;
+    perApproach.fetching.exactAgreement = fetchingComparison.exactAgreement;
+    perApproach.fetching.comparisonTolerance = fetchingComparison.comparisonTolerance;
+    perApproach.fetching.comparisonMethod = fetchingComparison.comparisonMethod;
+  }
+  if (approximation) {
+    const approximationComparison = approximationAccuracy?.matchedComparisons?.[0]
+      ?? compareAggregateResultEquivalence(approximation.resultValue, fetching?.resultValue);
+    perApproach.approximation.referenceResult = approximationComparison.referenceResult;
+    perApproach.approximation.producedResult = approximationComparison.producedResult;
+    perApproach.approximation.rawAbsoluteError = approximationComparison.rawAbsoluteError;
+    perApproach.approximation.absoluteError = approximationComparison.rawAbsoluteError;
+    perApproach.approximation.mae = approximationAccuracy?.mae ?? approximationComparison.rawAbsoluteError;
+    perApproach.approximation.exactAgreement = approximationComparison.exactAgreement;
+    perApproach.approximation.comparisonTolerance = approximationComparison.comparisonTolerance;
+    perApproach.approximation.comparisonMethod = approximationComparison.comparisonMethod;
+  }
+  if (chunked) {
+    const chunkedComparison = chunkedAccuracy?.matchedComparisons?.[0]
+      ?? compareAggregateResultEquivalence(chunked.resultValue, fetching?.resultValue);
+    perApproach.chunked.referenceResult = chunkedComparison.referenceResult;
+    perApproach.chunked.producedResult = chunkedComparison.producedResult;
+    perApproach.chunked.rawAbsoluteError = chunkedComparison.rawAbsoluteError;
+    perApproach.chunked.absoluteError = chunkedComparison.rawAbsoluteError;
+    perApproach.chunked.mae = chunkedAccuracy?.mae ?? chunkedComparison.rawAbsoluteError;
+    perApproach.chunked.exactAgreement = chunkedComparison.exactAgreement;
+    perApproach.chunked.comparisonTolerance = chunkedComparison.comparisonTolerance;
+    perApproach.chunked.comparisonMethod = chunkedComparison.comparisonMethod;
+    if (!chunkedComparison.exactAgreement) {
+      failures.push("chunked result is not exactly equal to fetching");
+    }
+  }
+
+  return {
+    pattern,
+    iteration,
+    status: failures.length === 0 ? "pass" : "fail",
+    warnings,
+    failures,
+    perApproach,
+  };
+}
+
+function buildTableRows(patternResults, approaches) {
+  const rows = [];
+  for (const patternResult of patternResults) {
+    for (const approach of approaches) {
+      const row = patternResult.perApproach[approach];
+      rows.push({
+        Pattern: patternResult.pattern,
+        Iteration: patternResult.iteration,
+        Approach: approach,
+        "Complete window": row?.completeWindow === true ? "yes" : "no",
+        "Query-to-first-result latency (ms)": formatNumber(row?.queryToFirstResultMs, 3),
+        "Post-window-close latency (ms)": formatNumber(row?.postWindowCloseLatencyMs, 3),
+        "Latency source": row?.latencyMetricSource ?? "",
+        "Average CPU (%)": formatNumber(row?.averageCpuPct, 3),
+        "Peak RSS (MiB)": formatNumber(row?.peakRssMb, 3),
+        Result: formatNumber(row?.resultValue, 12),
+        "Exact vs Fetching": approach === "fetching"
+          ? "1/1"
+          : row?.exactAgreement === true
+            ? "1/1"
+            : "0/1",
+        "Absolute error": formatNumber(row?.absoluteError, 12),
+      });
+    }
+  }
+  return rows;
+}
+
+function median(values) {
+  const finiteValues = values.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+  if (finiteValues.length === 0) {
+    return null;
+  }
+  const midpoint = Math.floor(finiteValues.length / 2);
+  if (finiteValues.length % 2 === 1) {
+    return finiteValues[midpoint];
+  }
+  return (finiteValues[midpoint - 1] + finiteValues[midpoint]) / 2;
+}
+
+function buildAggregatedRows(patternResults, approaches, iterations) {
+  const iterationCount = iterations.length;
+  const rows = [];
+
+  const patterns = [...new Set(patternResults.map((result) => result.pattern))];
+  for (const pattern of patterns) {
+    const perPatternResults = patternResults
+      .filter((result) => result.pattern === pattern)
+      .sort((left, right) => left.iteration - right.iteration);
+
+    for (const approach of approaches) {
+      const perApproachRows = perPatternResults
+        .map((result) => result.perApproach[approach])
+        .filter(Boolean);
+      const completeWindowCount = perApproachRows.filter((row) => row.completeWindow === true).length;
+      const exactAgreementCount = approach === "fetching"
+        ? perApproachRows.filter((row) => row.completeWindow === true).length
+        : perApproachRows.filter((row) => row.exactAgreement === true).length;
+
+      rows.push({
+        Pattern: pattern,
+        Approach: approach,
+        "Complete windows": `${completeWindowCount}/${iterationCount}`,
+        "Median query-to-first-result latency (ms)": formatNumber(median(perApproachRows.map((row) => row.queryToFirstResultMs)), 3),
+        "Median post-window-close latency (ms)": formatNumber(median(perApproachRows.map((row) => row.postWindowCloseLatencyMs)), 3),
+        "Median average CPU (%)": formatNumber(median(perApproachRows.map((row) => row.averageCpuPct)), 3),
+        "Median peak RSS (MiB)": formatNumber(median(perApproachRows.map((row) => row.peakRssMb)), 3),
+        "Exact vs Fetching": `${exactAgreementCount}/${iterationCount}`,
+        MAE: formatNumber(
+          perApproachRows.length > 0
+            ? perApproachRows.reduce((sum, row) => sum + (Number.isFinite(row.absoluteError) ? row.absoluteError : 0), 0) / perApproachRows.length
+            : null,
+          12,
+        ),
+      });
+    }
+  }
+
+  return rows;
+}
+
+function formatNumber(value, digits = 6) {
+  return Number.isFinite(value) ? Number(value.toFixed(digits)) : "";
+}
+
+function writeCsv(filePath, rows) {
+  const headers = [
+    "Pattern",
+    "Iteration",
+    "Approach",
+    "Complete window",
+    "Query-to-first-result latency (ms)",
+    "Post-window-close latency (ms)",
+    "Latency source",
+    "Average CPU (%)",
+    "Peak RSS (MiB)",
+    "Result",
+    "Exact vs Fetching",
+    "Absolute error",
+  ];
+  const lines = [
+    headers.join(","),
+    ...rows.map((row) => headers.map((header) => row[header]).join(",")),
+  ];
+  fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
+}
+
+function writeAggregatedCsv(filePath, rows) {
+  const headers = [
+    "Pattern",
+    "Approach",
+    "Complete windows",
+    "Median query-to-first-result latency (ms)",
+    "Median post-window-close latency (ms)",
+    "Median average CPU (%)",
+    "Median peak RSS (MiB)",
+    "Exact vs Fetching",
+    "MAE",
+  ];
+  const lines = [
+    headers.join(","),
+    ...rows.map((row) => headers.map((header) => row[header]).join(",")),
+  ];
+  fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
+}
+
+function renderMarkdown(summary) {
+  const lines = [
+    "# Custom-Pattern First-Window Smoke Validation",
+    "",
+    `Input root: \`${summary.inputRoot}\``,
+    `Patterns: \`${summary.patterns.join(",")}\``,
+    `Approaches: \`${summary.approaches.join(",")}\``,
+    `Iterations: \`${summary.iterations.join(",")}\``,
+    "",
+    "## Per-Iteration Results",
+    "",
+    "| Pattern | Iteration | Approach | Complete window | Query-to-first-result latency (ms) | Post-window-close latency (ms) | Latency source | Average CPU (%) | Peak RSS (MiB) | Result | Exact vs Fetching | Absolute error |",
+    "| ------- | --------: | -------- | --------------: | ----------------------------------: | ------------------------------: | -------------- | ---------------: | -------------: | -----: | ----------------: | -------------: |",
+  ];
+
+  for (const row of summary.tableRows) {
+    lines.push(
+      `| ${row.Pattern} | ${row.Iteration} | ${row.Approach} | ${row["Complete window"]} | ${row["Query-to-first-result latency (ms)"]} | ${row["Post-window-close latency (ms)"]} | ${row["Latency source"]} | ${row["Average CPU (%)"]} | ${row["Peak RSS (MiB)"]} | ${row.Result} | ${row["Exact vs Fetching"]} | ${row["Absolute error"]} |`,
+    );
+  }
+
+  lines.push("");
+  lines.push("## Aggregated Summary");
+  lines.push("");
+  lines.push("| Pattern | Approach | Complete windows | Median query-to-first-result latency (ms) | Median post-window-close latency (ms) | Median average CPU (%) | Median peak RSS (MiB) | Exact vs Fetching | MAE |");
+  lines.push("| ------- | -------- | ----------------: | -----------------------------------------: | -------------------------------------: | ---------------------: | --------------------: | ----------------: | --: |");
+
+  for (const row of summary.aggregatedTableRows) {
+    lines.push(
+      `| ${row.Pattern} | ${row.Approach} | ${row["Complete windows"]} | ${row["Median query-to-first-result latency (ms)"]} | ${row["Median post-window-close latency (ms)"]} | ${row["Median average CPU (%)"]} | ${row["Median peak RSS (MiB)"]} | ${row["Exact vs Fetching"]} | ${row.MAE} |`,
+    );
+  }
+
+  lines.push("");
+  lines.push(`Overall status: **${summary.status.toUpperCase()}**`);
+
+  if (summary.warnings.length > 0) {
+    lines.push("");
+    lines.push("Warnings:");
+    for (const warning of summary.warnings) {
+      lines.push(`- ${warning}`);
+    }
+  }
+
+  if (summary.failures.length > 0) {
+    lines.push("");
+    lines.push("Failures:");
+    for (const failure of summary.failures) {
+      lines.push(`- ${failure}`);
+    }
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function summarizeSmokeValidation(args) {
+  const iterations = sortNumeric(args.iterations);
+  const patternResults = args.patterns.flatMap((pattern) =>
+    iterations.map((iteration) => validatePattern(args.inputRoot, pattern, iteration, args.approaches)),
+  );
+  const failures = patternResults.flatMap((result) =>
+    result.failures.map((failure) => `${result.pattern} iteration ${result.iteration}: ${failure}`),
+  );
+  const warnings = patternResults.flatMap((result) =>
+    result.warnings.map((warning) => `${result.pattern} iteration ${result.iteration}: ${warning}`),
+  );
+
+  const tableRows = buildTableRows(patternResults, args.approaches);
+  const aggregatedTableRows = buildAggregatedRows(patternResults, args.approaches, iterations);
+
+  return {
+    timestamp: new Date().toISOString(),
+    inputRoot: args.inputRoot,
+    outputDir: args.outputDir,
+    patterns: args.patterns,
+    approaches: args.approaches,
+    iterations,
+    status: failures.length === 0 ? "pass" : "fail",
+    failures,
+    warnings,
+    patternResults,
+    tableRows,
+    aggregatedTableRows,
+  };
+}
+
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  ensureDir(args.outputDir);
+
+  const summary = summarizeSmokeValidation(args);
+  const jsonPath = path.join(args.outputDir, "summary.json");
+  const csvPath = path.join(args.outputDir, "summary.csv");
+  const aggregatedCsvPath = path.join(args.outputDir, "summary.aggregated.csv");
+  const mdPath = path.join(args.outputDir, "summary.md");
+
+  fs.writeFileSync(jsonPath, `${JSON.stringify(summary, null, 2)}\n`);
+  writeCsv(csvPath, summary.tableRows);
+  writeAggregatedCsv(aggregatedCsvPath, summary.aggregatedTableRows);
+  fs.writeFileSync(mdPath, renderMarkdown(summary));
+
+  console.log(`Smoke validation ${summary.status === "pass" ? "passed" : "failed"}.`);
+  console.log(`Summary JSON: ${jsonPath}`);
+  console.log(`Summary CSV: ${csvPath}`);
+  console.log(`Summary aggregated CSV: ${aggregatedCsvPath}`);
+  console.log(`Summary MD: ${mdPath}`);
+
+  if (summary.status !== "pass") {
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  parseArgs,
+  readApproachRow,
+  readFirstRawInputPublishTime,
+  renderMarkdown,
+  summarizeSmokeValidation,
+  validatePattern,
+  collectLatencyValidationFailures,
+};

@@ -8,6 +8,7 @@ export class Logger {
     private log_level: LogLevel;
     private loggable_classes: string[];
     private log_destination: any;
+    private max_log_file_size_bytes: number;
 
     /**
      *
@@ -19,8 +20,57 @@ export class Logger {
         this.log_level = logLevel;
         this.loggable_classes = loggableClasses;
         this.log_destination = logDestination;
+        this.max_log_file_size_bytes = this.getMaxFileSizeBytes();
         console.log(`Logger initialized with log level ${this.log_level}, loggable classes ${this.loggable_classes}, and log destination ${this.log_destination}`);
 
+    }
+
+    private getMaxFileSizeBytes(): number {
+        const envValue = process.env.LOG_MAX_FILE_SIZE_MB;
+        const parsed = envValue ? Number(envValue) : NaN;
+        const maxSizeMb = Number.isFinite(parsed) && parsed > 0 ? parsed : 256;
+        return Math.floor(maxSizeMb * 1024 * 1024);
+    }
+
+    private shouldDisableFileOutput(): boolean {
+        const envValue = process.env.LOG_DISABLE_FILE_OUTPUT;
+        return envValue === '1' || envValue?.toLowerCase() === 'true';
+    }
+
+    private getEffectiveDestination(): string {
+        const envDestination = process.env.LOG_DESTINATION?.trim().toUpperCase();
+        if (envDestination === 'CONSOLE' || envDestination === 'FILE' || envDestination === 'NONE') {
+            return envDestination;
+        }
+
+        if (this.shouldDisableFileOutput() && this.log_destination === 'FILE') {
+            return 'NONE';
+        }
+
+        return String(this.log_destination).toUpperCase();
+    }
+
+    private appendToClassFile(className: string, logMessage: string): void {
+        const logsDir = './logs';
+        const logPath = `${logsDir}/${className}.log`;
+        const rotatedPath = `${logPath}.1`;
+        const line = `${logMessage}\n`;
+        const incomingBytes = Buffer.byteLength(line, 'utf8');
+
+        fs.mkdirSync(logsDir, { recursive: true });
+
+        if (fs.existsSync(logPath)) {
+            const currentSize = fs.statSync(logPath).size;
+            if (currentSize + incomingBytes > this.max_log_file_size_bytes) {
+                if (fs.existsSync(rotatedPath)) {
+                    fs.unlinkSync(rotatedPath);
+                }
+                fs.renameSync(logPath, rotatedPath);
+                fs.writeFileSync(logPath, `${Date.now()},log_file_rotated,max_bytes=${this.max_log_file_size_bytes}\n`);
+            }
+        }
+
+        fs.appendFileSync(logPath, line);
     }
 
     /**
@@ -55,18 +105,19 @@ export class Logger {
      */
     log(level: LogLevel, message: string, className: string) {
         if (level >= this.log_level && this.loggable_classes.includes(className)) {
-            const logPrefix = `[${LogLevel[level]}] [${className}]`;
             const logMessage = `${Date.now()},${message}`;
-            switch (this.log_destination) {
+            switch (this.getEffectiveDestination()) {
                 case 'CONSOLE':
                     console.log(logMessage);
                     break;
                 case 'FILE':
                     try {
-                        fs.appendFileSync(`./logs/${className}.log`, `${logMessage}\n`);
+                        this.appendToClassFile(className, logMessage);
                     } catch (error) {
                         console.error(`Error writing to file: ${error}`);
                     }
+                    break;
+                case 'NONE':
                     break;
                 default:
                     console.log(`Invalid log destination: ${this.log_destination}`);

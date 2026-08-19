@@ -113,3 +113,38 @@ approximation_approach_log.csv
 .gitignore
 streaming_query_approximation_approach_log.csv
 approximation_approach_resource_usage.csv
+chunked_latency_log.csv
+
+# SPeCS containment checker solver artefact
+formula.smt
+docs/evaluation-30iter.tex
+.gitignore
+docs/.DS_Store
+.gitignore
+docs/evaluation-35iter.tex
+docs/evaluation.tex
+.DS_Store
+*.csv
+/results/
+# node scripts/benchmark/run-all-paper-benchmarks.js \
+#   --suite patterns \
+#   --iterations 1 \
+#   --patterns high_freq_oscillation \
+#   --approaches fetching,approximation,chunked \
+#   --output-dir results/paper-benchmarks/target-highfreq-accuracy
+
+# K-scaling generated artifacts
+analysis/k-scaling/raw/
+analysis/k-scaling/plots/
+analysis/k-scaling/k_scaling_plot_summary.csv
+analysis/k-scaling/k_scaling_interpretation.md
+
+# Local benchmark/debug outputs
+## User.md
+debug_test.js
+run_summary.json
+mqtt_traffic.ndjson
+chunked_debug_summary.json
+chunked_emission_proof.json
+analysis/_artifact_backups/
+analysis/k-scaling/extracted_files.txt

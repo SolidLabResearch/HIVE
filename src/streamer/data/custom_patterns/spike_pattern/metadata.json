@@ -1,0 +1,15 @@
+{
+  "pattern": "spike_pattern",
+  "description": "Spike Pattern",
+  "parameters": {
+    "v_base": -23,
+    "v_spike": -5,
+    "delta_t": 1.25
+  },
+  "duration_seconds": 120,
+  "sampling_rate_hz": 4,
+  "total_points": 480,
+  "random_seed": 20260716,
+  "random_source": "seeded_mulberry32",
+  "generated_at": "2026-07-17T07:15:56.846Z"
+}

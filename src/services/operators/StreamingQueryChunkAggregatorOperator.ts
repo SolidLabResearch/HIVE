@@ -1,234 +1,2370 @@
-import { RSPQLParser } from "rsp-js";
-import { RewriteChunkQuery } from "hive-thought-rewriter"
-import { RSPQueryProcess } from "../../rsp/RSPQueryProcess";
-import { hash_string_md5, storeToString } from "../../util/Util";
-import { R2ROperator } from "./r2r";
+import fs from "fs";
+import * as path from "path";
+import { RewriteChunkQuery } from "hive-thought-rewriter";
 import mqtt from "mqtt";
-import { CSVLogger } from "../../util/logger/CSVLogger";
+import { RSPQLParser } from "rsp-js";
+import { RSPQueryProcess } from "../../rsp/RSPQueryProcess";
 import { IStreamQueryOperator } from "../../util/Interfaces";
-const N3 = require('n3');
+import { CSVLogger } from "../../util/logger/CSVLogger";
+import { hash_string_md5, storeToString } from "../../util/Util";
+import { getCachedChunkRewrite, getCachedParsedQuery } from "../../util/queryCache";
+import {
+  endStageTimer,
+  profileAsync,
+  profileCount,
+  profileStageSync,
+  profileSync,
+  startStageTimer,
+  writeProfileArtifact,
+  writeStageProfileArtifact,
+} from "../../util/profiling";
+import { R2ROperator } from "./r2r";
+import {
+  AggregationFunction,
+  buildBenchmarkResultPayload,
+  buildBenchmarkWindowMetadata,
+  getBenchmarkEventTimeAnchor,
+  getBenchmarkStartTime,
+  getBenchmarkTargetWindowCount,
+  getChunkedUseImmediateTrigger,
+  getResultTopic,
+  getSessionId,
+  getTimestampDomainMax,
+  getTimestampDomainMin,
+  useCleanMqttSessionsForBenchmark,
+  useChunkedComparableOutputCadence,
+} from "../../util/runtimeConfig";
+import { PartialChunkResult } from "../../util/chunkTypes";
+import { recordPublishedMqttMessage } from "../../util/mqttTraffic";
+import { resourceTraceSnapshot } from "../../util/resourceTrace";
+import { alignWindowBoundsToOrigin } from "../../util/windowAlignment";
+import {
+  CompatibleChunkReuseSpec,
+  deriveProjectionValues,
+  detectCompatibleChunkReuse,
+} from "../../util/chunkStateReuse";
+import type {
+  ChunkCoverageState,
+  ChunkEmissionProofEntry,
+  ChunkProcessingState,
+  ChunkWindowDiagnostics,
+  ChunkedDebugSummary,
+  ComparableWindowDiagnostics,
+  CompletedChunkGroupState,
+  DerivedOriginalChunkSummary,
+  DerivedOriginalOutputConsumer,
+  FinalWindowCoverageState,
+  ManagerOwnedProducerMapping,
+  ParentPartialDiagnostics,
+  SubqueryIdentity,
+  WindowRecompositionSummary,
+} from "./chunked/types";
+import {
+  buildLogicalChunkGroupIdFromBounds,
+  deriveCandidateFinalWindowStartsForChunk,
+  deriveExpectedChunkKeysForFinalWindow,
+  getLogicalChunkGroupId,
+  insertCompletedChunkGroupOrdered,
+} from "./chunked/chunkWindow";
+import {
+  buildCoverageRecordsFromGroups as buildCoverageRecordsFromGroupsPure,
+  collectChunkByWindow as collectChunkByWindowPure,
+} from "./chunked/ChunkCoverage";
+import { buildChunkEmissionProofEntry as buildChunkEmissionProofEntryPure } from "./chunked/ChunkEmissionProof";
+import {
+  canRecomposeStructuredPartial as canRecomposeStructuredPartialPure,
+  compactStructuredPartial as compactStructuredPartialPure,
+  recomposeComparableWindow as recomposeComparableWindowPure,
+  recomputeExactResultFromPartials as recomputeExactResultFromPartialsPure,
+  summarizeChunkGroup as summarizeChunkGroupPure,
+  summarizeWindowRecomposition as summarizeWindowRecompositionPure,
+} from "./chunked/WindowRecomposer";
+
+export function parseManagerOwnedProducerMappings(raw: string | undefined): ManagerOwnedProducerMapping[] {
+  if (!raw || raw.trim() === "") {
+    return [];
+  }
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error("HIVE_PRODUCER_IDENTITY_MAPPINGS must be an array");
+  }
+  const mappings = parsed as ManagerOwnedProducerMapping[];
+  const canonicalIds = new Set<string>();
+  const runtimeIds = new Set<string>();
+  const topics = new Set<string>();
+  for (const mapping of mappings) {
+    if (
+      !mapping ||
+      typeof mapping.canonicalProducerId !== "string" ||
+      typeof mapping.runtimeProducerId !== "string" ||
+      typeof mapping.topic !== "string" ||
+      typeof mapping.canonicalProducerQuery !== "string" ||
+      typeof mapping.runtimeProducerQuery !== "string" ||
+      typeof mapping.expectedInputStream !== "string" ||
+      !Number.isFinite(mapping.alignmentOriginMs)
+    ) {
+      throw new Error("Invalid manager-owned producer mapping");
+    }
+    if (canonicalIds.has(mapping.canonicalProducerId)) {
+      throw new Error(`Duplicate canonical producer mapping: ${mapping.canonicalProducerId}`);
+    }
+    if (runtimeIds.has(mapping.runtimeProducerId)) {
+      throw new Error(`Two canonical producers claim runtime producer ${mapping.runtimeProducerId}`);
+    }
+    if (topics.has(mapping.topic)) {
+      throw new Error(`Duplicate manager-owned producer topic: ${mapping.topic}`);
+    }
+    canonicalIds.add(mapping.canonicalProducerId);
+    runtimeIds.add(mapping.runtimeProducerId);
+    topics.add(mapping.topic);
+  }
+  return mappings;
+}
+
+type ChunkedBenchmarkWindowMetadata = ReturnType<
+  typeof buildBenchmarkWindowMetadata
+> & {
+  latencyFromLogicalTriggerMs: number | null;
+  latencyFromWindowCloseMs: number | null;
+};
+import {
+  getOrCreatePublisherClient as getOrCreatePublisherClientPure,
+  publishWithSharedClient as publishWithSharedClientPure,
+} from "./chunked/ChunkedResultPublisher";
+import {
+  initializeLatencyLogging as initializeLatencyLoggingPure,
+  logLatency as logLatencyPure,
+  resolveChunkedWallClockWindowClose,
+  writeComparableDiagnostics as writeComparableDiagnosticsPure,
+  writeParentPartialDiagnostics as writeParentPartialDiagnosticsPure,
+} from "./chunked/ChunkedDiagnosticsWriter";
+import {
+  ChunkedPlanState,
+  type ChunkedReconstructionPlanConfig,
+  createChunkedPlanConfigFromEnvironment,
+} from "./chunked/ChunkedReconstructionPlan";
+import { SharedChunkedProducerSubscriptionRegistry, type DecodedProducerResult } from "../reuse/SharedChunkedProducerSubscriptionRegistry";
+const N3 = require("n3");
 
 /**
  *
  */
 export class StreamingQueryChunkAggregatorOperator implements IStreamQueryOperator {
+  public subQueries: string[];
+  public outputQuery: string = "";
+  private parser: RSPQLParser;
+  private queryMQTTTopicMap!: Map<string, string>;
+  private subQueryMQTTTopicMap: Map<string, string> = new Map<string, string>();
+  private chunkGCD: number;
+  private logger: CSVLogger;
+  private mqttBroker: string = "mqtt://localhost:1883"; // Default MQTT broker URL, can be changed if needed
+  private sessionId: string; // Unique session ID to isolate MQTT topics across iterations
+  private latencyLogStream!: fs.WriteStream;
+  private diagnosticsLogStream!: fs.WriteStream;
+  private parentPartialDiagnosticsStream!: fs.WriteStream;
+  private chunkedDebugSummaryPath: string;
+  private chunkedDebugSummary: ChunkedDebugSummary;
+  private chunkedDebugSummaryDirty: boolean = false;
+  private chunkedDebugSummaryFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private chunkedEmissionProofPath: string;
+  private chunkedEmissionProofEntries: ChunkEmissionProofEntry[] = [];
+  private chunkedEmissionProofDirty: boolean = false;
+  private chunkedEmissionProofFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private parentPartialDiagnosticsFilePath: string = "";
+  private windowCount: number = 0; // Track window count for latency logging
+  private queryRegisteredTime: number = 0; // Track when query was registered
+  private windowRange: number = 120000; // 120 seconds based on RANGE 120000
+  private windowSlide: number = 60000; // 60 seconds based on STEP 60000
+  private firstDataReceivedTime: number = 0; // Track when first data arrives (wall-clock)
+  private lastChunkReceivedTime: number = 0; // Track when last chunk was received
+  private intervalTriggerTime: number = 0; // Track when the setInterval fires
+  private lastProcessedTime: number = 0; // Track last time we processed (for immediate trigger)
+  private processingInProgress: boolean = false; // Prevent concurrent processing
+  private useImmediateTrigger: boolean;
+  private comparableOutputCadenceOnly: boolean;
+  private debugChunksEnabled: boolean;
+  private ignoredLegacyChunkCount: number = 0;
+  private duplicateChunkCount: number = 0;
+  private benchmarkEventTimeAnchor: number | null;
+  private runtimeReplayStartWallClockTime: number | null;
+  private timestampDomainMin: number | null;
+  private timestampDomainMax: number | null;
+  private rejectedContaminatedTimestampCount: number = 0;
+  private readonly planState = new ChunkedPlanState();
+  // Compatibility aliases keep established white-box regressions valid while
+  // the ownership remains the per-plan state object above.
+  private readonly chunkArrivalTimes = this.planState.chunkArrivalTimes;
+  private readonly chunkWindowMap = this.planState.chunkWindowMap;
+  private readonly acceptedContributions = this.planState.acceptedContributions;
+  private readonly latestWatermarkByProducer = this.planState.latestWatermarkByProducer;
+  private parentPartialAvailabilityLogged: boolean = false;
+  private readonly planConfig: ChunkedReconstructionPlanConfig;
+  private readonly managerOwnedProducerMappings: ManagerOwnedProducerMapping[];
+  private cachedParsedQueries: Map<string, any> = new Map();
+  private cachedOutputQuery: string = "";
+  private cachedOutputQueryParsed: any = null;
+  private cachedChunkPlanKey: string = "";
+  private cachedChunkPlan:
+    | { chunkSize: number; chunkWindowWidthMs: number; rewrittenQueries: string[] }
+    | null = null;
+  private mqttPublisherClient: any = null;
+  private activeMqttClients: any[] = [];
+  private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  private firstTickTimeout: ReturnType<typeof setTimeout> | null = null;
+  private cleanupRegistered: boolean = false;
+  private benchmarkTargetWindowCount: number | null;
+  private finalizedWindowNumbers: number[] = [];
+  private benchmarkTargetWindowReached: boolean = false;
+  private benchmarkStopReason:
+    | "target_window_count_reached"
+    | "finite_replay_duration_reached"
+    | "other" = "other";
+  private benchmarkWindowSummaryPath: string;
+  /**
+   *
+   */
+  constructor(
+    config?: ChunkedReconstructionPlanConfig,
+    private readonly lifecycle: {
+      onReady?: (details: { subscribedTopics: string[]; expectedSubqueryCount: number }) => void;
+      onComplete?: () => void;
+      onFailure?: (error: Error) => void;
+      producerSubscriptionRegistry?: SharedChunkedProducerSubscriptionRegistry;
+    } = {},
+  ) {
+    this.planConfig = config ?? createChunkedPlanConfigFromEnvironment();
+    this.benchmarkWindowSummaryPath = this.resolveLogFilePath(
+      "benchmark_window_cap_summary.json",
+    );
+    this.subQueries = [];
+    this.parser = new RSPQLParser();
+    this.managerOwnedProducerMappings = parseManagerOwnedProducerMappings(
+      JSON.stringify(this.planConfig.managerOwnedProducerMappings),
+    );
+    this.chunkGCD = 0;
+    this.comparableOutputCadenceOnly = this.planConfig.comparableOutputCadenceOnly;
+    this.useImmediateTrigger = this.planConfig.useImmediateTrigger;
+    this.debugChunksEnabled = this.planConfig.debugChunksEnabled;
+    const consumerIdx = this.planConfig.planId ? `_${this.planConfig.planId.replace(/[^a-zA-Z0-9_-]/g, "_")}` : "";
+    this.logger = new CSVLogger(this.resolveLogFilePath(`streaming_query_chunk_aggregator_log${consumerIdx}.csv`));
+    this.sessionId = this.planConfig.sessionId;
+    this.benchmarkEventTimeAnchor = this.planConfig.benchmarkEventTimeAnchor;
+    this.runtimeReplayStartWallClockTime = this.planConfig.benchmarkStartTime;
+    this.timestampDomainMin = this.planConfig.timestampDomainMin;
+    this.timestampDomainMax = this.planConfig.timestampDomainMax;
+    this.benchmarkTargetWindowCount = this.planConfig.benchmarkTargetWindowCount;
+    this.chunkedDebugSummaryPath = this.resolveLogFilePath(`chunked_debug_summary${consumerIdx}.json`);
+    this.chunkedEmissionProofPath = this.resolveLogFilePath(`chunked_emission_proof${consumerIdx}.json`);
+    this.chunkedDebugSummary = {
+      chunkSizeMs: 0,
+      managedProducerMode: this.managerOwnedProducerMappings.length > 0,
+      localProducerSpawnCount: 0,
+      managerOwnedSubscriptionCount: 0,
+      comparableOutputCadenceOnly: this.comparableOutputCadenceOnly,
+      useImmediateTrigger: this.useImmediateTrigger,
+      expectedSubqueryCount: 0,
+      expectedSubqueryIds: [],
+      subscribedTopics: [],
+      receivedChunkMessageCount: 0,
+      structuredChunkMessageCount: 0,
+      duplicateChunkCount: 0,
+      ignoredLegacyChunkCount: 0,
+      completedChunkGroupCount: 0,
+      comparableWindowEmissionCount: 0,
+      reconstructedSuperqueryResultCount: 0,
+      lastComparableWindowStart: null,
+      lastComparableWindowEnd: null,
+      missingChunkGroupCount: 0,
+      emittedIncompleteWindowCount: 0,
+      emissionProofWindowCount: 0,
+      coverageCompleteEmissionCount: 0,
+      coverageIncompleteBlockedCount: 0,
+      intervalTriggersWithoutEmission: 0,
+      intervalTriggersWithEmission: 0,
+    };
+    this.initializeLatencyLogging();
+    this.persistChunkedDebugSummary(true);
+    this.persistChunkedEmissionProof(true);
+    this.queryRegisteredTime = Date.now(); // Record when query is registered
+    this.logger.log(
+      `Benchmark target window cap ${this.benchmarkTargetWindowCount !== null ? `enabled target=${this.benchmarkTargetWindowCount}` : "disabled"}`,
+    );
+    this.registerCleanupHook();
+    resourceTraceSnapshot("startup", "chunked bee worker constructed");
+  }
 
-    public subQueries: string[];
-    public outputQuery: string = '';
-    private parser: RSPQLParser;
-    private queryMQTTTopicMap !: Map<string, string>;
-    private subQueryMQTTTopicMap: Map<string, string> = new Map<string, string>();
-    private chunkGCD: number;
-    private logger: CSVLogger;
-    private mqttBroker: string = 'mqtt://localhost:1883'; // Default MQTT broker URL, can be changed if needed
-    /**
-     *
-     */
-    constructor() {
-        this.subQueries = [];
-        this.parser = new RSPQLParser();
-        this.chunkGCD = 0;
-        this.logger = new CSVLogger("streaming_query_chunk_aggregator_log.csv");
+  private registerCleanupHook(): void {
+    if (this.cleanupRegistered) {
+      return;
     }
 
-    /**
-     *
-     */
-    public async init() {
-        this.logger.log("init() called");
-        await this.setMQTTTopicMap();
-        this.logger.log("StreamingQueryChunkAggregatorOperator initialized.");
+    this.cleanupRegistered = true;
+    process.once("exit", () => {
+      this.cleanup();
+    });
+  }
+
+  public cleanup(): void {
+    resourceTraceSnapshot("before_cleanup", "chunked bee worker cleanup");
+    profileSync("cleanup_time_ms", () => {
+      this.writeBenchmarkWindowSummary();
+      if (this.intervalHandle) {
+        clearInterval(this.intervalHandle);
+        this.intervalHandle = null;
+      }
+      if (this.firstTickTimeout) {
+        clearTimeout(this.firstTickTimeout);
+        this.firstTickTimeout = null;
+      }
+      if (this.chunkedDebugSummaryFlushTimer) {
+        clearTimeout(this.chunkedDebugSummaryFlushTimer);
+        this.chunkedDebugSummaryFlushTimer = null;
+      }
+      if (this.chunkedEmissionProofFlushTimer) {
+        clearTimeout(this.chunkedEmissionProofFlushTimer);
+        this.chunkedEmissionProofFlushTimer = null;
+      }
+
+      if (this.mqttPublisherClient) {
+        try {
+          this.mqttPublisherClient.end(true);
+        } catch (error) {
+          console.error("Failed to close chunked publisher client:", error);
+        }
+        this.mqttPublisherClient = null;
+      }
+
+      for (const client of this.activeMqttClients.splice(0)) {
+        try {
+          client.end(true);
+        } catch (error) {
+          console.error("Failed to close chunked MQTT client:", error);
+        }
+      }
+
+      if (this.latencyLogStream) {
+        this.latencyLogStream.end();
+      }
+      if (this.diagnosticsLogStream) {
+        this.diagnosticsLogStream.end();
+      }
+      if (this.parentPartialDiagnosticsStream) {
+        this.parentPartialDiagnosticsStream.end();
+      }
+    });
+    this.persistChunkedDebugSummary(true);
+    this.persistChunkedEmissionProof(true);
+    writeProfileArtifact();
+    writeStageProfileArtifact();
+    resourceTraceSnapshot("after_cleanup", "chunked bee worker cleanup complete");
+  }
+
+  private recordFinalizedWindow(windowNumber: number): void {
+    if (!this.finalizedWindowNumbers.includes(windowNumber)) {
+      this.finalizedWindowNumbers.push(windowNumber);
+      this.finalizedWindowNumbers.sort((left, right) => left - right);
     }
 
-    /**
-     *
-     * @param query
-     */
-    addOutputQuery(query: string): void {
-        this.outputQuery = query;
+    if (
+      this.benchmarkTargetWindowCount !== null &&
+      this.finalizedWindowNumbers.length >= this.benchmarkTargetWindowCount
+    ) {
+      this.benchmarkTargetWindowReached = true;
+      this.benchmarkStopReason = "target_window_count_reached";
+      this.logger.log(
+        `Benchmark target window reached: target=${this.benchmarkTargetWindowCount} finalWindows=${this.finalizedWindowNumbers.join(",")}`,
+      );
+      this.writeBenchmarkWindowSummary();
+      this.completePlan();
+    }
+  }
+
+  /** A logical plan completes without owning the lifetime of its host process. */
+  private completePlan(): void {
+    if (this.planState.completed) return;
+    this.planState.completed = true;
+    this.cleanup();
+    this.lifecycle.onComplete?.();
+  }
+
+  private writeBenchmarkWindowSummary(): void {
+    if (this.benchmarkTargetWindowCount === null) {
+      return;
     }
 
-    /**
-     *
-     */
-    async setMQTTTopicMap(): Promise<void> {
-        this.logger.log("setMQTTTopicMap() called");
-        this.queryMQTTTopicMap = new Map<string, string>();
-        this.logger.log(`MQTT Topic Map set for subqueries: ${JSON.stringify(this.queryMQTTTopicMap)}`);
-        const response = await fetch("http://localhost:8080/fetchQueries");
-        if (!response.ok) {
-            console.error("Failed to fetch queries from the server.");
-            return;
-        }
-        const data = await response.json();
-        // Log the full structure for debugging
-        this.logger.log(`Fetched data from server (full JSON): ${JSON.stringify(data, null, 2)}`);
+    try {
+      fs.writeFileSync(
+        this.benchmarkWindowSummaryPath,
+        JSON.stringify(
+          {
+            targetWindowCount: this.benchmarkTargetWindowCount,
+            emittedFinalWindowCount: this.finalizedWindowNumbers.length,
+            finalWindowNumbers: this.finalizedWindowNumbers,
+            stoppedAfterTargetWindows: this.benchmarkTargetWindowReached,
+            stopReason: this.benchmarkStopReason,
+            approach: "chunked",
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      console.error("Error writing benchmark window summary:", error);
+    }
+  }
 
-        for (const [queryHash, mqttTopic] of Object.entries(data)) {
-            const topicString = mqttTopic;
+  private resolveLogFilePath(fileName: string): string {
+    const logRoot = this.planConfig.logRoot;
+    fs.mkdirSync(logRoot, { recursive: true });
+    return path.join(logRoot, fileName);
+  }
 
-            this.queryMQTTTopicMap.set(queryHash as string, topicString as string);
-            this.logger.log(`DEBUG: queryMQTTTopicMap after set: ${JSON.stringify(Array.from(this.queryMQTTTopicMap.entries()))}`);
-            this.logger.log(`Subquery ${queryHash} mapped to MQTT Topic ${topicString}`);
-        }
+  /**
+   * Initialize latency logging
+   */
+  private initializeLatencyLogging() {
+    const initialized = initializeLatencyLoggingPure(
+      this.resolveLogFilePath.bind(this),
+    );
+    this.latencyLogStream = initialized.latencyLogStream;
+    this.diagnosticsLogStream = initialized.diagnosticsLogStream;
+    this.parentPartialDiagnosticsStream =
+      initialized.parentPartialDiagnosticsStream;
+    this.parentPartialDiagnosticsFilePath =
+      initialized.parentPartialDiagnosticsFilePath;
+  }
+
+  /**
+   * Log latency measurement with multiple metrics
+   */
+  private logLatency(
+    windowNumber: number,
+    expectedWindowClose: number,
+    lastChunkReceivedAt: number,
+    intervalTriggerAt: number,
+    resultTime: number,
+    value: string,
+    proofEntry?: ChunkEmissionProofEntry | null,
+    triggerSource?: string,
+    metadata?: ReturnType<typeof buildBenchmarkWindowMetadata>,
+  ) {
+    logLatencyPure({
+      windowNumber,
+      expectedWindowClose,
+      lastChunkReceivedAt,
+      intervalTriggerAt,
+      resultTime,
+      value,
+      proofEntry,
+      triggerSource,
+      queryRegisteredTime: this.queryRegisteredTime,
+      firstDataReceivedTime: this.firstDataReceivedTime,
+      windowRange: this.windowRange,
+      windowSlide: this.windowSlide,
+      comparableOutputCadenceOnly: this.comparableOutputCadenceOnly,
+      useImmediateTrigger: this.useImmediateTrigger,
+      chunkWindowMap: this.planState.chunkWindowMap,
+      chunkArrivalTimes: this.planState.chunkArrivalTimes,
+      runtimeReplayStartWallClockTime: this.runtimeReplayStartWallClockTime,
+      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+      latencyLogStream: this.latencyLogStream,
+      metadata,
+    });
+  }
+
+  /**
+   * Calculate expected window close time for a given window number
+   * Window N closes at: queryRegisteredTime + RANGE + (N-1) * STEP
+   */
+  private getExpectedWindowCloseTime(windowNumber: number): number {
+    return (
+      this.queryRegisteredTime +
+      this.windowRange +
+      (windowNumber - 1) * this.windowSlide
+    );
+  }
+
+
+  private debugChunkLog(message: string): void {
+    if (this.debugChunksEnabled) {
+      this.logger.log(`[DEBUG_CHUNKS] ${message}`);
+    }
+  }
+
+  private persistChunkedDebugSummary(force = false): void {
+    this.chunkedDebugSummaryDirty = true;
+    if (!force) {
+      if (this.chunkedDebugSummaryFlushTimer) {
+        return;
+      }
+      this.chunkedDebugSummaryFlushTimer = setTimeout(() => {
+        this.chunkedDebugSummaryFlushTimer = null;
+        this.persistChunkedDebugSummary(true);
+      }, 250);
+      this.chunkedDebugSummaryFlushTimer.unref?.();
+      return;
     }
 
+    if (!this.chunkedDebugSummaryDirty) {
+      return;
+    }
 
-    /**
-     *
-     */
-    async handleAggregation(): Promise<void> {
-        this.logger.log("Starting aggregation process for subqueries.");
-        await this.initializeSubQueryProcesses();
-        this.logger.log("SubQuery Processes initialized for aggregation.");
+    this.chunkedDebugSummaryDirty = false;
+    fs.writeFileSync(
+      this.chunkedDebugSummaryPath,
+      JSON.stringify(this.chunkedDebugSummary, null, 2),
+    );
+  }
 
-        if (this.subQueries.length === 0) {
-            this.logger.log("No subqueries available for aggregation.");
-            console.error("No subqueries available for aggregation.");
-            return;
+  private persistChunkedEmissionProof(force = false): void {
+    this.chunkedEmissionProofDirty = true;
+    if (!force) {
+      if (this.chunkedEmissionProofFlushTimer) {
+        return;
+      }
+      this.chunkedEmissionProofFlushTimer = setTimeout(() => {
+        this.chunkedEmissionProofFlushTimer = null;
+        this.persistChunkedEmissionProof(true);
+      }, 250);
+      this.chunkedEmissionProofFlushTimer.unref?.();
+      return;
+    }
+
+    if (!this.chunkedEmissionProofDirty) {
+      return;
+    }
+
+    this.chunkedEmissionProofDirty = false;
+    fs.writeFileSync(
+      this.chunkedEmissionProofPath,
+      JSON.stringify(this.chunkedEmissionProofEntries, null, 2),
+    );
+  }
+
+  private normalizeChunkPayload(message: string | DecodedProducerResult): PartialChunkResult | null {
+    try {
+      const normalize = () => {
+        const parsed = typeof message === "string" ? JSON.parse(message) : message;
+        if (
+          parsed &&
+          typeof parsed.queryId === "string" &&
+          typeof parsed.subqueryId === "string" &&
+          parsed.window &&
+          Number.isFinite(parsed.window.start) &&
+          Number.isFinite(parsed.window.end)
+        ) {
+          if (
+            this.managerOwnedProducerMappings.length > 0 &&
+            (typeof parsed.runtimeProducerId !== "string" ||
+              typeof parsed.canonicalProducerId !== "string")
+          ) {
+            throw new Error(
+              "Managed chunk payload requires explicit canonicalProducerId and runtimeProducerId",
+            );
+          }
+          const normalizedWindow = this.normalizeChunkWindowAlignment(
+            parsed.window,
+          );
+          const normalizedPartial = {
+            queryId: parsed.queryId,
+            window: normalizedWindow,
+          };
+          const chunkGroupId = getLogicalChunkGroupId(normalizedPartial);
+          return {
+            queryId: parsed.queryId,
+            subqueryId: parsed.subqueryId,
+            producerId:
+              this.managerOwnedProducerMappings.length > 0
+                ? parsed.canonicalProducerId
+                : typeof parsed.producerId === "string"
+                  ? parsed.producerId
+                  : parsed.subqueryId,
+            canonicalProducerId:
+              typeof parsed.canonicalProducerId === "string"
+                ? parsed.canonicalProducerId
+                : undefined,
+            runtimeProducerId:
+              typeof parsed.runtimeProducerId === "string"
+                ? parsed.runtimeProducerId
+                : this.managerOwnedProducerMappings.length > 0
+                  ? undefined
+                  : parsed.subqueryId,
+            chunkStart: normalizedWindow.start,
+            chunkEnd: normalizedWindow.end,
+            watermark: Number.isFinite(Number(parsed.watermark))
+              ? Number(parsed.watermark)
+              : normalizedWindow.logicalTriggerTime ?? normalizedWindow.end,
+            window: normalizedWindow,
+            chunkId: parsed.chunkId || `${chunkGroupId}:${parsed.subqueryId}`,
+            reuseClassKey:
+              typeof parsed.reuseClassKey === "string"
+                ? parsed.reuseClassKey
+                : undefined,
+            sourceStreamId:
+              typeof parsed.sourceStreamId === "string"
+                ? parsed.sourceStreamId
+                : undefined,
+            sourceTopic:
+              typeof parsed.sourceTopic === "string"
+                ? parsed.sourceTopic
+                : undefined,
+            aggregateFunction: parsed.aggregateFunction,
+            value: Number.isFinite(Number(parsed.value))
+              ? Number(parsed.value)
+              : undefined,
+            count: Number.isFinite(Number(parsed.count))
+              ? Number(parsed.count)
+              : undefined,
+            sum: Number.isFinite(Number(parsed.sum))
+              ? Number(parsed.sum)
+              : undefined,
+            avg: Number.isFinite(Number(parsed.avg))
+              ? Number(parsed.avg)
+              : undefined,
+            state:
+              parsed.state &&
+              (Number.isFinite(Number(parsed.state.count)) ||
+                Number.isFinite(Number(parsed.state.sum)))
+                ? {
+                    count: Number.isFinite(Number(parsed.state.count))
+                      ? Number(parsed.state.count)
+                      : undefined,
+                    sum: Number.isFinite(Number(parsed.state.sum))
+                      ? Number(parsed.state.sum)
+                      : undefined,
+                  }
+                : undefined,
+            rdfPayload: typeof parsed.rdfPayload === "string" ? parsed.rdfPayload : undefined,
+          };
         }
-        if (this.outputQuery === '') {
-            this.logger.log("Output query is not set for aggregation.");
-            console.error("Output query is not set for aggregation.");
-            return;
-        }
-        if (this.chunkGCD <= 0) {
-            this.logger.log("Chunk GCD is not valid for aggregation."); 
-            console.error("Chunk GCD is not valid for aggregation.");
-            return;
-        }
-        if (this.queryMQTTTopicMap.size === 0) {
-            this.logger.log("No MQTT topics mapped for subqueries.");
-            return;
-        }
-
-        this.logger.log(`Starting aggregation of subqueries with GCD chunk size: ${this.chunkGCD}`);
-
-        if (!this.outputQuery) {
-            console.error("Output query is not set or is undefined.");
-            return;
-        }
-        const outputQueryParsed = this.parser.parse(this.outputQuery);
-        if (!outputQueryParsed) {
-            console.error(`Failed to parse output query: ${this.outputQuery}`);
-            return;
-        }
-
-        const outputQueryWidth = outputQueryParsed.s2r[0].width;
-        const outputQuerySlide = outputQueryParsed.s2r[0].slide;
-        if (outputQueryWidth <= 0 || outputQuerySlide <= 0) {
-            console.error(`Invalid width or slide in output query: ${this.outputQuery}`);
-            return;
-        }
-
-        const rsp_client = mqtt.connect(this.mqttBroker);
-        this.logger.log(`Connecting to MQTT broker at ${this.mqttBroker}...`);
-        rsp_client.on("error", (err) => {
-            console.error("MQTT connection error:", err);
-        });
-        rsp_client.on("offline", () => {
-            console.error("MQTT client is offline. Please check the broker connection.");
-        });
-        rsp_client.on("reconnect", () => {
-            this.logger.log("Reconnecting to MQTT broker...");
-        });
-
-        const that = this;
-
-        rsp_client.on("connect", () => {
-
-            this.logger.log(`subQueryTopicMap : ${JSON.stringify(that.subQueryMQTTTopicMap)}`);
-            const topics = Array.from(that.subQueryMQTTTopicMap.values());
-            this.logger.log(`topics to subscribe: ${topics}`);
-            // TODO : Remove hardcoded topics, use the topics from subQueryMQTTTopicMap but currently there is a bug in the subQueryMQTTTopicMap that prevents it from being used correctly.
-            // TODO : Such that only one topic is subscribed to at a time.
-            let topicsOfProcesses: string[] = ["chunked/f8eec45a01e39e93d117673df8915525", "chunked/b22681cadced9975b3b35cb47f82bb40"];
-
-            topicsOfProcesses = topics;
-
-            this.logger.log(`DEBUG: topicsOfProcesses after loop: ${topicsOfProcesses}, length: ${topicsOfProcesses.length}`);
-            if (topicsOfProcesses.length === 0) {
-                this.logger.log('No valid MQTT topics to subscribe to. Please check the subQueryMQTTTopicMap.');
-                return;
+        if (
+          parsed?.message_format === "structured_reusable_result" &&
+          typeof parsed.source_query_id === "string" &&
+          typeof parsed.canonicalProducerId === "string" &&
+          typeof parsed.runtimeProducerId === "string" &&
+          Number.isFinite(Number(parsed.window_start ?? parsed.chunkStart)) &&
+          Number.isFinite(Number(parsed.window_end ?? parsed.chunkEnd))
+        ) {
+          const start = Number(parsed.window_start ?? parsed.chunkStart);
+          const end = Number(parsed.window_end ?? parsed.chunkEnd);
+          const runtimeProducerId = parsed.runtimeProducerId;
+          const managedMapping = this.managerOwnedProducerMappings.length > 0
+            ? this.managerOwnedProducerMappings.find(
+                (mapping) => mapping.runtimeProducerId === runtimeProducerId,
+              )
+            : undefined;
+          if (this.managerOwnedProducerMappings.length > 0) {
+            if (!managedMapping) {
+              throw new Error(`Unknown runtimeProducerId ${runtimeProducerId} in managed chunk`);
             }
-            for (const mqttTopic of topicsOfProcesses) {
-                rsp_client.subscribe(`${mqttTopic}`, (err) => {
-                    if (err) {
-                        this.logger.log(`Failed to subscribe to topic ${mqttTopic}: ${err}`);
-                    } else {
-                        this.logger.log(`Subscribed to topic: ${mqttTopic}`);
-                    }
-                });
+            const rawWindowStart = Number(parsed.rawWindowStart);
+            const rawWindowEnd = Number(parsed.rawWindowEnd);
+            const inputWatermark = Number(parsed.inputWatermark);
+            const producerCoverageOrigin = Number(parsed.producerCoverageOrigin);
+            if (
+              !Number.isFinite(rawWindowStart) ||
+              !Number.isFinite(rawWindowEnd) ||
+              !Number.isFinite(inputWatermark) ||
+              !Number.isFinite(producerCoverageOrigin)
+            ) {
+              throw new Error(
+                `Managed chunk from ${runtimeProducerId} omitted finite temporal completeness metadata`,
+              );
             }
+            if (producerCoverageOrigin !== managedMapping.alignmentOriginMs) {
+              throw new Error(
+                `Managed chunk coverage origin ${producerCoverageOrigin} conflicts with runtime mapping ${managedMapping.alignmentOriginMs}`,
+              );
+            }
+            const temporallyComplete =
+              rawWindowStart >= producerCoverageOrigin &&
+              inputWatermark >= rawWindowEnd;
+            if (parsed.temporallyComplete === true && !temporallyComplete) {
+              throw new Error(
+                `Managed chunk from ${runtimeProducerId} falsely claimed temporal completeness`,
+              );
+            }
+            if (parsed.temporallyComplete !== true) {
+              return null;
+            }
+          }
+          const window = this.normalizeChunkWindowAlignment({
+            start,
+            end,
+            range: Number(parsed.window?.range ?? end - start),
+            step: Number(parsed.window?.step ?? this.chunkGCD),
+            alignmentOriginMs: this.benchmarkEventTimeAnchor,
+            semantics: "[start,end)",
+            logicalTriggerTime: Number(parsed.logical_trigger_time ?? parsed.watermark),
+            windowDataCloseTime: Number(parsed.window_data_close_time ?? end),
+            resultEmittedAt: Number(parsed.result_emitted_at ?? Date.now()),
+            metadataSource: "reconstructed",
+          });
+          return {
+            queryId: parsed.source_query_id,
+            subqueryId: runtimeProducerId,
+            producerId:
+              this.managerOwnedProducerMappings.length > 0
+                ? parsed.canonicalProducerId
+                : typeof parsed.producerId === "string"
+                  ? parsed.producerId
+                  : parsed.source_query_id,
+            canonicalProducerId: parsed.canonicalProducerId,
+            runtimeProducerId,
+            chunkStart: window.start,
+            chunkEnd: window.end,
+            watermark: Number.isFinite(Number(parsed.watermark))
+              ? Number(parsed.watermark)
+              : window.logicalTriggerTime ?? window.end,
+            rawWindowStart: Number.isFinite(Number(parsed.rawWindowStart))
+              ? Number(parsed.rawWindowStart)
+              : undefined,
+            rawWindowEnd: Number.isFinite(Number(parsed.rawWindowEnd))
+              ? Number(parsed.rawWindowEnd)
+              : undefined,
+            inputWatermark: Number.isFinite(Number(parsed.inputWatermark))
+              ? Number(parsed.inputWatermark)
+              : undefined,
+            producerCoverageOrigin: Number.isFinite(Number(parsed.producerCoverageOrigin))
+              ? Number(parsed.producerCoverageOrigin)
+              : undefined,
+            temporallyComplete:
+              typeof parsed.temporallyComplete === "boolean"
+                ? parsed.temporallyComplete
+                : undefined,
+            window,
+            chunkId: `${this.sessionId}:${window.start}:${window.end}:${runtimeProducerId}`,
+            sourceTopic:
+              typeof parsed.source_topic === "string" ? parsed.source_topic : undefined,
+            aggregateFunction: parsed.aggregationType,
+            value: Number.isFinite(Number(parsed.value)) ? Number(parsed.value) : undefined,
+            count: Number.isFinite(Number(parsed.count)) ? Number(parsed.count) : undefined,
+            sum: Number.isFinite(Number(parsed.sum)) ? Number(parsed.sum) : undefined,
+            avg: Number.isFinite(Number(parsed.avg)) ? Number(parsed.avg) : undefined,
+            min: Number.isFinite(Number(parsed.min)) ? Number(parsed.min) : undefined,
+            max: Number.isFinite(Number(parsed.max)) ? Number(parsed.max) : undefined,
+            state: {
+              count: Number.isFinite(Number(parsed.count)) ? Number(parsed.count) : undefined,
+              sum: Number.isFinite(Number(parsed.sum)) ? Number(parsed.sum) : undefined,
+              min: Number.isFinite(Number(parsed.min)) ? Number(parsed.min) : undefined,
+              max: Number.isFinite(Number(parsed.max)) ? Number(parsed.max) : undefined,
+            },
+          };
+        }
+        return null;
+      };
+      return typeof message === "string"
+        ? profileStageSync("chunked.structured_json_parse_ms", () => profileSync("serialization_parsing_ms", normalize))
+        : normalize();
+    } catch (error) {
+      if (this.managerOwnedProducerMappings.length > 0) {
+        throw error;
+      }
+      // Unmanaged compatibility mode may ignore legacy payloads.
+    }
+    return null;
+  }
 
-            // Data structure to collect chunks by topic with timestamps
-            const chunksByTopic: Map<string, { data: string, timestamp: number }[]> = new Map();
-            const chunksRequired = Math.ceil(outputQueryWidth / this.chunkGCD) * this.subQueries.length;
-            this.logger.log(`Chunks required for aggregation: ${chunksRequired}`);
-            this.logger.log(`Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`);
+  private normalizeChunkWindowAlignment(window: any) {
+    const start = Number(window?.start);
+    const end = Number(window?.end);
+    const range = Number(window?.range);
+    const step = Number(window?.step);
+    const logicalTriggerTime = Number(window?.logicalTriggerTime);
+    const directAlignmentOrigin = Number(window?.alignmentOriginMs);
+    const alignmentOriginMs = Number.isFinite(directAlignmentOrigin)
+      ? directAlignmentOrigin
+      : this.benchmarkEventTimeAnchor;
 
-            rsp_client.on("message", (topic, message) => {
-                this.logger.log(`Received message on topic ${topic}: ${message.toString()}`);
-                
-                // Initialize topic array if it doesn't exist
-                if (!chunksByTopic.has(topic)) {
-                    chunksByTopic.set(topic, []);
-                }
-                
-                // Add chunk to the appropriate topic
-                chunksByTopic.get(topic)!.push({ data: message.toString(), timestamp: Date.now() });
-            });
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      !Number.isFinite(range) ||
+      !Number.isFinite(step) ||
+      step <= 0 ||
+      range <= 0
+    ) {
+      return window;
+    }
 
-            // Sliding window: evaluate every outputQuerySlide ms, using last outputQueryWidth ms of data
-            setInterval(async () => {
-                const now = Date.now();
-                const windowStart = now - outputQueryWidth;
-                
-                // Collect all chunks from all topics within the window
-                let allWindowChunks: string[] = [];
-                let totalTopicsWithData = 0;
-                
-                for (const [topic, chunks] of Array.from(chunksByTopic.entries())) {
-                    const windowChunks = chunks.filter(chunk => chunk.timestamp >= windowStart);
-                    
-                    if (windowChunks.length > 0) {
-                        totalTopicsWithData++;
-                        this.logger.log(`Sliding window evaluation for topic ${topic}. Number of chunks: ${windowChunks.length}`);
-                        this.logger.log(`Window start timestamp: ${windowStart}, Current time: ${now}`);
-                        this.logger.log(`Window chunks for ${topic}: ${JSON.stringify(windowChunks)}`);
-                        
-                        // Add this topic's chunks to the combined collection
-                        allWindowChunks.push(...windowChunks.map(chunk => chunk.data));
-                    }
-                    
-                    // Clean up old chunks for this topic
-                    chunksByTopic.set(topic, chunks.filter(chunk => chunk.timestamp >= windowStart));
-                }
-                
-                if (totalTopicsWithData > 0 && allWindowChunks.length > 0) {
-                    this.logger.log(`Sliding window evaluation completed. Combined chunks from ${totalTopicsWithData} topics, total chunks: ${allWindowChunks.length}`);
-                    this.logger.log("Sliding window evaluation. Aggregating and triggering R2R...");
-                    
-                    // Process all chunks together like the client-side approach
-                    await this.executeR2ROperator(allWindowChunks);
+    if (!Number.isFinite(alignmentOriginMs)) {
+      return window;
+    }
+
+    const normalizedAlignmentOriginMs = alignmentOriginMs as number;
+
+    const alignedBounds = alignWindowBoundsToOrigin(
+      { start, end },
+      {
+        rangeMs: range,
+        stepMs: step,
+        alignmentOriginMs: normalizedAlignmentOriginMs,
+      },
+    );
+
+    return {
+      ...window,
+      start: alignedBounds.start,
+      end: alignedBounds.end,
+      alignmentOriginMs: normalizedAlignmentOriginMs,
+      logicalTriggerTime: Number.isFinite(logicalTriggerTime)
+        ? logicalTriggerTime
+        : alignedBounds.end,
+      windowDataCloseTime: alignedBounds.end,
+    };
+  }
+
+  private canRecomposeStructuredPartial(
+    partial: PartialChunkResult,
+    aggregationFunction: AggregationFunction,
+  ): boolean {
+    return canRecomposeStructuredPartialPure(partial, aggregationFunction);
+  }
+
+  private compactStructuredPartial(
+    partial: PartialChunkResult,
+    aggregationFunction: AggregationFunction,
+  ): PartialChunkResult {
+    return compactStructuredPartialPure(partial, aggregationFunction);
+  }
+
+  private hasContiguousDerivedChunks(groups: DerivedOriginalChunkSummary[]): boolean {
+    for (let index = 1; index < groups.length; index += 1) {
+      if (groups[index - 1].end !== groups[index].start) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private buildDerivedOriginalConsumers(): Map<string, DerivedOriginalOutputConsumer> {
+    const consumers = new Map<string, DerivedOriginalOutputConsumer>();
+    for (const query of this.subQueries) {
+      const reuseSpec = detectCompatibleChunkReuse(query);
+      if (!reuseSpec) {
+        continue;
+      }
+
+      consumers.set(reuseSpec.sourceTopic, {
+        emittedWindowCount: 0,
+        nextWindowStartIndex: 0,
+        orderedChunks: [],
+        originalOutputTopic: reuseSpec.originalOutputTopic,
+        originalQueryHash: reuseSpec.originalQueryHash,
+        projectionTerms: reuseSpec.projectionTerms,
+        reuseSpec,
+      });
+    }
+    return consumers;
+  }
+
+  private async publishDerivedOriginalOutputFromChunks(
+    consumer: DerivedOriginalOutputConsumer,
+  ): Promise<void> {
+    const chunksPerWindow = Math.max(
+      1,
+      Math.ceil(consumer.reuseSpec.originalWindowRange / this.chunkGCD),
+    );
+    const chunksPerStep = Math.max(
+      1,
+      Math.ceil(consumer.reuseSpec.originalWindowStep / this.chunkGCD),
+    );
+
+    while (
+      consumer.nextWindowStartIndex + chunksPerWindow <=
+      consumer.orderedChunks.length
+    ) {
+      const windowChunks = consumer.orderedChunks.slice(
+        consumer.nextWindowStartIndex,
+        consumer.nextWindowStartIndex + chunksPerWindow,
+      );
+      if (!this.hasContiguousDerivedChunks(windowChunks)) {
+        break;
+      }
+
+      const totalCount = windowChunks.reduce((sum, chunk) => sum + (chunk.count ?? 0), 0);
+      const totalSum = windowChunks.reduce((sum, chunk) => sum + (chunk.sum ?? 0), 0);
+      const mins = windowChunks
+        .map((chunk) => chunk.min)
+        .filter((v): v is number => v !== undefined && v !== null);
+      const overallMin = mins.length > 0 ? Math.min(...mins) : undefined;
+      const maxs = windowChunks
+        .map((chunk) => chunk.max)
+        .filter((v): v is number => v !== undefined && v !== null);
+      const overallMax = maxs.length > 0 ? Math.max(...maxs) : undefined;
+      const payloads = deriveProjectionValues(
+        consumer.projectionTerms,
+        totalSum,
+        totalCount,
+        overallMin,
+        overallMax,
+      );
+      for (const payload of payloads) {
+        await this.publishWithSharedClient(consumer.originalOutputTopic, payload, {
+          qos: 1,
+        });
+        recordPublishedMqttMessage({
+          topic: consumer.originalOutputTopic,
+          payload,
+          messageType: "reusable_result",
+        });
+      }
+      consumer.emittedWindowCount += 1;
+      profileCount("original_agent_outputs_derived_from_chunks");
+
+      consumer.nextWindowStartIndex += chunksPerStep;
+      if (consumer.nextWindowStartIndex > 0) {
+        const retainFrom = Math.max(0, consumer.nextWindowStartIndex - chunksPerStep);
+        if (retainFrom > 0) {
+          consumer.orderedChunks.splice(0, retainFrom);
+          consumer.nextWindowStartIndex -= retainFrom;
+        }
+      }
+    }
+  }
+
+  public collectChunkByWindow(
+    chunksByWindow: Map<string, Map<string, PartialChunkResult>>,
+    partial: PartialChunkResult,
+    expectedSubqueryIds: string[],
+  ): { chunkGroupId: string; missingSubqueryIds: string[]; isComplete: boolean } {
+    return collectChunkByWindowPure(
+      chunksByWindow,
+      partial,
+      expectedSubqueryIds,
+    );
+  }
+
+  private summarizeChunkGroup(
+    chunkGroupId: string,
+    bySubquery: Map<string, PartialChunkResult>,
+    aggregationFunction: AggregationFunction,
+    coverageState: ChunkCoverageState,
+  ): ChunkWindowDiagnostics {
+    return summarizeChunkGroupPure(
+      chunkGroupId,
+      bySubquery,
+      aggregationFunction,
+      coverageState,
+    );
+  }
+
+  private summarizeWindowRecomposition(
+    windowChunkGroups: CompletedChunkGroupState[],
+    aggregationFunction: AggregationFunction,
+  ): WindowRecompositionSummary | null {
+    return summarizeWindowRecompositionPure(
+      windowChunkGroups,
+      aggregationFunction,
+    );
+  }
+
+  private recomposeComparableWindow(
+    windowChunkGroups: CompletedChunkGroupState[],
+    aggregationFunction: AggregationFunction,
+  ): ComparableWindowDiagnostics | null {
+    return profileSync("structured_recomposition_time_ms", () =>
+      recomposeComparableWindowPure(
+        windowChunkGroups,
+        aggregationFunction,
+        this.windowCount + 1,
+      ),
+    );
+  }
+
+  private buildCoverageRecordsFromGroups(
+    windowChunkGroups: CompletedChunkGroupState[],
+    expectedSubqueryIds: string[],
+  ): {
+    requiredChunksBySubquery: Record<string, string[]>;
+    receivedChunksUsedBySubquery: Record<string, string[]>;
+    missingChunksBySubquery: Record<string, string[]>;
+    duplicateChunksIgnoredBySubquery: Record<string, string[]>;
+    coverageComplete: boolean;
+    allExpectedSubqueriesPresent: boolean;
+  } {
+    return buildCoverageRecordsFromGroupsPure(
+      windowChunkGroups,
+      expectedSubqueryIds,
+    );
+  }
+
+  private recordChunkEmissionProof(entry: ChunkEmissionProofEntry): void {
+    this.chunkedEmissionProofEntries.push(entry);
+    this.chunkedDebugSummary.emissionProofWindowCount =
+      this.chunkedEmissionProofEntries.length;
+    if (entry.coverageComplete) {
+      this.chunkedDebugSummary.coverageCompleteEmissionCount += 1;
+    } else {
+      this.chunkedDebugSummary.emittedIncompleteWindowCount += 1;
+    }
+    this.persistChunkedEmissionProof();
+    this.persistChunkedDebugSummary();
+  }
+
+  private buildChunkEmissionProofEntry(
+    partials: PartialChunkResult[],
+    chunkGroupId: string | undefined,
+    comparableDiagnostics: ComparableWindowDiagnostics | undefined,
+    emissionReason: string,
+    coverageState?: ChunkCoverageState,
+  ): ChunkEmissionProofEntry | null {
+    const _chunkGroupId = chunkGroupId;
+    return buildChunkEmissionProofEntryPure(
+      partials,
+      comparableDiagnostics,
+      emissionReason,
+      Date.now(),
+      coverageState,
+    );
+  }
+
+  private buildFinalWindowCoverageState(
+    finalWindowStart: number,
+    state: ChunkProcessingState,
+  ): FinalWindowCoverageState | null {
+    const finalWindowEnd = finalWindowStart + this.windowRange;
+    const expectedChunkKeys = deriveExpectedChunkKeysForFinalWindow({
+      finalWindowStart,
+      finalWindowEnd,
+      chunkWindowWidthMs: state.chunkWindowWidthMs,
+      alignmentOriginMs: state.alignmentOriginMs,
+    });
+    if (expectedChunkKeys.length === 0) {
+      return null;
+    }
+
+    return {
+      finalWindowId: buildLogicalChunkGroupIdFromBounds(
+        finalWindowStart,
+        finalWindowEnd,
+        state.alignmentOriginMs,
+      ),
+      finalWindowStart,
+      finalWindowEnd,
+      expectedChunkKeys: [...expectedChunkKeys],
+      receivedChunkKeys: [],
+      missingChunkKeys: [...expectedChunkKeys],
+      duplicateChunkKeys: [],
+      coverageComplete: false,
+      completionReason: "waiting_for_expected_chunks",
+      emitted: false,
+    };
+  }
+
+  private getOrCreateFinalWindowCoverageState(
+    finalWindowStart: number,
+    state: ChunkProcessingState,
+  ): FinalWindowCoverageState | null {
+    const finalWindowEnd = finalWindowStart + this.windowRange;
+    const finalWindowId = buildLogicalChunkGroupIdFromBounds(
+      finalWindowStart,
+      finalWindowEnd,
+      state.alignmentOriginMs,
+    );
+    const existing = state.finalWindowCoverageById.get(finalWindowId);
+    if (existing) {
+      return existing;
+    }
+
+    const created = this.buildFinalWindowCoverageState(finalWindowStart, state);
+    if (!created) {
+      return null;
+    }
+    state.finalWindowCoverageById.set(finalWindowId, created);
+    return created;
+  }
+
+  private recordCompletedChunkForFinalWindows(
+    completedGroup: CompletedChunkGroupState,
+    state: ChunkProcessingState,
+  ): void {
+    const candidateStarts = deriveCandidateFinalWindowStartsForChunk({
+      chunkStart: completedGroup.start,
+      chunkEnd: completedGroup.end,
+      finalRangeMs: this.windowRange,
+      finalStepMs: this.windowSlide,
+      chunkWindowWidthMs: state.chunkWindowWidthMs,
+      alignmentOriginMs: state.alignmentOriginMs,
+      minimumFinalWindowStartMs:
+        state.nextComparableWindowStartMs ?? state.alignmentOriginMs,
+    });
+
+    for (const finalWindowStart of candidateStarts) {
+      const coverageState = this.getOrCreateFinalWindowCoverageState(
+        finalWindowStart,
+        state,
+      );
+      if (!coverageState) {
+        continue;
+      }
+      if (!coverageState.expectedChunkKeys.includes(completedGroup.chunkGroupId)) {
+        continue;
+      }
+      if (coverageState.receivedChunkKeys.includes(completedGroup.chunkGroupId)) {
+        coverageState.duplicateChunkKeys.push(completedGroup.chunkGroupId);
+        continue;
+      }
+      coverageState.receivedChunkKeys.push(completedGroup.chunkGroupId);
+      coverageState.missingChunkKeys = coverageState.expectedChunkKeys.filter(
+        (chunkKey) => !coverageState.receivedChunkKeys.includes(chunkKey),
+      );
+      coverageState.coverageComplete =
+        coverageState.missingChunkKeys.length === 0;
+      coverageState.completionReason = coverageState.coverageComplete
+        ? "all_expected_chunk_keys_received"
+        : "waiting_for_missing_chunk_keys";
+    }
+  }
+
+  private async processReadyChunkGroups(
+    triggerSource: string,
+    state: ChunkProcessingState,
+  ): Promise<void> {
+    if (this.processingInProgress) {
+      this.logger.log(
+        `Processing already in progress, skipping ${triggerSource} trigger`,
+      );
+      return;
+    }
+
+    this.processingInProgress = true;
+    this.intervalTriggerTime = Date.now();
+    try {
+      state.finalWindowCoverageById ??= new Map();
+      if (state.nextComparableWindowStartMs === undefined) {
+        state.nextComparableWindowStartMs = state.alignmentOriginMs ?? null;
+      }
+      const readyGroups: Array<[string, Map<string, PartialChunkResult>]> = [];
+      while (state.readyChunkGroupIds.length > 0) {
+        const chunkGroupId = state.readyChunkGroupIds.shift()!;
+        state.readyChunkGroupSet.delete(chunkGroupId);
+        const bySubquery = state.chunksByWindow.get(chunkGroupId);
+        if (bySubquery) {
+          readyGroups.push([chunkGroupId, bySubquery]);
+        }
+      }
+
+      let emittedCount = 0;
+      if (readyGroups.length === 0) {
+        if (triggerSource === "Interval") {
+          this.chunkedDebugSummary.intervalTriggersWithoutEmission += 1;
+          this.persistChunkedDebugSummary();
+        }
+        return;
+      }
+
+      readyGroups.sort((a, b) => {
+        const aStart = a[1].values().next().value?.window?.start ?? 0;
+        const bStart = b[1].values().next().value?.window?.start ?? 0;
+        return aStart - bStart;
+      });
+
+      for (const [chunkGroupId, bySubquery] of readyGroups) {
+        const partialsForAggregation: PartialChunkResult[] = [];
+        for (const subqueryId of state.expectedSubqueryIds) {
+          const partial = bySubquery.get(subqueryId);
+          if (partial) {
+            partialsForAggregation.push(partial);
+          }
+        }
+        const coverageState = state.chunkCoverageByWindow.get(chunkGroupId);
+        if (!coverageState) {
+          throw new Error(`Missing chunk coverage state for ${chunkGroupId}`);
+        }
+
+        if (partialsForAggregation.length === state.expectedSubqueryIds.length) {
+          const summary = this.summarizeChunkGroup(
+            chunkGroupId,
+            bySubquery,
+            state.outputAggregationFunction,
+            coverageState,
+          );
+          const completedGroup = {
+            chunkGroupId,
+            start: summary.start,
+            end: summary.end,
+            summary,
+          };
+          state.completedChunkGroups.set(chunkGroupId, completedGroup);
+          insertCompletedChunkGroupOrdered(
+            state.orderedCompletedChunkGroups,
+            completedGroup,
+          );
+          if (
+            state.alignmentOriginMs !== null &&
+            Number.isFinite(state.chunkWindowWidthMs) &&
+            state.chunkWindowWidthMs > 0
+          ) {
+            if (state.nextComparableWindowStartMs === null) {
+              state.nextComparableWindowStartMs = state.alignmentOriginMs;
+            }
+            this.recordCompletedChunkForFinalWindows(completedGroup, state);
+          }
+          this.chunkedDebugSummary.completedChunkGroupCount += 1;
+          profileCount("chunk_groups_completed");
+          this.debugChunkLog(
+            `buffered complete chunkGroupId=${chunkGroupId}; includedSubqueries=${Array.from(bySubquery.keys()).join(",")}`,
+          );
+          state.chunksByWindow.delete(chunkGroupId);
+          state.chunkCoverageByWindow.delete(chunkGroupId);
+        } else {
+          this.logger.log(
+            `${triggerSource}: chunkGroupId=${chunkGroupId} skipped due to incomplete coverage (${partialsForAggregation.length}/${state.expectedSubqueryIds.length})`,
+          );
+        }
+      }
+
+      if (
+        state.alignmentOriginMs !== null &&
+        Number.isFinite(state.chunkWindowWidthMs) &&
+        state.chunkWindowWidthMs > 0 &&
+        state.nextComparableWindowStartMs !== null
+      ) {
+        while (state.nextComparableWindowStartMs !== null) {
+          const coverageState = this.getOrCreateFinalWindowCoverageState(
+            state.nextComparableWindowStartMs,
+            state,
+          );
+          if (!coverageState || !coverageState.coverageComplete) {
+            profileCount("missingChunkGroups");
+            break;
+          }
+
+          const windowChunkGroups = coverageState.expectedChunkKeys
+            .map((chunkKey) => state.completedChunkGroups.get(chunkKey))
+            .filter(
+              (group): group is CompletedChunkGroupState => group !== undefined,
+            );
+          if (
+            windowChunkGroups.length !== coverageState.expectedChunkKeys.length
+          ) {
+            profileCount("missingChunkGroups");
+            break;
+          }
+
+          const comparableWindowId = coverageState.finalWindowId;
+          const comparableDiagnostics = this.recomposeComparableWindow(
+            windowChunkGroups,
+            state.outputAggregationFunction,
+          );
+          if (comparableDiagnostics) {
+            if (this.windowCount === 0) {
+              resourceTraceSnapshot(
+                "after_first_comparable_window_emitted",
+                "first comparable window ready",
+                {
+                  externalWindowStart:
+                    comparableDiagnostics.externalWindowStart,
+                  externalWindowEnd: comparableDiagnostics.externalWindowEnd,
+                },
+              );
+            }
+            this.chunkedDebugSummary.comparableWindowEmissionCount += 1;
+            profileCount("comparable_windows_emitted");
+            this.chunkedDebugSummary.lastComparableWindowStart =
+              comparableDiagnostics.externalWindowStart;
+            this.chunkedDebugSummary.lastComparableWindowEnd =
+              comparableDiagnostics.externalWindowEnd;
+          }
+
+          this.debugChunkLog(
+            `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}; expected=${coverageState.expectedChunkKeys.join("|")}`,
+          );
+          await this.executeR2ROperator(
+            [],
+            comparableWindowId,
+            comparableDiagnostics ?? undefined,
+            state.outputAggregationFunction,
+            undefined,
+            `${triggerSource.toLowerCase()}_ready_check`,
+          );
+          coverageState.emitted = true;
+          emittedCount += 1;
+          this.persistChunkedDebugSummary();
+          state.nextComparableWindowStartMs += this.windowSlide;
+        }
+      } else {
+        while (
+          state.nextComparableWindowStartIndex + state.chunksPerComparableWindow <=
+          state.orderedCompletedChunkGroups.length
+        ) {
+          const windowChunkGroups = state.orderedCompletedChunkGroups.slice(
+            state.nextComparableWindowStartIndex,
+            state.nextComparableWindowStartIndex + state.chunksPerComparableWindow,
+          );
+          const firstGroupId = windowChunkGroups[0]?.chunkGroupId ?? "unknown";
+          const lastGroupId =
+            windowChunkGroups[windowChunkGroups.length - 1]?.chunkGroupId ??
+            "unknown";
+          const comparableWindowId = `${firstGroupId}..${lastGroupId}`;
+          const comparableDiagnostics = this.recomposeComparableWindow(
+            windowChunkGroups,
+            state.outputAggregationFunction,
+          );
+          if (comparableDiagnostics) {
+            if (this.windowCount === 0) {
+              resourceTraceSnapshot(
+                "after_first_comparable_window_emitted",
+                "first comparable window ready",
+                {
+                  externalWindowStart:
+                    comparableDiagnostics.externalWindowStart,
+                  externalWindowEnd: comparableDiagnostics.externalWindowEnd,
+                },
+              );
+            }
+            this.chunkedDebugSummary.comparableWindowEmissionCount += 1;
+            profileCount("comparable_windows_emitted");
+            this.chunkedDebugSummary.lastComparableWindowStart =
+              comparableDiagnostics.externalWindowStart;
+            this.chunkedDebugSummary.lastComparableWindowEnd =
+              comparableDiagnostics.externalWindowEnd;
+          }
+
+          this.debugChunkLog(
+            `comparable emission window=${comparableWindowId}; groups=${windowChunkGroups.length}`,
+          );
+          await this.executeR2ROperator(
+            [],
+            comparableWindowId,
+            comparableDiagnostics ?? undefined,
+            state.outputAggregationFunction,
+            undefined,
+            `${triggerSource.toLowerCase()}_ready_check`,
+          );
+          emittedCount += 1;
+          this.persistChunkedDebugSummary();
+          state.nextComparableWindowStartIndex += state.chunkGroupsPerOutputStep;
+        }
+      }
+
+      if (
+        state.comparableOutputCadenceOnly &&
+        !this.parentPartialAvailabilityLogged &&
+        state.orderedCompletedChunkGroups.length >= state.chunkGroupsPerOutputStep
+      ) {
+        const parentPartialGroups = state.orderedCompletedChunkGroups.slice(
+          0,
+          state.chunkGroupsPerOutputStep,
+        );
+        const parentPartialSummary = this.summarizeWindowRecomposition(
+          parentPartialGroups,
+          state.outputAggregationFunction,
+        );
+        if (parentPartialSummary) {
+          const emittedAtMs = Date.now();
+          this.writeParentPartialDiagnostics({
+            outputType: "parent_partial",
+            comparable: false,
+            benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+            parentWindowNumber: 1,
+            parentWindowStart:
+              this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime,
+            parentWindowEndOrCoveredUntil:
+              (this.benchmarkEventTimeAnchor ?? this.queryRegisteredTime) +
+              this.windowSlide,
+            parentRangeMs: this.windowRange,
+            coveredDurationMs: this.windowSlide,
+            chunksUsed: state.chunkGroupsPerOutputStep,
+            eventCount: parentPartialSummary.recomposedCount,
+            sum: parentPartialSummary.recomposedSum,
+            avg: parentPartialSummary.recomposedAvg,
+            min: parentPartialSummary.recomposedMin,
+            max: parentPartialSummary.recomposedMax,
+            resultValue: parentPartialSummary.resultValue,
+            emittedAtMs,
+            elapsedSinceRegistrationMs:
+              emittedAtMs - this.queryRegisteredTime,
+            delayPastPartialTriggerMs:
+              emittedAtMs - (this.queryRegisteredTime + this.windowSlide),
+            internalChunkIds: parentPartialSummary.internalChunkGroupIds,
+            internalChunks: parentPartialSummary.internalChunks,
+          });
+          this.parentPartialAvailabilityLogged = true;
+        }
+      }
+
+      if (state.nextComparableWindowStartIndex > 0) {
+        const retainFrom = Math.max(
+          0,
+          state.nextComparableWindowStartIndex - state.chunkGroupsPerOutputStep,
+        );
+        const evictedGroups = state.orderedCompletedChunkGroups.slice(0, retainFrom);
+        for (const group of evictedGroups) {
+          state.completedChunkGroups.delete(group.chunkGroupId);
+          if (group.summary && group.summary.receivedChunkIdsBySubquery) {
+            for (const chunkIds of Object.values(group.summary.receivedChunkIdsBySubquery)) {
+              for (const chunkId of chunkIds) {
+                this.planState.chunkArrivalTimes.delete(chunkId);
+                this.planState.chunkWindowMap.delete(chunkId);
+              }
+            }
+          }
+        }
+        state.orderedCompletedChunkGroups.splice(0, retainFrom);
+        state.nextComparableWindowStartIndex = Math.max(
+          0,
+          state.nextComparableWindowStartIndex - retainFrom,
+        );
+      }
+
+      if (triggerSource === "Interval") {
+        if (emittedCount > 0) {
+          this.chunkedDebugSummary.intervalTriggersWithEmission += 1;
+        } else {
+          this.chunkedDebugSummary.intervalTriggersWithoutEmission += 1;
+        }
+        this.persistChunkedDebugSummary();
+      }
+    } finally {
+      this.processingInProgress = false;
+    }
+  }
+
+  private writeComparableDiagnostics(diagnostics: ComparableWindowDiagnostics): void {
+    writeComparableDiagnosticsPure({
+      diagnostics,
+      benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+      diagnosticsLogStream: this.diagnosticsLogStream,
+      debugChunksEnabled: this.debugChunksEnabled,
+      logger: this.logger,
+    });
+  }
+
+  private writeParentPartialDiagnostics(
+    diagnostics: ParentPartialDiagnostics,
+  ): void {
+    writeParentPartialDiagnosticsPure({
+      diagnostics,
+      parentPartialDiagnosticsStream: this.parentPartialDiagnosticsStream,
+      debugChunksEnabled: this.debugChunksEnabled,
+      logger: this.logger,
+    });
+  }
+
+  private buildWindowMetadata(
+    partials: PartialChunkResult[],
+    comparableDiagnostics: ComparableWindowDiagnostics | undefined,
+    resultEmittedAt: number,
+  ) {
+    const directSource = partials[0]?.window ?? null;
+    const comparableWindowEnd = comparableDiagnostics?.externalWindowEnd ?? null;
+    const comparableWindowStart = comparableDiagnostics?.externalWindowStart ?? null;
+    const windowSemantics =
+      directSource?.windowSemantics || this.planConfig.windowSemantics;
+
+    const directLogicalTriggerTime = Number(directSource?.logicalTriggerTime);
+    const directWindowDataCloseTime = Number(directSource?.windowDataCloseTime);
+    const hasDirectCloseMetadata = Number.isFinite(directWindowDataCloseTime);
+
+    return {
+      ...buildBenchmarkWindowMetadata({
+        windowSemantics,
+        logicalTriggerTime: comparableDiagnostics
+          ? comparableWindowEnd
+          : Number.isFinite(directLogicalTriggerTime)
+            ? directLogicalTriggerTime
+            : null,
+        windowStart: comparableWindowStart ?? partials[0]?.window.start ?? null,
+        windowEnd: comparableWindowEnd ?? partials[0]?.window.end ?? null,
+        windowDataCloseTime: comparableDiagnostics
+          ? comparableWindowEnd
+          : hasDirectCloseMetadata
+            ? directWindowDataCloseTime
+            : partials[0]?.window.end ?? null,
+        resultEmittedAt,
+        metadataSource: comparableDiagnostics
+          ? "reconstructed"
+          : hasDirectCloseMetadata
+            ? "direct"
+            : "reconstructed",
+      }),
+      latencyFromLogicalTriggerMs: null,
+      latencyFromWindowCloseMs: null,
+    };
+  }
+
+  private buildChunkedBenchmarkPayload(args: {
+    aggregationFunction: AggregationFunction;
+    resultValue: number;
+    windowNumber: number;
+    comparableDiagnostics?: ComparableWindowDiagnostics;
+    centeredWindowMetadata: ChunkedBenchmarkWindowMetadata;
+    coverageComplete: boolean;
+  }) {
+    const comparableWindow =
+      Boolean(args.comparableDiagnostics) && args.coverageComplete;
+    const requiredProducerIds = this.chunkedDebugSummary.expectedSubqueryIds;
+    // Carry the manager-owned identity mapping through to the final comparable
+    // result.  The reconstruction has already validated these runtime IDs; the
+    // payload makes that provenance auditable by production consumers without
+    // inferring it from a benchmark-side registration record.
+    const managerMappingByRuntimeProducerId = new Map(
+      this.managerOwnedProducerMappings.map((mapping) => [
+        mapping.runtimeProducerId,
+        mapping,
+      ]),
+    );
+    const producerIdentityMappings = requiredProducerIds
+      .map((runtimeProducerId) => managerMappingByRuntimeProducerId.get(runtimeProducerId))
+      .filter((mapping): mapping is ManagerOwnedProducerMapping => mapping !== undefined)
+      .map((mapping) => ({
+        canonicalProducerId: mapping.canonicalProducerId,
+        runtimeProducerId: mapping.runtimeProducerId,
+        topic: mapping.topic,
+      }));
+    const requiredRuntimeProducerIds = [...requiredProducerIds];
+    const requiredCanonicalProducerIds = requiredRuntimeProducerIds
+      .map((runtimeProducerId) =>
+        managerMappingByRuntimeProducerId.get(runtimeProducerId)?.canonicalProducerId,
+      )
+      .filter((producerId): producerId is string => producerId !== undefined);
+    const latestWatermarkByRequiredProducer = Object.fromEntries(
+      requiredProducerIds.map((producerId) => [
+        producerId,
+        this.planState.latestWatermarkByProducer.get(producerId) ?? null,
+      ]),
+    );
+    const producerWatermarks = Object.values(latestWatermarkByRequiredProducer).filter(
+      (watermark): watermark is number => typeof watermark === "number",
+    );
+    const derivedReconstructionWatermark =
+      producerWatermarks.length === requiredProducerIds.length && producerWatermarks.length > 0
+        ? Math.min(...producerWatermarks)
+        : null;
+    const internalChunks = args.comparableDiagnostics?.internalChunks ?? [];
+    const receivedRuntimeProducerIds = [...new Set(
+      internalChunks.flatMap((chunk) => chunk.subqueries ?? []),
+    )];
+    const receivedCanonicalProducerIds = receivedRuntimeProducerIds
+      .map((runtimeProducerId) =>
+        managerMappingByRuntimeProducerId.get(runtimeProducerId)?.canonicalProducerId,
+      )
+      .filter((producerId): producerId is string => producerId !== undefined);
+    const missingRuntimeProducerIds = requiredRuntimeProducerIds.filter(
+      (runtimeProducerId) => !receivedRuntimeProducerIds.includes(runtimeProducerId),
+    );
+    const missingCanonicalProducerIds = requiredCanonicalProducerIds.filter(
+      (canonicalProducerId) => !receivedCanonicalProducerIds.includes(canonicalProducerId),
+    );
+    const requiredChunkContributions = internalChunks.length * requiredProducerIds.length;
+    const receivedChunkContributions = internalChunks.reduce(
+      (total, chunk) => total + (chunk.subqueries?.length ?? 0),
+      0,
+    );
+    const missingContributionCount = Math.max(
+      0,
+      requiredChunkContributions - receivedChunkContributions,
+    );
+
+    return buildBenchmarkResultPayload(
+      "chunked",
+      args.aggregationFunction,
+      this.sessionId,
+      args.resultValue,
+      args.windowNumber,
+      {
+        benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+        windowStart:
+          args.comparableDiagnostics?.externalWindowStart ??
+          args.centeredWindowMetadata.windowStart,
+        windowEnd:
+          args.comparableDiagnostics?.externalWindowEnd ??
+          args.centeredWindowMetadata.windowEnd,
+        recomposedCount: args.comparableDiagnostics?.recomposedCount ?? null,
+        recomposedSum: args.comparableDiagnostics?.recomposedSum ?? null,
+        recomposedAvg: args.comparableDiagnostics?.recomposedAvg ?? null,
+        eventCount: args.comparableDiagnostics?.recomposedCount ?? null,
+        sumValue: args.comparableDiagnostics?.recomposedSum ?? null,
+        avgValue:
+          args.comparableDiagnostics?.recomposedAvg ?? args.resultValue,
+        count: args.comparableDiagnostics?.recomposedCount ?? null,
+        sum: args.comparableDiagnostics?.recomposedSum ?? null,
+        average:
+          args.comparableDiagnostics?.recomposedAvg ?? args.resultValue,
+        rangeMs: this.windowRange,
+        stepMs: this.windowSlide,
+        internalChunkIds:
+          args.comparableDiagnostics?.internalChunkGroupIds ?? [],
+        internalChunks,
+        producerIdentityMappings,
+        requiredCanonicalProducerIds,
+        receivedCanonicalProducerIds,
+        missingCanonicalProducerIds,
+        requiredRuntimeProducerIds,
+        receivedRuntimeProducerIds,
+        missingRuntimeProducerIds,
+        latestWatermarkByRequiredProducer,
+        latestWatermarkByRequiredRuntimeProducer:
+          latestWatermarkByRequiredProducer,
+        derivedReconstructionWatermark,
+        requiredChunkContributions,
+        receivedChunkContributions,
+        missingContributionCount,
+        coverageComplete: args.coverageComplete,
+        comparableWindow,
+        isPartialWindow: !comparableWindow,
+        isComparableWindow: comparableWindow,
+        localProducerSpawnCount: this.chunkedDebugSummary.localProducerSpawnCount,
+        managedProducerMode: this.chunkedDebugSummary.managedProducerMode,
+      },
+      {
+        windowSemantics: args.centeredWindowMetadata.windowSemantics,
+        logicalTriggerTime: args.centeredWindowMetadata.logicalTriggerTime,
+        windowStart: args.centeredWindowMetadata.windowStart,
+        windowEnd: args.centeredWindowMetadata.windowEnd,
+        windowDataCloseTime: args.centeredWindowMetadata.windowDataCloseTime,
+        resultEmittedAt: args.centeredWindowMetadata.resultEmittedAt,
+        latencyFromLogicalTriggerMs: null,
+        latencyFromWindowCloseMs: null,
+        metadataSource: args.centeredWindowMetadata.metadataSource,
+      },
+    );
+  }
+
+  /**
+   *
+   */
+  public async init() {
+    this.logger.log("init() called");
+    await this.setMQTTTopicMap();
+    this.logger.log("StreamingQueryChunkAggregatorOperator initialized.");
+  }
+
+  /**
+   *
+   * @param query
+   */
+  addOutputQuery(query: string): void {
+    this.outputQuery = query;
+  }
+
+  /**
+   *
+   */
+  async setMQTTTopicMap(): Promise<void> {
+    this.logger.log("setMQTTTopicMap() called");
+    this.queryMQTTTopicMap = new Map<string, string>();
+    this.logger.log(
+      `MQTT Topic Map set for subqueries: ${JSON.stringify(this.queryMQTTTopicMap)}`,
+    );
+    const response = await fetch("http://localhost:8080/fetchQueries");
+    if (!response.ok) {
+      console.error("Failed to fetch queries from the server.");
+      return;
+    }
+    const data = await response.json();
+    // Log the full structure for debugging
+    this.logger.log(
+      `Fetched data from server (full JSON): ${JSON.stringify(data, null, 2)}`,
+    );
+
+    for (const [queryHash, mqttTopic] of Object.entries(data)) {
+      const topicString = mqttTopic;
+
+      this.queryMQTTTopicMap.set(queryHash as string, topicString as string);
+      this.logger.log(
+        `DEBUG: queryMQTTTopicMap after set: ${JSON.stringify(Array.from(this.queryMQTTTopicMap.entries()))}`,
+      );
+      this.logger.log(
+        `Subquery ${queryHash} mapped to MQTT Topic ${topicString}`,
+      );
+    }
+  }
+
+  /**
+   *
+   */
+  async handleAggregation(): Promise<void> {
+    this.logger.log("Starting aggregation process for subqueries.");
+    if (this.managerOwnedProducerMappings.length > 0) {
+      await this.initializeManagerOwnedProducerSubscriptions();
+    } else {
+      if (this.planConfig.skipLocalProducerSpawning) {
+        throw new Error(
+          "Local producer spawning disabled but no manager-owned producer handles were supplied",
+        );
+      }
+      await this.initializeSubQueryProcesses();
+    }
+    resourceTraceSnapshot(
+      "after_subquery_processes_start",
+      "chunked subquery processes initialized",
+    );
+    this.logger.log("SubQuery Processes initialized for aggregation.");
+
+    if (this.subQueries.length === 0) {
+      this.logger.log("No subqueries available for aggregation.");
+      console.error("No subqueries available for aggregation.");
+      return;
+    }
+    if (this.outputQuery === "") {
+      this.logger.log("Output query is not set for aggregation.");
+      console.error("Output query is not set for aggregation.");
+      return;
+    }
+    if (this.chunkGCD <= 0) {
+      this.logger.log("Chunk GCD is not valid for aggregation.");
+      console.error("Chunk GCD is not valid for aggregation.");
+      return;
+    }
+    if (this.queryMQTTTopicMap.size === 0) {
+      this.logger.log(
+        "No legacy query-service MQTT topics mapped for subqueries; continuing with runtime-derived subquery topics.",
+      );
+    }
+
+    this.logger.log(
+      `Starting aggregation of subqueries with GCD chunk size: ${this.chunkGCD}`,
+    );
+
+    if (!this.outputQuery) {
+      console.error("Output query is not set or is undefined.");
+      return;
+    }
+    const outputQueryParsed = getCachedParsedQuery<any>(this.parser, this.outputQuery);
+    this.cachedOutputQuery = this.outputQuery;
+    this.cachedOutputQueryParsed = outputQueryParsed;
+    if (!outputQueryParsed) {
+      console.error(`Failed to parse output query: ${this.outputQuery}`);
+      return;
+    }
+
+	    const outputQueryWidth = outputQueryParsed.s2r[0].width;
+	    const outputQuerySlide = outputQueryParsed.s2r[0].slide;
+	    const comparableWindowWidth = outputQueryWidth;
+	    const chunkPlan = this.getOrBuildChunkPlan();
+	    const outputAggregationFunction = this.detectAggregationFunction(
+	      this.outputQuery,
+	    ) as AggregationFunction | null;
+    this.windowRange = outputQueryWidth;
+    this.windowSlide = outputQuerySlide;
+    if (outputQueryWidth <= 0 || outputQuerySlide <= 0) {
+      console.error(
+        `Invalid width or slide in output query: ${this.outputQuery}`,
+      );
+      return;
+    }
+    if (!outputAggregationFunction) {
+      console.error("No aggregation function detected in the output query.");
+      return;
+    }
+
+    const sharedInputRegistry = this.lifecycle.producerSubscriptionRegistry;
+    const chunkClient = sharedInputRegistry
+      ? sharedInputRegistry.createPlanClient(this.planConfig.planId)
+      : mqtt.connect(this.mqttBroker, {
+          clean: this.planConfig.cleanMqttSessions,
+          clientId: `chunk-aggregator-${Math.random().toString(16).slice(2, 10)}`,
+        });
+    this.activeMqttClients.push(chunkClient);
+    if (!sharedInputRegistry) profileCount("mqtt_clients_created");
+    const derivedOriginalConsumers = this.buildDerivedOriginalConsumers();
+    profileCount(
+      "chunk_consumers_registered",
+      derivedOriginalConsumers.size + 1,
+    );
+    this.logger.log(`Connecting to MQTT broker at ${this.mqttBroker}...`);
+    chunkClient.on("error", (err) => {
+      console.error("MQTT connection error:", err);
+    });
+    chunkClient.on("offline", () => {
+      console.error(
+        "MQTT client is offline. Please check the broker connection.",
+      );
+    });
+    chunkClient.on("reconnect", () => {
+      this.logger.log("Reconnecting to MQTT broker...");
+    });
+
+    const that = this;
+
+    chunkClient.on("connect", () => {
+      void (async () => {
+      resourceTraceSnapshot(
+        "after_mqtt_subscriptions_ready",
+        "chunk aggregator connected and subscribing",
+        {
+          expectedSubqueryTopics: that.subQueryMQTTTopicMap.size,
+        },
+      );
+      this.logger.log(
+        `subQueryTopicMap : ${JSON.stringify(that.subQueryMQTTTopicMap)}`,
+      );
+      const topics = Array.from(that.subQueryMQTTTopicMap.values());
+      const subqueryIdentities: SubqueryIdentity[] = Array.from(
+        that.subQueryMQTTTopicMap.entries(),
+      ).map(([subqueryId, topic]) => ({ subqueryId, topic }));
+      const expectedSubqueryIds = subqueryIdentities.map((entry) => entry.subqueryId);
+      const topicToSubqueryId = new Map(
+        subqueryIdentities.map((entry) => [entry.topic, entry.subqueryId]),
+      );
+      const managerMappingByRuntimeId = new Map(
+        this.managerOwnedProducerMappings.map((mapping) => [
+          mapping.runtimeProducerId,
+          mapping,
+        ]),
+      );
+      const managerMappingByTopic = new Map(
+        this.managerOwnedProducerMappings.map((mapping) => [mapping.topic, mapping]),
+      );
+      const sourceTopicToChunkTopic = new Map<string, string>();
+      for (let index = 0; index < this.subQueries.length; index += 1) {
+        const reuseSpec = detectCompatibleChunkReuse(this.subQueries[index]);
+        const rewrittenTopic = topics[index];
+        if (reuseSpec && rewrittenTopic) {
+          sourceTopicToChunkTopic.set(reuseSpec.sourceTopic, rewrittenTopic);
+        }
+      }
+      this.chunkedDebugSummary.expectedSubqueryCount = expectedSubqueryIds.length;
+      this.chunkedDebugSummary.expectedSubqueryIds = [...expectedSubqueryIds];
+      const topicsOfProcesses = Array.from(new Set(topics));
+      this.logger.log(`topics to subscribe: ${topicsOfProcesses}`);
+      this.chunkedDebugSummary.subscribedTopics = [...topicsOfProcesses];
+      this.persistChunkedDebugSummary();
+
+      this.logger.log(
+        `DEBUG: topicsOfProcesses after loop: ${topicsOfProcesses}, length: ${topicsOfProcesses.length}`,
+      );
+      if (topicsOfProcesses.length === 0) {
+        this.logger.log(
+          "No valid MQTT topics to subscribe to. Please check the subQueryMQTTTopicMap.",
+        );
+        return;
+      }
+      await Promise.all(
+        topicsOfProcesses.map(
+          (mqttTopic) =>
+            new Promise<void>((resolve, reject) => {
+              chunkClient.subscribe(`${mqttTopic}`, (err) => {
+                if (err) {
+                  this.logger.log(
+                    `Failed to subscribe to topic ${mqttTopic}: ${err}`,
+                  );
+                  reject(err);
                 } else {
-                    this.logger.log("Sliding window: no chunks to aggregate.");
+                  this.logger.log(`Subscribed to topic: ${mqttTopic}`);
+                  resolve();
                 }
-            }, outputQuerySlide);
+              });
+            }),
+        ),
+      );
+      if (this.lifecycle.onReady) {
+        this.lifecycle.onReady({ subscribedTopics: topicsOfProcesses, expectedSubqueryCount: expectedSubqueryIds.length });
+      } else {
+        process.send?.({ type: "chunked_worker_ready", readyAt: Date.now(), subscribedTopics: topicsOfProcesses, expectedSubqueryCount: expectedSubqueryIds.length });
+      }
 
-        });
+      this.logger.log(
+        `Output Query Width: ${outputQueryWidth}, Chunk GCD: ${this.chunkGCD}, SubQueries Length: ${this.subQueries.length}`,
+      );
+      this.logger.log(
+        `Chunked emission mode: comparableOutputCadenceOnly=${this.comparableOutputCadenceOnly}, useImmediateTrigger=${this.useImmediateTrigger}`,
+      );
+
+      const comparableWindowSpan = this.comparableOutputCadenceOnly
+        ? comparableWindowWidth
+        : outputQueryWidth;
+      const chunksPerComparableWindow = Math.max(
+        1,
+        Math.floor(
+          Math.max(0, comparableWindowSpan - chunkPlan.chunkWindowWidthMs) /
+            this.chunkGCD,
+        ) + 1,
+      );
+      const chunkGroupsPerOutputStep = Math.max(
+        1,
+        Math.ceil(outputQuerySlide / this.chunkGCD),
+      );
+      this.logger.log(
+        `Comparable window sizing: comparableWindowWidth=${comparableWindowWidth}, chunkWindowWidthMs=${chunkPlan.chunkWindowWidthMs}, chunksPerComparableWindow=${chunksPerComparableWindow}, chunkGroupsPerOutputStep=${chunkGroupsPerOutputStep}`,
+      );
+
+      const processingState: ChunkProcessingState = {
+        chunksByWindow: new Map<string, Map<string, PartialChunkResult>>(),
+        chunkCoverageByWindow: new Map<string, ChunkCoverageState>(),
+        completedChunkGroups: new Map<string, CompletedChunkGroupState>(),
+        orderedCompletedChunkGroups: [],
+        finalWindowCoverageById: new Map(),
+        readyChunkGroupIds: [],
+        readyChunkGroupSet: new Set<string>(),
+        nextComparableWindowStartIndex: 0,
+        nextComparableWindowStartMs: this.benchmarkEventTimeAnchor,
+        expectedSubqueryIds,
+        outputAggregationFunction,
+        chunksPerComparableWindow,
+        chunkGroupsPerOutputStep,
+        chunkWindowWidthMs: chunkPlan.chunkWindowWidthMs,
+        alignmentOriginMs: this.benchmarkEventTimeAnchor,
+        comparableOutputCadenceOnly: this.comparableOutputCadenceOnly,
+      };
+
+      const processChunks = async (triggerSource: string) => {
+        await this.processReadyChunkGroups(triggerSource, processingState);
+      };
+
+      // Interval handle — will be started (and restarted) aligned to first data arrival
+      chunkClient.on("message", async (topic: string, message: any) => {
+        const callbackStartedAt = startStageTimer();
+        if (this.debugChunksEnabled) {
+          this.logger.log(`Received chunk message on topic ${topic}`);
+        }
+
+        // Track when data is received for latency calculations
+        const now = Date.now();
+        if (this.firstDataReceivedTime === 0) {
+          resourceTraceSnapshot(
+            "after_first_chunk_received",
+            "first chunk result received",
+            { topic },
+          );
+          this.firstDataReceivedTime = now;
+          this.lastProcessedTime = 0; // Reset to allow first processing
+          this.logger.log(
+            `First data received at wall-clock time: ${this.firstDataReceivedTime}`,
+          );
+
+          // Restart the interval aligned to queryRegisteredTime so ticks fire at
+          // t0 + N * outputQuerySlide rather than firstDataReceivedTime + N *
+          // outputQuerySlide. This removes the artificial sub-window-step delay
+          // that inflated chunked latency measurements (BUG-001).
+          if (this.intervalHandle) clearInterval(this.intervalHandle);
+          const elapsed = now - this.queryRegisteredTime;
+          const firstTickDelay =
+            outputQuerySlide - (elapsed % outputQuerySlide);
+          this.firstTickTimeout = setTimeout(() => {
+            void processChunks("Interval");
+            this.intervalHandle = setInterval(async () => {
+              await processChunks("Interval");
+            }, outputQuerySlide);
+          }, firstTickDelay);
+          this.logger.log(
+            `Interval restarted aligned to queryRegisteredTime. First tick in ${firstTickDelay}ms, then every ${outputQuerySlide}ms.`,
+          );
+        }
+        this.lastChunkReceivedTime = now;
+        this.chunkedDebugSummary.receivedChunkMessageCount += 1;
+        if (!sharedInputRegistry) profileCount("mqtt_messages_received");
+
+        const normalized = this.normalizeChunkPayload(message as string | DecodedProducerResult);
+        if (normalized) {
+          this.planState.chunkArrivalTimes.set(normalized.chunkId, now);
+          this.planState.chunkWindowMap.set(normalized.chunkId, {
+            start: normalized.window.start,
+            end: normalized.window.end,
+          });
+          this.chunkedDebugSummary.structuredChunkMessageCount += 1;
+          const chunkTimestamp = Number.isFinite(normalized.window.logicalTriggerTime)
+            ? (normalized.window.logicalTriggerTime as number)
+            : normalized.window.end;
+          if (this.isContaminatedTimestamp(chunkTimestamp, topic)) {
+            endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
+            return;
+          }
+          if (!this.planState.firstObservedEventTimestampByTopic.has(topic)) {
+            this.planState.firstObservedEventTimestampByTopic.set(topic, chunkTimestamp);
+            this.logger.log(
+              `First observed event timestamp for topic=${topic}: ${chunkTimestamp}`,
+            );
+          }
+          this.planState.lastObservedEventTimestampByTopic.set(topic, normalized.window.end);
+          const derivedConsumer = normalized.sourceTopic
+            ? derivedOriginalConsumers.get(normalized.sourceTopic)
+            : undefined;
+          if (
+            derivedConsumer &&
+            sourceTopicToChunkTopic.get(derivedConsumer.reuseSpec.sourceTopic) === topic
+          ) {
+            const aggFn = derivedConsumer.reuseSpec.aggregationFunction;
+            const hasCount = aggFn === "AVG" || aggFn === "COUNT";
+            const hasSum = aggFn === "AVG" || aggFn === "SUM";
+            const hasMin = aggFn === "MIN";
+            const hasMax = aggFn === "MAX";
+
+            const count = hasCount
+              ? (normalized.state?.count ?? (Number.isFinite(normalized.count) ? normalized.count : (normalized.aggregateFunction === "COUNT" ? normalized.value : undefined)))
+              : undefined;
+            const sum = hasSum
+              ? (normalized.state?.sum ?? (Number.isFinite(normalized.sum) ? normalized.sum : (normalized.aggregateFunction === "SUM" ? normalized.value : undefined)))
+              : undefined;
+            const min = hasMin
+              ? (normalized.state?.min ?? (Number.isFinite(normalized.min) ? normalized.min : (normalized.aggregateFunction === "MIN" ? normalized.value : undefined)))
+              : undefined;
+            const max = hasMax
+              ? (normalized.state?.max ?? (Number.isFinite(normalized.max) ? normalized.max : (normalized.aggregateFunction === "MAX" ? normalized.value : undefined)))
+              : undefined;
+
+            const isCountValid = !hasCount || Number.isFinite(count);
+            const isSumValid = !hasSum || Number.isFinite(sum);
+            const isMinValid = !hasMin || Number.isFinite(min);
+            const isMaxValid = !hasMax || Number.isFinite(max);
+
+            if (isCountValid && isSumValid && isMinValid && isMaxValid) {
+              const alreadySeen = derivedConsumer.orderedChunks.some(
+                (chunk) => chunk.chunkId === normalized.chunkId,
+              );
+              if (!alreadySeen) {
+                derivedConsumer.orderedChunks.push({
+                  chunkId: normalized.chunkId,
+                  start: normalized.window.start,
+                  end: normalized.window.end,
+                  sum: sum !== undefined ? (sum as number) : undefined,
+                  count: count !== undefined ? (count as number) : undefined,
+                  min: min !== undefined ? (min as number) : undefined,
+                  max: max !== undefined ? (max as number) : undefined,
+                });
+                derivedConsumer.orderedChunks.sort((a, b) => a.start - b.start);
+                await this.publishDerivedOriginalOutputFromChunks(derivedConsumer);
+              }
+            }
+          }
+          const expectedSubqueryId = topicToSubqueryId.get(topic);
+          let effectiveSubqueryId = expectedSubqueryId || normalized.subqueryId;
+          if (this.managerOwnedProducerMappings.length > 0) {
+            const runtimeProducerId = normalized.runtimeProducerId;
+            if (!runtimeProducerId) {
+              throw new Error(`Managed chunk on ${topic} omitted runtimeProducerId`);
+            }
+            const runtimeMapping = managerMappingByRuntimeId.get(runtimeProducerId);
+            if (!runtimeMapping) {
+              throw new Error(`Unknown runtimeProducerId ${runtimeProducerId} on ${topic}`);
+            }
+            const topicMapping = managerMappingByTopic.get(topic);
+            if (!topicMapping || topicMapping.runtimeProducerId !== runtimeProducerId) {
+              throw new Error(
+                `Runtime producer ${runtimeProducerId} published on unregistered topic ${topic}`,
+              );
+            }
+            if (normalized.canonicalProducerId !== runtimeMapping.canonicalProducerId) {
+              throw new Error(
+                `Payload canonicalProducerId ${normalized.canonicalProducerId ?? "missing"} conflicts with runtime mapping ${runtimeMapping.canonicalProducerId}`,
+              );
+            }
+            effectiveSubqueryId = runtimeProducerId;
+            normalized.subqueryId = runtimeProducerId;
+            normalized.runtimeProducerId = runtimeProducerId;
+            normalized.canonicalProducerId = runtimeMapping.canonicalProducerId;
+          }
+
+          const producerId = effectiveSubqueryId;
+          const prevWatermark = this.planState.latestWatermarkByProducer.get(producerId);
+
+          let accepted = false;
+          let watermarkOutcome = "ignored";
+
+          if (prevWatermark === undefined) {
+            this.planState.latestWatermarkByProducer.set(producerId, chunkTimestamp);
+            accepted = true;
+            watermarkOutcome = "accepted";
+          } else if (chunkTimestamp > prevWatermark) {
+            this.planState.latestWatermarkByProducer.set(producerId, chunkTimestamp);
+            accepted = true;
+            watermarkOutcome = "accepted";
+          } else if (chunkTimestamp === prevWatermark) {
+            accepted = true; // Idempotent duplicate is accepted but does not advance the watermark
+            watermarkOutcome = "accepted";
+          } else {
+            accepted = false;
+            watermarkOutcome = "rejected";
+          }
+
+          const contributionKey = `${producerId}:${normalized.window.start}:${normalized.window.end}`;
+          const isDuplicateContribution = this.planState.acceptedContributions.has(contributionKey);
+
+          if (accepted && !isDuplicateContribution) {
+            this.planState.acceptedContributions.add(contributionKey);
+          }
+
+          let derivedReconstructionWatermark: number | null = null;
+          const allProducersHaveWatermark = expectedSubqueryIds.every((pid) =>
+            this.planState.latestWatermarkByProducer.has(pid)
+          );
+          if (allProducersHaveWatermark) {
+            const watermarks = expectedSubqueryIds.map((pid) =>
+              this.planState.latestWatermarkByProducer.get(pid)!
+            );
+            derivedReconstructionWatermark = Math.min(...watermarks);
+          }
+
+          const nextWindowStart = processingState.nextComparableWindowStartMs;
+          const missingContributionCount = nextWindowStart !== null
+            ? this.getMissingContributionCount(processingState, nextWindowStart)
+            : 0;
+
+          if (this.debugChunksEnabled || this.planConfig.watermarkDebugEnabled) {
+            const finalQueryLabelMatch = this.outputQuery.match(/REGISTER\s+\w+\s+<([^>]+)>/i);
+            const finalQueryLabel = finalQueryLabelMatch ? finalQueryLabelMatch[1] : "unknown-final-query";
+            const traceRecord = {
+              timestamp: Date.now(),
+              executionId: this.sessionId,
+              queryLabel: finalQueryLabel,
+              producerId,
+              chunkStart: normalized.window.start,
+              chunkEnd: normalized.window.end,
+              candidateWatermark: chunkTimestamp,
+              previousProducerWatermark: prevWatermark !== undefined ? prevWatermark : null,
+              watermarkOutcome,
+              duplicateContribution: isDuplicateContribution ? "true" : "false",
+              acceptedContribution: (accepted && !isDuplicateContribution) ? "true" : "false",
+              reconstructionWatermark: derivedReconstructionWatermark,
+              missingContributionCount,
+            };
+            this.logger.log(`WATERMARK_TRACE: ${JSON.stringify(traceRecord)}`);
+            console.log(`WATERMARK_TRACE: ${JSON.stringify(traceRecord)}`);
+          }
+
+          if (!accepted) {
+            this.logger.log(`Ignoring chunk ${normalized.chunkId} due to watermark regression for producer ${producerId}`);
+            endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
+            return;
+          }
+
+          if (isDuplicateContribution) {
+            this.duplicateChunkCount += 1;
+            this.chunkedDebugSummary.duplicateChunkCount = this.duplicateChunkCount;
+            profileCount("duplicateChunkCount");
+            const chunkGroupId = getLogicalChunkGroupId(normalized);
+            const coverageState =
+              processingState.chunkCoverageByWindow.get(chunkGroupId) ?? {
+                chunkGroupId,
+                expectedSubqueryIds: [...expectedSubqueryIds],
+                receivedChunkIdsBySubquery: Object.fromEntries(
+                  expectedSubqueryIds.map((subqueryId) => [subqueryId, [] as string[]]),
+                ),
+                duplicateChunksIgnoredBySubquery: Object.fromEntries(
+                  expectedSubqueryIds.map((subqueryId) => [subqueryId, [] as string[]]),
+                ),
+              };
+            processingState.chunkCoverageByWindow.set(chunkGroupId, coverageState);
+            coverageState.duplicateChunksIgnoredBySubquery[producerId].push(normalized.chunkId);
+            this.persistChunkedDebugSummary();
+            endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
+            return;
+          }
+
+          const chunkGroupId = getLogicalChunkGroupId(normalized);
+          const bySubquery =
+            processingState.chunksByWindow.get(chunkGroupId) ??
+            new Map<string, PartialChunkResult>();
+          const coverageState =
+            processingState.chunkCoverageByWindow.get(chunkGroupId) ?? {
+              chunkGroupId,
+              expectedSubqueryIds: [...expectedSubqueryIds],
+              receivedChunkIdsBySubquery: Object.fromEntries(
+                expectedSubqueryIds.map((subqueryId) => [subqueryId, [] as string[]]),
+              ),
+              duplicateChunksIgnoredBySubquery: Object.fromEntries(
+                expectedSubqueryIds.map((subqueryId) => [subqueryId, [] as string[]]),
+              ),
+            };
+          processingState.chunkCoverageByWindow.set(chunkGroupId, coverageState);
+          const existing = bySubquery.get(effectiveSubqueryId);
+          if (!existing) {
+            const outcome = this.collectChunkByWindow(
+              processingState.chunksByWindow,
+              {
+                ...this.compactStructuredPartial(
+                  normalized,
+                  outputAggregationFunction,
+                ),
+                subqueryId: effectiveSubqueryId,
+              },
+              expectedSubqueryIds,
+            );
+            coverageState.receivedChunkIdsBySubquery[effectiveSubqueryId].push(
+              normalized.chunkId,
+            );
+            this.debugChunkLog(
+              `received chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${outcome.chunkGroupId}; completeness=${expectedSubqueryIds.length - outcome.missingSubqueryIds.length}/${expectedSubqueryIds.length}; missing=${outcome.missingSubqueryIds.join(",") || "none"}`,
+            );
+            profileCount("buffered_chunk_results");
+            if (!outcome.isComplete) {
+              this.chunkedDebugSummary.missingChunkGroupCount += 1;
+              this.chunkedDebugSummary.coverageIncompleteBlockedCount += 1;
+            }
+            if (
+              outcome.isComplete &&
+              !processingState.readyChunkGroupSet.has(outcome.chunkGroupId)
+            ) {
+              processingState.readyChunkGroupSet.add(outcome.chunkGroupId);
+              processingState.readyChunkGroupIds.push(outcome.chunkGroupId);
+            }
+          } else {
+            this.duplicateChunkCount += 1;
+            this.chunkedDebugSummary.duplicateChunkCount =
+              this.duplicateChunkCount;
+            profileCount("duplicateChunkCount");
+            coverageState.duplicateChunksIgnoredBySubquery[effectiveSubqueryId].push(
+              normalized.chunkId,
+            );
+            this.debugChunkLog(
+              `duplicate chunk ignored chunkId=${normalized.chunkId}; subqueryId=${effectiveSubqueryId}; chunkGroupId=${chunkGroupId}; existingChunkId=${existing.chunkId}`,
+            );
+          }
+        } else {
+          this.ignoredLegacyChunkCount++;
+          this.chunkedDebugSummary.ignoredLegacyChunkCount =
+            this.ignoredLegacyChunkCount;
+          this.debugChunkLog(
+            `ignored legacy/unstructured chunk on topic=${topic}; ignoredLegacyChunkCount=${this.ignoredLegacyChunkCount}`,
+          );
+        }
+        this.persistChunkedDebugSummary();
+
+        // IMMEDIATE TRIGGER OPTIMIZATION:
+        // Process immediately when message arrives; only complete chunk groups emit.
+        if (this.useImmediateTrigger) {
+          await processChunks("Immediate");
+        }
+        endStageTimer("chunked.mqtt_message_callback_total_ms", callbackStartedAt);
+      });
+
+      // Initial interval — runs at startup as a safety net before first data arrives.
+      // Once the first chunk is received, this is cleared and restarted aligned to
+      // firstDataReceivedTime so that subsequent ticks fire at exact STEP boundaries.
+      this.intervalHandle = setInterval(async () => {
+        await processChunks("Interval");
+      }, outputQuerySlide);
+      })().catch((error) => {
+        const runtimeError =
+          error instanceof Error ? error : new Error(String(error));
+        console.error("Failed to initialize chunk aggregator subscriptions:", runtimeError);
+        if (this.lifecycle.onFailure) this.lifecycle.onFailure(runtimeError);
+        else process.send?.({ type: "chunked_worker_ready_failed", error: runtimeError.message });
+      });
+    });
+  }
+
+  private isContaminatedTimestamp(timestamp: number, topic: string): boolean {
+    if (!Number.isFinite(timestamp)) {
+      return true;
     }
 
+    if (this.timestampDomainMin !== null && timestamp < this.timestampDomainMin) {
+      this.rejectedContaminatedTimestampCount += 1;
+      this.logger.log(
+        `Rejected contaminated timestamp: ${JSON.stringify({
+          topic,
+          timestamp,
+          timestampDomainMin: this.timestampDomainMin,
+          timestampDomainMax: this.timestampDomainMax,
+          rejectedContaminatedTimestampCount:
+            this.rejectedContaminatedTimestampCount,
+        })}`,
+      );
+      return true;
+    }
 
+    if (this.timestampDomainMax !== null && timestamp > this.timestampDomainMax) {
+      this.rejectedContaminatedTimestampCount += 1;
+      this.logger.log(
+        `Rejected contaminated timestamp: ${JSON.stringify({
+          topic,
+          timestamp,
+          timestampDomainMin: this.timestampDomainMin,
+          timestampDomainMax: this.timestampDomainMax,
+          rejectedContaminatedTimestampCount:
+            this.rejectedContaminatedTimestampCount,
+        })}`,
+      );
+      return true;
+    }
 
-    /**
-     *
-     * @param chunks
-     */
-    async executeR2ROperator(chunks: string[]): Promise<void> {
-        this.logger.log(`Executing the R2R Operator with results: ${chunks}`);
+    return false;
+  }
 
-        /*
+  private getChunkPlanCacheKey(): string {
+    return `${this.outputQuery}::${this.subQueries.join("\u0001")}`;
+  }
+
+  private buildChunkPlan(): {
+    chunkSize: number;
+    chunkWindowWidthMs: number;
+    rewrittenQueries: string[];
+  } {
+    const chunkSize = this.findGCDChunk(this.subQueries, this.outputQuery);
+    let chunkWindowWidthMs = chunkSize;
+    const rewrittenQueries = this.subQueries.map((subQuery) => {
+      const parsedSubQuery = getCachedParsedQuery<any>(this.parser, subQuery);
+      const originalWidth = parsedSubQuery?.s2r?.[0]?.width;
+      const rewrittenWidth =
+        Number.isFinite(originalWidth) && originalWidth > 0
+          ? originalWidth
+          : chunkSize;
+      chunkWindowWidthMs = Math.max(chunkWindowWidthMs, rewrittenWidth);
+      const rewriteChunkQuery = new RewriteChunkQuery(chunkSize, rewrittenWidth);
+      return profileSync("query_rewriting_ms", () =>
+        getCachedChunkRewrite(
+          rewriteChunkQuery,
+          subQuery,
+          `${chunkSize}:${rewrittenWidth}`,
+        ),
+      );
+    });
+
+    return { chunkSize, chunkWindowWidthMs, rewrittenQueries };
+  }
+
+  private getOrBuildChunkPlan(): {
+    chunkSize: number;
+    chunkWindowWidthMs: number;
+    rewrittenQueries: string[];
+  } {
+    const cacheKey = this.getChunkPlanCacheKey();
+    if (this.cachedChunkPlan && this.cachedChunkPlanKey === cacheKey) {
+      return this.cachedChunkPlan;
+    }
+
+    const plan = profileSync("chunk_plan_ms", () => this.buildChunkPlan());
+    this.cachedChunkPlan = plan;
+    this.cachedChunkPlanKey = cacheKey;
+    return plan;
+  }
+
+  private getOrCreatePublisherClient(): any {
+    this.mqttPublisherClient = getOrCreatePublisherClientPure(
+      this.mqttBroker,
+      this.mqttPublisherClient,
+      this.activeMqttClients,
+    );
+    return this.mqttPublisherClient;
+  }
+
+  private publishWithSharedClient(
+    topic: string,
+    payload: string,
+    options: { qos?: number } = {},
+  ): Promise<void> {
+    const client = this.getOrCreatePublisherClient();
+    return publishWithSharedClientPure(client, topic, payload, options);
+  }
+
+  private recomputeExactResultFromPartials(
+    partials: PartialChunkResult[],
+    aggregationFunction: AggregationFunction,
+  ): number | null {
+    return recomputeExactResultFromPartialsPure(partials, aggregationFunction);
+  }
+
+  /**
+   *
+   * @param chunks
+   */
+  async executeR2ROperator(
+    partials: PartialChunkResult[],
+    chunkGroupId?: string,
+    comparableDiagnostics?: ComparableWindowDiagnostics,
+    aggregationFunction?: AggregationFunction | null,
+    coverageState?: ChunkCoverageState,
+    emissionReason: string = "coverage_complete",
+  ): Promise<void> {
+    this.logger.log(`Executing the R2R Operator with ${partials.length} partial results.`);
+    const detectAggregationFunction =
+      aggregationFunction ?? this.detectAggregationFunction(this.outputQuery);
+
+    /*
 For example, the allResults object might look like this:
           chunks: [
     '"<https://rsp.js/aggregation_event/89302616-a8d1-4a99-8b97-1f7efac51d88> <https://saref.etsi.org/core/hasTimestamp> \\"1749592410235\\"^^<http://www.w3.org/2001/XMLSchema#long> .\\n    <https://rsp.js/aggregation_event/89302616-a8d1-4a99-8b97-1f7efac51d88> <https://saref.etsi.org/core/hasValue> \\"-22.666666666666668\\"^^<http://www.w3.org/2001/XMLSchema#float> ."',
@@ -241,417 +2377,867 @@ For example, the allResults object might look like this:
     '"<https://rsp.js/aggregation_event/327ae8b1-52a1-48f8-9749-324000a75a45> <https://saref.etsi.org/core/hasTimestamp> \\"1749592770747\\"^^<http://www.w3.org/2001/XMLSchema#long> .\\n    <https://rsp.js/aggregation_event/327ae8b1-52a1-48f8-9749-324000a75a45> <https://saref.etsi.org/core/hasValue> \\"-23\\"^^<http://www.w3.org/2001/XMLSchema#float> ."'
   ]
         */
-        const store = new N3.Store();
-        const parser = new N3.Parser();
-        for (const chunk of chunks) {
-            let chunkString = chunk;
-            // If chunk is a JSON string, parse it
-            try {
-                if (chunkString.startsWith('"') && chunkString.endsWith('"')) {
-                    chunkString = JSON.parse(chunkString);
-                }
-            } catch (e) {
-                this.logger.log(`DEBUG: Could not JSON.parse chunk: ${chunkString}`);
-            }
-            try {
-                const quads = parser.parse(chunkString);
-                store.addQuads(quads);
-            } catch (e) {
-                this.logger.log(`DEBUG: Could not parse chunk as Turtle: ${chunkString}`);
-            }
-        }
-        this.logger.log(storeToString(store));
-        const detectAggregationFunction = this.detectAggregationFunction(this.outputQuery);
-        if (!detectAggregationFunction) {
-            console.error("No aggregation function detected in the output query.");
-            return;
-        }
-        const aggregationSPARQLQuery = this.getAggregationSPARQLQuery(detectAggregationFunction, 'o');
-        if (!aggregationSPARQLQuery) {
-            console.error("Failed to generate aggregation SPARQL query.");
-            return;
-        }
-        this.logger.log(`Generated Aggregation SPARQL Query: ${aggregationSPARQLQuery}`);
-        const r2rOperator = new R2ROperator(aggregationSPARQLQuery);
-        const bindingStream = await r2rOperator.execute(store);
-        if (!bindingStream) {
-            console.error("Failed to execute R2R Operator.");
-            return;
-        }
-        bindingStream.on('data', (data: any) => {
-            this.logger.log(`R2R Operator Data Received: ${data}`);
-            const outputQueryEvent = this.generateOutputQueryEvent(data.get('result').value);
-            this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
-            // Publish the output query event to the MQTT broker
-            const rsp_client = mqtt.connect(this.mqttBroker);
-            rsp_client.on("connect", () => {
-                const outputTopic = `output`;
-                this.logger.log(`calculated result ${outputQueryEvent}`);
+    if (!detectAggregationFunction) {
+      console.error("No aggregation function detected in the output query.");
+      return;
+    }
+    const directResult = profileStageSync(
+      "chunked.aggregation_recomposition_ms",
+      () =>
+        profileSync("structured_recomposition_time_ms", () =>
+          comparableDiagnostics
+            ? comparableDiagnostics.resultValue
+            : this.recomputeExactResultFromPartials(
+                partials,
+                detectAggregationFunction as AggregationFunction,
+              ),
+        ),
+    );
 
-                rsp_client.publish(outputTopic, outputQueryEvent, (err: any) => {
-                    if (err) {
-                        console.error(`Error publishing output query event to topic ${outputTopic}:`, err);
-                    } else {
-                        this.logger.log(`Output query event published to topic ${outputTopic}`);
-                    }
-                });
-            });
-            rsp_client.on("error", (err) => {
-                console.error("MQTT connection error:", err);
-            });
-            rsp_client.on("offline", () => {
-                console.error("MQTT client is offline. Please check the broker connection.");
-            }
+      if (Number.isFinite(directResult)) {
+      if (
+        this.benchmarkTargetWindowCount !== null &&
+        this.windowCount >= this.benchmarkTargetWindowCount
+      ) {
+        this.logger.log(
+          `Benchmark target window cap reached before direct emission: target=${this.benchmarkTargetWindowCount} emitted=${this.windowCount}`,
+        );
+        this.benchmarkTargetWindowReached = true;
+        this.benchmarkStopReason = "target_window_count_reached";
+        this.writeBenchmarkWindowSummary();
+        this.completePlan();
+        return;
+      }
+
+        const resultValue = String(directResult);
+      if (comparableDiagnostics) {
+        this.writeComparableDiagnostics(comparableDiagnostics);
+      }
+      const resultEmittedAt = Date.now();
+      const proofEntry = this.buildChunkEmissionProofEntry(
+        partials,
+        chunkGroupId,
+        comparableDiagnostics,
+        emissionReason,
+        coverageState,
+      );
+      if (proofEntry) {
+        proofEntry.emittedAt = resultEmittedAt;
+        this.recordChunkEmissionProof(proofEntry);
+      }
+      const outputQueryEvent = this.generateOutputQueryEvent(resultValue);
+      this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
+      if (chunkGroupId) {
+        this.debugChunkLog(
+          `final emission chunkGroupId=${chunkGroupId}; recomposedResult=${resultValue}`,
+        );
+      }
+
+      this.windowCount++;
+      const registrationAnchoredExpectedClose = this.getExpectedWindowCloseTime(
+        this.windowCount,
+      );
+      const centeredWindowMetadata = this.buildWindowMetadata(
+        partials,
+        comparableDiagnostics,
+        resultEmittedAt,
+      );
+      const triggerSource = emissionReason.startsWith("immediate") ? "Immediate" : "Interval";
+      this.logLatency(
+        this.windowCount,
+        registrationAnchoredExpectedClose,
+        this.lastChunkReceivedTime,
+        this.intervalTriggerTime,
+        resultEmittedAt,
+        resultValue,
+        proofEntry,
+        triggerSource,
+        centeredWindowMetadata,
+      );
+
+      const resultTopic = this.planConfig.outputTopic;
+      const useBenchmarkPayload = Boolean(this.planConfig.outputTopic);
+      const { wallClockWindowClose, latencyDomainStatus } =
+        resolveChunkedWallClockWindowClose({
+          eventTimeWindowClose: centeredWindowMetadata.windowDataCloseTime,
+          runtimeReplayStartWallClockTime: this.runtimeReplayStartWallClockTime,
+          benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+          queryRegisteredTime: this.queryRegisteredTime,
+        });
+      const wallClockCloseToResultMs =
+        wallClockWindowClose !== null
+          ? resultEmittedAt - wallClockWindowClose
+          : null;
+      const coverageComplete = proofEntry?.coverageComplete ?? false;
+      const payload = profileStageSync(
+        "chunked.final_payload_json_stringify_ms",
+        () =>
+          profileSync("serialization_parsing_ms", () =>
+            useBenchmarkPayload
+              ? JSON.stringify(
+                  this.buildChunkedBenchmarkPayload({
+                    aggregationFunction:
+                      detectAggregationFunction as AggregationFunction,
+                    resultValue: Number.parseFloat(resultValue),
+                    windowNumber: this.windowCount,
+                    comparableDiagnostics,
+                    centeredWindowMetadata: {
+                      ...centeredWindowMetadata,
+                      registrationAnchoredExpectedClose,
+                      eventTimeWindowStart: centeredWindowMetadata.windowStart,
+                      eventTimeWindowEnd: centeredWindowMetadata.windowEnd,
+                      eventTimeWindowClose:
+                        centeredWindowMetadata.windowDataCloseTime,
+                      wallClockWindowClose,
+                      wallClockCloseToResultMs,
+                      latencyDomainStatus,
+                      anchorAlignedWindowClose: wallClockWindowClose,
+                      anchorAlignedWindowCloseToResultMs:
+                        wallClockCloseToResultMs,
+                    } as ChunkedBenchmarkWindowMetadata,
+                    coverageComplete,
+                  }),
+                )
+              : outputQueryEvent,
+          ),
+      );
+      this.logger.log(`calculated result ${payload}`);
+      const publishStartedAt = startStageTimer();
+      await this.publishWithSharedClient(resultTopic, payload, { qos: 1 });
+      endStageTimer("chunked.final_mqtt_publish_total_ms", publishStartedAt);
+      this.recordFinalizedWindow(this.windowCount);
+      recordPublishedMqttMessage({
+        topic: resultTopic,
+        payload,
+        messageType: "superquery_result",
+      });
+      this.logger.log(
+        `Output query event published to topic ${resultTopic}`,
+      );
+      this.chunkedDebugSummary.reconstructedSuperqueryResultCount += 1;
+      profileCount("reconstructed_superquery_results");
+      profileCount("emitted_results");
+      this.persistChunkedDebugSummary();
+      return;
+    }
+
+    const rdfChunks = partials
+      .map((partial) => partial.rdfPayload)
+      .filter((rdfPayload): rdfPayload is string => typeof rdfPayload === "string");
+    const store = new N3.Store();
+    const parser = new N3.Parser();
+    profileSync("rdf_parse_time_ms", () => {
+      for (const chunkString of rdfChunks) {
+        try {
+          const quads = parser.parse(chunkString);
+          store.addQuads(quads);
+        } catch (e) {
+          this.debugChunkLog(`Could not parse chunk as Turtle for fallback`);
+        }
+      }
+    });
+    if (this.planConfig.debugChunksEnabled) {
+      this.logger.log(storeToString(store));
+    }
+    const aggregationSPARQLQuery = this.getAggregationSPARQLQuery(
+      detectAggregationFunction,
+      "o",
+    );
+    if (!aggregationSPARQLQuery) {
+      console.error("Failed to generate aggregation SPARQL query.");
+      return;
+    }
+    this.logger.log(
+      `Generated Aggregation SPARQL Query: ${aggregationSPARQLQuery}`,
+    );
+    const r2rOperator = new R2ROperator(aggregationSPARQLQuery);
+    const bindingStream = await profileAsync("r2r_execution_time_ms", () =>
+      r2rOperator.execute(store),
+    );
+    if (!bindingStream) {
+      console.error("Failed to execute R2R Operator.");
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      let completed = false;
+      let bindingStreamEnded = false;
+      let pendingPublishes = 0;
+      const finalize = () => {
+        if (completed) return;
+        completed = true;
+        resolve();
+      };
+      const finalizeWhenPublished = () => {
+        if (bindingStreamEnded && pendingPublishes === 0) {
+          finalize();
+        }
+      };
+
+      bindingStream.on("data", (data: any) => {
+        if (completed) return;
+
+        this.logger.log(`R2R Operator Data Received: ${data}`);
+        const resultValue = data.get("result").value;
+        const outputQueryEvent = this.generateOutputQueryEvent(resultValue);
+        this.logger.log(`Generated Output Query Event: ${outputQueryEvent}`);
+        if (chunkGroupId) {
+          this.debugChunkLog(
+            `final emission chunkGroupId=${chunkGroupId}; recomposedResult=${resultValue}`,
+          );
+        }
+
+        // Calculate and log latency with multiple metrics
+        pendingPublishes += 1;
+        const resultEmittedAt = Date.now();
+        const proofEntry = this.buildChunkEmissionProofEntry(
+          partials,
+          chunkGroupId,
+          comparableDiagnostics,
+          emissionReason,
+          coverageState,
+        );
+        if (proofEntry) {
+          proofEntry.emittedAt = resultEmittedAt;
+          this.recordChunkEmissionProof(proofEntry);
+        }
+        if (
+          this.benchmarkTargetWindowCount !== null &&
+          this.windowCount >= this.benchmarkTargetWindowCount
+        ) {
+          this.logger.log(
+            `Benchmark target window cap reached before fallback emission: target=${this.benchmarkTargetWindowCount} emitted=${this.windowCount}`,
+          );
+          this.benchmarkTargetWindowReached = true;
+          this.benchmarkStopReason = "target_window_count_reached";
+          this.writeBenchmarkWindowSummary();
+          this.completePlan();
+          finalize();
+          return;
+        }
+
+        this.windowCount++;
+        const registrationAnchoredExpectedClose = this.getExpectedWindowCloseTime(
+          this.windowCount,
+        );
+        const centeredWindowMetadata = this.buildWindowMetadata(
+          partials,
+          comparableDiagnostics,
+          resultEmittedAt,
+        );
+        const triggerSource = emissionReason.startsWith("immediate") ? "Immediate" : "Interval";
+        this.logLatency(
+          this.windowCount,
+          registrationAnchoredExpectedClose,
+          this.lastChunkReceivedTime,
+          this.intervalTriggerTime,
+          resultEmittedAt,
+          resultValue,
+          proofEntry,
+          triggerSource,
+          centeredWindowMetadata,
+        );
+
+        const { wallClockWindowClose, latencyDomainStatus } =
+          resolveChunkedWallClockWindowClose({
+            eventTimeWindowClose: centeredWindowMetadata.windowDataCloseTime,
+            runtimeReplayStartWallClockTime:
+              this.runtimeReplayStartWallClockTime,
+            benchmarkEventTimeAnchor: this.benchmarkEventTimeAnchor,
+            queryRegisteredTime: this.queryRegisteredTime,
+          });
+        const wallClockCloseToResultMs =
+          wallClockWindowClose !== null
+            ? resultEmittedAt - wallClockWindowClose
+            : null;
+        // Publish the output query event to the MQTT broker
+        const resultTopic = this.planConfig.outputTopic;
+        const useBenchmarkPayload = Boolean(this.planConfig.outputTopic);
+        const coverageComplete = proofEntry?.coverageComplete ?? false;
+        const payload = useBenchmarkPayload
+          ? JSON.stringify(
+              this.buildChunkedBenchmarkPayload({
+                aggregationFunction:
+                  detectAggregationFunction as AggregationFunction,
+                resultValue: Number.parseFloat(resultValue),
+                windowNumber: this.windowCount,
+                comparableDiagnostics,
+                centeredWindowMetadata: {
+                  ...centeredWindowMetadata,
+                  registrationAnchoredExpectedClose,
+                  eventTimeWindowStart: centeredWindowMetadata.windowStart,
+                  eventTimeWindowEnd: centeredWindowMetadata.windowEnd,
+                  eventTimeWindowClose:
+                    centeredWindowMetadata.windowDataCloseTime,
+                  wallClockWindowClose,
+                  wallClockCloseToResultMs,
+                  latencyDomainStatus,
+                  anchorAlignedWindowClose: wallClockWindowClose,
+                  anchorAlignedWindowCloseToResultMs:
+                    wallClockCloseToResultMs,
+                } as ChunkedBenchmarkWindowMetadata,
+                coverageComplete,
+              }),
+            )
+          : outputQueryEvent;
+        this.logger.log(`calculated result ${payload}`);
+        void this.publishWithSharedClient(resultTopic, payload, { qos: 1 })
+          .then(() => {
+                        this.logger.log(
+              `Output query event published to topic ${resultTopic}`,
             );
-            rsp_client.on("reconnect", () => {
-                this.logger.log("Reconnecting to MQTT broker...");
-            }
+            this.chunkedDebugSummary.reconstructedSuperqueryResultCount += 1;
+            profileCount("reconstructed_superquery_results");
+            this.persistChunkedDebugSummary();
+            profileCount("emitted_results");
+            this.recordFinalizedWindow(this.windowCount);
+          })
+          .finally(() => {
+            pendingPublishes -= 1;
+            finalizeWhenPublished();
+          });
+      });
+
+      bindingStream.on("end", () => {
+        this.logger.log(
+          "R2R Operator binding stream ended without additional results.",
+        );
+        bindingStreamEnded = true;
+        finalizeWhenPublished();
+      });
+
+      bindingStream.on("error", (err: any) => {
+        console.error("R2R Operator binding stream error:", err);
+        bindingStreamEnded = true;
+        finalizeWhenPublished();
+      });
+    });
+  }
+
+  /**
+   *
+   * @param data
+   */
+  generateOutputQueryEvent(data: any): string {
+    const uuid_random = uuidv4();
+    return ` <https://rsp.js/outputQueryEvent/${uuid_random}> <https://saref.etsi.org/core/hasValue> "${data}"^^<http://www.w3.org/2001/XMLSchema#float> .`;
+  }
+
+  /**
+   *
+   */
+  private async initializeManagerOwnedProducerSubscriptions(): Promise<void> {
+    if (!this.planConfig.skipLocalProducerSpawning) {
+      throw new Error(
+        "Manager-owned producer handles and reconstruction-local producer spawning cannot both be active",
+      );
+    }
+    const chunkPlan = this.getOrBuildChunkPlan();
+    if (chunkPlan.chunkSize <= 0) {
+      throw new Error("Invalid chunk plan for manager-owned producers");
+    }
+    if (this.managerOwnedProducerMappings.length !== this.subQueries.length) {
+      throw new Error(
+        `Manager-owned producer mapping count ${this.managerOwnedProducerMappings.length} does not match subquery count ${this.subQueries.length}`,
+      );
+    }
+    this.chunkGCD = chunkPlan.chunkSize;
+    this.chunkedDebugSummary.chunkSizeMs = chunkPlan.chunkSize;
+    this.chunkedDebugSummary.managedProducerMode = true;
+    this.chunkedDebugSummary.managerOwnedSubscriptionCount =
+      this.managerOwnedProducerMappings.length;
+    this.chunkedDebugSummary.localProducerSpawnCount = 0;
+    for (const mapping of this.managerOwnedProducerMappings) {
+      this.subQueryMQTTTopicMap.set(mapping.runtimeProducerId, mapping.topic);
+      this.logger.log(
+        `MANAGER_OWNED_PRODUCER_SUBSCRIPTION canonicalProducerId=${mapping.canonicalProducerId} runtimeProducerId=${mapping.runtimeProducerId} topic=${mapping.topic}`,
+      );
+    }
+    this.persistChunkedDebugSummary();
+    resourceTraceSnapshot(
+      "manager_owned_producer_subscriptions_configured",
+      "reconstruction uses manager-owned producers; local RSPQueryProcess creation disabled",
+      {
+        managerOwnedProducerCount: this.managerOwnedProducerMappings.length,
+        localProducerProcessCount: 0,
+      },
+    );
+  }
+
+  private async initializeSubQueryProcesses(): Promise<void> {
+    if (
+      this.managerOwnedProducerMappings.length > 0 ||
+      this.planConfig.skipLocalProducerSpawning
+    ) {
+      throw new Error(
+        "Reconstruction-local RSPQueryProcess creation is forbidden when managed producers are configured or local spawning is disabled",
+      );
+    }
+    this.chunkedDebugSummary.managedProducerMode = false;
+    this.logger.log(`Initializing subquery processes.`);
+    this.logger.log(`DEBUG: subQueries length: ${this.subQueries.length}`);
+    this.logger.log(`DEBUG: subQueries: ${JSON.stringify(this.subQueries)}`);
+    this.logger.log(`DEBUG: outputQuery: ${this.outputQuery}`);
+    const chunkPlan = this.getOrBuildChunkPlan();
+    this.logger.log(`Calculated GCD Chunk Size: ${chunkPlan.chunkSize}`);
+    this.chunkGCD = chunkPlan.chunkSize;
+    this.chunkedDebugSummary.chunkSizeMs = chunkPlan.chunkSize;
+    this.persistChunkedDebugSummary();
+    if (chunkPlan.chunkSize > 0) {
+      const allPromises: Promise<void>[] = [];
+      const uniqueRewrittenQueries = Array.from(new Set(chunkPlan.rewrittenQueries));
+      const skipSpawning = this.planConfig.skipLocalProducerSpawning;
+
+      for (let i = 0; i < uniqueRewrittenQueries.length; i++) {
+        const rewrittenQuery = uniqueRewrittenQueries[i];
+        profileCount("query_rewrites");
+        const hash_subQuery = hash_string_md5(rewrittenQuery);
+        const topicName = `chunked/${this.sessionId}/${hash_subQuery}`;
+        this.subQueryMQTTTopicMap.set(hash_subQuery, topicName);
+        console.log(`EXPECTED_CHUNK_TOPIC: hash=${hash_subQuery} topic=${topicName} skipSpawning=${skipSpawning}`);
+        this.logger.log(`Expected chunk topic: hash=${hash_subQuery} topic=${topicName} skipSpawning=${skipSpawning}`);
+        
+        if (!skipSpawning) {
+          this.chunkedDebugSummary.localProducerSpawnCount += 1;
+          const rspQueryProcess = new RSPQueryProcess(
+            rewrittenQuery,
+            topicName,
+            this.sessionId,
+            hash_subQuery,
+          );
+          profileCount("rsp_query_processes_started");
+          profileCount("shared_chunk_producers_created");
+          const p = rspQueryProcess
+            .stream_process()
+            .then(() => {
+              this.logger.log(
+                `RSP Query Process started for rewritten subquery ${i}: ${rewrittenQuery}`,
+              );
+            })
+            .catch((error) => {
+              console.error(
+                `Error starting RSP Query Process for rewritten subquery ${i}: ${rewrittenQuery}`,
+                error,
+              );
+            });
+          allPromises.push(p);
+        } else {
+          this.logger.log(`Skipping RSP Query Process instantiation for rewritten subquery ${i} (secondary consumer)`);
+        }
+      }
+
+      await Promise.all(allPromises);
+      resourceTraceSnapshot(
+        "after_subquery_streams_started",
+        "chunked rsp query processes subscribed",
+        {
+          rspQueryProcessCount: uniqueRewrittenQueries.length,
+        },
+      );
+      this.logger.log(
+        `DEBUG: Final subQueryMQTTTopicMap: ${JSON.stringify(Array.from(this.subQueryMQTTTopicMap.entries()))}`,
+      );
+    } else {
+      console.error("Failed to find a valid chunk size for the aggregation.");
+      this.logger.log("Failed to find a valid chunk size for the aggregation.");
+    }
+  }
+
+  /**
+   *
+   * @param subQueries
+   * @param outputQuery
+   */
+  findGCDChunk(subQueries: string[], outputQuery: string): number {
+    const window_parameters: number[] = [];
+    for (let i = 0; i < subQueries.length; i++) {
+      const subQueryParsed = getCachedParsedQuery<any>(this.parser, subQueries[i]);
+
+      if (subQueryParsed) {
+        for (const s2r of subQueryParsed.s2r) {
+          window_parameters.push(s2r.width);
+          window_parameters.push(s2r.slide);
+        }
+      }
+    }
+
+    const outputQueryParsed = getCachedParsedQuery<any>(this.parser, outputQuery);
+
+    if (outputQueryParsed) {
+      for (const s2r of outputQueryParsed.s2r) {
+        window_parameters.push(s2r.width);
+        window_parameters.push(s2r.slide);
+      }
+    }
+    // Find the GCD of the window parameters
+    return this.findGCD(window_parameters);
+  }
+
+  /**
+   *
+   * @param arr
+   */
+  findGCD(arr: number[]): number {
+    if (arr.length === 0) {
+      return 1;
+    }
+    const gcd = (a: number, b: number): number => {
+      return b === 0 ? a : gcd(b, a % b);
+    };
+
+    return arr.reduce((acc, val) => gcd(acc, val), arr[0]);
+  }
+
+  /**
+   *
+   * @param arr
+   */
+  findLCM(arr: number[]): number {
+    const lcm = (a: number, b: number): number => {
+      return (a * b) / this.findGCD([a, b]);
+    };
+
+    return arr.reduce((acc, val) => lcm(acc, val), 1);
+  }
+
+  /**
+   *
+   * @param query
+   */
+  addSubQuery(query: string): void {
+    this.subQueries.push(query);
+    if (this.logger) {
+      this.logger.log(
+        `addSubQuery called. Current subQueries length: ${this.subQueries.length}`,
+      );
+      this.logger.log(
+        `addSubQuery called. Current subQueries: ${JSON.stringify(this.subQueries)}`,
+      );
+    }
+  }
+
+  /**
+   *
+   * @param query
+   */
+  setOutputQuery(query: string): void {
+    this.outputQuery = query;
+    this.logger.log(`Output query set: ${this.outputQuery}`);
+    if (this.outputQuery === "") {
+      console.error("Output query is empty. Please set a valid output query.");
+    }
+  }
+  /**
+   *
+   */
+  getOutputQuery(): string {
+    return this.outputQuery ?? "";
+  }
+  /**
+   *
+   */
+  getSubQueries(): string[] {
+    return this.subQueries;
+  }
+  /**
+   *
+   */
+  clearSubQueries(): void {
+    this.subQueries = [];
+  }
+
+  /**
+   *
+   * @param query
+   */
+  detectAggregationFunction(query: string): string | null {
+    const resultValueAliasMatch = query.match(
+      /\((AVG|SUM|COUNT|MIN|MAX)\s*\([^)]+\)\s+AS\s+\?resultValue\)/i,
+    );
+    if (resultValueAliasMatch?.[1]) {
+      return resultValueAliasMatch[1].toUpperCase();
+    }
+
+    const aggregationFunctions = ["AVG", "SUM", "COUNT", "MIN", "MAX"];
+    for (const func of aggregationFunctions) {
+      if (query.includes(func)) {
+        return func;
+      }
+    }
+    return null;
+  }
+
+  /**
+   *
+   * @param aggregationFunction
+   * @param variable
+   */
+    getAggregationSPARQLQuery(
+    aggregationFunction: string,
+    variable: string,
+  ): string {
+    const allowedFunctions = ["AVG", "SUM", "COUNT", "MIN", "MAX"];
+
+    if (!aggregationFunction || !variable) {
+      console.error("Missing aggregation function or variable.");
+      return "";
+    }
+
+    aggregationFunction = aggregationFunction.toUpperCase();
+    if (!allowedFunctions.includes(aggregationFunction)) {
+      console.error("Invalid aggregation function.");
+      return "";
+    }
+
+    if (!variable.startsWith("?")) {
+      variable = "?" + variable;
+    }
+
+    // Weighted Average Logic for AVG
+    if (aggregationFunction === "AVG") {
+       return `
+        PREFIX saref: <https://saref.etsi.org/core/>
+        SELECT ((SUM(?val * ?cnt) / SUM(?cnt)) AS ?result)
+        WHERE {
+          ?s saref:hasValue ?val .
+          ?s saref:hasCount ?cnt .
+        }
+       `;
+    }
+
+    // COUNT: each sub-query emits per-sub-window count as saref:hasValue.
+    // Summing those values yields the total count for the output window.
+    if (aggregationFunction === "COUNT") {
+      return `
+        PREFIX saref: <https://saref.etsi.org/core/>
+        SELECT (SUM(?val) AS ?result)
+        WHERE {
+          ?s saref:hasValue ?val .
+        }
+      `;
+    }
+
+    // Default behavior for other functions (assuming simple hasValue for now, but really only AVG is critical here)
+    // Note: This simplifies the dynamic variable name usage because the RDF data is now consistently using saref:hasValue
+    return `
+      PREFIX saref: <https://saref.etsi.org/core/>
+      SELECT (${aggregationFunction}(?val) AS ?result)
+      WHERE {
+        ?s saref:hasValue ?val .
+      }
+    `;
+  }
+
+  /**
+   *
+   * @param ms
+   */
+  sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Execute R2R Operator for a specific topic's chunks
+   * @param topic
+   * @param chunks
+   */
+  async executeR2ROperatorForTopic(
+    topic: string,
+    chunks: string[],
+  ): Promise<number | null> {
+    this.logger.log(
+      `Executing the R2R Operator for topic ${topic} with ${chunks.length} chunks`,
+    );
+
+    const store = new N3.Store();
+    const parser = new N3.Parser();
+
+    // Filter out plain numeric values that might be duplicates of RDF values
+    // Only process chunks that look like RDF (contain URIs and predicates)
+    const rdfChunks = chunks.filter((chunk) => {
+      let chunkString = chunk;
+      // Handle JSON-wrapped chunks
+      try {
+        if (chunkString.startsWith('"') && chunkString.endsWith('"')) {
+          chunkString = JSON.parse(chunkString);
+        }
+      } catch (e) {
+        // If it's not JSON, use as-is
+      }
+
+      // Check if chunk contains RDF patterns (URIs and predicates)
+      // Skip plain numeric values that are likely duplicates
+      const isRDF =
+        chunkString.includes("https://") && chunkString.includes("hasValue");
+      const isPlainNumber = /^-?\d+\.?\d*$/.test(chunkString.trim());
+
+      if (isPlainNumber) {
+        this.logger.log(
+          `DEBUG: Filtering out plain numeric duplicate for ${topic}: ${chunkString}`,
+        );
+        return false; // Skip plain numbers
+      }
+
+      return isRDF; // Only process RDF chunks
+    });
+
+    this.logger.log(
+      `DEBUG: Filtered ${chunks.length} chunks down to ${rdfChunks.length} RDF chunks for topic ${topic}`,
+    );
+
+    for (const chunk of rdfChunks) {
+      let chunkString = chunk;
+      // If chunk is a JSON string, parse it
+      try {
+        if (chunkString.startsWith('"') && chunkString.endsWith('"')) {
+          chunkString = JSON.parse(chunkString);
+        }
+      } catch (e) {
+        this.logger.log(
+          `DEBUG: Could not JSON.parse chunk for ${topic}: ${chunkString}`,
+        );
+      }
+      try {
+        const quads = parser.parse(chunkString);
+        store.addQuads(quads);
+      } catch (e) {
+        this.logger.log(
+          `DEBUG: Could not parse chunk as Turtle for ${topic}: ${chunkString}`,
+        );
+      }
+    }
+
+    if (store.size === 0) {
+      this.logger.log(`No valid RDF data found for topic ${topic}`);
+      return null;
+    }
+
+    this.logger.log(
+      `Topic ${topic} RDF store contents: ${storeToString(store)}`,
+    );
+    const detectAggregationFunction = this.detectAggregationFunction(
+      this.outputQuery,
+    );
+    if (!detectAggregationFunction) {
+      console.error(
+        `No aggregation function detected in the output query for topic ${topic}.`,
+      );
+      return null;
+    }
+    const aggregationSPARQLQuery = this.getAggregationSPARQLQuery(
+      detectAggregationFunction,
+      "o",
+    );
+    if (!aggregationSPARQLQuery) {
+      console.error(
+        `Failed to generate aggregation SPARQL query for topic ${topic}.`,
+      );
+      return null;
+    }
+    this.logger.log(
+      `Generated Aggregation SPARQL Query for ${topic}: ${aggregationSPARQLQuery}`,
+    );
+
+    return new Promise<number | null>((resolve) => {
+      const r2rOperator = new R2ROperator(aggregationSPARQLQuery);
+      r2rOperator
+        .execute(store)
+        .then((bindingStream) => {
+          if (!bindingStream) {
+            console.error(`Failed to execute R2R Operator for topic ${topic}.`);
+            resolve(null);
+            return;
+          }
+
+          let completed = false;
+          const finalize = (value: number | null) => {
+            if (completed) return;
+            completed = true;
+            resolve(value);
+          };
+
+          bindingStream.on("data", (data: any) => {
+            if (completed) return;
+            const resultValue = data.get("result").value;
+            this.logger.log(
+              `R2R Operator Data Received for ${topic}: ${JSON.stringify(data)}`,
             );
+            const numericResult = parseFloat(resultValue);
+            finalize(numericResult);
+          });
+          bindingStream.on("end", () => {
+            this.logger.log(
+              `R2R Operator stream ended for ${topic} without additional results.`,
+            );
+            finalize(null);
+          });
+          bindingStream.on("error", (error: any) => {
+            console.error(`R2R Operator error for topic ${topic}:`, error);
+            finalize(null);
+          });
+        })
+        .catch((error) => {
+          console.error(
+            `R2R Operator execution failed for topic ${topic}:`,
+            error,
+          );
+          resolve(null);
         });
+    });
+  }
+
+  /**
+   * Publish combined results from all topics
+   * @param finalResult
+   */
+  publishCombinedResults(finalResult: any): void {
+    const resultTopic = getResultTopic("chunked/output");
+    const payload = JSON.stringify(finalResult);
+    this.publishWithSharedClient(resultTopic, payload, { qos: 1 }).then(() => {
+      recordPublishedMqttMessage({
+        topic: resultTopic,
+        payload,
+        messageType: "superquery_result",
+        warmup: this.windowCount === 1,
+      });
+      console.log("Successfully published chunked results to chunked/output");
+      this.logger.log("Successfully published chunked results to chunked/output");
+      profileCount("emitted_results");
+    });
+  }
+
+  private getMissingContributionCount(
+    state: ChunkProcessingState,
+    finalWindowStart: number | null
+  ): number {
+    if (finalWindowStart === null) return 0;
+    const finalWindowEnd = finalWindowStart + this.windowRange;
+    const expectedChunkKeys = deriveExpectedChunkKeysForFinalWindow({
+      finalWindowStart,
+      finalWindowEnd,
+      chunkWindowWidthMs: state.chunkWindowWidthMs,
+      alignmentOriginMs: state.alignmentOriginMs,
+    });
+    
+    let missing = 0;
+    for (const chunkKey of expectedChunkKeys) {
+      const completed = state.completedChunkGroups.get(chunkKey);
+      if (!completed) {
+        const partialsMap = state.chunksByWindow.get(chunkKey);
+        const presentCount = partialsMap ? partialsMap.size : 0;
+        missing += (state.expectedSubqueryIds.length - presentCount);
+      }
     }
-
-    /**
-     *
-     * @param data
-     */
-    generateOutputQueryEvent(data: any): string {
-        const uuid_random = uuidv4();
-        return ` <https://rsp.js/outputQueryEvent/${uuid_random}> <https://saref.etsi.org/core/hasValue> "${data}"^^<http://www.w3.org/2001/XMLSchema#float> .`
-    }
-
-    /**
-     *
-     */
-    async initializeSubQueryProcesses(): Promise<void> {
-        this.logger.log(`Initializing subquery processes.`);
-        this.logger.log(`DEBUG: subQueries length: ${this.subQueries.length}`);
-        this.logger.log(`DEBUG: subQueries: ${JSON.stringify(this.subQueries)}`);
-        this.logger.log(`DEBUG: outputQuery: ${this.outputQuery}`);
-        const chunkSize = this.findGCDChunk(this.subQueries, this.outputQuery);
-        this.logger.log(`Calculated GCD Chunk Size: ${chunkSize}`);
-        this.chunkGCD = chunkSize;
-        const rewrittenChunkQueries: string[] = [];
-        if (chunkSize > 0) {
-            const rewriteChunkQuery = new RewriteChunkQuery(chunkSize, chunkSize);
-            for (let i = 0; i < this.subQueries.length; i++) {
-                const subQuery = this.subQueries[i];
-                this.logger.log(`DEBUG: Rewriting subQuery ${i}: ${subQuery}`);
-                const rewrittenQuery = rewriteChunkQuery.rewriteQueryWithNewChunkSize(subQuery);
-                this.logger.log(`Rewritten SubQuery ${i}: ${rewrittenQuery}`);
-                rewrittenChunkQueries.push(rewrittenQuery);
-            }
-
-            // Collect all promises
-            const allPromises: Promise<void>[] = [];
-            for (let i = 0; i < rewrittenChunkQueries.length; i++) {
-                const hash_subQuery = hash_string_md5(rewrittenChunkQueries[i]);
-                this.logger.log(`DEBUG: Setting subQueryMQTTTopicMap[${hash_subQuery}] = chunked/${hash_subQuery}`);
-                this.subQueryMQTTTopicMap.set(hash_subQuery, `chunked/${hash_subQuery}`);
-                this.logger.log(`DEBUG: subQueryMQTTTopicMap after set: ${JSON.stringify(Array.from(this.subQueryMQTTTopicMap.entries()))}`);
-                const rspQueryProcess = new RSPQueryProcess(rewrittenChunkQueries[i], `chunked/${hash_subQuery}`);
-                this.logger.log(`chunked/${hash_subQuery} topic created for rewrittenChunkQueries: ${rewrittenChunkQueries[i]}: ${rewrittenChunkQueries[i]}`);
-                const p = rspQueryProcess.stream_process().then(() => {
-                    this.logger.log(`Topic chunked/${hash_subQuery} created for subquery ${i}`);
-                    this.logger.log(`RSP Query Process started for subquery ${i}: ${rewrittenChunkQueries[i]}`);
-                }).catch((error) => {
-                    console.error(`Error starting RSP Query Process for subquery ${i}: ${rewrittenChunkQueries[i]}`, error);
-                });
-                allPromises.push(p);
-            }
-            // Wait for all subquery processes to finish initializing
-            await Promise.all(allPromises);
-            this.logger.log(`DEBUG: Final subQueryMQTTTopicMap: ${JSON.stringify(Array.from(this.subQueryMQTTTopicMap.entries()))}`);
-        } else {
-            console.error("Failed to find a valid chunk size for the aggregation.");
-            this.logger.log("Failed to find a valid chunk size for the aggregation.");
-        }
-    }
-
-    /**
-     *
-     * @param subQueries
-     * @param outputQuery
-     */
-    findGCDChunk(subQueries: string[], outputQuery: string): number {
-        const window_parameters: number[] = [];
-        for (let i = 0; i < subQueries.length; i++) {
-            const subQueryParsed = this.parser.parse(subQueries[i]);
-            this.logger.log(`Parsed subquery ${i}: ${JSON.stringify(subQueryParsed)}`);
-
-            if (subQueryParsed) {
-                for (const s2r of subQueryParsed.s2r) {
-                    window_parameters.push(s2r.width);
-                    window_parameters.push(s2r.slide);
-                }
-            }
-            else {
-                console.error(`Failed to parse subquery: ${subQueries[i]}`);
-            }
-        }
-
-        const outputQueryParsed = this.parser.parse(outputQuery);
-        this.logger.log(`Parsed output query: ${JSON.stringify(outputQueryParsed)}`);
-
-        if (outputQueryParsed) {
-            for (const s2r of outputQueryParsed.s2r) {
-                window_parameters.push(s2r.width);
-                window_parameters.push(s2r.slide);
-            }
-        } else {
-            console.error(`Failed to parse output query: ${outputQuery}`);
-        }
-        // Find the GCD of the window parameters
-        return this.findGCD(window_parameters);
-    }
-
-    /**
-     *
-     * @param arr
-     */
-    findGCD(arr: number[]): number {
-        if (arr.length === 0) {
-            return 1;
-        }
-        const gcd = (a: number, b: number): number => {
-            return b === 0 ? a : gcd(b, a % b);
-        };
-
-        return arr.reduce((acc, val) => gcd(acc, val), arr[0]);
-    }
-
-    /**
-     *
-     * @param arr
-     */
-    findLCM(arr: number[]): number {
-        const lcm = (a: number, b: number): number => {
-            return (a * b) / this.findGCD([a, b]);
-        };
-
-        return arr.reduce((acc, val) => lcm(acc, val), 1);
-    }
-
-    /**
-     *
-     * @param query
-     */
-    addSubQuery(query: string): void {
-        this.subQueries.push(query);
-        if (this.logger) {
-            this.logger.log(`addSubQuery called. Current subQueries length: ${this.subQueries.length}`);
-            this.logger.log(`addSubQuery called. Current subQueries: ${JSON.stringify(this.subQueries)}`);
-        }
-    }
-
-    /**
-     *
-     * @param query
-     */
-    setOutputQuery(query: string): void {
-        this.outputQuery = query;
-        this.logger.log(`Output query set: ${this.outputQuery}`);
-        if (this.outputQuery === '') {
-            console.error("Output query is empty. Please set a valid output query.");
-        }
-    }
-    /**
-     *
-     */
-    getOutputQuery(): string {
-        return this.outputQuery ?? "";
-    }
-    /**
-     *
-     */
-    getSubQueries(): string[] {
-        return this.subQueries;
-    }
-    /**
-     *
-     */
-    clearSubQueries(): void {
-        this.subQueries = [];
-    }
-
-    /**
-     *
-     * @param query
-     */
-    detectAggregationFunction(query: string): string | null {
-        const aggregationFunctions = ['SUM', 'AVG', 'COUNT', 'MIN', 'MAX'];
-        for (const func of aggregationFunctions) {
-            if (query.includes(func)) {
-                return func;
-            }
-        }
-        return null;
-    }
-
-    /**
-     *
-     * @param aggregationFunction
-     * @param variable
-     */
-    getAggregationSPARQLQuery(aggregationFunction: string, variable: string): string {
-        const allowedFunctions = ['AVG', 'SUM', 'COUNT', 'MIN', 'MAX'];
-
-        if (!aggregationFunction || !variable) {
-            console.error("Missing aggregation function or variable.");
-            return '';
-        }
-
-        aggregationFunction = aggregationFunction.toUpperCase();
-        if (!allowedFunctions.includes(aggregationFunction)) {
-            console.error("Invalid aggregation function.");
-            return '';
-        }
-
-        if (!variable.startsWith('?')) {
-            variable = '?' + variable;
-        }
-
-        return `SELECT (${aggregationFunction}(${variable}) AS ?result) WHERE { ?s ?p ${variable} }`;
-    }
-
-    /**
-     *
-     * @param ms
-     */
-    sleep(ms: number): Promise<void> {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    /**
-     * Execute R2R Operator for a specific topic's chunks
-     * @param topic
-     * @param chunks
-     */
-    async executeR2ROperatorForTopic(topic: string, chunks: string[]): Promise<number | null> {
-        this.logger.log(`Executing the R2R Operator for topic ${topic} with ${chunks.length} chunks`);
-
-        const store = new N3.Store();
-        const parser = new N3.Parser();
-        
-        // Filter out plain numeric values that might be duplicates of RDF values
-        // Only process chunks that look like RDF (contain URIs and predicates)
-        const rdfChunks = chunks.filter(chunk => {
-            let chunkString = chunk;
-            // Handle JSON-wrapped chunks
-            try {
-                if (chunkString.startsWith('"') && chunkString.endsWith('"')) {
-                    chunkString = JSON.parse(chunkString);
-                }
-            } catch (e) {
-                // If it's not JSON, use as-is
-            }
-            
-            // Check if chunk contains RDF patterns (URIs and predicates)
-            // Skip plain numeric values that are likely duplicates
-            const isRDF = chunkString.includes('https://') && chunkString.includes('hasValue');
-            const isPlainNumber = /^-?\d+\.?\d*$/.test(chunkString.trim());
-            
-            if (isPlainNumber) {
-                this.logger.log(`DEBUG: Filtering out plain numeric duplicate for ${topic}: ${chunkString}`);
-                return false; // Skip plain numbers
-            }
-            
-            return isRDF; // Only process RDF chunks
-        });
-        
-        this.logger.log(`DEBUG: Filtered ${chunks.length} chunks down to ${rdfChunks.length} RDF chunks for topic ${topic}`);
-        
-        for (const chunk of rdfChunks) {
-            let chunkString = chunk;
-            // If chunk is a JSON string, parse it
-            try {
-                if (chunkString.startsWith('"') && chunkString.endsWith('"')) {
-                    chunkString = JSON.parse(chunkString);
-                }
-            } catch (e) {
-                this.logger.log(`DEBUG: Could not JSON.parse chunk for ${topic}: ${chunkString}`);
-            }
-            try {
-                const quads = parser.parse(chunkString);
-                store.addQuads(quads);
-            } catch (e) {
-                this.logger.log(`DEBUG: Could not parse chunk as Turtle for ${topic}: ${chunkString}`);
-            }
-        }
-        
-        if (store.size === 0) {
-            this.logger.log(`No valid RDF data found for topic ${topic}`);
-            return null;
-        }
-        
-        this.logger.log(`Topic ${topic} RDF store contents: ${storeToString(store)}`);
-        const detectAggregationFunction = this.detectAggregationFunction(this.outputQuery);
-        if (!detectAggregationFunction) {
-            console.error(`No aggregation function detected in the output query for topic ${topic}.`);
-            return null;
-        }
-        const aggregationSPARQLQuery = this.getAggregationSPARQLQuery(detectAggregationFunction, 'o');
-        if (!aggregationSPARQLQuery) {
-            console.error(`Failed to generate aggregation SPARQL query for topic ${topic}.`);
-            return null;
-        }
-        this.logger.log(`Generated Aggregation SPARQL Query for ${topic}: ${aggregationSPARQLQuery}`);
-        
-        return new Promise<number | null>((resolve) => {
-            const r2rOperator = new R2ROperator(aggregationSPARQLQuery);
-            r2rOperator.execute(store).then(bindingStream => {
-                if (!bindingStream) {
-                    console.error(`Failed to execute R2R Operator for topic ${topic}.`);
-                    resolve(null);
-                    return;
-                }
-                bindingStream.on('data', (data: any) => {
-                    const resultValue = data.get('result').value;
-                    this.logger.log(`R2R Operator Data Received for ${topic}: ${JSON.stringify(data)}`);
-                    const numericResult = parseFloat(resultValue);
-                    resolve(numericResult);
-                });
-                bindingStream.on('error', (error: any) => {
-                    console.error(`R2R Operator error for topic ${topic}:`, error);
-                    resolve(null);
-                });
-            }).catch(error => {
-                console.error(`R2R Operator execution failed for topic ${topic}:`, error);
-                resolve(null);
-            });
-        });
-    }
-
-    /**
-     * Publish combined results from all topics
-     * @param finalResult
-     */
-    publishCombinedResults(finalResult: any): void {
-        const rsp_client = mqtt.connect(this.mqttBroker);
-        rsp_client.on('connect', () => {
-            // Publish to chunked/output topic to differentiate from other approaches
-            rsp_client.publish('chunked/output', JSON.stringify(finalResult), { qos: 1 }, (error) => {
-                if (error) {
-                    console.error('Failed to publish chunked results:', error);
-                    this.logger.log(`Failed to publish chunked results: ${error}`);
-                } else {
-                    console.log('Successfully published chunked results to chunked/output');
-                    this.logger.log('Successfully published chunked results to chunked/output');
-                }
-                rsp_client.end();
-            });
-        });
-    }
-
-
+    return missing;
+  }
 }
 
 /**
  *
  */
 function uuidv4() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-        const r = Math.random() * 16 | 0;
-        const v = c === 'x' ? r : (r & 0x3 | 0x8);
-        return v.toString(16);
-    });
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }

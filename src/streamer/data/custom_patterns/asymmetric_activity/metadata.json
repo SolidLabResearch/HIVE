@@ -1,0 +1,34 @@
+{
+  "pattern": "asymmetric_activity",
+  "description": "Asymmetric Activity",
+  "parameters": {
+    "segments": [
+      {
+        "start": 0,
+        "end": 40,
+        "value": -23
+      },
+      {
+        "start": 40,
+        "end": 55,
+        "value": -8
+      },
+      {
+        "start": 55,
+        "end": 95,
+        "value": -23
+      },
+      {
+        "start": 95,
+        "end": 120,
+        "value": -15
+      }
+    ]
+  },
+  "duration_seconds": 120,
+  "sampling_rate_hz": 4,
+  "total_points": 480,
+  "random_seed": 20260716,
+  "random_source": "seeded_mulberry32",
+  "generated_at": "2026-07-17T07:15:56.879Z"
+}

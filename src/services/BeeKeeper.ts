@@ -30,10 +30,22 @@ export class BeeKeeper {
      * @param {string }r2s_topic - The topic to which the results will be published.
      * @returns {void} - No return value.
      */
-    public executeQuery(query: string, r2s_topic: string, operator: string, subQueries?: string[]) {
+    public executeQuery(
+        query: string,
+        r2s_topic: string,
+        operator: string,
+        subQueries?: string[],
+        additionalEnv?: Record<string, string>,
+        callbacks?: {
+            onMessage?: (message: unknown) => void;
+            onExit?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
+            onError?: (error: Error) => void;
+        },
+    ) {
         const query_hash = hash_string_md5(query);
-        const worker = new HiveQueryBee(query, r2s_topic, operator, subQueries);
+        const worker = new HiveQueryBee(query, r2s_topic, operator, subQueries, additionalEnv, callbacks);
         this.bees.set(query_hash, worker);
+        return worker;
     }    /**
      * Stop a query by terminating the corresponding HiveQueryBee worker.
      * The worker is identified by the unique hash generated
@@ -54,5 +66,27 @@ export class BeeKeeper {
             throw new Error("Worker not found for the given query");
 
         }
+    }
+
+    public kill(signal?: NodeJS.Signals): void {
+        for (const worker of this.bees.values()) {
+            try {
+                worker.kill(signal);
+            } catch (e) {
+                console.error("Error killing worker:", e);
+            }
+        }
+        this.bees.clear();
+    }
+
+    public async stop(): Promise<void> {
+        for (const worker of this.bees.values()) {
+            try {
+                worker.stop();
+            } catch (e) {
+                console.error("Error stopping worker:", e);
+            }
+        }
+        this.bees.clear();
     }
 }

@@ -1,0 +1,2171 @@
+#!/usr/bin/env node
+
+/**
+ * Custom Pattern Analysis - All Approaches
+ *
+ * Tests all three approaches (Fetching, Approximation, Chunked) across representative
+ * and stress custom patterns.
+ * 1. Low Variability (μ=-23.0, σ=0.25)
+ * 2. Step Pattern (v1=-23.0, v2=-15.0, t_step=60s)
+ * 3. Spike Pattern (v_base=-23.0, v_spike=-5.0, Δt=1.25s)
+ * 4. Low Freq. Oscillation (μ=-23.0, A=5.0, f=0.05Hz)
+ * 5. High Freq. Oscillation (μ=-23.0, A=3.0, f=0.5Hz)
+ *
+ * Measures:
+ * - Accuracy (MAPE, MAE, RMSE)
+ * - First-event latency
+ * - Resource usage (CPU, memory)
+ *
+ * Usage:
+ *   node run-custom-patterns-comparison.js                    # Run all patterns (default 35 iterations)
+ *   node run-custom-patterns-comparison.js --iterations 10    # Run with 10 iterations
+ *   node run-custom-patterns-comparison.js --retries 1        # Retry failed cases once
+ *   node run-custom-patterns-comparison.js -i 35              # Short flag
+ *   node run-custom-patterns-comparison.js low_variability    # Run specific pattern
+ */
+
+const { execFileSync, spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const { createBenchmarkReplayRunEnv } = require("../utils/benchmarkReplayEnv");
+const { finalizeMqttTrafficArtifacts } = require("../../dist/util/mqttTraffic");
+const {
+  cleanupStaleBenchmarkProcesses,
+  delay,
+  terminateChildProcessTree,
+} = require("../utils/processCleanup");
+const {
+  ProcessTreeTracker,
+  collectTreeMetrics,
+  summarizeResourceSamples,
+} = require("../utils/processTreeMetrics");
+
+const SMOKE_PATTERN_TYPE = "low_variability";
+const SMOKE_APPROACHES = ["fetching", "approximation"];
+const ALL_PATTERN_TYPES = [
+  "low_variability",
+  "step_pattern",
+  "spike_pattern",
+  "low_freq_oscillation",
+  "high_freq_oscillation",
+  "spike_boundary_short",
+  "spike_boundary_medium",
+  "spike_asymmetric_long",
+  "late_burst",
+  "multiple_bursts",
+  "step_misaligned_45",
+  "step_misaligned_75",
+  "linear_ramp",
+  "asymmetric_activity",
+];
+const ALL_APPROACHES = [
+  "fetching",
+  "naive_distributed",
+  "approximation",
+  "chunked",
+];
+
+function resolveMaybeRelativePath(inputPath) {
+  return path.isAbsolute(inputPath)
+    ? inputPath
+    : path.resolve(process.cwd(), inputPath);
+}
+
+function extractFirstDatasetTimestampMs(filePath) {
+  const content = fs.readFileSync(filePath, "utf8");
+  const matches = content.matchAll(
+    /<https:\/\/saref\.etsi\.org\/core\/hasTimestamp>\s+"([^"]+)"/g,
+  );
+
+  let firstTimestamp = null;
+  for (const match of matches) {
+    const epoch = Date.parse(match[1]);
+    if (!Number.isFinite(epoch)) {
+      continue;
+    }
+    if (firstTimestamp === null || epoch < firstTimestamp) {
+      firstTimestamp = epoch;
+    }
+  }
+
+  return firstTimestamp;
+}
+
+function extractDatasetTimestampBoundsMs(filePath) {
+  const content = fs.readFileSync(filePath, "utf8");
+  const matches = content.matchAll(
+    /<https:\/\/saref\.etsi\.org\/core\/hasTimestamp>\s+"([^"]+)"/g,
+  );
+
+  let minTimestamp = null;
+  let maxTimestamp = null;
+  for (const match of matches) {
+    const epoch = Date.parse(match[1]);
+    if (!Number.isFinite(epoch)) {
+      continue;
+    }
+    if (minTimestamp === null || epoch < minTimestamp) {
+      minTimestamp = epoch;
+    }
+    if (maxTimestamp === null || epoch > maxTimestamp) {
+      maxTimestamp = epoch;
+    }
+  }
+
+  return {
+    minTimestamp,
+    maxTimestamp,
+    durationMs:
+      minTimestamp !== null && maxTimestamp !== null
+        ? maxTimestamp - minTimestamp
+        : null,
+  };
+}
+
+function parseSelectionList(value, allowedValues) {
+  if (!value) {
+    return null;
+  }
+
+  const entries = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const filtered = entries.filter((entry) => allowedValues.includes(entry));
+  return [...new Set(filtered)];
+}
+
+function sumNumericFields(records, fieldNames) {
+  const result = {};
+  for (const fieldName of fieldNames) {
+    result[fieldName] = records.reduce(
+      (sum, record) =>
+        sum + (Number.isFinite(Number(record?.[fieldName])) ? Number(record[fieldName]) : 0),
+      0,
+    );
+  }
+  return result;
+}
+
+function buildProfileAggregate(logDir, metadata = {}) {
+  if (!fs.existsSync(logDir)) {
+    return null;
+  }
+
+  const profileFiles = fs
+    .readdirSync(logDir)
+    .filter(
+      (fileName) =>
+        /^hive_profile_summary\.[^.]+\.json$/.test(fileName) &&
+        fileName !== "hive_profile_summary.aggregate.json",
+    )
+    .sort();
+
+  const processProfiles = profileFiles.map((fileName) => {
+    const filePath = path.join(logDir, fileName);
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return {
+      fileName,
+      filePath: path.resolve(filePath),
+      ...parsed,
+    };
+  });
+
+  const summedCounterNames = [
+    "compatible_queries_detected",
+    "original_agent_outputs_derived_from_chunks",
+    "original_agent_rsps_skipped",
+    "fallback_original_agent_rsps_started",
+    "shared_chunk_producers_created",
+    "chunk_state_messages_published",
+    "chunk_consumers_registered",
+    "rsp_engines_created",
+    "mqtt_clients_created",
+    "emitted_results",
+    "reconstructed_superquery_results",
+  ];
+
+  const aggregate = {
+    timestamp: new Date().toISOString(),
+    approach: metadata.approach || null,
+    pattern: metadata.pattern || null,
+    iteration: metadata.iteration ?? null,
+    logDir: path.resolve(logDir),
+    processCount: processProfiles.length,
+    processProfiles: processProfiles.map((profile) => ({
+      fileName: profile.fileName,
+      filePath: profile.filePath,
+      pid: profile.processId,
+      processRole: profile.processRole || null,
+      processRoleGroup: profile.processRoleGroup || null,
+      approach: profile.approach || metadata.approach || null,
+      pattern: profile.pattern || metadata.pattern || null,
+      iteration: profile.iteration || metadata.iteration || null,
+      counters: profile.counters || {},
+      timingsMs: profile.timingsMs || {},
+      compatible_queries_detected: Number(profile.compatible_queries_detected || 0),
+      original_agent_outputs_derived_from_chunks: Number(
+        profile.original_agent_outputs_derived_from_chunks || 0,
+      ),
+      original_agent_rsps_skipped: Number(profile.original_agent_rsps_skipped || 0),
+      fallback_original_agent_rsps_started: Number(
+        profile.fallback_original_agent_rsps_started || 0,
+      ),
+      shared_chunk_producers_created: Number(
+        profile.shared_chunk_producers_created || 0,
+      ),
+      chunk_state_messages_published: Number(
+        profile.chunk_state_messages_published || 0,
+      ),
+      chunk_consumers_registered: Number(profile.chunk_consumers_registered || 0),
+      rsp_engines_created: Number(profile.rsp_engines_created || 0),
+      mqtt_clients_created: Number(profile.mqtt_clients_created || 0),
+      emitted_results: Number(profile.emitted_results || 0),
+      reconstructed_superquery_results: Number(
+        profile.reconstructed_superquery_results || 0,
+      ),
+    })),
+    countersByProcessRole: Object.fromEntries(
+      processProfiles.map((profile) => [
+        profile.processRoleGroup || profile.processRole || "unknown",
+        {
+          pid: profile.processId,
+          processRole: profile.processRole || null,
+          approach: profile.approach || metadata.approach || null,
+          pattern: profile.pattern || metadata.pattern || null,
+          iteration: profile.iteration || metadata.iteration || null,
+          counters: profile.counters || {},
+          timingsMs: profile.timingsMs || {},
+          compatible_queries_detected: Number(profile.compatible_queries_detected || 0),
+          original_agent_outputs_derived_from_chunks: Number(
+            profile.original_agent_outputs_derived_from_chunks || 0,
+          ),
+          original_agent_rsps_skipped: Number(profile.original_agent_rsps_skipped || 0),
+          fallback_original_agent_rsps_started: Number(
+            profile.fallback_original_agent_rsps_started || 0,
+          ),
+          shared_chunk_producers_created: Number(
+            profile.shared_chunk_producers_created || 0,
+          ),
+          chunk_state_messages_published: Number(
+            profile.chunk_state_messages_published || 0,
+          ),
+          chunk_consumers_registered: Number(profile.chunk_consumers_registered || 0),
+          rsp_engines_created: Number(profile.rsp_engines_created || 0),
+          mqtt_clients_created: Number(profile.mqtt_clients_created || 0),
+          emitted_results: Number(profile.emitted_results || 0),
+          reconstructed_superquery_results: Number(
+            profile.reconstructed_superquery_results || 0,
+          ),
+        },
+      ]),
+    ),
+    summedCounters: sumNumericFields(processProfiles, summedCounterNames),
+  };
+
+  const aggregatePath = path.join(logDir, "hive_profile_summary.aggregate.json");
+  fs.writeFileSync(aggregatePath, `${JSON.stringify(aggregate, null, 2)}\n`);
+  return {
+    aggregatePath: path.resolve(aggregatePath),
+    processProfiles: aggregate.processProfiles,
+    summedCounters: aggregate.summedCounters,
+  };
+}
+
+class AttemptResourceSampler {
+  constructor(logDir, options = {}) {
+    this.logDir = logDir;
+    this.sampleIntervalMs = options.sampleIntervalMs || 500;
+    this.getRootPids = options.getRootPids || (() => []);
+    this.startedAt = null;
+    this.samples = [];
+    this.timer = null;
+    this.stopped = false;
+    this.running = false;
+    this.pidSamples = new Map();
+    this.tracker = new ProcessTreeTracker();
+  }
+
+  start() {
+    if (this.timer) {
+      return;
+    }
+
+    this.startedAt = Date.now();
+    this.timer = setInterval(() => {
+      void this.sample();
+    }, this.sampleIntervalMs);
+    this.timer.unref?.();
+    void this.sample();
+  }
+
+  async sample() {
+    if (this.stopped || this.running) {
+      return;
+    }
+
+    this.running = true;
+    try {
+      const timestamp = Date.now();
+      const elapsedMs = this.startedAt ? timestamp - this.startedAt : 0;
+      const stats = collectTreeMetrics(this.getRootPids(), this.tracker, timestamp, elapsedMs);
+      if (!stats) {
+        return;
+      }
+
+      this.samples.push({
+        timestamp,
+        elapsedMs,
+        ...stats,
+      });
+      for (const proc of stats.tree || []) {
+        const bucket = this.pidSamples.get(proc.pid) || [];
+        bucket.push({
+          timestamp,
+          elapsedMs,
+          pid: proc.pid,
+          ppid: proc.ppid,
+          cpuPct: proc.cpuPct,
+          rssMb: proc.rssKb / 1024,
+          command: proc.command,
+        });
+        this.pidSamples.set(proc.pid, bucket);
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  summarize() {
+    const wallTimeMs = this.startedAt ? Date.now() - this.startedAt : 0;
+    const resource = summarizeResourceSamples(this.samples);
+
+    return {
+      sampleIntervalMs: this.sampleIntervalMs,
+      sampleCount: resource.sampleCount,
+      wallTimeMs,
+      wallTimeSec: wallTimeMs / 1000,
+      meanCpuPct: resource.meanCpuPct,
+      peakCpuPct: resource.peakCpuPct,
+      cpuSeconds: resource.cpuSeconds,
+      meanRssMb: resource.meanRssMb,
+      peakRssMb: resource.peakRssMb,
+      peakProcessCount: resource.peakProcessCount,
+      cpuAccountingNegativeDeltaCount: this.tracker.negativeDeltaEvents.length,
+    };
+  }
+
+  writeArtifacts(metadata = {}) {
+    if (!fs.existsSync(this.logDir)) {
+      fs.mkdirSync(this.logDir, { recursive: true });
+    }
+
+    const csvPath = path.join(this.logDir, "resource_usage.csv");
+    const summaryPath = path.join(this.logDir, "resource_summary.json");
+    const perPidPath = path.join(this.logDir, "resource_per_pid_summary.json");
+    const lines = [
+      "timestamp,elapsed_ms,root_pid_count,process_count,total_cpu_pct,total_rss_mb,peak_rss_mb,tree_cpu_seconds,tree_cpu_seconds_delta,tree_cpu_seconds_raw_snapshot",
+      ...this.samples.map((sample) =>
+        [
+          sample.timestamp,
+          sample.elapsedMs,
+          sample.rootPids.length,
+          sample.processCount,
+          sample.totalCpuPct.toFixed(4),
+          sample.totalRssMb.toFixed(3),
+          sample.peakRssMb.toFixed(3),
+          sample.treeCpuSeconds.toFixed(6),
+          sample.treeCpuSecondsDelta.toFixed(6),
+          sample.treeCpuSecondsRawSnapshot.toFixed(6),
+        ].join(",")
+      ),
+    ];
+
+    fs.writeFileSync(csvPath, `${lines.join("\n")}\n`);
+    const pidMetadata = this.readPidMetadata();
+    const perPidCpuSeconds = new Map(
+      this.tracker.getPerPidSummary().map((entry) => [entry.pid, entry.cpuSeconds]),
+    );
+    const perPidSummary = Array.from(this.pidSamples.entries())
+      .map(([pid, samples]) => {
+        const sampleCount = samples.length;
+        const meanCpuPct = sampleCount > 0
+          ? samples.reduce((sum, sample) => sum + sample.cpuPct, 0) / sampleCount
+          : 0;
+        const peakCpuPct = sampleCount > 0
+          ? Math.max(...samples.map((sample) => sample.cpuPct))
+          : 0;
+        const meanRssMb = sampleCount > 0
+          ? samples.reduce((sum, sample) => sum + sample.rssMb, 0) / sampleCount
+          : 0;
+        const peakRssMb = sampleCount > 0
+          ? Math.max(...samples.map((sample) => sample.rssMb))
+          : 0;
+        const wallTimeSec = sampleCount > 1
+          ? (samples[samples.length - 1].elapsedMs - samples[0].elapsedMs) / 1000
+          : 0;
+        const meta = pidMetadata.get(pid) || null;
+        return {
+          pid,
+          ppid: samples[0]?.ppid ?? null,
+          role: meta?.role || this.inferRole(pid, samples[0]?.ppid, metadata),
+          command: meta?.command || samples[0]?.command || "",
+          sampleCount,
+          wallTimeSec,
+          cpuSeconds: perPidCpuSeconds.get(pid) ?? 0,
+          meanCpuPct,
+          peakCpuPct,
+          meanRssMb,
+          peakRssMb,
+        };
+      })
+      .sort((a, b) => b.cpuSeconds - a.cpuSeconds);
+    fs.writeFileSync(perPidPath, JSON.stringify(perPidSummary, null, 2));
+    fs.writeFileSync(
+      summaryPath,
+      JSON.stringify(
+        {
+          ...metadata,
+          ...this.summarize(),
+          csvPath: path.resolve(csvPath),
+          summaryPath: path.resolve(summaryPath),
+          perPidSummaryPath: path.resolve(perPidPath),
+        },
+        null,
+        2,
+      ),
+    );
+
+    return { csvPath, summaryPath, perPidPath };
+  }
+
+  readPidMetadata() {
+    const results = new Map();
+    if (!fs.existsSync(this.logDir)) {
+      return results;
+    }
+    for (const fileName of fs.readdirSync(this.logDir)) {
+      if (!/^resource_trace_process_\\d+\\.json$/.test(fileName)) {
+        continue;
+      }
+      try {
+        const meta = JSON.parse(
+          fs.readFileSync(path.join(this.logDir, fileName), "utf8"),
+        );
+        if (Number.isFinite(meta?.pid)) {
+          results.set(meta.pid, meta);
+        }
+      } catch (_err) {
+      }
+    }
+    return results;
+  }
+
+  inferRole(pid, ppid, metadata = {}) {
+    if (pid === metadata.approachPid) {
+      return "approach_orchestrator";
+    }
+    if (pid === metadata.publisherPid) {
+      return "publisher";
+    }
+    if (ppid === metadata.approachPid) {
+      return "approach_child";
+    }
+    if (ppid === metadata.publisherPid) {
+      return "publisher_child";
+    }
+    return "unknown";
+  }
+
+  async stop(metadata = {}) {
+    if (this.stopped) {
+      return this.writeArtifacts(metadata);
+    }
+
+    this.stopped = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+
+    await this.sample();
+    return this.writeArtifacts(metadata);
+  }
+}
+
+function inferTerminationReason(result) {
+  if (result?.terminationReason) {
+    return result.terminationReason;
+  }
+
+  if (result?.extractionStatus && !["success", "skipped"].includes(result.extractionStatus)) {
+    return "extraction_failed";
+  }
+
+  if (result?.reachedDurationLimit) {
+    return "duration_limit_reached";
+  }
+
+  if (result?.benchmarkStatus === "interrupted") {
+    return "manual_interrupt";
+  }
+
+  if (result?.benchmarkStatus === "completed") {
+    return "process_exit";
+  }
+
+  if (result?.timedOut) {
+    return "startup_timeout";
+  }
+
+  if (result?.benchmarkStatus === "failed" || result?.error) {
+    return "process_error";
+  }
+
+  return "process_exit";
+}
+
+class CustomPatternComparisonRunner {
+  constructor(iterations = 35, options = {}) {
+    this.iterations = iterations;
+    this.smokeMode = Boolean(options.smokeMode ?? process.env.PAPER_BENCHMARK_SMOKE === "1");
+    this.retries = resolveRetryCount(options.retries, process.env.CUSTOM_PATTERN_RETRIES);
+    this.allApproaches = ALL_APPROACHES;
+    this.allPatterns = [
+      {
+        type: "low_variability",
+        name: "Low Variability",
+        params: "μ=-23.0, σ=0.25",
+      },
+      {
+        type: "step_pattern",
+        name: "Step Pattern",
+        params: "v₁=-23.0, v₂=-15.0, t_step=60s",
+      },
+      {
+        type: "spike_pattern",
+        name: "Spike Pattern",
+        params: "v_base=-23.0, v_spike=-5.0, Δt=1.25s",
+      },
+      {
+        type: "low_freq_oscillation",
+        name: "Low Freq. Oscillation",
+        params: "μ=-23.0, A=5.0, f=0.05Hz",
+      },
+      {
+        type: "high_freq_oscillation",
+        name: "High Freq. Oscillation",
+        params: "μ=-23.0, A=3.0, f=0.5Hz",
+      },
+      {
+        type: "spike_boundary_short",
+        name: "Spike Boundary Short",
+        params: "baseline=-23.0, spike=-5.0, start=59s, duration=4s",
+      },
+      {
+        type: "spike_boundary_medium",
+        name: "Spike Boundary Medium",
+        params: "baseline=-23.0, spike=-5.0, start=55s, duration=10s",
+      },
+      {
+        type: "spike_asymmetric_long",
+        name: "Spike Asymmetric Long",
+        params: "baseline=-23.0, spike=-5.0, start=50s, duration=20s",
+      },
+      {
+        type: "late_burst",
+        name: "Late Burst",
+        params: "baseline=-23.0, burst=-5.0, start=85s, duration=20s",
+      },
+      {
+        type: "multiple_bursts",
+        name: "Multiple Bursts",
+        params: "baseline=-23.0, burst=-5.0, bursts=25-35s and 85-95s",
+      },
+      {
+        type: "step_misaligned_45",
+        name: "Step Misaligned 45",
+        params: "v₁=-23.0, v₂=-15.0, t_step=45s",
+      },
+      {
+        type: "step_misaligned_75",
+        name: "Step Misaligned 75",
+        params: "v₁=-23.0, v₂=-15.0, t_step=75s",
+      },
+      {
+        type: "linear_ramp",
+        name: "Linear Ramp",
+        params: "start=-23.0, end=-11.0, duration=120s",
+      },
+      {
+        type: "asymmetric_activity",
+        name: "Asymmetric Activity",
+        params: "0-40:-23.0, 40-55:-8.0, 55-95:-23.0, 95-120:-15.0",
+      },
+    ];
+    this.selectedPatternTypes = Array.isArray(options.patternTypes) && options.patternTypes.length > 0
+      ? [...options.patternTypes]
+      : parseSelectionList(
+        process.env.CUSTOM_PATTERN_SELECTED_PATTERNS,
+        ALL_PATTERN_TYPES,
+      );
+    this.selectedApproaches = Array.isArray(options.approachNames) && options.approachNames.length > 0
+      ? [...options.approachNames]
+      : parseSelectionList(
+        process.env.CUSTOM_PATTERN_SELECTED_APPROACHES,
+        ALL_APPROACHES,
+      );
+    this.activeAttemptCleanup = null;
+    this.shutdownInProgress = false;
+    this.targetWindowCount = Number.isFinite(options.targetWindowCount)
+      ? options.targetWindowCount
+      : null;
+
+    const baseApproaches = this.smokeMode ? SMOKE_APPROACHES : this.allApproaches;
+    const smokePattern = this.allPatterns.find((pattern) => pattern.type === SMOKE_PATTERN_TYPE);
+    const basePatterns = this.smokeMode
+      ? (smokePattern ? [smokePattern] : [])
+      : this.allPatterns;
+
+    this.patterns = this.selectedPatternTypes
+      ? this.selectedPatternTypes
+        .map((patternType) => basePatterns.find((pattern) => pattern.type === patternType))
+        .filter(Boolean)
+      : basePatterns;
+    this.approaches = this.selectedApproaches
+      ? this.selectedApproaches.filter((approach) => baseApproaches.includes(approach))
+      : baseApproaches;
+    this.replayEnv = createBenchmarkReplayRunEnv(process.env);
+
+    this.baseLogDir = options.outputDir
+      ? resolveMaybeRelativePath(options.outputDir)
+      : resolveMaybeRelativePath(
+        process.env.CUSTOM_PATTERN_OUTPUT_DIR || "./logs/custom-pattern-comparison",
+      );
+    this.timeout = resolvePatternTestTimeoutMs(options.patternTestTimeoutMs, this.smokeMode);
+    this.installSignalHandlers();
+  }
+
+  getIterationRootDir(approach, patternName, iterationNum) {
+    return path.join(
+      this.baseLogDir,
+      approach,
+      patternName,
+      `iteration${iterationNum}`,
+    );
+  }
+
+  getAttemptLogDir(approach, patternName, iterationNum, attemptNumber) {
+    const iterationRootDir = this.getIterationRootDir(approach, patternName, iterationNum);
+    if (this.retries <= 0) {
+      return iterationRootDir;
+    }
+    return path.join(iterationRootDir, `attempt${attemptNumber}`);
+  }
+
+  getDataPath(pattern) {
+    return `custom_patterns/${pattern.type}`;
+  }
+
+  getPatternName(pattern) {
+    return pattern.type;
+  }
+
+  getApproachScript(approach) {
+    const scripts = {
+      fetching:
+        "dist/approaches/StreamingQueryFetchingClientSideApproachOrchestrator.js",
+      // Reusable approaches must go through production /register so HIVE owns
+      // the final shared producer/reconstruction topology.  The legacy
+      // orchestrators remain intentionally unused here.
+      approximation: "experiments/pattern-analysis/run-production-pattern-runtime.js",
+      chunked: "experiments/pattern-analysis/run-production-pattern-runtime.js",
+      naive_distributed: "dist/approaches/StreamingQueryNaiveDistributedApproachOrchestrator.js",
+    };
+    return scripts[approach];
+  }
+
+  cleanupStaleProcesses() {
+    return cleanupStaleBenchmarkProcesses({ logger: (message) => console.log(message) });
+  }
+
+  installSignalHandlers() {
+    if (CustomPatternComparisonRunner.signalHandlersInstalled) {
+      return;
+    }
+
+    CustomPatternComparisonRunner.signalHandlersInstalled = true;
+
+    const handleSignal = (signal, exitCode) => {
+      void (async () => {
+        if (this.shutdownInProgress) {
+          return;
+        }
+        this.shutdownInProgress = true;
+        console.log(`Received ${signal}; cleaning up benchmark processes...`);
+        await this.cleanupActiveAttempt();
+        await this.cleanupStaleProcesses();
+        process.exit(exitCode);
+      })();
+    };
+
+    process.on("SIGINT", () => handleSignal("SIGINT", 130));
+    process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
+  }
+
+  async cleanupActiveAttempt() {
+    const cleanup = this.activeAttemptCleanup;
+    if (!cleanup) {
+      return;
+    }
+
+    this.activeAttemptCleanup = null;
+    await cleanup();
+  }
+
+  cleanupAttemptArtifacts(logDir, iterationRootDir) {
+    if (fs.existsSync(logDir)) {
+      fs.rmSync(logDir, { recursive: true, force: true });
+    }
+
+    const rootArtifacts = [
+      "streaming_query_chunk_aggregator_log.csv",
+      "chunked_latency_log.csv",
+      "chunked_parent_partial_latency_log.csv",
+      "chunked_window_diagnostics.csv",
+      "chunked_results.csv",
+      "chunked_metadata.json",
+      "fetching_client_side_log.csv",
+      "fetching_latency_log.csv",
+      "fetching_window_diagnostics.csv",
+      "fetching_resource_usage.csv",
+      "fetching_results.csv",
+      "fetching_metadata.json",
+      "approximation_approach_log.csv",
+      "approximation_latency_log.csv",
+      "approximation_approach_resource_usage.csv",
+      "approximation_results.csv",
+      "approximation_metadata.json",
+      "naive_distributed_approach_log.csv",
+      "naive_distributed_latency_log.csv",
+      "naive_distributed_approach_resource_usage.csv",
+      "naive_distributed_results.csv",
+      "naive_distributed_metadata.json",
+      "streaming_query_hive_resource_log.csv",
+      "replayer-log.csv",
+    ];
+
+    for (const fileName of rootArtifacts) {
+      const filePath = path.join(iterationRootDir, fileName);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+  }
+
+  cleanupApproximationScratchFiles() {
+    const scratchFiles = [
+      "approximation_approach_log.csv",
+      "approximation_latency_log.csv",
+      "approximation_approach_resource_usage.csv",
+    ];
+
+    for (const fileName of scratchFiles) {
+      if (!fs.existsSync(fileName)) {
+        continue;
+      }
+
+      fs.rmSync(fileName, { force: true });
+      console.log(`[cleanup] approximation-scratch removed=${fileName}`);
+    }
+  }
+
+  async runSingleTest(approach, pattern, iterationNum = 1, attemptNumber = 1) {
+    const lifecycleTs = () => new Date().toISOString();
+    const lifecycleLog = (event, details = {}) => {
+      const parts = Object.entries(details)
+        .filter(([, value]) => value !== undefined && value !== null && value !== "")
+        .map(([key, value]) => `${key}=${value}`);
+      const suffix = parts.length > 0 ? ` ${parts.join(" ")}` : "";
+      console.log(`[lifecycle ${lifecycleTs()}] ${event}${suffix}`);
+    };
+
+    lifecycleLog("runSingleTest.entered", {
+      approach,
+      pattern: pattern?.type,
+      iteration: iterationNum,
+      attempt: attemptNumber,
+    });
+    await this.cleanupStaleProcesses();
+    const patternName = this.getPatternName(pattern);
+    const dataPath = this.getDataPath(pattern);
+
+    console.log(`\n${"=".repeat(80)}`);
+    console.log(
+      `TESTING: ${approach.toUpperCase()} - ${pattern.name} - Iteration ${iterationNum}/${this.iterations}`,
+    );
+    console.log(`Attempt: ${attemptNumber}/${this.retries + 1}`);
+    console.log(`Pattern: ${pattern.params}`);
+    console.log(`Data: ${dataPath}`);
+    console.log("=".repeat(80));
+
+    const iterationRootDir = this.getIterationRootDir(approach, patternName, iterationNum);
+    const logDir = this.getAttemptLogDir(approach, patternName, iterationNum, attemptNumber);
+    const expectedResultPaths = {
+      extractionSummary: path.join(logDir, `${approach}_results.csv`),
+      attemptMetadata: path.join(logDir, "attempt_metadata.json"),
+      publisherLog: path.join(logDir, "publisher.log"),
+      orchestratorLog: path.join(logDir, `${approach}_orchestrator.log`),
+    };
+    lifecycleLog("runSingleTest.paths", {
+      attemptDir: logDir,
+      iterationRootDir,
+      expectedResultPaths: JSON.stringify(expectedResultPaths),
+      });
+      this.cleanupAttemptArtifacts(logDir, iterationRootDir);
+      if (approach === "approximation") {
+        this.cleanupApproximationScratchFiles();
+      }
+      if (!fs.existsSync(iterationRootDir)) {
+        fs.mkdirSync(iterationRootDir, { recursive: true });
+      }
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+
+    // Check if data exists
+    const smartphoneDataPath = path.join(
+      "src/streamer/data",
+      dataPath,
+      "smartphone.acceleration.x",
+      "data.nt",
+    );
+    if (!fs.existsSync(smartphoneDataPath)) {
+      console.log(`⚠️  Data not found: ${smartphoneDataPath}`);
+      console.log(
+        `\n💡 Generate data first: node scripts/generate-custom-patterns.js\n`,
+      );
+      return { success: false, error: "Data not found" };
+    }
+
+    const benchmarkEventTimeAnchor =
+      extractFirstDatasetTimestampMs(smartphoneDataPath);
+    if (!Number.isFinite(benchmarkEventTimeAnchor)) {
+      return {
+        success: false,
+        error: `Unable to derive first dataset timestamp from ${smartphoneDataPath}`,
+      };
+    }
+
+    const attemptId = `${approach}-${patternName}-iter${iterationNum}-attempt${attemptNumber}`;
+    const topicPrefix = `bench/${attemptId}`;
+    const timestampBounds = extractDatasetTimestampBoundsMs(smartphoneDataPath);
+    const timestampDomainMin = benchmarkEventTimeAnchor;
+
+    const targetWindowsStr = this.targetWindowCount
+      ? String(this.targetWindowCount)
+      : (process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "35");
+    const targetWindows = parseInt(targetWindowsStr, 10);
+    const outputWindowRangeMs = parseInt(process.env.OUTPUT_WINDOW_RANGE || "120000", 10);
+    const outputWindowStepMs = parseInt(process.env.OUTPUT_WINDOW_STEP || "60000", 10);
+    const derivedReplayDurationSeconds = Math.ceil(
+      (outputWindowRangeMs + ((targetWindows + 2) * outputWindowStepMs)) / 1000
+    );
+
+    const finiteReplayDurationSeconds =
+      process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS ||
+      String(derivedReplayDurationSeconds);
+    const finiteReplayExplicitlySet =
+      process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY !== undefined;
+    const finiteReplay = finiteReplayExplicitlySet
+      ? process.env.STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY
+      : "1";
+
+    const finalTestTimeoutMs = Math.max((derivedReplayDurationSeconds * 1000) + 120000, this.timeout);
+
+    const timestampDomainMax =
+      benchmarkEventTimeAnchor +
+      finalTestTimeoutMs +
+      120000 +
+      Math.max(0, timestampBounds.durationMs || 0);
+
+    const attemptMetadata = {
+      attempt_id: attemptId,
+      topic_prefix: topicPrefix,
+      benchmark_event_time_anchor: benchmarkEventTimeAnchor,
+      timestamp_domain_min: timestampDomainMin,
+      timestamp_domain_max: timestampDomainMax,
+      output_window_range: String(outputWindowRangeMs),
+      output_window_step: String(outputWindowStepMs),
+      sub_window_range: process.env.SUB_WINDOW_RANGE || "60000",
+      sub_window_step: process.env.SUB_WINDOW_STEP || "30000",
+      data_path: dataPath,
+      approach,
+      pattern: patternName,
+      iteration: iterationNum,
+      attempt: attemptNumber,
+    };
+    fs.writeFileSync(
+      path.join(logDir, "attempt_metadata.json"),
+      JSON.stringify(attemptMetadata, null, 2),
+    );
+    lifecycleLog("attempt.metadata.written", {
+      attemptDir: logDir,
+      attemptMetadataPath: path.join(logDir, "attempt_metadata.json"),
+    });
+
+    const env = this.replayEnv.withBenchmarkReplayEnv({
+      ...process.env,
+      DATA_PATH: dataPath,
+      LOG_PATH: logDir,
+      BENCHMARK_SCENARIO: "custom-pattern-comparison",
+      BENCHMARK_SCALE: patternName,
+      BENCHMARK_APPROACH: approach,
+      BENCHMARK_ITERATION: String(iterationNum),
+      STREAMING_QUERY_HIVE_BENCHMARK_TOPIC_PREFIX: topicPrefix,
+      STREAMING_QUERY_HIVE_BENCHMARK_START_TIME: String(
+        benchmarkEventTimeAnchor,
+      ),
+      STREAMING_QUERY_HIVE_BENCHMARK_EVENT_TIME_ANCHOR: String(
+        benchmarkEventTimeAnchor,
+      ),
+      STREAMING_QUERY_HIVE_TIMESTAMP_DOMAIN_MIN: String(timestampDomainMin),
+      STREAMING_QUERY_HIVE_TIMESTAMP_DOMAIN_MAX: String(timestampDomainMax),
+      STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS: targetWindowsStr,
+      STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD:
+        // The shared production reconstruction runtime requires the structured
+        // reusable-result contract; compact legacy payloads are intentionally
+        // not enabled for this benchmark.
+        process.env.STREAMING_QUERY_HIVE_COMPACT_REUSABLE_RESULT_PAYLOAD || "0",
+      STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE:
+        process.env.STREAMING_QUERY_HIVE_APPROXIMATION_COMPLETED_WINDOW_MODE || "1",
+      STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE:
+        process.env.STREAMING_QUERY_HIVE_APPROXIMATION_EARLY_TRIGGER_MODE || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_COMPARABLE_OUTPUT_ONLY || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_CADENCE_ONLY || "0",
+      STREAMING_QUERY_HIVE_CHUNKED_USE_IMMEDIATE_TRIGGER:
+        process.env.STREAMING_QUERY_HIVE_CHUNKED_USE_IMMEDIATE_TRIGGER || "1",
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY: finiteReplay,
+      STREAMING_QUERY_HIVE_BENCHMARK_FINITE_REPLAY_DURATION_SECONDS: finiteReplayDurationSeconds,
+    });
+
+    console.log(
+      `Attempt start: id=${attemptId} topicPrefix=${topicPrefix} benchmarkAnchor=${benchmarkEventTimeAnchor} timestampRewriteMode=deterministic expectedTimestampDomain=[${timestampDomainMin},${timestampDomainMax}]`,
+    );
+
+    return new Promise((resolve) => {
+      const startTime = Date.now();
+      let reachedDurationLimit = false;
+      let finalized = false;
+      let cleanupPromise = null;
+      let timeoutId = null;
+      let publisherStartTimer = null;
+      let approachProc = null;
+      let publisherProc = null;
+      const resourceMonitor = new AttemptResourceSampler(logDir, {
+        sampleIntervalMs: Number.parseInt(
+          process.env.HIVE_RESOURCE_SAMPLE_INTERVAL_MS || "500",
+          10,
+        ),
+        getRootPids: () =>
+          [approachProc?.pid, publisherProc?.pid].filter((pid) =>
+            Number.isFinite(pid),
+          ),
+      });
+      let publisherActivitySeen = false;
+      let childActivitySeen = false;
+      let lastPublisherActivityAt = null;
+      let lastChildActivityAt = null;
+      let currentWaitState = "initializing";
+
+      const cleanupAttempt = () => {
+        lifecycleLog("cleanup.start", {
+          attemptId,
+          waitState: currentWaitState,
+          lastPublisherActivityAt,
+          lastChildActivityAt,
+        });
+        if (!cleanupPromise) {
+          cleanupPromise = (async () => {
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+              timeoutId = null;
+            }
+            if (publisherStartTimer) {
+              clearTimeout(publisherStartTimer);
+              publisherStartTimer = null;
+            }
+
+            await terminateChildProcessTree(publisherProc, {
+              name: `${attemptId} publisher`,
+              logger: (message) => console.log(message),
+            });
+            await terminateChildProcessTree(approachProc, {
+              name: `${attemptId} ${approach}`,
+              logger: (message) => console.log(message),
+            });
+            await delay(500);
+            await resourceMonitor.stop({
+              attemptId,
+              approach,
+              pattern: patternName,
+              iteration: iterationNum,
+              attempt: attemptNumber,
+              approachPid: approachProc?.pid ?? null,
+              publisherPid: publisherProc?.pid ?? null,
+            });
+            lifecycleLog("cleanup.finish", {
+              attemptId,
+              waitState: currentWaitState,
+              lastPublisherActivityAt,
+              lastChildActivityAt,
+            });
+          })();
+        }
+
+        return cleanupPromise;
+      };
+
+      const finalizeAttempt = async (result) => {
+        if (finalized) {
+          return;
+        }
+        finalized = true;
+        lifecycleLog("runSingleTest.finalize.entered", {
+          attemptId,
+          benchmarkStatus: result?.benchmarkStatus,
+          extractionStatus: result?.extractionStatus,
+          finalStatus: result?.finalStatus,
+          waitState: currentWaitState,
+        });
+        this.activeAttemptCleanup = null;
+        await cleanupAttempt();
+        this.moveLogFiles(approach, logDir);
+        const mqttTrafficSummary = finalizeMqttTrafficArtifacts({ logDir });
+        const profileArtifactSummary = buildProfileAggregate(logDir, {
+          approach,
+          pattern: patternName,
+          iteration: iterationNum,
+        });
+        lifecycleLog("runSingleTest.finalize.resolved", {
+          attemptId,
+          benchmarkStatus: result?.benchmarkStatus,
+          extractionStatus: result?.extractionStatus,
+          finalStatus: result?.finalStatus,
+          waitState: currentWaitState,
+        });
+        resolve({
+          ...result,
+          mqttTrafficSummary,
+          profileArtifactSummary,
+        });
+      };
+
+      this.activeAttemptCleanup = cleanupAttempt;
+
+      // Start approach
+      console.log(`Starting ${approach} approach...`);
+      lifecycleLog("child.spawn.requested", {
+        attemptId,
+        command: `node ${this.getApproachScript(approach)}`,
+      });
+      const approachArgs = [this.getApproachScript(approach)];
+      if (["approximation", "chunked"].includes(approach)) {
+        approachArgs.push(approach);
+      }
+      approachProc = spawn("node", approachArgs, {
+        env: {
+          ...env,
+          HIVE_PROCESS_ROLE: `${approach}_orchestrator`,
+        },
+        stdio: "pipe",
+        detached: true,
+      });
+      resourceMonitor.start();
+      lifecycleLog("child.spawned", {
+        attemptId,
+        pid: approachProc.pid,
+        command: `node ${this.getApproachScript(approach)}`,
+      });
+
+      // Capture logs
+      const approachLogPath = path.join(logDir, `${approach}_orchestrator.log`);
+      const approachLogStream = fs.createWriteStream(approachLogPath);
+      approachProc.stdout.on("data", (chunk) => {
+        const ts = lifecycleTs();
+        childActivitySeen = true;
+        lastChildActivityAt = ts;
+        if (!approachProc.__lifecycleStdoutSeen) {
+          approachProc.__lifecycleStdoutSeen = true;
+          lifecycleLog("child.stdout.firstLine", {
+            attemptId,
+            pid: approachProc.pid,
+            timestamp: ts,
+          });
+        }
+        approachLogStream.write(chunk);
+      });
+      approachProc.stderr.on("data", (chunk) => {
+        const ts = lifecycleTs();
+        childActivitySeen = true;
+        lastChildActivityAt = ts;
+        if (!approachProc.__lifecycleStderrSeen) {
+          approachProc.__lifecycleStderrSeen = true;
+          lifecycleLog("child.stderr.firstLine", {
+            attemptId,
+            pid: approachProc.pid,
+            timestamp: ts,
+          });
+        }
+        approachLogStream.write(chunk);
+      });
+
+      // Start publisher after delay
+      approachProc.on("error", (err) => {
+        console.log(`✗ ${approach} process error: ${err.message}`);
+        void finalizeAttempt({
+            approach,
+            pattern: patternName,
+            patternDisplayName: pattern.name,
+            patternParams: pattern.params,
+            iteration: iterationNum,
+            attempt: attemptNumber,
+            benchmarkStatus: "failed",
+            terminationReason: "process_error",
+            timedOut: false,
+            reachedDurationLimit,
+            exitCode: null,
+            duration: Date.now() - startTime,
+            durationMs: Date.now() - startTime,
+            configuredTimeoutMs: finalTestTimeoutMs,
+            logDir,
+            iterationRootDir,
+            benchmarkEventTimeAnchor,
+            topicPrefix,
+            error: err.message,
+          });
+      });
+      approachProc.on("close", (code, signal) => {
+        lifecycleLog("child.close", {
+          attemptId,
+          pid: approachProc.pid,
+          code,
+          signal,
+          durationMs: Date.now() - startTime,
+          lastChildActivityAt,
+        });
+
+        if (finalized) {
+          return;
+        }
+
+        // Verify if the orchestrator completed cleanly and emitted the target windows
+        let hasValidOutput = false;
+        let invalidReason = "";
+
+        if (code !== 0 || signal !== null) {
+          invalidReason = `exit code: ${code}, signal: ${signal}`;
+        } else {
+          const summaryPath = path.join(logDir, "benchmark_window_cap_summary.json");
+          if (!fs.existsSync(summaryPath)) {
+            invalidReason = "missing benchmark_window_cap_summary.json";
+          } else {
+            try {
+              const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+              if (summary.stoppedAfterTargetWindows !== true) {
+                invalidReason = "stoppedAfterTargetWindows is not true in summary";
+              } else if (typeof summary.emittedFinalWindowCount !== "number" || summary.emittedFinalWindowCount < targetWindows) {
+                invalidReason = `emittedFinalWindowCount ${summary.emittedFinalWindowCount} is less than target windows ${targetWindows}`;
+              } else {
+                hasValidOutput = true;
+              }
+            } catch (err) {
+              invalidReason = `failed to parse benchmark_window_cap_summary.json: ${err.message}`;
+            }
+          }
+        }
+
+        if (hasValidOutput) {
+          console.log(`✓ Approach process exited cleanly after reaching target windows`);
+          void (async () => {
+            const durationMs = Date.now() - startTime;
+            await finalizeAttempt({
+              approach,
+              pattern: patternName,
+              patternDisplayName: pattern.name,
+              patternParams: pattern.params,
+              iteration: iterationNum,
+              attempt: attemptNumber,
+              benchmarkStatus: "completed",
+              terminationReason: "process_exit",
+              timedOut: false,
+              reachedDurationLimit: false,
+              exitCode: code,
+              duration: durationMs,
+              durationMs,
+              configuredTimeoutMs: finalTestTimeoutMs,
+              logDir,
+              iterationRootDir,
+              benchmarkEventTimeAnchor,
+              topicPrefix,
+            });
+          })();
+        } else {
+          // Early exit failure
+          console.log(`✗ Approach process exited early and invalidly: ${invalidReason}`);
+          void (async () => {
+            const durationMs = Date.now() - startTime;
+            const errorMsg = `Approach process exited early and invalidly: exit code ${code}, signal ${signal} (${invalidReason})`;
+            await finalizeAttempt({
+              approach,
+              pattern: patternName,
+              patternDisplayName: pattern.name,
+              patternParams: pattern.params,
+              iteration: iterationNum,
+              attempt: attemptNumber,
+              benchmarkStatus: "failed",
+              terminationReason: "process_error",
+              timedOut: false,
+              reachedDurationLimit,
+              exitCode: code,
+              duration: durationMs,
+              durationMs,
+              configuredTimeoutMs: finalTestTimeoutMs,
+              logDir,
+              iterationRootDir,
+              benchmarkEventTimeAnchor,
+              topicPrefix,
+              error: errorMsg,
+            });
+          })();
+        }
+      });
+
+      publisherStartTimer = setTimeout(() => {
+        if (finalized) {
+          return;
+        }
+        console.log("Starting data publisher...");
+        lifecycleLog("publisher.start.requested", {
+          attemptId,
+          waitState: currentWaitState,
+        });
+        currentWaitState = "waiting_for_publisher_close";
+        publisherProc = spawn("node", ["dist/streamer/src/publish.js"], {
+          env: {
+            ...env,
+            HIVE_PROCESS_ROLE: "benchmark_publisher",
+          },
+          stdio: "pipe",
+          detached: true,
+        });
+        lifecycleLog("publisher.spawned", {
+          attemptId,
+          pid: publisherProc.pid,
+          command: "node dist/streamer/src/publish.js",
+        });
+
+        const publisherLogPath = path.join(logDir, "publisher.log");
+        const publisherLogStream = fs.createWriteStream(publisherLogPath);
+        publisherProc.stdout.on("data", (chunk) => {
+          const ts = lifecycleTs();
+          publisherActivitySeen = true;
+          lastPublisherActivityAt = ts;
+          if (!publisherProc.__lifecycleStdoutSeen) {
+            publisherProc.__lifecycleStdoutSeen = true;
+            lifecycleLog("publisher.stdout.firstLine", {
+              attemptId,
+              pid: publisherProc.pid,
+              timestamp: ts,
+            });
+          }
+          publisherLogStream.write(chunk);
+        });
+        publisherProc.stderr.on("data", (chunk) => {
+          const ts = lifecycleTs();
+          publisherActivitySeen = true;
+          lastPublisherActivityAt = ts;
+          if (!publisherProc.__lifecycleStderrSeen) {
+            publisherProc.__lifecycleStderrSeen = true;
+            lifecycleLog("publisher.stderr.firstLine", {
+              attemptId,
+              pid: publisherProc.pid,
+              timestamp: ts,
+            });
+          }
+          publisherLogStream.write(chunk);
+        });
+
+        timeoutId = setTimeout(() => {
+          lifecycleLog("timeout.watchdog.fired", {
+            attemptId,
+            timeoutMs: finalTestTimeoutMs,
+            timestamp: lifecycleTs(),
+            lastPublisherActivityAt,
+            lastChildActivityAt,
+            waitState: currentWaitState,
+          });
+          console.log("⏰ Benchmark duration limit reached");
+          reachedDurationLimit = true;
+          void cleanupAttempt();
+        }, finalTestTimeoutMs);
+        lifecycleLog("timeout.watchdog.armed", {
+          attemptId,
+          timeoutMs: finalTestTimeoutMs,
+          armedAt: lifecycleTs(),
+          waitState: currentWaitState,
+        });
+
+        publisherProc.on("error", (err) => {
+          console.log(`✗ Publisher error: ${err.message}`);
+          void finalizeAttempt({
+            approach,
+            pattern: patternName,
+            patternDisplayName: pattern.name,
+            patternParams: pattern.params,
+            iteration: iterationNum,
+            attempt: attemptNumber,
+            benchmarkStatus: "failed",
+            terminationReason: "process_error",
+            timedOut: false,
+            reachedDurationLimit,
+            exitCode: null,
+            duration: Date.now() - startTime,
+            durationMs: Date.now() - startTime,
+            configuredTimeoutMs: finalTestTimeoutMs,
+            logDir,
+            iterationRootDir,
+            benchmarkEventTimeAnchor,
+            topicPrefix,
+            error: err.message,
+          });
+        });
+
+        publisherProc.on("close", (code) => {
+          void (async () => {
+            lifecycleLog("publisher.close", {
+              attemptId,
+              pid: publisherProc.pid,
+              code,
+              signal: publisherProc.signalCode || null,
+              durationMs: Date.now() - startTime,
+              lastPublisherActivityAt,
+            });
+            currentWaitState = "waiting_for_extraction";
+            const durationMs = Date.now() - startTime;
+            const benchmarkStatus =
+              reachedDurationLimit || code === 0 ? "completed" : "failed";
+            const terminationReason = reachedDurationLimit
+              ? "duration_limit_reached"
+              : (code === 0 ? "process_exit" : "process_error");
+
+            const result = {
+              approach,
+              pattern: patternName,
+              patternDisplayName: pattern.name,
+              patternParams: pattern.params,
+              iteration: iterationNum,
+              attempt: attemptNumber,
+              benchmarkStatus,
+              terminationReason,
+              timedOut: false,
+              reachedDurationLimit,
+              exitCode: code,
+              duration: durationMs,
+              durationMs,
+              configuredTimeoutMs: finalTestTimeoutMs,
+              logDir,
+              iterationRootDir,
+              benchmarkEventTimeAnchor,
+              topicPrefix,
+            };
+
+            await delay(2000);
+            console.log(`✓ Test completed in ${(durationMs / 1000).toFixed(1)}s`);
+            await finalizeAttempt(result);
+          })();
+        });
+      }, 2000);
+      lifecycleLog("runSingleTest.waiting", {
+        attemptId,
+        waitState: "waiting_for_publisher_spawn",
+        attemptDir: logDir,
+        expectedResultPaths: JSON.stringify(expectedResultPaths),
+      });
+    });
+  }
+
+  moveLogFiles(approach, logDir) {
+    const logFileMap = {
+      fetching: [
+        "fetching_client_side_log.csv",
+        "fetching_latency_log.csv",
+        "fetching_window_diagnostics.csv",
+        "fetching_resource_usage.csv",
+        "replayer-log.csv",
+      ],
+      approximation: [
+        "approximation_approach_log.csv",
+        "approximation_latency_log.csv",
+        "approximation_approach_resource_usage.csv",
+        "replayer-log.csv",
+      ],
+      chunked: [
+        "streaming_query_chunk_aggregator_log.csv",
+        "chunked_latency_log.csv",
+        "chunked_parent_partial_latency_log.csv",
+        "chunked_window_diagnostics.csv",
+        "streaming_query_hive_resource_log.csv",
+        "replayer-log.csv",
+      ],
+      naive_distributed: [
+        "naive_distributed_approach_log.csv",
+        "naive_distributed_latency_log.csv",
+        "naive_distributed_approach_resource_usage.csv",
+        "replayer-log.csv",
+      ],
+    };
+
+    const logFiles = logFileMap[approach] || [];
+
+    logFiles.forEach((logFile) => {
+      const srcPath = path.join(".", logFile);
+      const destPath = path.join(logDir, logFile);
+
+      if (fs.existsSync(srcPath)) {
+        try {
+          fs.copyFileSync(srcPath, destPath);
+          fs.unlinkSync(srcPath);
+          console.log(`  Moved ${logFile}`);
+        } catch (err) {
+          console.log(`  Failed to move ${logFile}: ${err.message}`);
+        }
+      }
+    });
+  }
+
+  async extractResults(approach, pattern, iterationNum = 1, attemptNumber = 1, explicitLogDir = null) {
+    const patternName = this.getPatternName(pattern);
+    console.log(
+      `\n📊 Extracting results for ${approach} - ${pattern.name} - Iteration ${iterationNum} - Attempt ${attemptNumber}...`,
+    );
+    console.log(
+      `[lifecycle ${new Date().toISOString()}] extraction.start approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} logDir=${explicitLogDir || this.getAttemptLogDir(approach, patternName, iterationNum, attemptNumber)}`,
+    );
+
+    if (approach === "naive_distributed") {
+      console.log("  Skipping extraction for naive_distributed; it is not part of the custom pattern accuracy comparison.");
+      return { status: "skipped" };
+    }
+
+    return new Promise((resolve) => {
+      const logDir = explicitLogDir || this.getAttemptLogDir(approach, patternName, iterationNum, attemptNumber);
+
+      // Call extraction script with custom parameters
+      const proc = spawn(
+        "node",
+        [
+          "experiments/pattern-analysis/extract-pattern-results.js",
+          approach,
+          patternName,
+          logDir,
+        ],
+        { stdio: "inherit" },
+      );
+
+      proc.on("close", (code) => {
+        if (code === 0) {
+          console.log(`✓ Extraction completed`);
+          console.log(
+            `[lifecycle ${new Date().toISOString()}] extraction.finish approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} status=success code=${code}`,
+          );
+          resolve({ status: "success" });
+        } else {
+          console.log(`⚠️  Extraction had issues (code ${code})`);
+          console.log(
+            `[lifecycle ${new Date().toISOString()}] extraction.finish approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} status=failed code=${code}`,
+          );
+          resolve({ status: "failed" });
+        }
+      });
+
+      proc.on("error", (err) => {
+        console.log(`✗ Extraction error: ${err.message}`);
+        console.log(
+          `[lifecycle ${new Date().toISOString()}] extraction.finish approach=${approach} pattern=${patternName} iteration=${iterationNum} attempt=${attemptNumber} status=failed error=${err.message}`,
+        );
+        resolve({ status: "failed" });
+      });
+    });
+  }
+
+  finalizeTestResult(baseResult, extractionResult) {
+    const extractionStatus = extractionResult?.status || "failed";
+    const success = extractionStatus === "success" || extractionStatus === "skipped";
+    const terminationReason = success
+      ? (baseResult?.terminationReason || "process_exit")
+      : "extraction_failed";
+
+    return {
+      ...baseResult,
+      extractionStatus,
+      finalExtractionStatus: extractionStatus,
+      finalStatus: success ? "success" : "failed",
+      terminationReason,
+      success,
+    };
+  }
+
+  buildAttemptFailureReason(result) {
+    if (result?.success) {
+      return null;
+    }
+    if (result?.error) {
+      return result.error;
+    }
+    if (result?.extractionStatus && !["success", "skipped"].includes(result.extractionStatus)) {
+      return `Extraction ${result.extractionStatus}`;
+    }
+    if (result?.benchmarkStatus && result.benchmarkStatus !== "completed") {
+      return `Benchmark ${result.benchmarkStatus}`;
+    }
+    if (result?.terminationReason && result?.terminationReason !== "duration_limit_reached") {
+      return `Termination ${result.terminationReason}`;
+    }
+    return null;
+  }
+
+  normalizeAttemptResult(result, attemptNumber) {
+    const extractionStatus = result?.extractionStatus || "failed";
+    const success = Boolean(result?.success);
+    const benchmarkStatus = result?.benchmarkStatus || (success ? "completed" : "failed");
+    const durationMs = Number.isFinite(result?.durationMs) ? result.durationMs : (result?.duration ?? null);
+    const configuredTimeoutMs = Number.isFinite(result?.configuredTimeoutMs)
+      ? result.configuredTimeoutMs
+      : null;
+    const reachedDurationLimit = Boolean(result?.reachedDurationLimit);
+    const terminationReason = result?.terminationReason
+      || inferTerminationReason({ benchmarkStatus, extractionStatus, success, reachedDurationLimit });
+
+    return {
+      approach: result?.approach || null,
+      pattern: result?.pattern || null,
+      patternDisplayName: result?.patternDisplayName || null,
+      patternParams: result?.patternParams || null,
+      iteration: result?.iteration || null,
+      attempt: attemptNumber,
+      success,
+      benchmarkStatus,
+      terminationReason,
+      extractionStatus,
+      finalStatus: result?.finalStatus || (success ? "success" : "failed"),
+      timedOut: Boolean(result?.timedOut),
+      reachedDurationLimit,
+      exitCode: result?.exitCode ?? null,
+      duration: durationMs,
+      durationMs,
+      configuredTimeoutMs,
+      logDir: result?.logDir || null,
+      error: result?.error || null,
+      failureReason: this.buildAttemptFailureReason({
+        ...result,
+        extractionStatus,
+        benchmarkStatus,
+        terminationReason,
+        success,
+      }),
+    };
+  }
+
+  buildCaseResult(pattern, approach, iterationNum, attemptResults) {
+    const finalAttempt = attemptResults[attemptResults.length - 1] || {};
+    const firstFailedAttempt = attemptResults.find((attempt) => !attempt.success) || null;
+
+    return {
+      approach,
+      pattern: pattern.type,
+      patternDisplayName: pattern.name,
+      patternParams: pattern.params,
+      iteration: iterationNum,
+      success: Boolean(finalAttempt.success),
+      finalStatus: finalAttempt.success ? "success" : "failed",
+      benchmarkStatus: finalAttempt.benchmarkStatus || (finalAttempt.success ? "completed" : "failed"),
+      terminationReason: finalAttempt.terminationReason
+        || inferTerminationReason(finalAttempt),
+      extractionStatus: finalAttempt.extractionStatus || "failed",
+      finalExtractionStatus: finalAttempt.extractionStatus || "failed",
+      timedOut: Boolean(finalAttempt.timedOut),
+      reachedDurationLimit: Boolean(finalAttempt.reachedDurationLimit),
+      exitCode: finalAttempt.exitCode ?? null,
+      duration: finalAttempt.duration ?? null,
+      durationMs: finalAttempt.durationMs ?? finalAttempt.duration ?? null,
+      configuredTimeoutMs: finalAttempt.configuredTimeoutMs ?? this.timeout,
+      logDir: finalAttempt.logDir || null,
+      finalLogDir: finalAttempt.logDir || null,
+      finalAttemptNumber: finalAttempt.attempt || attemptResults.length,
+      attemptCount: attemptResults.length,
+      retriesConfigured: this.retries,
+      retryUsed: attemptResults.length > 1,
+      firstFailureReason: firstFailedAttempt?.failureReason || null,
+      error: finalAttempt.error || null,
+      attempts: attemptResults,
+    };
+  }
+
+  async runCaseWithRetries(approach, pattern, iterationNum) {
+    const attemptResults = [];
+    const maxAttempts = this.retries + 1;
+
+    for (let attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber += 1) {
+      try {
+        const benchmarkResult = await this.runSingleTest(approach, pattern, iterationNum, attemptNumber);
+        const extractionResult = await this.extractResults(
+          approach,
+          pattern,
+          iterationNum,
+          attemptNumber,
+          benchmarkResult.logDir,
+        );
+        const finalizedResult = this.finalizeTestResult(benchmarkResult, extractionResult);
+        attemptResults.push(this.normalizeAttemptResult(finalizedResult, attemptNumber));
+
+        if (finalizedResult.success) {
+          break;
+        }
+      } catch (error) {
+        attemptResults.push(this.normalizeAttemptResult({
+          approach,
+          pattern: pattern.type,
+          patternDisplayName: pattern.name,
+          patternParams: pattern.params,
+          iteration: iterationNum,
+          success: false,
+          benchmarkStatus: "failed",
+          terminationReason: "process_error",
+          extractionStatus: "failed",
+          error: error.message,
+          logDir: this.getAttemptLogDir(approach, pattern.type, iterationNum, attemptNumber),
+          configuredTimeoutMs: this.timeout,
+        }, attemptNumber));
+      }
+
+      if (attemptNumber < maxAttempts) {
+        console.log(
+          `↻ Retrying ${approach} - ${pattern.name} - iteration ${iterationNum} (attempt ${attemptNumber + 1}/${maxAttempts})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
+
+    return this.buildCaseResult(pattern, approach, iterationNum, attemptResults);
+  }
+
+  async runAllPatterns() {
+    console.log(`\n${"█".repeat(80)}`);
+    console.log("CUSTOM PATTERN COMPARISON - ALL APPROACHES");
+    console.log("█".repeat(80));
+    console.log(`Total patterns: ${this.patterns.length}`);
+    console.log(`Approaches: ${this.approaches.join(", ")}`);
+    console.log(`Iterations per pattern-approach: ${this.iterations}`);
+    console.log(
+      `Total tests: ${this.patterns.length * this.approaches.length * this.iterations}`,
+    );
+    console.log("█".repeat(80));
+
+    const results = [];
+
+    for (const pattern of this.patterns) {
+      console.log(`\n${"─".repeat(80)}`);
+      console.log(`Pattern: ${pattern.name}`);
+      console.log(`Parameters: ${pattern.params}`);
+      console.log("─".repeat(80));
+
+      for (const approach of this.approaches) {
+        console.log(`\n  Approach: ${approach.toUpperCase()}`);
+
+        for (let iter = 1; iter <= this.iterations; iter++) {
+          const caseResult = await this.runCaseWithRetries(approach, pattern, iter);
+          results.push(caseResult);
+
+          // Wait between iterations
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+
+        // Wait between approaches
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+
+      // Wait between patterns
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+
+    return results;
+  }
+
+  async runSpecificPattern(patternType) {
+    const pattern = this.patterns.find((p) => p.type === patternType);
+
+    if (!pattern) {
+      throw new Error(
+        `Unknown pattern type: ${patternType}. Available: ${this.patterns.map((p) => p.type).join(", ")}`,
+      );
+    }
+
+    console.log("\n" + "█".repeat(80));
+    console.log(`SINGLE PATTERN TEST: ${pattern.name}`);
+    console.log(`Parameters: ${pattern.params}`);
+    console.log("█".repeat(80));
+
+    const results = [];
+
+    for (const approach of this.approaches) {
+      for (let iter = 1; iter <= this.iterations; iter++) {
+        const caseResult = await this.runCaseWithRetries(approach, pattern, iter);
+        results.push(caseResult);
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+
+    return results;
+  }
+
+  generateSummary(results) {
+    console.log("\n" + "█".repeat(80));
+    console.log("FINAL SUMMARY");
+    console.log("█".repeat(80));
+
+    const successful = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    const retried = results.filter((r) => r.retryUsed);
+    const totalAttempts = results.reduce((sum, result) => sum + (result.attemptCount || 0), 0);
+
+    console.log(`\nTotal tests: ${results.length}`);
+    console.log(`Successful: ${successful.length}`);
+    console.log(`Failed: ${failed.length}`);
+    console.log(`Iterations per test: ${this.iterations}`);
+    console.log(`Retries configured: ${this.retries}`);
+    console.log(`Retried cases: ${retried.length}`);
+    console.log(`Total attempts: ${totalAttempts}`);
+
+    // Group by approach
+    const byApproach = {};
+    this.approaches.forEach((approach) => {
+      byApproach[approach] = {
+        total: results.filter((r) => r.approach === approach).length,
+        success: results.filter((r) => r.approach === approach && r.success)
+          .length,
+      };
+    });
+
+    console.log("\n" + "─".repeat(80));
+    console.log("Results by Approach:");
+    Object.entries(byApproach).forEach(([approach, stats]) => {
+      console.log(`  ${approach}: ${stats.success}/${stats.total} successful`);
+    });
+
+    // Group by pattern
+    const byPattern = {};
+    this.patterns.forEach((pattern) => {
+      const patternResults = results.filter((r) => r.pattern === pattern.type);
+      byPattern[pattern.name] = {
+        total: patternResults.length,
+        success: patternResults.filter((r) => r.success).length,
+      };
+    });
+
+    console.log("\n" + "─".repeat(80));
+    console.log("Results by Pattern:");
+    Object.entries(byPattern).forEach(([name, stats]) => {
+      console.log(`  ${name}: ${stats.success}/${stats.total} successful`);
+    });
+
+    if (failed.length > 0) {
+      console.log("\n" + "─".repeat(80));
+      console.log("Failed Tests:");
+      failed.forEach((r) => {
+        console.log(
+          `  ✗ ${r.approach} - ${r.patternDisplayName || r.pattern} - iteration ${r.iteration || "?"}`,
+        );
+        if (r.firstFailureReason) console.log(`    First failure: ${r.firstFailureReason}`);
+        if (r.error) console.log(`    Final error: ${r.error}`);
+      });
+    }
+
+    if (retried.length > 0) {
+      console.log("\n" + "─".repeat(80));
+      console.log("Retried Cases:");
+      retried.forEach((r) => {
+        console.log(
+          `  ↻ ${r.approach} - ${r.patternDisplayName || r.pattern} - iteration ${r.iteration}: ${r.attemptCount} attempt(s), final=${r.finalStatus}`,
+        );
+      });
+    }
+
+    // Save summary
+    const summaryPath = path.join(
+      this.baseLogDir,
+      "custom_pattern_comparison_summary.json",
+    );
+    const summary = {
+      timestamp: new Date().toISOString(),
+      totalTests: results.length,
+      iterations: this.iterations,
+      retries: this.retries,
+      smokeMode: this.smokeMode,
+      selectedPatterns: this.patterns.map((pattern) => pattern.type),
+      selectedApproaches: this.approaches,
+      successful: successful.length,
+      failed: failed.length,
+      totalAttempts,
+      retryCountConfigured: this.retries,
+      retryUsed: retried.length > 0,
+      retriedCases: retried.map((result) => ({
+        approach: result.approach,
+        pattern: result.pattern,
+        iteration: result.iteration,
+        attemptCount: result.attemptCount,
+        finalStatus: result.finalStatus,
+        finalLogDir: result.finalLogDir,
+      })),
+      failedAfterRetries: failed.map((result) => ({
+        approach: result.approach,
+        pattern: result.pattern,
+        iteration: result.iteration,
+        attemptCount: result.attemptCount,
+        finalStatus: result.finalStatus,
+        benchmarkStatus: result.benchmarkStatus,
+        terminationReason: result.terminationReason,
+        firstFailureReason: result.firstFailureReason,
+        finalLogDir: result.finalLogDir,
+        finalExtractionStatus: result.finalExtractionStatus,
+      })),
+      byApproach: byApproach,
+      byPattern: byPattern,
+      results: results.map((result) => ({
+        ...result,
+        extractionStatus: result.extractionStatus || "failed",
+        finalExtractionStatus: result.finalExtractionStatus || result.extractionStatus || "failed",
+        benchmarkStatus: result.benchmarkStatus || (result.success ? "completed" : "failed"),
+        finalStatus: result.finalStatus || (result.success ? "success" : "failed"),
+        terminationReason: result.terminationReason
+          || inferTerminationReason(result),
+        durationMs: result.durationMs ?? result.duration ?? null,
+        configuredTimeoutMs: result.configuredTimeoutMs ?? this.timeout,
+        reachedDurationLimit: Boolean(result.reachedDurationLimit),
+      })),
+    };
+
+    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
+    console.log(`\n📄 Summary saved to: ${summaryPath}`);
+    console.log("█".repeat(80));
+  }
+
+  async runAnalysis() {
+    console.log("\n" + "=".repeat(80));
+    console.log("RUNNING COMPREHENSIVE ANALYSIS");
+    console.log("=".repeat(80));
+
+    const analysisArgs = [
+      "analysis/accuracy/accuracy-comparison-custom-patterns.js",
+      "--input-root",
+      this.baseLogDir,
+      "--output-dir",
+      path.join(this.baseLogDir, "analysis", "custom-pattern-accuracy"),
+      "--execution-summary",
+      path.join(this.baseLogDir, "custom_pattern_comparison_summary.json"),
+    ];
+
+    if (this.patterns.length > 0) {
+      analysisArgs.push("--patterns", this.patterns.map((pattern) => pattern.type).join(","));
+    }
+
+    if (this.approaches.length > 0) {
+      analysisArgs.push("--approaches", this.approaches.join(","));
+    }
+
+    if (this.iterations > 0) {
+      analysisArgs.push(
+        "--iterations",
+        Array.from({ length: this.iterations }, (_, index) => String(index + 1)).join(","),
+      );
+    }
+
+    return new Promise((resolve) => {
+      const proc = spawn(
+        "node",
+        analysisArgs,
+        { stdio: "inherit" },
+      );
+
+      proc.on("close", (code) => {
+        if (code === 0) {
+          console.log("✓ Analysis completed");
+          resolve(true);
+        } else {
+          console.log("⚠️  Analysis completed with warnings/errors");
+          resolve(false);
+        }
+      });
+
+      proc.on("error", (err) => {
+        console.error(`✗ Failed to run analysis: ${err.message}`);
+        resolve(false);
+      });
+    });
+  }
+}
+
+function resolvePatternTestTimeoutMs(explicitTimeoutMs, smokeMode = false) {
+  const defaultTimeoutMs = 240000;
+
+  if (smokeMode && !Number.isFinite(explicitTimeoutMs)) {
+    return 120000;
+  }
+
+  if (Number.isFinite(explicitTimeoutMs)) {
+    return explicitTimeoutMs;
+  }
+
+  const envTimeoutMs = process.env.CUSTOM_PATTERN_TEST_TIMEOUT_MS;
+  if (envTimeoutMs !== undefined) {
+    const parsedTimeoutMs = Number.parseInt(envTimeoutMs, 10);
+    if (Number.isFinite(parsedTimeoutMs)) {
+      return parsedTimeoutMs;
+    }
+  }
+
+  return defaultTimeoutMs;
+}
+
+function resolveRetryCount(explicitRetries, envRetries) {
+  if (Number.isFinite(explicitRetries)) {
+    return Math.max(0, explicitRetries);
+  }
+
+  if (envRetries !== undefined) {
+    const parsedRetries = Number.parseInt(envRetries, 10);
+    if (Number.isFinite(parsedRetries)) {
+      return Math.max(0, parsedRetries);
+    }
+  }
+
+  return 0;
+}
+
+function parseCliArgs(argv) {
+  const args = {
+    iterations: 35,
+    patternTestTimeoutMs: undefined,
+    retries: 0,
+    patternTypes: null,
+    approachNames: null,
+    targetWindowCount: null,
+    outputDir: null,
+    patternType: null,
+    help: false,
+  };
+
+  const positional = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = argv[index + 1];
+
+    if (arg === "--iterations" || arg === "-i") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`${arg} requires a positive integer`);
+      }
+      args.iterations = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--pattern-test-timeout" || arg === "--test-timeout") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`${arg} requires a positive integer`);
+      }
+      args.patternTestTimeoutMs = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--retries") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value < 0) {
+        throw new Error("--retries requires a non-negative integer");
+      }
+      args.retries = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--pattern" || arg === "--patterns") {
+      const parsed = parseSelectionList(next, ALL_PATTERN_TYPES);
+      if (!parsed || parsed.length === 0) {
+        throw new Error(`${arg} requires a comma-separated list of known pattern names`);
+      }
+      args.patternTypes = parsed;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--approach" || arg === "--approaches") {
+      const parsed = parseSelectionList(next, ALL_APPROACHES);
+      if (!parsed || parsed.length === 0) {
+        throw new Error(`${arg} requires a comma-separated list of known approach names`);
+      }
+      args.approachNames = parsed;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--target-windows") {
+      const value = Number.parseInt(next || "", 10);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error("--target-windows requires a positive integer");
+      }
+      args.targetWindowCount = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--output-dir") {
+      if (!next) {
+        throw new Error("--output-dir requires a value");
+      }
+      args.outputDir = resolveMaybeRelativePath(next);
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      args.help = true;
+      continue;
+    }
+
+    positional.push(arg);
+  }
+
+  if (positional.length > 1) {
+    throw new Error(`Unknown argument(s): ${positional.slice(1).join(", ")}`);
+  }
+
+  if (positional.length === 1) {
+    if (!ALL_PATTERN_TYPES.includes(positional[0])) {
+      throw new Error(`Unknown pattern type: ${positional[0]}`);
+    }
+    args.patternType = positional[0];
+  }
+
+  return args;
+}
+
+// Main execution
+async function main() {
+  const cliArgs = parseCliArgs(process.argv.slice(2));
+
+  if (cliArgs.help) {
+    console.log("Usage:");
+    console.log(
+      "  node run-custom-patterns-comparison.js [--iterations N] [--approaches list] [--patterns list] [--target-windows N] [--output-dir path]",
+    );
+    console.log(
+      "  node run-custom-patterns-comparison.js low_variability [-i N] [--approaches list] [--target-windows N] [--output-dir path]",
+    );
+    console.log("\nOptions:");
+    console.log(
+      "  --iterations, -i N          Number of iterations per test (default: 35)",
+    );
+    console.log(
+      "  --approach, --approaches    Comma-separated approaches",
+    );
+    console.log(
+      "  --pattern, --patterns       Comma-separated pattern types",
+    );
+    console.log(
+      "  --target-windows N          Target completed windows per run",
+    );
+    console.log(
+      "  --output-dir PATH           Benchmark output root (default: logs/custom-pattern-comparison)",
+    );
+    console.log(
+      "  --pattern-test-timeout MS   Per-test timeout in milliseconds (default: 240000)",
+    );
+    console.log(
+      "  --retries N                 Retry failed cases up to N additional attempts (default: 0)",
+    );
+    process.exit(0);
+  }
+
+  const runner = new CustomPatternComparisonRunner(cliArgs.iterations, {
+    patternTestTimeoutMs: cliArgs.patternTestTimeoutMs,
+    retries: cliArgs.retries,
+    smokeMode: process.env.PAPER_BENCHMARK_SMOKE === "1",
+    patternTypes: cliArgs.patternTypes,
+    approachNames: cliArgs.approachNames,
+    targetWindowCount: cliArgs.targetWindowCount,
+    outputDir: cliArgs.outputDir,
+  });
+
+  console.log(`\n${"=".repeat(80)}`);
+  console.log(`Configuration: Running ${cliArgs.iterations} iteration(s) per test`);
+  console.log(`Pattern test timeout: ${runner.timeout} ms`);
+  console.log(`Retries per failed case: ${runner.retries}`);
+  console.log(`Smoke mode: ${runner.smokeMode ? "enabled" : "disabled"}`);
+  console.log(`Total patterns: ${runner.patterns.length} custom pattern(s)`);
+  console.log(`Approaches: ${runner.approaches.join(", ")}`);
+  console.log(`Selected patterns: ${runner.patterns.map((pattern) => pattern.type).join(", ") || "none"}`);
+  console.log(`Selected approaches: ${runner.approaches.join(", ") || "none"}`);
+  console.log(`Target windows per run: ${runner.targetWindowCount || process.env.STREAMING_QUERY_HIVE_BENCHMARK_TARGET_WINDOWS || "35"}`);
+  console.log(`Output root: ${runner.baseLogDir}`);
+  console.log(
+    `Expected total tests: ${runner.patterns.length * runner.approaches.length * cliArgs.iterations} (${runner.patterns.length} patterns × ${runner.approaches.length} approaches × ${cliArgs.iterations} iterations)`,
+  );
+  const estimatedRuntimeMs = runner.patterns.length * runner.approaches.length * cliArgs.iterations * runner.timeout;
+  const estimatedRuntimeMinutes = estimatedRuntimeMs / 60000;
+  console.log(
+    `Expected runtime: ~${estimatedRuntimeMinutes >= 60 ? `${(estimatedRuntimeMinutes / 60).toFixed(1)} hours` : `${Math.ceil(estimatedRuntimeMinutes)} minutes`} (${estimatedRuntimeMs} ms total)`,
+  );
+  console.log("=".repeat(80));
+
+  try {
+    if (!cliArgs.patternType) {
+      // Run all patterns
+      const results = await runner.runAllPatterns();
+      runner.generateSummary(results);
+      await runner.runAnalysis();
+    } else {
+      // Run specific pattern
+      const results = await runner.runSpecificPattern(cliArgs.patternType);
+      runner.generateSummary(results);
+    }
+
+    console.log("\n✓ All experiments completed!");
+    process.exit(0);
+  } catch (error) {
+    console.error("\n✗ Experiment failed:", error.message);
+    console.error(error.stack);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  ALL_APPROACHES,
+  ALL_PATTERN_TYPES,
+  CustomPatternComparisonRunner,
+  parseCliArgs,
+};

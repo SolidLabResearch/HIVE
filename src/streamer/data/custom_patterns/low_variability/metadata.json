@@ -1,0 +1,14 @@
+{
+  "pattern": "low_variability",
+  "description": "Low Variability Pattern",
+  "parameters": {
+    "mu": -23,
+    "sigma": 0.25
+  },
+  "duration_seconds": 120,
+  "sampling_rate_hz": 4,
+  "total_points": 480,
+  "random_seed": 20260716,
+  "random_source": "seeded_mulberry32",
+  "generated_at": "2026-07-17T07:15:56.839Z"
+}

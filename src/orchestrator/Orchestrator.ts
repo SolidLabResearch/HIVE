@@ -3,6 +3,8 @@ import { BeeKeeper } from "../services/BeeKeeper";
 import { HTTPServer } from "../services/server/HTTPServer";
 import config from '../config/httpServerConfig.json';
 import { hash_string_md5 } from "../util/Util";
+import { detectCompatibleChunkReuse } from "../util/chunkStateReuse";
+import { endStageTimer, profileCount, startStageTimer } from "../util/profiling";
 
 /**
  *
@@ -33,14 +35,49 @@ export class Orchestrator {
     addSubQuery(query: string): void {
         this.subQueriesToRun.push(query);
         const query_hash = hash_string_md5(query);
+        const compatibleReuse =
+            this.operatorType === "StreamingQueryChunkAggregatorOperator"
+                ? detectCompatibleChunkReuse(query)
+                : null;
 
+        if (compatibleReuse) {
+            profileCount("compatible_queries_detected");
+            profileCount("original_agent_rsps_skipped");
+            const registerStartedAt = startStageTimer();
+            RSPAgent.registerQueryDefinition(query, `chunked/${query_hash}`, {
+                chunk_state_primary_reuse: true,
+                compatibility_kind: "avg_sum_count_vertical_slice",
+                reuse_class_key: compatibleReuse.reuseClassKey,
+                source_topic: compatibleReuse.sourceTopic,
+                source_stream_id: compatibleReuse.sourceStreamId,
+                original_window_range: compatibleReuse.originalWindowRange,
+                original_window_step: compatibleReuse.originalWindowStep,
+            }).then(() => {
+                endStageTimer("orchestrator.compatible_reuse_registration_ms", registerStartedAt);
+                console.log(`Registered compatible chunk-reuse sub-query without raw RSPAgent: ${query}`);
+            }).catch((error: Error) => {
+                endStageTimer("orchestrator.compatible_reuse_registration_ms", registerStartedAt);
+                console.error(`Error registering compatible sub-query "${query}":`, error);
+            });
+            console.log(`Sub-query added via compatible chunk-state reuse: ${query}`);
+            return;
+        }
+
+        const agentSetupStartedAt = startStageTimer();
         const queryAgent = new RSPAgent(query, `chunked/${query_hash}`);
+        endStageTimer("orchestrator.rsp_agent_setup_ms", agentSetupStartedAt);
+        if (this.operatorType === "StreamingQueryChunkAggregatorOperator") {
+            profileCount("fallback_original_agent_rsps_started");
+        }
+        const processStreamsStartedAt = startStageTimer();
         queryAgent.process_streams()
             .then(() => {
+                endStageTimer("orchestrator.rsp_agent_stream_process_start_ms", processStreamsStartedAt);
                 console.log(`Added sub-query: ${query}`);
             }
             )
             .catch((error: Error) => {
+                endStageTimer("orchestrator.rsp_agent_stream_process_start_ms", processStreamsStartedAt);
                 console.error(`Error processing sub-query "${query}":`, error);
             }
             );
@@ -116,8 +153,16 @@ export class Orchestrator {
             return;
         }
 
-        this.beeKeeper.executeQuery(this.registeredQuery, "output", this.operatorType, this.subQueriesToRun)
+        const resultTopic = process.env.RESULT_TOPIC || "output";
+        const handoffStartedAt = startStageTimer();
+        this.beeKeeper.executeQuery(this.registeredQuery, resultTopic, this.operatorType, this.subQueriesToRun)
+        endStageTimer("orchestrator.bee_worker_handoff_ms", handoffStartedAt);
         console.log(`Running registered query: ${this.registeredQuery}`);
 
+    }
+
+    public async stop(): Promise<void> {
+        await this.beeKeeper.stop();
+        this.http_server.close();
     }
 }

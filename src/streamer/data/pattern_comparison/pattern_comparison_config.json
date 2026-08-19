@@ -1,0 +1,53 @@
+{
+  "data_points": 480,
+  "timestamp_interval_ms": 250,
+  "total_duration_s": 120.0,
+  "sampling_frequency_hz": 4.0,
+  "patterns": [
+    "low_variability",
+    "step_pattern",
+    "spike_pattern",
+    "low_freq_oscillation",
+    "high_freq_oscillation"
+  ],
+  "pattern_descriptions": {
+    "low_variability": "Low variability with Gaussian noise",
+    "step_pattern": "Step change from v1 to v2 at t=60s",
+    "spike_pattern": "Brief spike from base to spike value",
+    "low_freq_oscillation": "Low frequency oscillation (0.05 Hz)",
+    "high_freq_oscillation": "High frequency oscillation (0.5 Hz)"
+  },
+  "pattern_parameters": {
+    "low_variability": {
+      "mu": -23.0,
+      "sigma": 0.25
+    },
+    "step_pattern": {
+      "v1": -23.0,
+      "v2": -15.0,
+      "t_step": 60.0
+    },
+    "spike_pattern": {
+      "v_base": -23.0,
+      "v_spike": -5.0,
+      "delta_t": 1.25
+    },
+    "low_freq_oscillation": {
+      "mu": -23.0,
+      "A": 5.0,
+      "f": 0.05
+    },
+    "high_freq_oscillation": {
+      "mu": -23.0,
+      "A": 3.0,
+      "f": 0.5
+    }
+  },
+  "data_paths": {
+    "low_variability": "pattern_comparison/low_variability",
+    "step_pattern": "pattern_comparison/step_pattern",
+    "spike_pattern": "pattern_comparison/spike_pattern",
+    "low_freq_oscillation": "pattern_comparison/low_freq_oscillation",
+    "high_freq_oscillation": "pattern_comparison/high_freq_oscillation"
+  }
+}
