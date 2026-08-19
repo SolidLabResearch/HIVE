@@ -138,3 +138,13 @@ analysis/k-scaling/raw/
 analysis/k-scaling/plots/
 analysis/k-scaling/k_scaling_plot_summary.csv
 analysis/k-scaling/k_scaling_interpretation.md
+
+# Local benchmark/debug outputs
+## User.md
+debug_test.js
+run_summary.json
+mqtt_traffic.ndjson
+chunked_debug_summary.json
+chunked_emission_proof.json
+analysis/_artifact_backups/
+analysis/k-scaling/extracted_files.txt
