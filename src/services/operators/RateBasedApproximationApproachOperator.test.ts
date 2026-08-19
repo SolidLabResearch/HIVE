@@ -92,7 +92,7 @@ WHERE { WINDOW :wout { ?sensor :value ?v } }
 `;
 
 const SUBQUERY_A = `
-PREFIX : <https://rsp.js/>
+PREFIX : <mqtt://localhost/>
 REGISTER RStream <output> AS
 SELECT (AVG(?v) AS ?avgTemp)
 FROM NAMED WINDOW :w1 ON STREAM :stream1 [RANGE 120000 STEP 60000]
@@ -100,7 +100,7 @@ WHERE { WINDOW :w1 { ?sensor :value ?v } }
 `;
 
 const SUBQUERY_B = `
-PREFIX : <https://rsp.js/>
+PREFIX : <mqtt://localhost/>
 REGISTER RStream <output> AS
 SELECT (AVG(?v) AS ?avgTemp)
 FROM NAMED WINDOW :w2 ON STREAM :stream2 [RANGE 120000 STEP 60000]
